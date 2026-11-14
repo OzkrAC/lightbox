@@ -1,0 +1,158 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Everything that needs no root: the header check, the analyzer gate and the
+  # unit, validation and seccomp suites.
+  check:
+    name: Checks (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: ${{ matrix.experimental }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # GCC 14 is the compiler the analyzer gate is kept clean for.
+          - name: x86_64
+            runner: ubuntu-24.04
+            cc: gcc-14
+            packages: gcc-14 gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+            targets: check
+            experimental: false
+          # What Ubuntu 24.04 installs as gcc: GCC 13, which knows C23 as
+          # -std=c2x. An analyzer's findings change from release to release,
+          # so the gate is not run with this one.
+          - name: x86_64 with GCC 13
+            runner: ubuntu-24.04
+            cc: gcc
+            packages: gcc
+            targets: check-sys test
+            experimental: false
+          # lightbox had never been run on aarch64 when this workflow was
+          # written: its seccomp numbers were compared with the kernel's
+          # headers and the filter was interpreted, nothing more. Until this
+          # job has been green once, a failure here is reported and does not
+          # fail the workflow. Remove "experimental" then.
+          - name: aarch64
+            runner: ubuntu-24.04-arm
+            cc: gcc-14
+            packages: gcc-14
+            targets: check
+            experimental: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install the toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build ${{ matrix.packages }}
+      # Ubuntu's AppArmor keeps unprivileged processes from using user
+      # namespaces. The seccomp suite makes one to watch the filter refuse
+      # the next; with the restriction on, it skips that case.
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - name: Build
+        run: make CC=${{ matrix.cc }}
+      - name: Check
+        run: make CC=${{ matrix.cc }} ${{ matrix.targets }}
+      - name: Kernel log
+        if: ${{ failure() }}
+        run: sudo dmesg | tail -n 60
+
+  # The suite that starts containers: tests/lifecycle.sh, as root. It works in
+  # private network, mount and PID namespaces and fails if it leaves anything
+  # on the runner.
+  lifecycle:
+    name: Lifecycle suite (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    continue-on-error: ${{ matrix.experimental }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86_64
+            runner: ubuntu-24.04
+            experimental: false
+          # See the aarch64 note in the job above.
+          - name: aarch64
+            runner: ubuntu-24.04-arm
+            experimental: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install the toolchain and what the suite needs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build gcc-14 busybox-static iproute2 iptables util-linux
+      - name: Build
+        run: make CC=gcc-14
+      # The suite makes bridge and veth interfaces, and lightbox's firewall
+      # rules use the state match and masquerading. Runner kernels keep some
+      # modules in a package of extras.
+      - name: Kernel modules
+        run: |
+          missing=
+          for m in bridge veth br_netfilter xt_state xt_conntrack xt_MASQUERADE nf_nat; do
+            sudo modprobe -n "$m" 2>/dev/null || missing="$missing $m"
+          done
+          if [ -n "$missing" ]; then
+            echo "not available:$missing"
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)" ||
+              echo "no package of extra modules for this kernel; the suite will say what it cannot do"
+          else
+            echo "all available"
+          fi
+      - name: Host facts
+        run: |
+          uname -srm
+          echo "cgroup controllers: $(cat /sys/fs/cgroup/cgroup.controllers)"
+          echo "enabled below the root: $(cat /sys/fs/cgroup/cgroup.subtree_control)"
+          iptables --version
+          ip -V
+          busybox | head -n 1
+          unshare --version
+          echo "loaded: $(lsmod | awk '{ print $1 }' | grep -E '^(bridge|veth|br_netfilter|nf_tables|nft_compat|nf_nat|xt_.*)$' | sort | tr '\n' ' ')"
+      # sudo drops the environment, so the suite's options are make variables.
+      - name: Lifecycle suite
+        run: sudo make CC=gcc-14 test-lifecycle GITHUB_ACTIONS=true LIGHTBOX_TEST_MODPROBE=1
+      - name: Kernel log
+        if: ${{ failure() }}
+        run: sudo dmesg | tail -n 80
+
+  # README's "make CC=aarch64-linux-gnu-gcc", with the compiler Ubuntu ships
+  # under that name. AR and STRIP follow from the prefix.
+  cross:
+    name: Cross-build for aarch64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install the toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build gcc-aarch64-linux-gnu
+      - name: Build
+        run: make CC=aarch64-linux-gnu-gcc
+      - name: The result is a static aarch64 executable
+        run: |
+          file lightbox
+          file lightbox | grep -q 'ARM aarch64'
+          file lightbox | grep -q 'statically linked'

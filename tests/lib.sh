@@ -16,8 +16,12 @@
 # output is shown only when the result is not the expected one, or with V=1.
 #
 # A suite may define case_setup, which runs before each case in the same
-# subshell and receives the case number, and SHOW_FILTER, a sed expression
-# applied to the output that is shown.
+# subshell and receives the case number; SHOW_FILTER, a sed expression applied
+# to the output that is shown; and SHOW_LINES, how many lines of it to show
+# (40 unless set). A suite may also replace run_case after sourcing this file.
+#
+# Under GitHub Actions a failed case and an unexpected pass are also written as
+# error annotations, which the run's summary page lists without the log.
 
 n=0 passed=0 failed=0 xfailed=0 xpassed=0 skipped=0
 
@@ -32,7 +36,17 @@ run_case() { # function -> sets rc and out
 
 show() {
     [ -n "$out" ] || return 0
-    printf '%s\n' "$out" | sed -e "${SHOW_FILTER:-s/^//}" -e 's/^/       | /' | head -40
+    printf '%s\n' "$out" | sed -e "${SHOW_FILTER:-s/^//}" -e 's/^/       | /' | head -n "${SHOW_LINES:-40}"
+}
+
+annotate() { # title: the case's output as a GitHub Actions error annotation
+    [ "${GITHUB_ACTIONS:-}" = true ] || return 0
+    local title text
+    # a workflow command is one line: %, newlines, and in a property : and , are escaped
+    title=$(printf '%s' "$1" | sed -e 's/%/%25/g' -e 's/:/%3A/g' -e 's/,/%2C/g')
+    text=$(printf '%s\n' "$out" | sed -e "${SHOW_FILTER:-s/^//}" | head -n 20 |
+           sed -e 's/%/%25/g' | awk '{ printf "%s%%0A", $0 }')
+    printf '::error title=%s::%s\n' "$title" "${text:-no output}"
 }
 
 check() { # name, function
@@ -44,6 +58,7 @@ check() { # name, function
         skipped=$((skipped + 1)); printf 'skip   %s\n' "$1"; show
     else
         failed=$((failed + 1)); printf 'FAIL   %s\n' "$1"; show
+        annotate "FAIL: $1"
     fi
     return 0
 }
@@ -59,6 +74,8 @@ xfail() { # ledger id, name, function
         xpassed=$((xpassed + 1))
         printf 'XPASS  %-22s %s\n' "$1" "$2"
         printf '       | passes now: change this case from xfail to check\n'
+        [ "${V:-0}" = 1 ] && show
+        annotate "XPASS: $2 ($1 passes now)"
     fi
     return 0
 }

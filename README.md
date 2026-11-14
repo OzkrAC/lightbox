@@ -50,6 +50,20 @@ runs everything that needs no root:
 
 In the test suites an open finding from `ROADMAP.md` is an expected failure that names its ledger id. When a fix makes one pass, the suite fails until the case is changed from `xfail` to `check`.
 
+One more suite starts real containers, so it needs root:
+
+```sh
+sudo make test-lifecycle
+```
+
+It covers `setup`, `create`, `start`, `exec`, `stop` and `rm`, volumes, limits, the init hook, the sandbox and the network between containers. It needs a kernel with bridge, veth and cgroup v2, and a statically linked busybox to build the containers' root filesystem from (`busybox-static` on Debian, Ubuntu and Void). `LIGHTBOX_TEST_ROOTFS=/path` uses a copy of a root filesystem of yours instead.
+
+The suite works in private network, mount and PID namespaces with a configuration of its own, so your bridge, firewall rules and containers are not touched. Its cgroups live under `/sys/fs/cgroup/lightbox-test-<pid>` and are removed at the end, and the run fails if the host's interfaces, firewall rules or cgroups differ afterwards. Kernel modules that get loaded on the way stay loaded.
+
+sudo drops the environment, so options go on make's command line: `sudo make test-lifecycle V=1 KEEP=1`. Build first, as yourself; the target builds nothing.
+
+`.github/workflows/ci.yml` runs `make check` and the lifecycle suite on every push to `main` and every pull request, on x86_64 and on aarch64.
+
 ## Quick start
 
 ### 1. Get a rootfs
