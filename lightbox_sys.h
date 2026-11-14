@@ -6,9 +6,10 @@
  * lightc does not wrap yet.
  *
  * This is the only place in lightbox that may hold a raw syscall number.
- * tests/sys_check.c compares every number, constant and structure layout here
- * with the kernel's own headers for x86_64 and aarch64 (make check-sys), so a
- * wrong value fails the build instead of calling a different syscall.
+ * tests/sys_check.c and tests/sys_check_net.c compare every number, constant
+ * and structure layout here with the kernel's own headers for x86_64 and
+ * aarch64 (make check-sys), so a wrong value fails the build instead of
+ * calling a different syscall.
  *
  * Delete an entry when lightc ships the wrapper for it.
  */
@@ -30,12 +31,10 @@
 #define LB_SYS_capset     126
 #define LB_SYS_statfs     137
 #define LB_SYS_chroot     161
-#define LB_SYS_mount      165   /* lightc before its 0a.4 has 40 (sendfile) here */
 #define LB_SYS_renameat   264
 #define LB_SYS_statx      332
 #elif defined(__aarch64__)
 #define LB_SYS_renameat   38
-#define LB_SYS_mount      40
 #define LB_SYS_statfs     43
 #define LB_SYS_fchdir     50
 #define LB_SYS_chroot     51
@@ -50,8 +49,9 @@
 /* ─── Kernel constants (the same on both architectures) ─────────────────── */
 
 #define LB_ENOENT                 2
-#define LB_EINTR  4
 #define LB_ESRCH                  3
+#define LB_EINTR                  4
+#define LB_EEXIST                 17
 
 #define LB_S_IFMT                 0170000
 #define LB_S_IFDIR                0040000
@@ -63,7 +63,30 @@
 #define LB_CGROUP_SUPER_MAGIC     0x0027e0eb    /* a cgroup v1 hierarchy */
 #define LB_CGROUP2_SUPER_MAGIC    0x63677270
 
+/* f_flags of statfs: what the mount at a path carries. Each of these four is
+ * the bit mount(2) takes for the same thing (MS_RDONLY and so on). */
+#define LB_ST_RDONLY              1
+#define LB_ST_NOSUID              2
+#define LB_ST_NODEV               4
+#define LB_ST_NOEXEC              8
+
+/* A socket to carry interface requests, and the two requests that read and
+ * write an interface's flags (sys/socket.h, linux/sockios.h, linux/if.h). */
+#define LB_AF_INET                2
+#define LB_SOCK_DGRAM             2
+#define LB_SIOCGIFFLAGS           0x8913
+#define LB_SIOCSIFFLAGS           0x8914
+#define LB_IFF_UP                 0x1
+
 /* ─── Structures ────────────────────────────────────────────────────────── */
+
+/* struct ifreq (linux/if.h), as the two flag requests use it: the interface's
+ * name and its flags. The rest of the kernel's union is padding here. */
+struct lb_ifreq_flags {
+    char    name[16];
+    int16_t flags;
+    char    pad[22];
+};
 
 /* struct statfs as the 64-bit kernels lay it out (asm-generic/statfs.h). */
 struct lb_statfs {
@@ -137,13 +160,9 @@ static inline lc_sysret lb_sys_capset(void *header, const void *data) {
     return lc_syscall2(LB_SYS_capset, (int64_t)header, (int64_t)data);
 }
 
-/* mount(2) with lightbox's own number, so the call is right whichever lightc
- * release the build uses. */
-static inline lc_sysret lb_sys_mount(const char *source, const char *target,
-                                     const char *fstype, uint64_t flags,
-                                     const void *data) {
-    return lc_syscall5(LB_SYS_mount, (int64_t)source, (int64_t)target,
-                       (int64_t)fstype, (int64_t)flags, (int64_t)data);
+/* socket(2). The number is lightc's own, which its library uses too. */
+static inline lc_sysret lb_sys_socket(int32_t domain, int32_t type, int32_t protocol) {
+    return lc_syscall3(SYS_socket, domain, type, protocol);
 }
 
 static inline lc_sysret lb_sys_statfs(const char *path, struct lb_statfs *buf) {

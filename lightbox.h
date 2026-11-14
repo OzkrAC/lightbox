@@ -10,6 +10,12 @@
 
 #include "lightbox_sys.h"
 
+/* mount(2) goes through lightc's wrapper. On x86_64 that wrapper has the
+ * right syscall number from lightc 0.1.1 on; before, it called sendfile. */
+#if LC_VERSION_MAJOR == 0 && (LC_VERSION_MINOR < 1 || (LC_VERSION_MINOR == 1 && LC_VERSION_PATCH < 1))
+#error "lightbox needs lightc 0.1.1 or later"
+#endif
+
 #define MAX_PATH         512
 #define NAME_MAX_LEN     12
 #define MAX_VOLS         16
@@ -69,6 +75,11 @@ void cfg_global_load(char **envp);
 
 int read_file(const char *path, char *buf, size_t bufsz);
 bool path_exists(const char *path);
+bool path_is_directory(const char *path);
+/* mkdir -p, in this process: 0, or -1 with the failure reported */
+[[nodiscard]] int make_dirs(const char *path);
+/* ip link set lo up, in this process: 0, or -1 with the failure reported */
+[[nodiscard]] int loopback_up(void);
 int dir_is_empty(const char *path);
 void require_rm_rf(const char *path);
 
@@ -93,15 +104,15 @@ extern const char *const TOOL_ENV[];   /* what tools run with: a fixed PATH */
 lc_sysret exec_program(const char *prog, const char *const argv[], const char *const envp[]);
 [[nodiscard]] int wait_child(int32_t pid, int32_t *status);
 int exit_code_from_status(int32_t status);
-int do_mount(const char *source, const char *target,
-             const char *fstype, uint64_t flags, const char *data);
+/* mount(2): 0, or -1 with the failure reported. A change of a mount's flags
+ * (MS_REMOUNT | MS_BIND) keeps the restrictions the mount already has. */
+[[nodiscard]] int do_mount(const char *source, const char *target,
+                           const char *fstype, uint64_t flags, const char *data);
+/* the same, ending the process on failure */
 void require_mount(const char *source, const char *target,
                    const char *fstype, uint64_t flags, const char *data);
 const char *tool_path_ip(void);
 const char *tool_path_iptables(void);
-const char *tool_path_mount(void);
-const char *tool_path_umount(void);
-const char *tool_path_mkdir(void);
 const char *tool_path_cp(void);
 const char *tool_path_chown(void);
 const char *tool_path_rm(void);

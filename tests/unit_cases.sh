@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 #
-# Unit suite (ROADMAP 3.1). Unprivileged; creates no file.
+# Unit suite (ROADMAP 3.1 and 1.2). Unprivileged. The mount cases work in a
+# temporary directory, inside a user and mount namespace of their own.
 #
 #   tests/unit_cases.sh <unit harness>
 #   V=1 tests/unit_cases.sh ...            show the output of every case
 #
-# The harness is built from lightbox.c and calls lightbox's own helper for
-# running a program, the one every tool invocation goes through. It prints
-# "result <n>": the program's exit status, or 256 when no child could be made,
-# 257 when the program could not be executed, 258 when a signal ended it and
-# 259 when it could not be waited for.
+# The harness is built from lightbox.c and calls lightbox's own helpers. For
+# the one that runs a program, which every tool invocation goes through, it
+# prints "result <n>": the program's exit status, or 256 when no child could be
+# made, 257 when the program could not be executed, 258 when a signal ended it
+# and 259 when it could not be waited for. For the ones that mount, make
+# directories and bring up loopback, "result 0" or "result -1".
 #
 # The case runner (check, xfail, summary) is tests/lib.sh.
 
@@ -20,6 +22,7 @@ if [ ! -x "$UNIT" ]; then
     echo "unit: $UNIT is not an executable; run make test-unit" >&2
     exit 2
 fi
+UNIT=$(cd "$(dirname "$UNIT")" && pwd)/$(basename "$UNIT")
 HERE=$(cd "$(dirname "$0")" && pwd)
 
 . "$HERE/lib.sh"
@@ -159,6 +162,130 @@ t_status_decoding() {
     [ "$a" = 0 ] && [ "$b" = 7 ] && [ "$c" = 137 ] && [ "$d" = 139 ]
 }
 
+# ─── do_mount ───────────────────────────────────────────────────────────────
+
+# Run a script as root of a user namespace with a mount namespace of its own.
+# The script gets the harness as $1 and an empty directory as $2, and these:
+#   opts <mount point>         the mount's options, as /proc/self/mountinfo has them
+#   has  <mount point> <flag>  whether they include the flag
+#   m    <unit mount's arguments>   do_mount, which must succeed
+in_mount_namespace() { # script
+    unshare -r --mount true 2>/dev/null || { echo "user namespaces are not available to this user"; return 77; }
+    local dir rc
+    dir=$(mktemp -d "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    unshare -r --mount -- bash -c '
+        opts() { awk -v m="$1" '"'"'$5 == m { o = $6 } END { print o }'"'"' /proc/self/mountinfo; }
+        has()  { case ",$(opts "$1")," in *",$2,"*) return 0 ;; esac; return 1; }
+        m()    { r=$("$UNIT" mount "$@" 2>&1); [ "$r" = "result 0" ] || { echo "mount $*: $r"; exit 1; }; }
+        UNIT=$1; D=$2
+        '"$1" _ "$UNIT" "$dir"
+    rc=$?
+    rm -rf -- "$dir"
+    return $rc
+}
+
+t_mount_with_flags_and_data() {
+    in_mount_namespace '
+        mkdir "$D/t"
+        m tmpfs "$D/t" tmpfs nosuid,noexec mode=750
+        echo "options: $(opts "$D/t"), mode $(stat -c %a "$D/t")"
+        has "$D/t" nosuid && has "$D/t" noexec && ! has "$D/t" nodev && ! has "$D/t" ro &&
+        [ "$(stat -c %a "$D/t")" = 750 ]'
+}
+
+# Changing the flags of a mount replaces them all. lightbox only ever adds a
+# restriction, so the ones the mount has must still be there afterwards.
+t_mount_change_keeps_restrictions() {
+    in_mount_namespace '
+        mkdir "$D/src" "$D/dst"
+        m tmpfs "$D/src" tmpfs nodev,noexec -
+        m "$D/src" "$D/dst" - bind -
+        echo "a bind of a nodev,noexec mount: $(opts "$D/dst")"
+        m - "$D/dst" - remount,bind,nosuid,ro -
+        echo "after asking for nosuid and ro:  $(opts "$D/dst")"
+        has "$D/dst" ro && has "$D/dst" nosuid && has "$D/dst" nodev && has "$D/dst" noexec'
+}
+
+t_mount_file_over_file() {
+    in_mount_namespace '
+        : > "$D/file"
+        m /dev/null "$D/file" - bind -
+        m - "$D/file" - remount,bind,nosuid,noexec,ro -
+        echo "options: $(opts "$D/file")"
+        [ -c "$D/file" ] && has "$D/file" ro && has "$D/file" nosuid && has "$D/file" noexec'
+}
+
+t_mount_makes_private() {
+    in_mount_namespace '
+        mkdir "$D/t"
+        m tmpfs "$D/t" tmpfs - -
+        mount --make-shared "$D/t" || exit 77
+        grep " $D/t " /proc/self/mountinfo | grep -q " shared:" || { echo "could not make a shared mount to begin with"; exit 77; }
+        m - "$D/t" - rec,private -
+        ! grep " $D/t " /proc/self/mountinfo | grep -q " shared:"'
+}
+
+# Needs no namespace: the target is looked up before the kernel asks who is calling.
+t_mount_failure_is_reported() {
+    both mount tmpfs /nonexistent/lightbox-unit-dir tmpfs - -
+    [ "$out" = "result -1" ] && [ "$err" = "Error: mount failed: /nonexistent/lightbox-unit-dir (errno 2)" ]
+}
+
+# ─── make_dirs and loopback_up ──────────────────────────────────────────────
+
+t_make_dirs() {
+    dir=$(mktemp -d "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    (
+        umask 022
+        both mkdirs "$dir/a/b/c"
+        [ "$out" = "result 0" ] && [ -z "$err" ] && [ -d "$dir/a/b/c" ] || exit 1
+        echo "modes: $(stat -c %a "$dir/a" "$dir/a/b" "$dir/a/b/c" | tr '\n' ' ')"
+        [ "$(stat -c %a "$dir/a/b/c")" = 755 ] && [ "$(stat -c %a "$dir/a")" = 755 ] || exit 1
+        # again, and with slashes to spare: what is there already is fine
+        both mkdirs "$dir/a//b/c/"
+        [ "$out" = "result 0" ] && [ -z "$err" ] || exit 1
+        # a directory someone else made keeps its mode
+        mkdir -m 700 "$dir/closed"
+        both mkdirs "$dir/closed/inside"
+        [ "$out" = "result 0" ] && [ "$(stat -c %a "$dir/closed")" = 700 ] && [ -d "$dir/closed/inside" ]
+    )
+    rc=$?
+    rm -rf -- "$dir"
+    return $rc
+}
+
+t_make_dirs_stops_at_a_file() {
+    dir=$(mktemp -d "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    (
+        : > "$dir/file"
+        both mkdirs "$dir/file/below"
+        [ "$out" = "result -1" ] && [ "$err" = "Error: cannot make directory: $dir/file/below (errno 20)" ] || exit 1
+        both mkdirs "$dir/file"
+        [ "$out" = "result -1" ] && [ "$err" = "Error: not a directory: $dir/file" ]
+    )
+    rc=$?
+    rm -rf -- "$dir"
+    return $rc
+}
+
+# A network namespace starts with its loopback interface down.
+t_loopback_up() {
+    command -v ip >/dev/null 2>&1 || { echo "no ip to look at the interface with"; return 77; }
+    unshare -r --net true 2>/dev/null || { echo "user namespaces are not available to this user"; return 77; }
+    unshare -r --net -- bash -c '
+        before=$(ip -o link show lo)
+        result=$("$1" loopback 2>&1)
+        after=$(ip -o link show lo)
+        echo "before: ${before%%>*}>"
+        echo "$result"
+        echo "after:  ${after%%>*}>"
+        case $before in *"<LOOPBACK>"*) ;; *) echo "loopback was not down to begin with"; exit 77 ;; esac
+        [ "$result" = "result 0" ] || exit 1
+        case $after in *[\<,]UP[,\>]*) ;; *) exit 1 ;; esac
+        # and once more: an interface that is up already stays up
+        [ "$("$1" loopback 2>&1)" = "result 0" ]' _ "$UNIT"
+}
+
 check 'a program that succeeds gives 0'                          t_success
 check 'a non-zero exit status is returned as it is'              t_exit_status
 check 'a program killed by a signal is a failure, and reported'  t_killed_by_signal
@@ -177,5 +304,15 @@ check 'capturing a missing program gives an empty string'        t_capture_of_mi
 check 'tools run with a fixed PATH and nothing else'             t_environment
 check 'a signal the caller blocks is not blocked in the tool'    t_signal_mask_cleared
 check 'wait statuses decode as a shell reports them'             t_status_decoding
+
+check 'a mount gets the flags and the data it was given'         t_mount_with_flags_and_data
+check 'changing a mount keeps the restrictions it has'           t_mount_change_keeps_restrictions
+check 'a file is bound over a file, then restricted'             t_mount_file_over_file
+check 'a mount is made private'                                  t_mount_makes_private
+check 'a mount that fails is reported with its errno'            t_mount_failure_is_reported
+
+check 'directories are made with the ones above them'            t_make_dirs
+check 'a file in the way of a directory is an error'             t_make_dirs_stops_at_a_file
+check 'the loopback interface is brought up'                     t_loopback_up
 
 summary unit

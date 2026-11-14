@@ -168,30 +168,6 @@ const char *tool_path_iptables(void) {
     return pick_tool_path(candidates, sizeof(candidates) / sizeof(candidates[0]));
 }
 
-const char *tool_path_mount(void) {
-    static const char *const candidates[] = {
-        "/bin/mount",
-        "/usr/bin/mount",
-    };
-    return pick_tool_path(candidates, sizeof(candidates) / sizeof(candidates[0]));
-}
-
-const char *tool_path_umount(void) {
-    static const char *const candidates[] = {
-        "/bin/umount",
-        "/usr/bin/umount",
-    };
-    return pick_tool_path(candidates, sizeof(candidates) / sizeof(candidates[0]));
-}
-
-const char *tool_path_mkdir(void) {
-    static const char *const candidates[] = {
-        "/bin/mkdir",
-        "/usr/bin/mkdir",
-    };
-    return pick_tool_path(candidates, sizeof(candidates) / sizeof(candidates[0]));
-}
-
 const char *tool_path_cp(void) {
     static const char *const candidates[] = {
         "/bin/cp",
@@ -332,6 +308,14 @@ bool path_exists(const char *path) {
     return lc_kernel_faccessat2(AT_FDCWD, path, F_OK, 0) == 0;
 }
 
+bool path_is_directory(const char *path) {
+    lc_sysret fd = lc_kernel_open_file(path, O_RDONLY | O_DIRECTORY, 0);
+    if (fd < 0)
+        return false;
+    lc_kernel_close_file((int32_t)fd);
+    return true;
+}
+
 /* ─── Running programs ──────────────────────────────────────────────────── */
 
 /* The environment of every tool lightbox runs: a fixed PATH and nothing of
@@ -372,9 +356,9 @@ static lc_sysret read_retry(int32_t fd, void *buf, size_t len) {
     }
 }
 
-/* "Error: <before><prog><after><number>)" or, with after == NULL,
- * "Error: <before><prog>". */
-static void report_run(const char *before, const char *prog, const char *after, int number) {
+/* "Error: <before><what><after><number>)" or, with after == NULL,
+ * "Error: <before><what>". */
+static void report_failure(const char *before, const char *prog, const char *after, int number) {
     print_str(STDERR, "Error: ");
     print_str(STDERR, before);
     print_str(STDERR, prog);
@@ -422,7 +406,7 @@ static int run_program(const char *prog, const char *const argv[], const struct 
         }
     }
     if (rc < 0) {
-        report_run("cannot start ", prog, " (pipe failed, errno ", (int)-rc);
+        report_failure("cannot start ", prog, " (pipe failed, errno ", (int)-rc);
         return RUN_FORK_FAILED;
     }
 
@@ -434,7 +418,7 @@ static int run_program(const char *prog, const char *const argv[], const struct 
             lc_kernel_close_file(out_pipe[0]);
             lc_kernel_close_file(out_pipe[1]);
         }
-        report_run("cannot start ", prog, " (fork failed, errno ", (int)-pid);
+        report_failure("cannot start ", prog, " (fork failed, errno ", (int)-pid);
         return RUN_FORK_FAILED;
     }
 
@@ -488,15 +472,15 @@ static int run_program(const char *prog, const char *const argv[], const struct 
 
     int32_t status = 0;
     if (wait_child((int32_t)pid, &status) < 0) {
-        report_run("lost track of ", prog, NULL, 0);
+        report_failure("lost track of ", prog, NULL, 0);
         return RUN_WAIT_FAILED;
     }
     if (told == (lc_sysret)sizeof(exec_errno)) {
-        report_run("cannot execute ", prog, " (errno ", exec_errno);
+        report_failure("cannot execute ", prog, " (errno ", exec_errno);
         return RUN_EXEC_FAILED;
     }
     if (status & 0x7f) {
-        report_run("", prog, " was killed (signal ", status & 0x7f);
+        report_failure("", prog, " was killed (signal ", status & 0x7f);
         return RUN_SIGNALED;
     }
     return (status >> 8) & 0xff;
@@ -524,63 +508,109 @@ void require_rm_rf(const char *path) {
         die2("Error: rm -rf failed: ", path);
 }
 
+/* ─── Directories and the loopback interface ────────────────────────────── */
+
+/*
+ * What "mkdir -p" does: make the directory and every missing one above it,
+ * with mode 0755 before the umask. 0, or -1 once the path and the errno have
+ * been reported. Something that is in the way of a directory is an error.
+ */
+int make_dirs(const char *path) {
+    char buf[MAX_PATH];
+    size_t len = lc_string_length(path);
+    if (len == 0 || len >= sizeof(buf)) {
+        report_failure("path is empty or too long: ", path, NULL, 0);
+        return -1;
+    }
+    lc_bytes_copy(buf, path, len + 1);
+
+    /* every prefix that ends where a component ends, the whole path last */
+    for (size_t i = 1; i <= len; i++) {
+        if (buf[i] != '/' && buf[i] != '\0')
+            continue;
+        if (buf[i - 1] == '/')
+            continue;               /* "a//b", or a slash at the end */
+        char after = buf[i];
+        buf[i] = '\0';
+        lc_sysret rc = lc_kernel_mkdirat(AT_FDCWD, buf, 0755);
+        if (rc < 0 && rc != -LB_EEXIST) {
+            report_failure("cannot make directory: ", buf, " (errno ", (int)-rc);
+            return -1;
+        }
+        buf[i] = after;
+    }
+    if (!path_is_directory(path)) {
+        report_failure("not a directory: ", path, NULL, 0);
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * What "ip link set lo up" does: read the loopback interface's flags, add
+ * "up", write them back. Any socket carries the two requests. 0, or -1 once
+ * the failing step and its errno have been reported.
+ */
+int loopback_up(void) {
+    lc_sysret fd = lb_sys_socket(LB_AF_INET, LB_SOCK_DGRAM, 0);
+    if (fd < 0) {
+        report_failure("cannot bring up ", "lo", ": no socket (errno ", (int)-fd);
+        return -1;
+    }
+
+    struct lb_ifreq_flags ifr = { .name = "lo" };
+    lc_sysret rc = lc_kernel_device_control((int32_t)fd, LB_SIOCGIFFLAGS, &ifr);
+    if (rc >= 0) {
+        ifr.flags |= LB_IFF_UP;
+        rc = lc_kernel_device_control((int32_t)fd, LB_SIOCSIFFLAGS, &ifr);
+    }
+    lc_kernel_close_file((int32_t)fd);
+
+    if (rc < 0) {
+        report_failure("cannot bring up ", "lo", " (errno ", (int)-rc);
+        return -1;
+    }
+    return 0;
+}
+
+/* ─── Mounting ──────────────────────────────────────────────────────────── */
+
+/* What a mount carries that a change of its flags would drop unless the call
+ * names it again. In f_flags of statfs these have the bits mount(2) takes. */
+#define MOUNT_KEPT_FLAGS (LB_ST_RDONLY | LB_ST_NOSUID | LB_ST_NODEV | LB_ST_NOEXEC)
+
+/*
+ * mount(2), checked: 0, or -1 once the target and the errno have been
+ * reported.
+ *
+ * The arguments reach the kernel as they are, with one addition. Changing the
+ * flags of a mount (MS_REMOUNT | MS_BIND) replaces all of them, so a call
+ * that asks for nosuid would quietly take nodev away. Here such a call keeps
+ * read-only, nosuid, nodev and noexec from what the mount has now: it can add
+ * restrictions and never removes one. mount(8), which lightbox ran for every
+ * mount until 0.2, behaved the same way.
+ */
 int do_mount(const char *source, const char *target,
              const char *fstype, uint64_t flags, const char *data) {
-    const char *argv[16];
-    int ai = 0;
-    argv[ai++] = "mount";
-    if ((flags & MS_PRIVATE) && (flags & MS_REC)) {
-        argv[ai++] = "--make-rprivate";
-        argv[ai++] = target;
-        argv[ai] = NULL;
-        return run_cmd(tool_path_mount(), argv);
-    }
+    lc_sysret rc = 0;
+
     if ((flags & MS_REMOUNT) && (flags & MS_BIND)) {
-        char remount_opts[64];
-        int rolen = 0;
-        argv[ai++] = "-o";
-        rolen = (int)str_copy(remount_opts, "remount,bind", sizeof(remount_opts));
-        if (flags & MS_RDONLY) { remount_opts[rolen++] = ','; rolen += (int)str_copy(remount_opts + rolen, "ro", sizeof(remount_opts) - (size_t)rolen); }
-        if (flags & MS_NOSUID) { remount_opts[rolen++] = ','; rolen += (int)str_copy(remount_opts + rolen, "nosuid", sizeof(remount_opts) - (size_t)rolen); }
-        if (flags & MS_NODEV)  { remount_opts[rolen++] = ','; rolen += (int)str_copy(remount_opts + rolen, "nodev", sizeof(remount_opts) - (size_t)rolen); }
-        if (flags & MS_NOEXEC) { remount_opts[rolen++] = ','; rolen += (int)str_copy(remount_opts + rolen, "noexec", sizeof(remount_opts) - (size_t)rolen); }
-        argv[ai++] = remount_opts;
-        argv[ai++] = target;
-        argv[ai] = NULL;
-        return run_cmd(tool_path_mount(), argv);
+        struct lb_statfs now;
+        rc = lb_sys_statfs(target, &now);
+        if (rc >= 0)
+            flags |= (uint64_t)now.f_flags & MOUNT_KEPT_FLAGS;
     }
-    if ((flags & MS_BIND) && (flags & MS_REC)) {
-        argv[ai++] = "--rbind";
-        argv[ai++] = source;
-        argv[ai++] = target;
-        argv[ai] = NULL;
-        return run_cmd(tool_path_mount(), argv);
+    if (rc >= 0)
+        rc = lc_kernel_mount(source, target, fstype, flags, data);
+    if (rc < 0) {
+        report_failure("mount failed: ", target, " (errno ", (int)-rc);
+        return -1;
     }
-    if (flags & MS_BIND) {
-        argv[ai++] = "--bind";
-        argv[ai++] = source;
-        argv[ai++] = target;
-        argv[ai] = NULL;
-        return run_cmd(tool_path_mount(), argv);
-    }
-    char opts[256];
-    int olen = 0;
-    if (flags & MS_RDONLY)  { if (olen) opts[olen++] = ','; olen += (int)str_copy(opts + olen, "ro", sizeof(opts) - (size_t)olen); }
-    if (flags & MS_NOSUID)  { if (olen) opts[olen++] = ','; olen += (int)str_copy(opts + olen, "nosuid", sizeof(opts) - (size_t)olen); }
-    if (flags & MS_NODEV)   { if (olen) opts[olen++] = ','; olen += (int)str_copy(opts + olen, "nodev", sizeof(opts) - (size_t)olen); }
-    if (flags & MS_NOEXEC)  { if (olen) opts[olen++] = ','; olen += (int)str_copy(opts + olen, "noexec", sizeof(opts) - (size_t)olen); }
-    if (data && data[0])    { if (olen) opts[olen++] = ','; str_copy(opts + olen, data, sizeof(opts) - (size_t)olen); olen += (int)lc_string_length(data); }
-    opts[olen] = '\0';
-    if (fstype && fstype[0]) { argv[ai++] = "-t"; argv[ai++] = fstype; }
-    if (olen > 0)            { argv[ai++] = "-o"; argv[ai++] = opts; }
-    if (source && source[0]) argv[ai++] = source;
-    argv[ai++] = target;
-    argv[ai] = NULL;
-    return run_cmd(tool_path_mount(), argv);
+    return 0;
 }
 
 void require_mount(const char *source, const char *target,
                    const char *fstype, uint64_t flags, const char *data) {
     if (do_mount(source, target, fstype, flags, data) != 0)
-        die2("Error: mount failed: ", target);
+        lc_kernel_exit(1);      /* do_mount has said what failed */
 }

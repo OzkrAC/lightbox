@@ -130,18 +130,23 @@ analyze: | $(LIGHTC_HDR)
 
 # lightbox_sys.h and the seccomp table of lightbox_seccomp.h against the
 # kernel's headers, for every compiler that is installed. Compile-only: nothing
-# is linked or run.
+# is linked or run. The second file holds what needs the C library's headers
+# beside the kernel's.
 SYS_CHECK_CCS := $(sort $(CC) $(foreach c,aarch64-linux-gnu-gcc x86_64-linux-gnu-gcc,$(shell command -v $(c) >/dev/null 2>&1 && echo $(c))))
 
 check-sys:
 	@for cc in $(SYS_CHECK_CCS); do \
 	    echo "  SYSCHECK $$cc"; \
-	    $$cc -std=c11 -ffreestanding -fsyntax-only -Wall -Wextra -Werror tests/sys_check.c || exit 1; \
+	    for f in tests/sys_check.c tests/sys_check_net.c; do \
+	        $$cc -std=c11 -ffreestanding -fsyntax-only -Wall -Wextra -Werror $$f || exit 1; \
+	    done; \
 	done
 
 # ─── Tests ──────────────────────────────────────────────────────────────────
-# All three suites run as an ordinary user. An open finding is an expected
-# failure that names its ledger id in ROADMAP.md; see tests/lib.sh.
+# The unit, validation and seccomp suites run as an ordinary user and start no
+# container; "make test" runs those three. The lifecycle suite, further down,
+# starts containers and needs root. In all of them an open finding is an
+# expected failure that names its ledger id in ROADMAP.md; see tests/lib.sh.
 
 # Compiler for the one hosted test program (it needs a C library and threads).
 HOSTCC ?= cc
@@ -183,6 +188,26 @@ test-seccomp: $(SECCOMP_TESTS)
 
 test: test-unit test-validation test-seccomp
 
+# The suite that starts containers. It needs root, a kernel with bridge, veth
+# and cgroup v2, and a static busybox, and it runs in private network, mount
+# and PID namespaces; tests/lifecycle.sh says what it leaves alone. sudo drops
+# the environment, so its options go on make's command line:
+#     sudo make test-lifecycle V=1 KEEP=1
+# It builds nothing, so that sudo leaves no file of root's in the tree.
+REQUIRE_BUILT = $(MAKE) -q --no-print-directory lightbox || { \
+    echo "lightbox is missing or older than its sources: run make first, without sudo" >&2; exit 2; }
+
+test-lifecycle:
+	@$(REQUIRE_BUILT)
+	bash tests/lifecycle.sh ./lightbox
+
+# Wall time of create, start, exec, stop and rm, and the processes one start
+# makes. As root, in the lifecycle suite's namespaces. bench/baseline.txt holds
+# the numbers from before Phase 1 of ROADMAP.md.
+bench:
+	@$(REQUIRE_BUILT)
+	bash bench/bench.sh ./lightbox
+
 check: check-sys analyze test
 
 # ─── Install ────────────────────────────────────────────────────────────────
@@ -219,4 +244,4 @@ clean:
 	rm -f $(SECCOMP_TESTS) tests/seccomp_profile.o tests/seccomp_profile.d
 	rm -f tests/unit tests/unit.o tests/unit.d
 
-.PHONY: analyze check check-sys clean install test test-seccomp test-unit test-validation uninstall
+.PHONY: analyze bench check check-sys clean install test test-lifecycle test-seccomp test-unit test-validation uninstall

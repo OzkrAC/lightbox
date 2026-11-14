@@ -11,6 +11,9 @@
  *
  * compiles it with the native compiler and with every cross compiler it finds
  * (aarch64-linux-gnu-gcc, x86_64-linux-gnu-gcc). Nothing is linked or run.
+ *
+ * Only kernel headers are included here. What can be checked only next to the
+ * C library's headers is in sys_check_net.c.
  */
 
 #define LIGHTBOX_SYS_CHECK 1
@@ -24,8 +27,10 @@
 #include <linux/audit.h>
 #include <linux/filter.h>
 #include <linux/magic.h>
+#include <linux/mount.h>
 #include <linux/sched.h>
 #include <linux/seccomp.h>
+#include <linux/sockios.h>
 #include <linux/stat.h>
 
 #include "../lightbox_sys.h"
@@ -41,7 +46,6 @@ SAME_NR(capget);
 SAME_NR(capset);
 SAME_NR(statfs);
 SAME_NR(chroot);
-SAME_NR(mount);
 SAME_NR(renameat);
 SAME_NR(statx);
 
@@ -51,6 +55,9 @@ SAME_NR(statx);
 SAME_VALUE(LB_ENOENT, ENOENT);
 SAME_VALUE(LB_ESRCH, ESRCH);
 SAME_VALUE(LB_EINTR, EINTR);
+SAME_VALUE(LB_EEXIST, EEXIST);
+SAME_VALUE(LB_SIOCGIFFLAGS, SIOCGIFFLAGS);
+SAME_VALUE(LB_SIOCSIFFLAGS, SIOCSIFFLAGS);
 SAME_VALUE(LB_S_IFMT, S_IFMT);
 SAME_VALUE(LB_S_IFDIR, S_IFDIR);
 SAME_VALUE(LB_STATX_TYPE, STATX_TYPE);
@@ -58,6 +65,13 @@ SAME_VALUE(LB_STATX_MODE, STATX_MODE);
 SAME_VALUE(LB_STATX_ATTR_MOUNT_ROOT, STATX_ATTR_MOUNT_ROOT);
 SAME_VALUE(LB_CGROUP_SUPER_MAGIC, CGROUP_SUPER_MAGIC);
 SAME_VALUE(LB_CGROUP2_SUPER_MAGIC, CGROUP2_SUPER_MAGIC);
+
+/* The flags statfs reports for a mount are passed back to mount(2) as they
+ * are, so each must be the bit mount(2) takes for the same thing. */
+SAME_VALUE(LB_ST_RDONLY, MS_RDONLY);
+SAME_VALUE(LB_ST_NOSUID, MS_NOSUID);
+SAME_VALUE(LB_ST_NODEV, MS_NODEV);
+SAME_VALUE(LB_ST_NOEXEC, MS_NOEXEC);
 
 #define SAME_SIZE(ours, kernels) \
     _Static_assert(sizeof(struct ours) == sizeof(struct kernels), \
