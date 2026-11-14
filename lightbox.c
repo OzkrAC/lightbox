@@ -26,17 +26,12 @@
 /* ─── Compile-time limits ───────────────────────────────────────────────── */
 
 #define MAX_PATH         512
-#define MAX_VOLS         16
-#define MAX_LINKS        8
 #define NAME_MAX_LEN     12
-#define CONF_BUF_SIZE    2048
 #define USERNS_RANGE_SIZE 65536
 #define USERNS_MIN_START 100000
 #define CHILD_STACK_SIZE (1024 * 1024) /* 1 MiB */
 
 /* ─── Configurable defaults ─────────────────────────────────────────────── */
-
-#define LIGHTBOX_CONF_PATH  "/.config/lightbox/lightbox.conf"
 
 /* All runtime-configurable values live here. Initialized to built-in defaults,
  * then overridden by lightbox.conf if present. */
@@ -47,7 +42,6 @@ global_config cfg_global;
 /* prctl constants */
 #define PR_SET_NO_NEW_PRIVS  38
 #define PR_SET_KEEPCAPS      8
-#define PR_CAPBSET_READ      23
 #define PR_CAPBSET_DROP      24
 #define PR_SET_SECCOMP       22
 
@@ -82,34 +76,12 @@ global_config cfg_global;
 #define CAP_SETUID           7
 #define CAP_SETPCAP          8
 #define CAP_NET_BIND_SERVICE 10
-#define CAP_NET_RAW          13
 #define CAP_SYS_CHROOT       18
-#define CAP_MKNOD            27
 #define CAP_AUDIT_WRITE      29
 #define CAP_SETFCAP          31
 
 /* device numbers: makedev(major, minor) */
 #define MAKEDEV(ma, mi) (((uint64_t)(ma) << 8) | (mi))
-
-/* clone flags (supplement those from syscall.h) */
-#define CLONE_VM        0x00000100
-#define CLONE_VFORK     0x00004000
-#ifndef O_DIRECTORY
-#define O_DIRECTORY     00200000
-#endif
-
-/* raw syscall numbers used by lightbox directly */
-#define SYS_fchdir      81
-#define SYS_chroot      161
-#if defined(__x86_64__)
-#define SYS_capget      125
-#define SYS_capset      126
-#elif defined(__aarch64__)
-#define SYS_capget      90
-#define SYS_capset      91
-#else
-#error "Unsupported architecture"
-#endif
 
 /* ─── Structs ───────────────────────────────────────────────────────────── */
 
@@ -292,11 +264,10 @@ static void validate_volume_paths(const char *src, const char *dst) {
 
 static void parse_volume_spec_or_die(const char *spec, volume_spec *vol) {
     const char *colon1 = NULL, *colon2 = NULL;
-    for (const char *p = spec; *p; p++) {
-        if (*p == ':') {
-            if (!colon1) colon1 = p;
-            else if (!colon2) colon2 = p;
-        }
+    for (size_t i = 0; spec[i]; i++) {
+        if (spec[i] != ':') continue;
+        if (!colon1) colon1 = spec + i;
+        else if (!colon2) colon2 = spec + i;
     }
     if (!colon1) die("Error: volume format is src:dst[:ro]");
 
@@ -366,9 +337,8 @@ static void parent_dir(char *buf, size_t bufsz, const char *path) {
 }
 
 static bool container_has_volume(const char *name, const volume_spec *needle) {
-    char conf_path[MAX_PATH], conf_buf[2048];
-    container_conf_path(conf_path, name);
-    if (read_file(conf_path, conf_buf, sizeof(conf_buf)) <= 0)
+    char conf_buf[CONF_MAX];
+    if (container_conf_read(name, conf_buf) <= 0)
         return false;
 
     char *p = conf_buf;
@@ -396,26 +366,45 @@ static bool container_has_volume(const char *name, const volume_spec *needle) {
     return false;
 }
 
+#define STRINGIFY_(x) #x
+#define STRINGIFY(x)  STRINGIFY_(x)
+
 static void append_container_volume(const char *name, const volume_spec *vol) {
-    char conf_path[MAX_PATH], conf_buf[4096], new_buf[4300];
+    char conf_path[MAX_PATH], conf_buf[CONF_MAX], new_buf[CONF_MAX];
     container_conf_path(conf_path, name);
-    int n = read_file(conf_path, conf_buf, sizeof(conf_buf));
+    int n = container_conf_read(name, conf_buf);
     if (n < 0)
         die2("Error: failed to read container config: ", conf_path);
 
-    size_t pos = 0;
-    if (n > 0)
-        pos = str_copy(new_buf, conf_buf, sizeof(new_buf));
-    if (pos > 0 && new_buf[pos - 1] != '\n')
-        pos = str_append(new_buf, pos, "\n", sizeof(new_buf));
+    int nvols = 0;
+    for (size_t i = 0; conf_buf[i]; ) {
+        if (conf_buf[i] == 'v' && conf_buf[i + 1] == 'o' && conf_buf[i + 2] == 'l' && conf_buf[i + 3] == '=')
+            nvols++;
+        while (conf_buf[i] && conf_buf[i] != '\n') i++;
+        if (conf_buf[i] == '\n') i++;
+    }
+    if (nvols >= MAX_VOLS)
+        die2("Error: container already has the maximum of " STRINGIFY(MAX_VOLS) " volumes: ", name);
 
-    pos = str_append(new_buf, pos, "vol=", sizeof(new_buf));
-    pos = str_append(new_buf, pos, vol->src, sizeof(new_buf));
-    pos = str_append(new_buf, pos, ":", sizeof(new_buf));
-    pos = str_append(new_buf, pos, vol->dst, sizeof(new_buf));
+    bool overflow = false;
+    size_t pos = 0;
+    new_buf[0] = '\0';
+    if (n > 0)
+        pos = str_append_whole(new_buf, pos, conf_buf, sizeof(new_buf), &overflow);
+    if (pos > 0 && new_buf[pos - 1] != '\n')
+        pos = str_append_whole(new_buf, pos, "\n", sizeof(new_buf), &overflow);
+
+    pos = str_append_whole(new_buf, pos, "vol=", sizeof(new_buf), &overflow);
+    pos = str_append_whole(new_buf, pos, vol->src, sizeof(new_buf), &overflow);
+    pos = str_append_whole(new_buf, pos, ":", sizeof(new_buf), &overflow);
+    pos = str_append_whole(new_buf, pos, vol->dst, sizeof(new_buf), &overflow);
     if (vol->ro)
-        pos = str_append(new_buf, pos, ":ro", sizeof(new_buf));
-    pos = str_append(new_buf, pos, "\n", sizeof(new_buf));
+        pos = str_append_whole(new_buf, pos, ":ro", sizeof(new_buf), &overflow);
+    str_append_whole(new_buf, pos, "\n", sizeof(new_buf), &overflow);
+
+    /* Never write a config that lost part of itself. */
+    if (overflow)
+        die2("Error: container config would exceed its size limit: ", conf_path);
 
     require_write_file_atomic(conf_path, new_buf);
 }
@@ -612,71 +601,82 @@ static void drop_capabilities(void) {
 /* ─── Security: seccomp ─────────────────────────────────────────────────── */
 
 /*
- * x86_64 syscall numbers to block (Docker's default deny list).
- * We build a BPF filter that returns EPERM for these.
+ * x86_64 syscall numbers to block (Docker's default deny list), each with the
+ * errno the caller gets. Almost all answer EPERM. clone3 answers ENOSYS: its
+ * flags sit behind a pointer the filter cannot read, so it cannot be allowed
+ * selectively, and ENOSYS is the one answer that makes a C library fall back
+ * to clone. With EPERM, glibc 2.34 and later cannot create a thread.
  */
-static const uint32_t BLOCKED_SYSCALLS[] = {
+struct seccomp_deny {
+    uint32_t nr;
+    uint16_t err;   /* the errno the caller sees */
+};
+
+#define SC_EPERM   1
+#define SC_ENOSYS  38
+
+static const struct seccomp_deny BLOCKED_SYSCALLS[] = {
     /* x86_64 syscall numbers */
-    163,  /* acct */
-    248,  /* add_key */
-    321,  /* bpf */
-    305,  /* clock_adjtime */
-    227,  /* clock_settime */
-    174,  /* create_module */
-    176,  /* delete_module */
-    313,  /* finit_module */
-    177,  /* get_kernel_syms */
-    239,  /* get_mempolicy */
-    425,  /* io_uring_setup */
-    426,  /* io_uring_enter */
-    427,  /* io_uring_register */
-    175,  /* init_module */
-    173,  /* ioperm */
-    172,  /* iopl */
-    312,  /* kcmp */
-    320,  /* kexec_file_load */
-    246,  /* kexec_load */
-    250,  /* keyctl */
-    212,  /* lookup_dcookie */
-    237,  /* mbind */
-    256,  /* migrate_pages */
+    { 163, SC_EPERM },  /* acct */
+    { 248, SC_EPERM },  /* add_key */
+    { 321, SC_EPERM },  /* bpf */
+    { 305, SC_EPERM },  /* clock_adjtime */
+    { 227, SC_EPERM },  /* clock_settime */
+    { 174, SC_EPERM },  /* create_module */
+    { 176, SC_EPERM },  /* delete_module */
+    { 313, SC_EPERM },  /* finit_module */
+    { 177, SC_EPERM },  /* get_kernel_syms */
+    { 239, SC_EPERM },  /* get_mempolicy */
+    { 425, SC_EPERM },  /* io_uring_setup */
+    { 426, SC_EPERM },  /* io_uring_enter */
+    { 427, SC_EPERM },  /* io_uring_register */
+    { 175, SC_EPERM },  /* init_module */
+    { 173, SC_EPERM },  /* ioperm */
+    { 172, SC_EPERM },  /* iopl */
+    { 312, SC_EPERM },  /* kcmp */
+    { 320, SC_EPERM },  /* kexec_file_load */
+    { 246, SC_EPERM },  /* kexec_load */
+    { 250, SC_EPERM },  /* keyctl */
+    { 212, SC_EPERM },  /* lookup_dcookie */
+    { 237, SC_EPERM },  /* mbind */
+    { 256, SC_EPERM },  /* migrate_pages */
     /* 40, mount — allowed for container setup, blocked by caps */
-    429,  /* move_mount */
-    279,  /* move_pages */
-    303,  /* name_to_handle_at */
-    180,  /* nfsservctl */
-    304,  /* open_by_handle_at */
-    428,  /* open_tree */
-    298,  /* perf_event_open */
-    135,  /* personality */
+    { 429, SC_EPERM },  /* move_mount */
+    { 279, SC_EPERM },  /* move_pages */
+    { 303, SC_EPERM },  /* name_to_handle_at */
+    { 180, SC_EPERM },  /* nfsservctl */
+    { 304, SC_EPERM },  /* open_by_handle_at */
+    { 428, SC_EPERM },  /* open_tree */
+    { 298, SC_EPERM },  /* perf_event_open */
+    { 135, SC_EPERM },  /* personality */
     /* 155, pivot_root — blocked by caps after setup */
-    310,  /* process_vm_readv */
-    311,  /* process_vm_writev */
-    101,  /* ptrace */
-    178,  /* query_module */
-    179,  /* quotactl */
-    169,  /* reboot */
-    249,  /* request_key */
-    238,  /* set_mempolicy */
-    308,  /* setns */
-    164,  /* settimeofday */
+    { 310, SC_EPERM },  /* process_vm_readv */
+    { 311, SC_EPERM },  /* process_vm_writev */
+    { 101, SC_EPERM },  /* ptrace */
+    { 178, SC_EPERM },  /* query_module */
+    { 179, SC_EPERM },  /* quotactl */
+    { 169, SC_EPERM },  /* reboot */
+    { 249, SC_EPERM },  /* request_key */
+    { 238, SC_EPERM },  /* set_mempolicy */
+    { 308, SC_EPERM },  /* setns */
+    { 164, SC_EPERM },  /* settimeofday */
     /* 200, stime — doesn't exist on x86_64 */
-    167,  /* swapon */
-    168,  /* swapoff */
-    156,  /* _sysctl */
-    139,  /* sysfs */
-    166,  /* umount2 */
-    272,  /* unshare */
-    134,  /* uselib */
-    323,  /* userfaultfd */
-    136,  /* ustat */
+    { 167, SC_EPERM },  /* swapon */
+    { 168, SC_EPERM },  /* swapoff */
+    { 156, SC_EPERM },  /* _sysctl */
+    { 139, SC_EPERM },  /* sysfs */
+    { 166, SC_EPERM },  /* umount2 */
+    { 272, SC_EPERM },  /* unshare */
+    { 134, SC_EPERM },  /* uselib */
+    { 323, SC_EPERM },  /* userfaultfd */
+    { 136, SC_EPERM },  /* ustat */
     /* vm86/vm86old don't exist on x86_64 */
-    435,  /* clone3 */
-    442,  /* mount_setattr */
-    430,  /* fsopen */
-    431,  /* fsconfig */
-    432,  /* fsmount */
-    433,  /* fspick */
+    { 435, SC_ENOSYS },  /* clone3: glibc falls back to clone only on ENOSYS */
+    { 442, SC_EPERM },  /* mount_setattr */
+    { 430, SC_EPERM },  /* fsopen */
+    { 431, SC_EPERM },  /* fsconfig */
+    { 432, SC_EPERM },  /* fsmount */
+    { 433, SC_EPERM },  /* fspick */
 };
 #define N_BLOCKED_SYSCALLS (sizeof(BLOCKED_SYSCALLS) / sizeof(BLOCKED_SYSCALLS[0]))
 
@@ -684,7 +684,7 @@ static void apply_seccomp(void) {
     /*
      * Build a BPF program:
      *   load syscall nr
-     *   for each blocked syscall: if equal, return ERRNO(EPERM)
+     *   for each blocked syscall: if equal, return ERRNO(its errno)
      *   return ALLOW
      *
      * Total instructions:
@@ -710,8 +710,8 @@ static void apply_seccomp(void) {
 
     /* for each blocked syscall: check and deny */
     for (size_t i = 0; i < n; i++) {
-        filter[idx++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, BLOCKED_SYSCALLS[i], 0, 1);
-        filter[idx++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | 1 /* EPERM */);
+        filter[idx++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, BLOCKED_SYSCALLS[i].nr, 0, 1);
+        filter[idx++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | BLOCKED_SYSCALLS[i].err);
     }
 
     /* default: allow */
@@ -817,6 +817,22 @@ static void cmd_create(int argc, char **argv) {
     container_root(root, name);
     if (path_exists(cdir)) die2("Error: container already exists: ", name);
 
+    /* The base must be a directory with something in it. A link to one is
+     * followed. Checked before anything is created, so a refusal leaves
+     * nothing behind. */
+    {
+        struct lb_statx stx;
+        if (lb_sys_statx(AT_FDCWD, cfg_global.rootfs, 0, LB_STATX_TYPE, &stx) < 0)
+            die2("Error: base rootfs does not exist: ", cfg_global.rootfs);
+        if ((stx.stx_mode & LB_S_IFMT) != LB_S_IFDIR)
+            die2("Error: base rootfs is not a directory: ", cfg_global.rootfs);
+        int empty = dir_is_empty(cfg_global.rootfs);
+        if (empty < 0)
+            die2("Error: base rootfs cannot be read: ", cfg_global.rootfs);
+        if (empty)
+            die2("Error: base rootfs is empty: ", cfg_global.rootfs);
+    }
+
     print_str(STDOUT,"Creating container '");
     print_str(STDOUT,name);
     print_str(STDOUT,"'...\n");
@@ -825,20 +841,21 @@ static void cmd_create(int argc, char **argv) {
     bool created_dir = false;
 
     /* create container directory and copy rootfs into it */
-    if (lc_kernel_mkdirat(AT_FDCWD, cdir, 0755) < 0) {
+    if (lc_kernel_mkdirat(AT_FDCWD, cdir, MODE_PRIVATE_DIR) < 0) {
         create_err = "failed to create container dir";
         goto fail_create;
     }
     created_dir = true;
     set_container_state(name, "creating\n");
-    if (!path_exists(cfg_global.rootfs)) {
-        create_err = "rootfs not found";
-        goto fail_create;
-    }
     {
+        /* Copy what is in the base ("<base>/."), not the path itself: given a
+         * link to the base, copying the path would make the container's rootfs
+         * that link, and everything written to it would land in the base. */
+        char base_contents[MAX_PATH + 4];
+        path_join(base_contents, sizeof(base_contents), cfg_global.rootfs, ".");
         lc_sysret pid = lc_kernel_fork();
         if (pid == 0) {
-            char *argv2[] = { "cp", "-a", (char *)cfg_global.rootfs, root, NULL };
+            char *argv2[] = { "cp", "-a", base_contents, root, NULL };
             char *envp[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", NULL };
             lc_kernel_execute(tool_path_cp(), argv2, envp);
             lc_kernel_exit(1);
@@ -854,27 +871,28 @@ static void cmd_create(int argc, char **argv) {
     /* store IP */
     char ip_path[MAX_PATH];
     container_ip_path(ip_path, name);
-    if (write_file_atomic(ip_path, ip) < 0) {
+    if (write_file_atomic(ip_path, ip, MODE_PRIVATE_FILE) < 0) {
         create_err = "failed to write IP metadata";
         goto fail_create;
     }
 
     /* write config */
-    char conf_path[MAX_PATH], conf_buf[1024];
+    char conf_path[MAX_PATH], conf_buf[CONF_MAX];
+    bool conf_overflow = false;
     container_conf_path(conf_path, name);
     size_t cpos = 0;
-    cpos = str_append(conf_buf, cpos, "mem=", sizeof(conf_buf));
-    cpos = str_append(conf_buf, cpos, cfg.mem, sizeof(conf_buf));
-    cpos = str_append(conf_buf, cpos, "\npids=", sizeof(conf_buf));
-    cpos = str_append(conf_buf, cpos, cfg.pids, sizeof(conf_buf));
-    cpos = str_append(conf_buf, cpos, "\ncpu=", sizeof(conf_buf));
-    cpos = str_append(conf_buf, cpos, cfg.cpu, sizeof(conf_buf));
-    cpos = str_append(conf_buf, cpos, "\n", sizeof(conf_buf));
+    cpos = str_append_whole(conf_buf, cpos, "mem=", sizeof(conf_buf), &conf_overflow);
+    cpos = str_append_whole(conf_buf, cpos, cfg.mem, sizeof(conf_buf), &conf_overflow);
+    cpos = str_append_whole(conf_buf, cpos, "\npids=", sizeof(conf_buf), &conf_overflow);
+    cpos = str_append_whole(conf_buf, cpos, cfg.pids, sizeof(conf_buf), &conf_overflow);
+    cpos = str_append_whole(conf_buf, cpos, "\ncpu=", sizeof(conf_buf), &conf_overflow);
+    cpos = str_append_whole(conf_buf, cpos, cfg.cpu, sizeof(conf_buf), &conf_overflow);
+    cpos = str_append_whole(conf_buf, cpos, "\n", sizeof(conf_buf), &conf_overflow);
 
-    if (cfg.privileged) cpos = str_append(conf_buf, cpos, "privileged=1\n", sizeof(conf_buf));
-    if (cfg.read_only) cpos = str_append(conf_buf, cpos, "readonly=1\n", sizeof(conf_buf));
+    if (cfg.privileged) cpos = str_append_whole(conf_buf, cpos, "privileged=1\n", sizeof(conf_buf), &conf_overflow);
+    if (cfg.read_only) cpos = str_append_whole(conf_buf, cpos, "readonly=1\n", sizeof(conf_buf), &conf_overflow);
     if (cfg.userns) {
-        cpos = str_append(conf_buf, cpos, "userns=1\n", sizeof(conf_buf));
+        cpos = str_append_whole(conf_buf, cpos, "userns=1\n", sizeof(conf_buf), &conf_overflow);
         if (cfg.uid_start == 0) {
             cfg.uid_start = allocate_uid_start(name);
             if (cfg.uid_start <= 0) {
@@ -891,30 +909,35 @@ static void cmd_create(int argc, char **argv) {
             goto fail_create;
         }
         char uid_buf[16]; fmt_int(uid_buf, cfg.uid_start);
-        cpos = str_append(conf_buf, cpos, "uid_start=", sizeof(conf_buf));
-        cpos = str_append(conf_buf, cpos, uid_buf, sizeof(conf_buf));
-        cpos = str_append(conf_buf, cpos, "\n", sizeof(conf_buf));
+        cpos = str_append_whole(conf_buf, cpos, "uid_start=", sizeof(conf_buf), &conf_overflow);
+        cpos = str_append_whole(conf_buf, cpos, uid_buf, sizeof(conf_buf), &conf_overflow);
+        cpos = str_append_whole(conf_buf, cpos, "\n", sizeof(conf_buf), &conf_overflow);
     }
     {
         char oom_buf[16]; fmt_int(oom_buf, cfg.oom_score);
-        cpos = str_append(conf_buf, cpos, "oom_score=", sizeof(conf_buf));
-        cpos = str_append(conf_buf, cpos, oom_buf, sizeof(conf_buf));
-        cpos = str_append(conf_buf, cpos, "\n", sizeof(conf_buf));
+        cpos = str_append_whole(conf_buf, cpos, "oom_score=", sizeof(conf_buf), &conf_overflow);
+        cpos = str_append_whole(conf_buf, cpos, oom_buf, sizeof(conf_buf), &conf_overflow);
+        cpos = str_append_whole(conf_buf, cpos, "\n", sizeof(conf_buf), &conf_overflow);
     }
     for (int i = 0; i < cfg.nvols; i++) {
-        cpos = str_append(conf_buf, cpos, "vol=", sizeof(conf_buf));
-        cpos = str_append(conf_buf, cpos, cfg.vol_src[i], sizeof(conf_buf));
-        cpos = str_append(conf_buf, cpos, ":", sizeof(conf_buf));
-        cpos = str_append(conf_buf, cpos, cfg.vol_dst[i], sizeof(conf_buf));
-        if (cfg.vol_ro[i]) cpos = str_append(conf_buf, cpos, ":ro", sizeof(conf_buf));
-        cpos = str_append(conf_buf, cpos, "\n", sizeof(conf_buf));
+        cpos = str_append_whole(conf_buf, cpos, "vol=", sizeof(conf_buf), &conf_overflow);
+        cpos = str_append_whole(conf_buf, cpos, cfg.vol_src[i], sizeof(conf_buf), &conf_overflow);
+        cpos = str_append_whole(conf_buf, cpos, ":", sizeof(conf_buf), &conf_overflow);
+        cpos = str_append_whole(conf_buf, cpos, cfg.vol_dst[i], sizeof(conf_buf), &conf_overflow);
+        if (cfg.vol_ro[i]) cpos = str_append_whole(conf_buf, cpos, ":ro", sizeof(conf_buf), &conf_overflow);
+        cpos = str_append_whole(conf_buf, cpos, "\n", sizeof(conf_buf), &conf_overflow);
     }
     for (int i = 0; i < cfg.nlinks; i++) {
-        cpos = str_append(conf_buf, cpos, "link=", sizeof(conf_buf));
-        cpos = str_append(conf_buf, cpos, cfg.links[i], sizeof(conf_buf));
-        cpos = str_append(conf_buf, cpos, "\n", sizeof(conf_buf));
+        cpos = str_append_whole(conf_buf, cpos, "link=", sizeof(conf_buf), &conf_overflow);
+        cpos = str_append_whole(conf_buf, cpos, cfg.links[i], sizeof(conf_buf), &conf_overflow);
+        cpos = str_append_whole(conf_buf, cpos, "\n", sizeof(conf_buf), &conf_overflow);
     }
-    if (write_file_atomic(conf_path, conf_buf) < 0) {
+    /* Never write a config that lost part of itself. */
+    if (conf_overflow) {
+        create_err = "container config exceeds its size limit";
+        goto fail_create;
+    }
+    if (write_file_atomic(conf_path, conf_buf, MODE_PRIVATE_FILE) < 0) {
         create_err = "failed to write container config";
         goto fail_create;
     }
@@ -925,7 +948,8 @@ static void cmd_create(int argc, char **argv) {
     path_join(etc_dir, MAX_PATH, root, "etc");
     lc_kernel_mkdirat(AT_FDCWD, etc_dir, 0755);
     path_join(resolv, MAX_PATH, root, "etc/resolv.conf");
-    if (write_file_atomic(resolv, "nameserver 1.1.1.1\nnameserver 8.8.8.8\n") < 0) {
+    /* inside the container's own filesystem, so readable by its users */
+    if (write_file_atomic(resolv, "nameserver 1.1.1.1\nnameserver 8.8.8.8\n", MODE_PUBLIC_FILE) < 0) {
         create_err = "failed to write resolv.conf";
         goto fail_create;
     }
@@ -968,10 +992,6 @@ fail_create:
     if (create_err) {
         print_str(STDERR, "Error: ");
         print_str(STDERR, create_err);
-        if (streq(create_err, "rootfs not found")) {
-            print_str(STDERR, ": ");
-            print_str(STDERR, cfg_global.rootfs);
-        }
         lc_print_char(STDERR, '\n');
     }
     if (created_dir)
@@ -1126,9 +1146,9 @@ static int exec_inside_container(const char *name, int target_pid, int userns,
     require_setns_fd(ipcfd, CLONE_NEWIPC, "ipc");
     require_setns_fd(netfd, CLONE_NEWNET, "net");
 
-    if (lc_kernel_fchdir(rootfd) < 0)
+    if (lb_sys_fchdir(rootfd) < 0)
         die("Error: failed to chdir to target root");
-    if (lc_kernel_change_root(".") < 0)
+    if (lb_sys_chroot(".") < 0)
         die("Error: failed to chroot into target root");
     if (lc_kernel_chdir("/") < 0)
         die("Error: failed to chdir to container root");
@@ -1249,13 +1269,13 @@ static void enter_user_namespace_root(void) {
     if (lc_kernel_setuid(0) < 0)
         die("Error: failed to setuid(0) in userns");
 
-    if (lc_syscall2(SYS_capget, (int64_t)&hdr, (int64_t)data) < 0)
+    if (lb_sys_capget(&hdr, data) < 0)
         die("Error: capget failed in userns");
 
     data[0].effective = data[0].permitted;
     data[1].effective = data[1].permitted;
 
-    if (lc_syscall2(SYS_capset, (int64_t)&hdr, (int64_t)data) < 0)
+    if (lb_sys_capset(&hdr, data) < 0)
         die("Error: capset failed in userns");
 }
 
@@ -1285,10 +1305,8 @@ static int container_child(void *arg) {
     lc_kernel_sethostname(ca->name, lc_string_length(ca->name));
 
     /* read volume config and set up bind mounts */
-    char conf_path[MAX_PATH];
-    container_conf_path(conf_path, ca->name);
-    char conf_buf[2048];
-    if (read_file(conf_path, conf_buf, sizeof(conf_buf)) > 0) {
+    char conf_buf[CONF_MAX];
+    if (container_conf_read(ca->name, conf_buf) > 0) {
         char *p = conf_buf;
         while (*p) {
             if (p[0] == 'v' && p[1] == 'o' && p[2] == 'l' && p[3] == '=') {
@@ -1347,6 +1365,7 @@ static int container_child(void *arg) {
     {
         char dev_path[MAX_PATH];
         path_join(dev_path, MAX_PATH, ca->root, "dev");
+        lc_kernel_mkdirat(AT_FDCWD, dev_path, 0755);   /* a minimal image may not have it */
         require_mount("tmpfs", dev_path, "tmpfs", MS_NOSUID | MS_NOEXEC, "mode=755");
 
         struct { const char *name; uint64_t dev; int mode; } devs[] = {
@@ -1481,6 +1500,7 @@ static void cmd_start(int argc, char **argv) {
     if (!path_exists(root)) die2("Error: container does not exist: ", name);
 
     if (is_running(name)) die2("Error: container is already running: ", name);
+    container_reap_if_dead(name);   /* a previous init that died without a stop */
 
     /* read container IP */
     char ip[16];
@@ -1713,11 +1733,11 @@ static void cmd_start(int argc, char **argv) {
         lc_bytes_copy(pid_start, p, len);
         pid_start[len] = '\0';
     }
-    if (write_file_atomic(pid_start_path, pid_start) < 0) {
+    if (write_file_atomic(pid_start_path, pid_start, MODE_PRIVATE_FILE) < 0) {
         start_err = "failed to write pid starttime file";
         goto fail_start;
     }
-    if (write_file_atomic(pid_path, pidbuf) < 0) {
+    if (write_file_atomic(pid_path, pidbuf, MODE_PRIVATE_FILE) < 0) {
         start_err = "failed to write pid file";
         goto fail_start;
     }
@@ -1761,7 +1781,10 @@ static void cmd_stop(int argc, char **argv) {
     const char *name = argv[0];
     validate_name(name);
 
-    if (!is_running(name)) die2("Error: container is not running: ", name);
+    if (!is_running(name)) {
+        container_reap_if_dead(name);
+        die2("Error: container is not running: ", name);
+    }
 
     int pid = get_container_pid(name);
 
@@ -2239,7 +2262,7 @@ static void cmd_exec(int argc, char **argv) {
 
 /* ─── Usage ─────────────────────────────────────────────────────────────── */
 
-static void usage(void) {
+[[noreturn]] static void usage(void) {
     print_str(STDERR,
         "Usage: lightbox <command> [args]\n"
         "\n"

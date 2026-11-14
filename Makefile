@@ -1,22 +1,29 @@
 # lightbox — container runtime built on lightc
 #
-# lightc is resolved in order:
-#   1. lightc/     (git submodule — preferred)
-#   2. ../lightc/  (sibling directory)
-#   3. LIGHTC=...  (override on command line)
+# lightc is found in this order:
+#   1. LIGHTC=/path   given on the command line or in the environment
+#   2. lightc/        the pinned git submodule (git submodule update --init)
+#   3. ../lightc/     a sibling checkout
+#
+# Only the submodule is configured and built from here. A LIGHTC= or sibling
+# tree is someone else's working copy: lightbox links its build/liblightc.a if
+# that exists, and stops with a hint if it does not.
 
-ifeq ($(wildcard lightc/include/lightc/syscall.h),lightc/include/lightc/syscall.h)
-  LIGHTC ?= lightc
-else ifeq ($(wildcard ../lightc/include/lightc/syscall.h),../lightc/include/lightc/syscall.h)
-  LIGHTC ?= ../lightc
-else ifdef LIGHTC
-  # user-provided path
+ifdef LIGHTC
+  LIGHTC_KIND := external
+else ifneq ($(wildcard lightc/include/lightc/syscall.h),)
+  LIGHTC      := lightc
+  LIGHTC_KIND := submodule
+else ifneq ($(wildcard ../lightc/include/lightc/syscall.h),)
+  LIGHTC      := ../lightc
+  LIGHTC_KIND := external
 else
-  $(error lightc not found. Either: \
-    1) git submodule update --init, \
-    2) place lightc alongside this directory, or \
-    3) pass LIGHTC=/path/to/lightc)
+  LIGHTC      := lightc
+  LIGHTC_KIND := missing
 endif
+
+LIGHTC_HDR := $(LIGHTC)/include/lightc/syscall.h
+LIGHTC_LIB := $(LIGHTC)/build/liblightc.a
 
 PREFIX     ?= /usr/local
 BINDIR     ?= $(PREFIX)/bin
@@ -25,46 +32,150 @@ DATADIR    ?= /var/lib/lightbox
 RUNDIR     ?= /run/lightbox
 HOME_CONF  ?= $(HOME)/.config/lightbox
 
-CC = gcc
-CFLAGS = -std=c23 -O2 -DNDEBUG -Wall -Wextra -Wpedantic \
-         -ffreestanding -nostdlib -nostartfiles -nodefaultlibs \
-         -fno-stack-protector -I$(LIGHTC)/include
+# ─── Toolchain ──────────────────────────────────────────────────────────────
+# make CC=aarch64-linux-gnu-gcc cross-builds; AR and STRIP follow the prefix.
+
+ifeq ($(origin CC),default)
+  CC := gcc
+endif
+ifeq ($(origin AR),default)
+  AR := $(if $(filter %-gcc,$(CC)),$(patsubst %-gcc,%-ar,$(CC)),ar)
+endif
+ifeq ($(origin STRIP),undefined)
+  STRIP := $(if $(filter %-gcc,$(CC)),$(patsubst %-gcc,%-strip,$(CC)),strip)
+endif
+
+ARCH := $(firstword $(subst -, ,$(shell $(CC) -dumpmachine 2>/dev/null)))
+
+# The flag if this compiler accepts it, nothing otherwise.
+cc-option = $(shell $(CC) $(1) -x c -c /dev/null -o /dev/null >/dev/null 2>&1 && echo $(1))
+
+# GCC 14 spells it -std=c23, older releases -std=c2x (the probe lightc uses).
+CSTD := $(or $(call cc-option,-std=c23),-std=c2x)
+
+WARN := -Wall -Wextra -Wpedantic
+
+# Hardening that needs no runtime support. The non-executable stack marking
+# comes from lightc's linker script; the stack protector needs lightc's canary
+# setup and is not available yet.
+HARDEN := $(call cc-option,-fstack-clash-protection) \
+          $(call cc-option,-ftrivial-auto-var-init=zero)
+ifeq ($(ARCH),x86_64)
+  HARDEN += $(call cc-option,-fcf-protection=full)
+endif
+ifeq ($(ARCH),aarch64)
+  ARCH_CFLAGS := -mno-outline-atomics
+endif
+
+CFLAGS  = $(CSTD) -O2 -DNDEBUG $(WARN) $(HARDEN) $(ARCH_CFLAGS) \
+          -ffreestanding -nostdlib -nostartfiles -nodefaultlibs \
+          -fno-stack-protector -I$(LIGHTC)/include $(EXTRA_CFLAGS)
 LDFLAGS = -static -no-pie -nostdlib -nostartfiles -nodefaultlibs \
           -T $(LIGHTC)/lightc.ld
 
-OBJS = lightbox.o lightbox_meta.o lightbox_state.o lightbox_net.o lightbox_config.o lightbox_util.o
+SRCS = lightbox.c lightbox_meta.c lightbox_state.c lightbox_net.c lightbox_config.c lightbox_util.c
+OBJS = $(SRCS:.c=.o)
+DEPS = $(OBJS:.o=.d)
 
-lightbox: $(OBJS) $(LIGHTC)/build/liblightc.a
-	$(CC) $(LDFLAGS) $^ -o $@ && strip $@
+# ─── Build ──────────────────────────────────────────────────────────────────
 
-lightbox.o: lightbox.c
-	$(CC) $(CFLAGS) -c $< -o $@
+lightbox: $(OBJS) $(LIGHTC_LIB)
+	$(CC) $(LDFLAGS) $(OBJS) $(LIGHTC_LIB) -o $@
+	$(STRIP) $@
 
-lightbox_meta.o: lightbox_meta.c lightbox.h
-	$(CC) $(CFLAGS) -c $< -o $@
+%.o: %.c | $(LIGHTC_HDR)
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
-lightbox_state.o: lightbox_state.c lightbox.h
-	$(CC) $(CFLAGS) -c $< -o $@
+-include $(DEPS) tests/seccomp_profile.d
 
-lightbox_net.o: lightbox_net.c lightbox.h
-	$(CC) $(CFLAGS) -c $< -o $@
+ifeq ($(LIGHTC_KIND),submodule)
 
-lightbox_config.o: lightbox_config.c lightbox.h
-	$(CC) $(CFLAGS) -c $< -o $@
+$(LIGHTC_LIB):
+	cd $(LIGHTC) && ARCH=$(ARCH) CC=$(CC) AR=$(AR) ./configure release && ninja build/liblightc.a
 
-lightbox_util.o: lightbox_util.c lightbox.h
-	$(CC) $(CFLAGS) -c $< -o $@
+else ifeq ($(LIGHTC_KIND),external)
 
-$(LIGHTC)/build/liblightc.a:
-	cd $(LIGHTC) && ./configure release && ninja
+$(LIGHTC_LIB):
+	@echo "lightbox: $(LIGHTC_LIB) does not exist." >&2
+	@echo "  $(LIGHTC) is not lightbox's own submodule, so lightbox will not configure or build it." >&2
+	@echo "  Build it yourself:   (cd $(LIGHTC) && ./configure release && ninja build/liblightc.a)" >&2
+	@echo "  or use the pinned copy:   git submodule update --init" >&2
+	@false
+
+else
+
+$(LIGHTC_HDR) $(LIGHTC_LIB):
+	@echo "lightbox: lightc was not found." >&2
+	@echo "  Use the pinned copy:   git submodule update --init" >&2
+	@echo "  or point at a built tree:   make LIGHTC=/path/to/lightc" >&2
+	@false
+
+endif
+
+# ─── Checks ─────────────────────────────────────────────────────────────────
+
+# -fanalyzer plus the strict warning set of the November 2026 review. Every
+# diagnostic is an error. Three warnings of that set are not in the gate yet;
+# each comes back with the roadmap item that makes the tree clean for it:
+#   -Wwrite-strings -Wcast-qual   3.1  (argv arrays built from string literals)
+#   -Wcast-align=strict           5.11 (directory entries read through casts)
+ANALYZE_FLAGS = -fanalyzer -Werror \
+    -Wshadow -Wformat=2 -Wnull-dereference -Wuninitialized -Wmaybe-uninitialized \
+    -Wstrict-overflow=2 -Wundef -Wunused-macros -Wredundant-decls \
+    -Wmissing-prototypes -Wduplicated-cond -Wduplicated-branches -Wlogical-op \
+    -Wstringop-overflow=4 -Warray-bounds=2 -Walloca -Wvla
+
+analyze: | $(LIGHTC_HDR)
+	@rc=0; for f in $(SRCS); do \
+	    echo "  ANALYZE $$f"; \
+	    $(CC) $(CFLAGS) $(ANALYZE_FLAGS) -c $$f -o /dev/null || rc=1; \
+	done; exit $$rc
+
+# lightbox_sys.h against the kernel's headers, for every compiler that is
+# installed. Compile-only: nothing is linked or run.
+SYS_CHECK_CCS := $(sort $(CC) $(foreach c,aarch64-linux-gnu-gcc x86_64-linux-gnu-gcc,$(shell command -v $(c) >/dev/null 2>&1 && echo $(c))))
+
+check-sys:
+	@for cc in $(SYS_CHECK_CCS); do \
+	    echo "  SYSCHECK $$cc"; \
+	    $$cc -std=c11 -ffreestanding -fsyntax-only -Wall -Wextra -Werror tests/sys_check.c || exit 1; \
+	done
+
+# ─── Tests ──────────────────────────────────────────────────────────────────
+# Both suites run as an ordinary user. An open finding is an expected failure
+# that names its ledger id in ROADMAP.md; see tests/lib.sh.
+
+# Compiler for the one hosted test program (it needs a C library and threads).
+HOSTCC ?= cc
+
+test-validation: lightbox
+	bash tests/validation.sh ./lightbox
+
+# The seccomp harness is lightbox.c itself with another main().
+tests/seccomp_profile: tests/seccomp_profile.c lightbox.c lightbox.h lightbox_sys.h $(OBJS) $(LIGHTC_LIB)
+	$(CC) $(CFLAGS) -MMD -MP -c tests/seccomp_profile.c -o tests/seccomp_profile.o
+	$(CC) $(LDFLAGS) tests/seccomp_profile.o $(filter-out lightbox.o,$(OBJS)) $(LIGHTC_LIB) -o $@
+
+# Skipped by the suite when this host cannot build a hosted, threaded program.
+tests/seccomp_thread: tests/seccomp_thread.c
+	-$(HOSTCC) -O1 -pthread $< -o $@
+
+test-seccomp: tests/seccomp_profile tests/seccomp_thread
+	bash tests/seccomp_cases.sh tests/seccomp_profile tests/seccomp_thread
+
+test: test-validation test-seccomp
+
+check: check-sys analyze test
+
+# ─── Install ────────────────────────────────────────────────────────────────
 
 install: lightbox
 	install -d $(DESTDIR)$(BINDIR)
 	install -m 755 lightbox $(DESTDIR)$(BINDIR)/lightbox
 	install -d -m 755 $(DESTDIR)$(CONFDIR)
-	install -d -m 755 $(DESTDIR)$(DATADIR)
+	install -d -m 700 $(DESTDIR)$(DATADIR)
 	install -d -m 755 $(DESTDIR)$(DATADIR)/rootfs
-	install -d -m 755 $(DESTDIR)$(DATADIR)/containers
+	install -d -m 700 $(DESTDIR)$(DATADIR)/containers
 	install -d -m 755 $(DESTDIR)$(RUNDIR)
 	install -d -m 755 $(HOME_CONF)
 	@if [ ! -f $(HOME_CONF)/lightbox.conf ]; then \
@@ -86,14 +197,7 @@ uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/lightbox
 
 clean:
-	rm -f lightbox $(OBJS)
+	rm -f lightbox $(OBJS) $(DEPS)
+	rm -f tests/seccomp_profile tests/seccomp_profile.o tests/seccomp_profile.d tests/seccomp_thread
 
-test-validation: lightbox
-	chmod +x test_validation.sh
-	./test_validation.sh
-
-test-lifecycle: lightbox
-	chmod +x test_lifecycle.sh
-	./test_lifecycle.sh
-
-.PHONY: clean install uninstall test-validation test-lifecycle
+.PHONY: analyze check check-sys clean install test test-seccomp test-validation uninstall

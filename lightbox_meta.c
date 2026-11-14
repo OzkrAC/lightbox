@@ -59,14 +59,12 @@ void cmd_ls(int argc, char **argv) {
 
                 (void)read_container_ip(dname, ip_buf, sizeof(ip_buf));
 
-                if (is_running(dname)) {
-                    status = "running";
+                container_liveness live = container_probe(dname);
+                if (live == CONTAINER_RUNNING)
                     fmt_int(pid_str, get_container_pid(dname));
-                } else {
-                    get_container_state(dname, state_buf, sizeof(state_buf));
-                    if (state_buf[0] && !streq(state_buf, "unknown"))
-                        status = state_buf;
-                }
+                container_shown_state(dname, live, state_buf, sizeof(state_buf));
+                if (state_buf[0] && !streq(state_buf, "unknown"))
+                    status = state_buf;
 
                 if (json) {
                     if (!first) print_str(STDOUT, ",");
@@ -143,11 +141,12 @@ void cmd_inspect(int argc, char **argv) {
 
     if (read_container_ip(name, ip, sizeof(ip)) < 0)
         str_copy(ip, "-", sizeof(ip));
-    get_container_state(name, state, sizeof(state));
+    container_liveness live = container_probe(name);
+    container_shown_state(name, live, state, sizeof(state));
 
     print_kv("name", name);
     print_kv("state", state);
-    print_kv("running", is_running(name) ? "yes" : "no");
+    print_kv("running", live == CONTAINER_RUNNING ? "yes" : "no");
     print_kv("ip", ip);
     print_kv("dir", cdir);
     print_kv("rootfs", root);

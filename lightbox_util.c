@@ -1,17 +1,5 @@
 #include "lightbox.h"
 
-#define SYS_fchdir 81
-#define SYS_chroot 161
-#if defined(__x86_64__)
-#define SYS_fsync 74
-#define SYS_renameat 264
-#elif defined(__aarch64__)
-#define SYS_fsync 82
-#define SYS_renameat 38
-#else
-#error "Unsupported architecture"
-#endif
-
 void print_str(int32_t fd, const char *s) {
     lc_print_string(fd, s, lc_string_length(s));
 }
@@ -47,6 +35,22 @@ size_t str_copy(char *dst, const char *src, size_t max) {
 size_t str_append(char *dst, size_t pos, const char *src, size_t max) {
     size_t len = lc_string_length(src);
     if (pos + len >= max) len = max - pos - 1;
+    lc_bytes_copy(dst + pos, src, len);
+    dst[pos + len] = '\0';
+    return pos + len;
+}
+
+/*
+ * Like str_append, for text that must be stored whole: a source that does not
+ * fit is not cut. Nothing is appended and *overflow is set, and stays set.
+ */
+size_t str_append_whole(char *dst, size_t pos, const char *src, size_t max, bool *overflow) {
+    size_t len = lc_string_length(src);
+    if (pos >= max || len >= max - pos) {
+        *overflow = true;
+        if (pos < max) dst[pos] = '\0';
+        return pos;
+    }
     lc_bytes_copy(dst + pos, src, len);
     dst[pos + len] = '\0';
     return pos + len;
@@ -105,15 +109,6 @@ void require_write_file(const char *path, const char *data) {
         die2("Error: write failed: ", path);
 }
 
-static lc_sysret lc_kernel_fsync(int32_t fd) {
-    return lc_syscall1(SYS_fsync, fd);
-}
-
-static lc_sysret lc_kernel_renameat(int32_t olddirfd, const char *oldpath,
-                                    int32_t newdirfd, const char *newpath) {
-    return lc_syscall4(SYS_renameat, olddirfd, (int64_t)oldpath, newdirfd, (int64_t)newpath);
-}
-
 static int sync_parent_dir(const char *path) {
     char dirpath[MAX_PATH];
     size_t len = lc_string_length(path);
@@ -136,7 +131,7 @@ static int sync_parent_dir(const char *path) {
     if (dirfd < 0)
         return -1;
 
-    lc_sysret rc = lc_kernel_fsync((int32_t)dirfd);
+    lc_sysret rc = lb_sys_fsync((int32_t)dirfd);
     lc_kernel_close_file((int32_t)dirfd);
     return (rc < 0) ? -1 : 0;
 }
@@ -247,7 +242,7 @@ void require_tool(const char *label, const char *path) {
 }
 
 
-int write_file_atomic(const char *path, const char *data) {
+int write_file_atomic(const char *path, const char *data, int32_t mode) {
     char tmp[MAX_PATH];
     char pidbuf[16];
     int pid = lc_kernel_get_process_id();
@@ -257,7 +252,7 @@ int write_file_atomic(const char *path, const char *data) {
     pos = str_append(tmp, pos, ".tmp.", sizeof(tmp));
     str_append(tmp, pos, pidbuf, sizeof(tmp));
 
-    lc_sysret fd = lc_kernel_open_file(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    lc_sysret fd = lc_kernel_open_file(tmp, O_WRONLY | O_CREAT | O_TRUNC, mode);
     if (fd < 0)
         return -1;
 
@@ -273,14 +268,14 @@ int write_file_atomic(const char *path, const char *data) {
         off += (size_t)n;
     }
 
-    if (lc_kernel_fsync((int32_t)fd) < 0) {
+    if (lb_sys_fsync((int32_t)fd) < 0) {
         lc_kernel_close_file((int32_t)fd);
         lc_kernel_unlinkat(AT_FDCWD, tmp, 0);
         return -1;
     }
     lc_kernel_close_file((int32_t)fd);
 
-    if (lc_kernel_renameat(AT_FDCWD, tmp, AT_FDCWD, path) < 0) {
+    if (lb_sys_renameat(AT_FDCWD, tmp, AT_FDCWD, path) < 0) {
         lc_kernel_unlinkat(AT_FDCWD, tmp, 0);
         return -1;
     }
@@ -291,7 +286,7 @@ int write_file_atomic(const char *path, const char *data) {
 }
 
 void require_write_file_atomic(const char *path, const char *data) {
-    if (write_file_atomic(path, data) < 0)
+    if (write_file_atomic(path, data, MODE_PRIVATE_FILE) < 0)
         die2("Error: atomic write failed: ", path);
 }
 
@@ -305,16 +300,36 @@ int read_file(const char *path, char *buf, size_t bufsz) {
     return (int)n;
 }
 
+/* 1 if the directory has no entries, 0 if it has some, -1 if it cannot be read. */
+int dir_is_empty(const char *path) {
+    lc_sysret fd = lc_kernel_open_file(path, O_RDONLY, 0);
+    if (fd < 0)
+        return -1;
+
+    char buf[1024];
+    int empty = 1;
+    while (empty == 1) {
+        lc_sysret n = lc_kernel_read_directory((int32_t)fd, buf, sizeof(buf));
+        if (n < 0) { empty = -1; break; }
+        if (n == 0) break;
+        for (lc_sysret pos = 0; pos < n; ) {
+            /* struct linux_dirent64: d_reclen at offset 16, d_name at 19 */
+            uint16_t reclen;
+            lc_bytes_copy(&reclen, buf + pos + 16, sizeof(reclen));
+            const char *entry = buf + pos + 19;
+            bool dot = entry[0] == '.' &&
+                       (entry[1] == '\0' || (entry[1] == '.' && entry[2] == '\0'));
+            if (!dot) { empty = 0; break; }
+            if (reclen == 0) { empty = -1; break; }
+            pos += reclen;
+        }
+    }
+    lc_kernel_close_file((int32_t)fd);
+    return empty;
+}
+
 bool path_exists(const char *path) {
     return lc_kernel_faccessat2(AT_FDCWD, path, F_OK, 0) == 0;
-}
-
-lc_sysret lc_kernel_fchdir(int32_t fd) {
-    return lc_syscall1(SYS_fchdir, fd);
-}
-
-lc_sysret lc_kernel_change_root(const char *path) {
-    return lc_syscall1(SYS_chroot, (int64_t)path);
 }
 
 void require_rm_rf(const char *path) {

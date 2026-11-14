@@ -3,7 +3,9 @@
 # Place this file at ~/.config/lightbox/lightbox.conf
 # All values are optional — built-in defaults are shown below.
 
-# Base directory for lightbox data (base rootfs and container directories)
+# Base directory for lightbox data (base rootfs and container directories).
+# `lightbox setup` makes this directory and container_dir mode 0700, so both
+# must be directories that only lightbox uses.
 # lightbox_dir = /var/lib/lightbox
 
 # Default rootfs to copy when creating containers

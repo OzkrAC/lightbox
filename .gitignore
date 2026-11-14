@@ -1,2 +1,5 @@
 lightbox
 *.o
+*.d
+tests/seccomp_profile
+tests/seccomp_thread

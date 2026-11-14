@@ -15,19 +15,35 @@ A minimal, secure Linux container runtime. Single static binary, ~33KB, no libc 
 Depends on [lightc](https://github.com/OscarAC/lightc), a freestanding C runtime.
 
 ```sh
-# Option 1: git submodule (preferred)
-git clone --recursive <lightbox-repo-url>
-cd lightbox && make
-
-# Option 2: sibling directory
+# lightc next to lightbox: build lightc first, then lightbox
 git clone https://github.com/OscarAC/lightc ../lightc
+(cd ../lightc && ./configure release && ninja build/liblightc.a)
 make
 
-# Option 3: explicit path
+# or point at any lightc tree that is already built
 make LIGHTC=/path/to/lightc
 ```
 
-The Makefile auto-detects lightc as a submodule (`lightc/`) or sibling (`../lightc/`). It builds the lightc static library if needed, then produces a single statically linked `lightbox` binary.
+The Makefile looks for lightc in `LIGHTC=`, then in `lightc/` inside this tree, then in `../lightc/`, and produces a single statically linked `lightbox` binary. A `lightc/` directory inside this tree is the only copy it configures and builds itself. A sibling or `LIGHTC=` tree is someone else's working copy: lightbox links its `build/liblightc.a` and stops with a hint if that file is missing.
+
+`make CC=aarch64-linux-gnu-gcc` cross-builds; lightc must be built for the same architecture.
+
+### Checks
+
+```sh
+make check
+```
+
+runs everything that needs no root:
+
+| Target | What it does |
+| --- | --- |
+| `make check-sys` | Compiles `tests/sys_check.c`, which compares every private syscall number and structure in `lightbox_sys.h` with the kernel's headers, for x86_64 and aarch64 |
+| `make analyze` | Compiles every file with `-fanalyzer` and a strict warning set; any diagnostic is an error |
+| `make test-validation` | Runs the built binary as an ordinary user against a temporary directory tree |
+| `make test-seccomp` | Installs lightbox's real seccomp profile and probes every syscall in its deny table |
+
+In both test suites an open finding from `ROADMAP.md` is an expected failure that names its ledger id. When a fix makes one pass, the suite fails until the case is changed from `xfail` to `check`.
 
 ## Quick start
 

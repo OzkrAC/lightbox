@@ -1,6 +1,6 @@
 #include "lightbox.h"
 
-static void die_cmd(const char *prefix, const char *prog) {
+[[noreturn]] static void die_cmd(const char *prefix, const char *prog) {
     die2(prefix, prog);
 }
 
@@ -41,9 +41,8 @@ int read_container_ip(const char *name, char *ip, size_t ipsz) {
 }
 
 int update_link_rules(const char *name, const char *ip, bool add_rules) {
-    char conf_buf[2048], conf_p[MAX_PATH];
-    container_conf_path(conf_p, name);
-    if (read_file(conf_p, conf_buf, sizeof(conf_buf)) <= 0) return 0;
+    char conf_buf[CONF_MAX];
+    if (container_conf_read(name, conf_buf) <= 0) return 0;
 
     char *p = conf_buf;
     while (*p) {
@@ -127,14 +126,103 @@ static void detect_wan_interface(char *wan_if, size_t bufsz) {
     wan_if[i] = '\0';
 }
 
+[[noreturn]] static void die_cgroup_root(const char *root, const char *reason) {
+    print_str(STDERR, "Error: cgroup_root ");
+    print_str(STDERR, root);
+    print_str(STDERR, " is not a cgroup v2 hierarchy (");
+    print_str(STDERR, reason);
+    print_str(STDERR, ").\n"
+        "lightbox needs cgroup v2. On a cgroup v1 or hybrid host, boot with\n"
+        "cgroup_no_v1=all, or set cgroup_root to a cgroup2 mount or to an empty\n"
+        "directory for lightbox to mount one on.\n");
+    lc_kernel_exit(1);
+}
+
+/*
+ * Make sure cgroup_root is a cgroup2 hierarchy without mounting blindly.
+ *
+ *   already cgroup2                         -> nothing to do
+ *   missing, or an empty plain directory    -> mount cgroup2 there, checked
+ *   anything else (v1, hybrid, other mount) -> stop with a message
+ *
+ * setup used to call mount unconditionally and ignore the result. That only
+ * looked harmless because the call never reached mount(2); on a host where
+ * cgroup_root is already cgroup2 it would add one more mount on every run.
+ */
+static void ensure_cgroup2_root(void) {
+    const char *root = cfg_global.cgroup_root;
+    struct lb_statfs sfs;
+
+    lc_sysret rc = lb_sys_statfs(root, &sfs);
+    if (rc == -LB_ENOENT) {
+        if (lc_kernel_mkdirat(AT_FDCWD, root, 0755) < 0)
+            die2("Error: cannot create cgroup_root: ", root);
+        rc = lb_sys_statfs(root, &sfs);
+    }
+    if (rc < 0)
+        die2("Error: cannot examine cgroup_root: ", root);
+
+    if (sfs.f_type == LB_CGROUP2_SUPER_MAGIC)
+        return;
+    if (sfs.f_type == LB_CGROUP_SUPER_MAGIC)
+        die_cgroup_root(root, "it is a cgroup v1 hierarchy");
+
+    struct lb_statx stx;
+    if (lb_sys_statx(AT_FDCWD, root, 0, LB_STATX_TYPE, &stx) < 0)
+        die2("Error: cannot examine cgroup_root: ", root);
+    if ((stx.stx_mode & LB_S_IFMT) != LB_S_IFDIR)
+        die_cgroup_root(root, "it is not a directory");
+    if (!(stx.stx_attributes_mask & LB_STATX_ATTR_MOUNT_ROOT))
+        die_cgroup_root(root, "this kernel cannot tell whether it is a mount point; Linux 5.8 or later is needed");
+    if (stx.stx_attributes & LB_STATX_ATTR_MOUNT_ROOT)
+        die_cgroup_root(root, "another filesystem is mounted there");
+
+    int empty = dir_is_empty(root);
+    if (empty < 0)
+        die2("Error: cannot read cgroup_root: ", root);
+    if (empty == 0)
+        die_cgroup_root(root, "it is a directory that is not empty");
+
+    if (lb_sys_mount("none", root, "cgroup2", 0, NULL) < 0)
+        die2("Error: failed to mount cgroup2 at ", root);
+    print_str(STDOUT, "Mounted cgroup2 at ");
+    print_str(STDOUT, root);
+    lc_print_char(STDOUT, '\n');
+}
+
+/*
+ * Create a storage directory for root alone, or restrict one that exists.
+ * Installations made before this check have these directories at 0755.
+ */
+static void ensure_private_dir(const char *path) {
+    lc_kernel_mkdirat(AT_FDCWD, path, MODE_PRIVATE_DIR);   /* it may exist */
+
+    struct lb_statx stx;
+    if (lb_sys_statx(AT_FDCWD, path, 0, LB_STATX_TYPE | LB_STATX_MODE, &stx) < 0 ||
+        (stx.stx_mode & LB_S_IFMT) != LB_S_IFDIR)
+        die2("Error: cannot create storage directory: ", path);
+    if ((stx.stx_mode & 0777) == MODE_PRIVATE_DIR)
+        return;
+
+    if (lc_kernel_fchmodat(AT_FDCWD, path, MODE_PRIVATE_DIR, 0) < 0)
+        die2("Error: cannot restrict storage directory to root: ", path);
+    print_str(STDOUT, "Restricted ");
+    print_str(STDOUT, path);
+    print_str(STDOUT, " to its owner (mode 0700)\n");
+}
+
 void cmd_setup(void) {
     require_tool("ip", tool_path_ip());
     require_tool("iptables", tool_path_iptables());
 
+    /* Before anything on the host changes: a host without cgroup v2 cannot
+     * run containers, so setup stops here and leaves no bridge behind. */
+    ensure_cgroup2_root();
+
     print_str(STDOUT, "Setting up host networking...\n");
 
-    lc_kernel_mkdirat(AT_FDCWD, cfg_global.lightbox_dir, 0755);
-    lc_kernel_mkdirat(AT_FDCWD, cfg_global.container_dir, 0755);
+    ensure_private_dir(cfg_global.lightbox_dir);
+    ensure_private_dir(cfg_global.container_dir);
 
     {
         char *show[] = { "ip", "link", "show", cfg_global.bridge, NULL };
@@ -157,9 +245,6 @@ void cmd_setup(void) {
             print_str(STDOUT, " already exists, skipping\n");
         }
     }
-
-    lc_kernel_mkdirat(AT_FDCWD, cfg_global.cgroup_root, 0755);
-    lc_kernel_mount("none", cfg_global.cgroup_root, "cgroup2", 0, NULL);
 
     require_write_file("/proc/sys/net/ipv4/ip_forward", "1");
 

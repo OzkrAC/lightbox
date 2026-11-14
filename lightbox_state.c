@@ -1,7 +1,5 @@
 #include "lightbox.h"
 
-#define USERNS_RANGE_SIZE 65536
-
 void container_dir_path(char *buf, const char *name) {
     path_join(buf, MAX_PATH, cfg_global.container_dir, name);
 }
@@ -61,10 +59,23 @@ void get_container_state(const char *name, char *buf, size_t bufsz) {
     if (!buf[0]) str_copy(buf, "unknown", bufsz);
 }
 
-int conf_get(const char *name, const char *key, char *val, size_t valsz, const char *def) {
-    char path[MAX_PATH], buf[2048];
+/*
+ * Read a container's whole .conf into a buffer of CONF_MAX bytes. Returns the
+ * length, or -1 if the file cannot be read. A file that does not fit stops the
+ * command: a shorter config would silently drop volumes or their ":ro".
+ */
+int container_conf_read(const char *name, char *buf) {
+    char path[MAX_PATH];
     container_conf_path(path, name);
-    if (read_file(path, buf, sizeof(buf)) < 0) {
+    int n = read_file(path, buf, CONF_MAX);
+    if (n >= CONF_MAX - 1)
+        die2("Error: container config is larger than lightbox supports: ", path);
+    return n;
+}
+
+int conf_get(const char *name, const char *key, char *val, size_t valsz, const char *def) {
+    char buf[CONF_MAX];
+    if (container_conf_read(name, buf) < 0) {
         str_copy(val, def, valsz);
         return 0;
     }
@@ -163,55 +174,76 @@ int get_container_pid_starttime(const char *name, char *buf, size_t bufsz) {
     return buf[0] ? 0 : -1;
 }
 
-bool is_running(const char *name) {
+/*
+ * What the runtime files say about a container's init process.
+ *
+ * This only reads. A query must never change what is recorded: an unprivileged
+ * caller, or one on a host that hides other users' processes, cannot tell a
+ * dead process from one it is not allowed to look at. Only "no such process"
+ * counts as gone. A permission error does not.
+ */
+container_liveness container_probe(const char *name) {
     int pid = get_container_pid(name);
-    if (pid <= 0) return false;
+    if (pid <= 0)
+        return CONTAINER_NO_RECORD;
 
-    if (lc_kernel_send_signal(pid, 0) < 0) {
-        clear_runtime_identity(name, true);
-        return false;
-    }
+    lc_sysret sig = lc_kernel_send_signal(pid, 0);
+    if (sig == -LB_ESRCH)
+        return CONTAINER_DEAD;
+    bool may_look = (sig == 0);
 
+    /* The PID may have been reused since: the start time is the identity. */
     char expected_start[32], actual_start[32];
-    if (get_container_pid_starttime(name, expected_start, sizeof(expected_start)) < 0 ||
-        read_proc_starttime(pid, actual_start, sizeof(actual_start)) < 0 ||
-        !streq(expected_start, actual_start)) {
-        clear_runtime_identity(name, true);
-        return false;
-    }
+    if (get_container_pid_starttime(name, expected_start, sizeof(expected_start)) < 0)
+        return CONTAINER_DEAD;
+    if (read_proc_starttime(pid, actual_start, sizeof(actual_start)) < 0)
+        return may_look ? CONTAINER_DEAD : CONTAINER_RUNNING;
+    if (!streq(expected_start, actual_start))
+        return CONTAINER_DEAD;
 
-    char pid_ns[64], init_ns[64], proc_path[64];
-    char intbuf[16];
-    char *pid_ptr = intbuf;
-    int pid_val = pid;
-
-    if (pid_val == 0) {
-        intbuf[0] = '0';
-        intbuf[1] = '\0';
-    } else {
-        char rev[16];
-        int len = 0;
-        while (pid_val > 0 && len < (int)sizeof(rev)) {
-            rev[len++] = (char)('0' + (pid_val % 10));
-            pid_val /= 10;
-        }
-        for (int i = 0; i < len; i++)
-            intbuf[i] = rev[len - 1 - i];
-        intbuf[len] = '\0';
-    }
-
+    /* A container's init lives in a PID namespace of its own. */
+    char proc_path[64], pidbuf[16], pid_ns[64], init_ns[64];
+    fmt_int(pidbuf, pid);
     size_t pos = str_copy(proc_path, "/proc/", sizeof(proc_path));
-    pos = str_append(proc_path, pos, pid_ptr, sizeof(proc_path));
+    pos = str_append(proc_path, pos, pidbuf, sizeof(proc_path));
     str_append(proc_path, pos, "/ns/pid", sizeof(proc_path));
 
     lc_sysret n1 = lc_kernel_readlinkat(AT_FDCWD, proc_path, pid_ns, sizeof(pid_ns) - 1);
+    if (n1 == -LB_ENOENT || n1 == -LB_ESRCH)
+        return CONTAINER_DEAD;
     lc_sysret n2 = lc_kernel_readlinkat(AT_FDCWD, "/proc/1/ns/pid", init_ns, sizeof(init_ns) - 1);
-    if (n1 <= 0 || n2 <= 0) {
-        clear_runtime_identity(name, true);
-        return false;
-    }
+    if (n1 <= 0 || n2 <= 0)
+        return CONTAINER_RUNNING;   /* not allowed to look; the start time matched */
     pid_ns[n1] = '\0';
     init_ns[n2] = '\0';
 
-    return !streq(pid_ns, init_ns);
+    return streq(pid_ns, init_ns) ? CONTAINER_DEAD : CONTAINER_RUNNING;
+}
+
+bool is_running(const char *name) {
+    return container_probe(name) == CONTAINER_RUNNING;
+}
+
+/*
+ * The clean-up for a container whose init is gone: forget the PID and record
+ * the state as failed. Only commands that change a container call this (start
+ * and stop). ls, inspect and exec report what they see and write nothing.
+ */
+void container_reap_if_dead(const char *name) {
+    if (container_probe(name) == CONTAINER_DEAD)
+        clear_runtime_identity(name, true);
+}
+
+/*
+ * The state to show: what is recorded, corrected by what was observed. A
+ * record that still says "running" for a process that is gone reads "exited".
+ */
+void container_shown_state(const char *name, container_liveness live, char *buf, size_t bufsz) {
+    if (live == CONTAINER_RUNNING) {
+        str_copy(buf, "running", bufsz);
+        return;
+    }
+    get_container_state(name, buf, bufsz);
+    if (live == CONTAINER_DEAD || streq(buf, "running"))
+        str_copy(buf, "exited", bufsz);
 }
