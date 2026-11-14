@@ -71,8 +71,28 @@ int read_file(const char *path, char *buf, size_t bufsz);
 bool path_exists(const char *path);
 int dir_is_empty(const char *path);
 void require_rm_rf(const char *path);
-int run_cmd(const char *prog, char *const argv[]);
-int run_cmd_quiet(const char *prog, char *const argv[]);
+
+/* Running a program and waiting for it. The result is its exit status, 0 to
+ * 255, or one of these when there is none; each of them has been reported on
+ * stderr by the time the call returns. */
+#define RUN_FORK_FAILED  256   /* no child process could be made */
+#define RUN_EXEC_FAILED  257   /* the program could not be executed */
+#define RUN_SIGNALED     258   /* a signal ended the program */
+#define RUN_WAIT_FAILED  259   /* the program could not be waited for */
+
+extern const char *const TOOL_ENV[];   /* what tools run with: a fixed PATH */
+
+[[nodiscard]] int run_cmd(const char *prog, const char *const argv[]);
+/* the same with the program's stdout and stderr sent to /dev/null */
+[[nodiscard]] int run_cmd_quiet(const char *prog, const char *const argv[]);
+/* the same with another environment than TOOL_ENV */
+[[nodiscard]] int run_cmd_env(const char *prog, const char *const argv[], const char *const envp[]);
+/* the same with the program's stdout collected in out as a string, cut to fit */
+[[nodiscard]] int run_cmd_capture(const char *prog, const char *const argv[], char *out, size_t outsz);
+
+lc_sysret exec_program(const char *prog, const char *const argv[], const char *const envp[]);
+[[nodiscard]] int wait_child(int32_t pid, int32_t *status);
+int exit_code_from_status(int32_t status);
 int do_mount(const char *source, const char *target,
              const char *fstype, uint64_t flags, const char *data);
 void require_mount(const char *source, const char *target,
@@ -88,7 +108,21 @@ const char *tool_path_rm(void);
 const char *tool_path_nsenter(void);
 bool tool_available(const char *path);
 void require_tool(const char *label, const char *path);
+/* a macro's value as a string literal */
+#define STRINGIFY_(x) #x
+#define STRINGIFY(x)  STRINGIFY_(x)
+
 void validate_name(const char *name);
+/* [a-zA-Z0-9_-], 1 to NAME_MAX_LEN characters: what validate_name accepts */
+bool name_is_valid(const char *name);
+
+/* The most containers one listing holds. */
+#define MAX_LISTED 1024
+/* The containers under container_dir, sorted by name: every directory whose
+ * name is a valid container name. Anything else there is not lightbox's and is
+ * left out. Stores at most max names and returns how many; *more, if given,
+ * says whether some did not fit. */
+int list_containers(char names[][NAME_MAX_LEN + 1], int max, bool *more);
 
 void container_dir_path(char *buf, const char *name);
 void container_root(char *buf, const char *name);

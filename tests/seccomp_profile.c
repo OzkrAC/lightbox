@@ -12,6 +12,14 @@
  *       Call every syscall of the deny table before and after installing the
  *       profile and print what each returned. tests/seccomp_cases.sh reads it.
  *
+ * It prints one line per table row, then what the x32 range (x86_64 only), a
+ * clone with a namespace flag and a plain clone returned:
+ *
+ *   deny <nr> <documented errno> <returned before> <returned after>
+ *   x32 <returned before> <returned after>
+ *   clone_newuser <returned before> <returned after>
+ *   clone_plain <returned before> <returned after>
+ *
  * Probes pass -1 for every argument. A denied syscall never runs, and one that
  * does run (before the profile, or because the profile missed it) fails on the
  * invalid argument without doing anything: a bad pointer, descriptor or flag.
@@ -48,10 +56,10 @@ static int64_t probe_x32(void) {
 }
 #endif
 
-/* clone with a namespace flag. 1 when a child was created (it exits at once),
+/* clone with the given flags. 1 when a child was created (it exits at once),
  * otherwise the negative errno. */
-static int64_t probe_clone_newuser(void) {
-    lc_sysret pid = lc_syscall5(SYS_clone, CLONE_NEWUSER_FLAG | SIGCHLD_NR, 0, 0, 0, 0);
+static int64_t probe_clone(int64_t flags) {
+    lc_sysret pid = lc_syscall5(SYS_clone, flags | SIGCHLD_NR, 0, 0, 0, 0);
     if (pid == 0)
         lc_kernel_exit(0);
     if (pid < 0)
@@ -60,6 +68,9 @@ static int64_t probe_clone_newuser(void) {
     lc_kernel_wait_for_child((int32_t)pid, &status, 0);
     return 1;
 }
+
+static int64_t probe_clone_newuser(void) { return probe_clone(CLONE_NEWUSER_FLAG); }
+static int64_t probe_clone_plain(void)   { return probe_clone(0); }
 
 /* Run a probe in a child, so that a filter which kills instead of returning an
  * errno is reported and does not end the harness. */
@@ -93,24 +104,25 @@ static void install_profile(void) {
 }
 
 static void cmd_probe(void) {
-    static int64_t before[N_BLOCKED_SYSCALLS];
-    size_t n = N_BLOCKED_SYSCALLS;
+    static int64_t before[LB_SECCOMP_TABLE_LEN];
+    size_t n = LB_SECCOMP_TABLE_LEN;
 
     for (size_t i = 0; i < n; i++)
-        before[i] = probe_nr(BLOCKED_SYSCALLS[i].nr);
+        before[i] = probe_nr(LB_SECCOMP_TABLE[i].nr);
 #if defined(__x86_64__)
     int64_t x32_before = probe_x32();
 #endif
     int64_t clone_before = in_child(probe_clone_newuser);
+    int64_t plain_before = in_child(probe_clone_plain);
 
     install_profile();
 
     /* deny <nr> <documented errno> <returned before> <returned after> */
     for (size_t i = 0; i < n; i++) {
-        put("deny ");   put_num(BLOCKED_SYSCALLS[i].nr);
-        put(" ");       put_num(BLOCKED_SYSCALLS[i].err);
+        put("deny ");   put_num(LB_SECCOMP_TABLE[i].nr);
+        put(" ");       put_num(LB_SECCOMP_TABLE[i].err);
         put(" ");       put_num(before[i]);
-        put(" ");       put_num(probe_nr(BLOCKED_SYSCALLS[i].nr));
+        put(" ");       put_num(probe_nr(LB_SECCOMP_TABLE[i].nr));
         put("\n");
     }
 #if defined(__x86_64__)
@@ -120,6 +132,9 @@ static void cmd_probe(void) {
 #endif
     put("clone_newuser ");  put_num(clone_before);
     put(" ");               put_num(in_child(probe_clone_newuser));
+    put("\n");
+    put("clone_plain ");    put_num(plain_before);
+    put(" ");               put_num(in_child(probe_clone_plain));
     put("\n");
 }
 

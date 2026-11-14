@@ -1,9 +1,11 @@
 /*
- * Compile-only check of lightbox_sys.h against the kernel's own headers.
+ * Compile-only check of lightbox_sys.h and lightbox_seccomp.h against the
+ * kernel's own headers.
  *
  * lightbox is freestanding and carries a few syscall numbers, constants and
- * structure layouts of its own. A wrong one does not fail to build; it calls a
- * different syscall or reads the wrong bytes. This file makes it fail to build.
+ * structure layouts of its own, and its seccomp table lists numbers for two
+ * architectures. A wrong one does not fail to build; it calls or denies a
+ * different syscall, or reads the wrong bytes. This file makes it fail to build.
  *
  *   make check-sys
  *
@@ -19,10 +21,15 @@
 #include <asm/errno.h>
 #include <asm/statfs.h>
 #include <asm/unistd.h>
+#include <linux/audit.h>
+#include <linux/filter.h>
 #include <linux/magic.h>
+#include <linux/sched.h>
+#include <linux/seccomp.h>
 #include <linux/stat.h>
 
 #include "../lightbox_sys.h"
+#include "../lightbox_seccomp.h"
 
 #define SAME_NR(name) \
     _Static_assert(LB_SYS_##name == __NR_##name, \
@@ -43,6 +50,7 @@ SAME_NR(statx);
 
 SAME_VALUE(LB_ENOENT, ENOENT);
 SAME_VALUE(LB_ESRCH, ESRCH);
+SAME_VALUE(LB_EINTR, EINTR);
 SAME_VALUE(LB_S_IFMT, S_IFMT);
 SAME_VALUE(LB_S_IFDIR, S_IFDIR);
 SAME_VALUE(LB_STATX_TYPE, STATX_TYPE);
@@ -72,3 +80,80 @@ SAME_FIELD(lb_statx, statx, stx_attributes_mask);
 SAME_FIELD(lb_statx, statx, stx_dev_major);
 SAME_FIELD(lb_statx, statx, stx_dev_minor);
 SAME_FIELD(lb_statx, statx, stx_mnt_id);
+
+/* ─── lightbox_seccomp.h ────────────────────────────────────────────────── */
+
+/* Every row of the deny table holds the kernel's number for its name, on the
+ * architecture this file is being compiled for. */
+#if defined(__x86_64__)
+#define ROW_NR(x86_64, aarch64) (x86_64)
+#else
+#define ROW_NR(x86_64, aarch64) (aarch64)
+#endif
+
+#define CHECK_ROW(name, x86_64, aarch64, err) \
+    _Static_assert(ROW_NR(x86_64, aarch64) == __NR_##name, \
+                   "lightbox_seccomp.h: wrong number for " #name);
+LB_SECCOMP_DENY(CHECK_ROW)
+
+/* The x86_64-only rows: right on x86_64, and really absent everywhere else. If
+ * the kernel's headers define __NR_<name>, NR_TEXT(__NR_<name>) is its digits;
+ * if they do not, it is the name itself. */
+#define NR_TEXT_(token) #token
+#define NR_TEXT(token)  NR_TEXT_(token)
+
+#if defined(__x86_64__)
+#define CHECK_ROW_X86_64(name, nr, err) \
+    _Static_assert((nr) == __NR_##name, "lightbox_seccomp.h: wrong x86_64 number for " #name);
+#else
+#define CHECK_ROW_X86_64(name, nr, err) \
+    _Static_assert(sizeof(NR_TEXT(__NR_##name)) == sizeof("__NR_" #name), \
+                   "lightbox_seccomp.h: " #name " exists on this architecture; move it to LB_SECCOMP_DENY");
+#endif
+LB_SECCOMP_DENY_X86_64(CHECK_ROW_X86_64)
+
+SAME_VALUE(LB_SECCOMP_NR_CLONE, __NR_clone);
+SAME_VALUE(LB_SC_EPERM, EPERM);
+SAME_VALUE(LB_SC_ENOSYS, ENOSYS);
+
+#if defined(__x86_64__)
+SAME_VALUE(LB_SECCOMP_AUDIT_ARCH, AUDIT_ARCH_X86_64);
+SAME_VALUE(LB_X32_SYSCALL_BIT, __X32_SYSCALL_BIT);
+#else
+SAME_VALUE(LB_SECCOMP_AUDIT_ARCH, AUDIT_ARCH_AARCH64);
+#endif
+SAME_VALUE(LB_AUDIT_ARCH_X86_64, AUDIT_ARCH_X86_64);
+SAME_VALUE(LB_AUDIT_ARCH_AARCH64, AUDIT_ARCH_AARCH64);
+
+SAME_VALUE(LB_SECCOMP_MODE_FILTER, SECCOMP_MODE_FILTER);
+SAME_VALUE(LB_SECCOMP_RET_KILL_PROCESS, SECCOMP_RET_KILL_PROCESS);
+SAME_VALUE(LB_SECCOMP_RET_ERRNO, SECCOMP_RET_ERRNO);
+SAME_VALUE(LB_SECCOMP_RET_ALLOW, SECCOMP_RET_ALLOW);
+/* an errno travels in the low 16 bits of the return value */
+SAME_VALUE(0xffffU, SECCOMP_RET_DATA);
+
+SAME_VALUE(LB_BPF_LD_W_ABS, BPF_LD | BPF_W | BPF_ABS);
+SAME_VALUE(LB_BPF_JEQ_K, BPF_JMP | BPF_JEQ | BPF_K);
+SAME_VALUE(LB_BPF_JGE_K, BPF_JMP | BPF_JGE | BPF_K);
+SAME_VALUE(LB_BPF_JSET_K, BPF_JMP | BPF_JSET | BPF_K);
+SAME_VALUE(LB_BPF_RET_K, BPF_RET | BPF_K);
+
+SAME_VALUE(LB_SECCOMP_DATA_NR, offsetof(struct seccomp_data, nr));
+SAME_VALUE(LB_SECCOMP_DATA_ARCH, offsetof(struct seccomp_data, arch));
+SAME_VALUE(LB_SECCOMP_DATA_ARG0_LO, offsetof(struct seccomp_data, args));
+
+SAME_VALUE(LB_SECCOMP_CLONE_NS_FLAGS,
+           CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWIPC |
+           CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET);
+/* CLONE_NEWTIME is left out of that mask because it overlaps the exit signal */
+SAME_VALUE(CLONE_NEWTIME & ~CSIGNAL, 0);
+
+SAME_SIZE(lb_sock_filter, sock_filter);
+SAME_FIELD(lb_sock_filter, sock_filter, code);
+SAME_FIELD(lb_sock_filter, sock_filter, jt);
+SAME_FIELD(lb_sock_filter, sock_filter, jf);
+SAME_FIELD(lb_sock_filter, sock_filter, k);
+
+SAME_SIZE(lb_sock_fprog, sock_fprog);
+SAME_FIELD(lb_sock_fprog, sock_fprog, len);
+SAME_FIELD(lb_sock_fprog, sock_fprog, filter);

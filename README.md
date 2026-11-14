@@ -15,16 +15,20 @@ A minimal, secure Linux container runtime. Single static binary, ~33KB, no libc 
 Depends on [lightc](https://github.com/OscarAC/lightc), a freestanding C runtime.
 
 ```sh
-# lightc next to lightbox: build lightc first, then lightbox
-git clone https://github.com/OscarAC/lightc ../lightc
-(cd ../lightc && ./configure release && ninja build/liblightc.a)
+git clone --recursive https://github.com/OzkrAC/lightbox
+cd lightbox
 make
 
-# or point at any lightc tree that is already built
+# in a clone made without --recursive
+git submodule update --init
+
+# or build against another lightc tree that is already built
 make LIGHTC=/path/to/lightc
 ```
 
-The Makefile looks for lightc in `LIGHTC=`, then in `lightc/` inside this tree, then in `../lightc/`, and produces a single statically linked `lightbox` binary. A `lightc/` directory inside this tree is the only copy it configures and builds itself. A sibling or `LIGHTC=` tree is someone else's working copy: lightbox links its `build/liblightc.a` and stops with a hint if that file is missing.
+lightc is pinned as a git submodule in `lightc/`. `make` configures and builds it there, then produces a single statically linked `lightbox` binary.
+
+The Makefile looks for lightc in `LIGHTC=`, then in the `lightc/` submodule, then in a sibling `../lightc/`. The submodule is the only copy it configures and builds itself. A sibling or `LIGHTC=` tree is someone else's working copy: lightbox links its `build/liblightc.a` and stops with a hint if that file is missing.
 
 `make CC=aarch64-linux-gnu-gcc` cross-builds; lightc must be built for the same architecture.
 
@@ -38,12 +42,13 @@ runs everything that needs no root:
 
 | Target | What it does |
 | --- | --- |
-| `make check-sys` | Compiles `tests/sys_check.c`, which compares every private syscall number and structure in `lightbox_sys.h` with the kernel's headers, for x86_64 and aarch64 |
+| `make check-sys` | Compiles `tests/sys_check.c`, which compares every private syscall number and structure in `lightbox_sys.h`, and every number in the seccomp table of `lightbox_seccomp.h`, with the kernel's headers, for x86_64 and aarch64 |
 | `make analyze` | Compiles every file with `-fanalyzer` and a strict warning set; any diagnostic is an error |
+| `make test-unit` | Runs lightbox's helper for starting programs against real ones: exit statuses, signals, missing programs, quiet and captured output |
 | `make test-validation` | Runs the built binary as an ordinary user against a temporary directory tree |
-| `make test-seccomp` | Installs lightbox's real seccomp profile and probes every syscall in its deny table |
+| `make test-seccomp` | Installs lightbox's real seccomp profile and probes every syscall in its deny table; also interprets the x86_64 and the aarch64 filter program for every syscall number |
 
-In both test suites an open finding from `ROADMAP.md` is an expected failure that names its ledger id. When a fix makes one pass, the suite fails until the case is changed from `xfail` to `check`.
+In the test suites an open finding from `ROADMAP.md` is an expected failure that names its ledger id. When a fix makes one pass, the suite fails until the case is changed from `xfail` to `check`.
 
 ## Quick start
 
@@ -213,7 +218,7 @@ All security features are on by default. Pass `--privileged` to disable.
 | Feature | Implementation |
 |---------|---------------|
 | Capability dropping | `prctl(PR_CAPBSET_DROP)` — keeps Docker's 14 default caps |
-| Seccomp | BPF filter blocking ~50 dangerous syscalls |
+| Seccomp | BPF filter denying 56 syscalls on x86_64 (47 on aarch64), the x32 range, and `clone` with namespace flags |
 | no_new_privs | Prevents SUID escalation |
 | /proc masking | Bind-mounts `/dev/null` over kcore, sysrq-trigger, etc. |
 | /proc read-only | Remounts /proc/sys, /proc/bus, /proc/fs, /proc/irq read-only |

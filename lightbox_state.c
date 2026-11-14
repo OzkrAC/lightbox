@@ -247,3 +247,78 @@ void container_shown_state(const char *name, container_liveness live, char *buf,
     if (live == CONTAINER_DEAD || streq(buf, "running"))
         str_copy(buf, "exited", bufsz);
 }
+
+/* ─── Listing ───────────────────────────────────────────────────────────── */
+
+/* struct linux_dirent64, as getdents64 fills a buffer with it: d_ino and d_off
+ * of 8 bytes each, then these. A record starts wherever the previous one
+ * ended, so its fields are read bytewise and never through a cast. */
+#define DIRENT_RECLEN  16   /* uint16_t */
+#define DIRENT_TYPE    18   /* uint8_t */
+#define DIRENT_NAME    19   /* NUL-terminated */
+
+#define DIRENT_UNKNOWN 0    /* DT_UNKNOWN: the filesystem does not say */
+#define DIRENT_DIR     4    /* DT_DIR */
+
+static bool entry_is_directory(int32_t dirfd, const char *entry) {
+    struct lb_statx stx;
+    if (lb_sys_statx(dirfd, entry, AT_SYMLINK_NOFOLLOW, LB_STATX_TYPE, &stx) < 0)
+        return false;
+    return (stx.stx_mode & LB_S_IFMT) == LB_S_IFDIR;
+}
+
+static bool name_before(const char *a, const char *b) {
+    return lc_string_compare(a, lc_string_length(a), b, lc_string_length(b)) < 0;
+}
+
+int list_containers(char names[][NAME_MAX_LEN + 1], int max, bool *more) {
+    if (more)
+        *more = false;
+
+    lc_sysret dirfd = lc_kernel_open_file(cfg_global.container_dir, O_RDONLY | O_DIRECTORY, 0);
+    if (dirfd < 0)
+        return 0;
+
+    int count = 0;
+    char buf[4096];
+    for (;;) {
+        lc_sysret n = lc_kernel_read_directory((int32_t)dirfd, buf, sizeof(buf));
+        if (n <= 0)
+            break;
+
+        for (lc_sysret pos = 0; pos < n; ) {
+            uint16_t reclen;
+            lc_bytes_copy(&reclen, buf + pos + DIRENT_RECLEN, sizeof(reclen));
+            if (reclen == 0)
+                break;
+            uint8_t type = (uint8_t)buf[pos + DIRENT_TYPE];
+            const char *entry = buf + pos + DIRENT_NAME;
+            pos += reclen;
+
+            /* "." and ".." are not valid names either */
+            if (!name_is_valid(entry))
+                continue;
+            if (type != DIRENT_DIR &&
+                (type != DIRENT_UNKNOWN || !entry_is_directory((int32_t)dirfd, entry)))
+                continue;
+            if (count == max) {
+                if (more)
+                    *more = true;
+                continue;
+            }
+
+            /* insert in order: a listing is small, and already sorted
+             * directories cost one comparison per name */
+            int at = count;
+            while (at > 0 && name_before(entry, names[at - 1])) {
+                lc_bytes_copy(names[at], names[at - 1], NAME_MAX_LEN + 1);
+                at--;
+            }
+            str_copy(names[at], entry, NAME_MAX_LEN + 1);
+            count++;
+        }
+    }
+
+    lc_kernel_close_file((int32_t)dirfd);
+    return count;
+}

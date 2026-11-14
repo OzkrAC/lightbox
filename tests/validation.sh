@@ -364,7 +364,54 @@ t_ls_json_escapes_names() {
     mkdir "$C/we\"ird"
     json=$(lb ls --json)
     printf '%s\n' "$json"
-    printf '%s' "$json" | json_valid
+    printf '%s' "$json" | json_valid || return $?
+    printf '%s' "$json" | grep -q '"name":"web"'
+}
+
+# one field of the first entry of ls --json, decoded by a real JSON parser
+json_field() { python3 -I -c 'import json, sys; sys.stdout.write(str(json.load(sys.stdin)[0][sys.argv[1]]))' "$1"; }
+
+# A record is a file anyone with access can damage. Whatever it holds, the
+# listing stays JSON and gives the value back unchanged.
+t_ls_json_escapes_values() {
+    command -v python3 >/dev/null 2>&1 || { echo "no python3 to decode JSON with"; return 77; }
+    lb create web 10.0.0.2 || return 1
+    printf '1"2\\3\t4\001' > "$C/web/.ip"
+    json=$(lb ls --json)
+    printf '%s\n' "$json"
+    printf '%s' "$json" | json_valid || return 1
+    [ "$(printf '%s' "$json" | json_field ip | od -An -c | tr -s ' ')" = "$(printf '1"2\\3\t4\001' | od -An -c | tr -s ' ')" ]
+}
+
+t_ls_json_pid_is_null_when_stopped() {
+    lb create web 10.0.0.2 || return 1
+    json=$(lb ls --json)
+    printf '%s\n' "$json"
+    printf '%s' "$json" | json_valid || return $?
+    printf '%s' "$json" | grep -q '"pid":null}'
+}
+
+t_ls_is_sorted() {
+    lb create zeta 10.0.0.2 && lb create alpha 10.0.0.3 && lb create mid 10.0.0.4 || return 1
+    text=$(lb ls | sed '1,2d' | awk '{print $1}' | tr '\n' ' ')
+    json=$(lb ls --json | grep -o '"name":"[a-z]*"' | tr '\n' ' ')
+    echo "text: $text"
+    echo "json: $json"
+    [ "$text" = "alpha mid zeta " ] && [ "$json" = '"name":"alpha" "name":"mid" "name":"zeta" ' ]
+}
+
+# containers/ may hold things that are not containers. Only directories with a
+# valid container name are listed.
+t_ls_lists_only_containers() {
+    lb create web 10.0.0.2 || return 1
+    mkdir "$C/has space" "$C/far-too-long-for-a-name" "$C/.hidden"
+    : > "$C/afile"
+    ln -s web "$C/alink"
+    listing=$(lb ls | sed '1,2d' | awk '{print $1}' | tr '\n' ' ')
+    json=$(lb ls --json)
+    echo "listed: $listing"
+    printf '%s\n' "$json"
+    [ "$listing" = "web " ] && [ "$(printf '%s' "$json" | grep -o '"name"' | wc -l)" -eq 1 ]
 }
 
 t_symlinked_base_is_copied() {
@@ -509,7 +556,11 @@ xfail CLI-opt-values       '--mem must be a size'                            t_m
 xfail CFG-parse-int        '--oom-score must be a number'                    t_oom_score_must_be_a_number
 xfail CFG-parse-int        'a number with trailing text is refused'          t_number_with_trailing_text_refused
 xfail CLI-missing-value    'an option without its value is named'            t_missing_value_is_named
-xfail CLI-ls-json          'ls --json escapes names'                         t_ls_json_escapes_names
+check 'ls --json stays JSON next to an odd directory name'    t_ls_json_escapes_names
+check 'ls --json escapes whatever a record holds'             t_ls_json_escapes_values
+check 'ls --json gives pid as null for a stopped container'   t_ls_json_pid_is_null_when_stopped
+check 'ls is sorted by name'                                  t_ls_is_sorted
+check 'ls lists only directories with a container name'       t_ls_lists_only_containers
 xfail CLI-inspect          'inspect shows volumes and links'                 t_inspect_shows_volumes_and_links
 xfail CFG-parse            'configuration: carriage returns are stripped'    t_config_strips_carriage_returns
 xfail CFG-parse            'configuration: inline comments are stripped'     t_config_strips_inline_comments

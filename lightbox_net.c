@@ -4,27 +4,30 @@
     die2(prefix, prog);
 }
 
-static void require_cmd(const char *prog, char *const argv[]) {
+static void require_cmd(const char *prog, const char *const argv[]) {
     if (run_cmd(prog, argv) != 0)
         die_cmd("Error: command failed: ", prog);
 }
 
-static int iptables_check(char *const argv[]) {
+static int iptables_check(const char *const argv[]) {
     return run_cmd_quiet(tool_path_iptables(), argv);
 }
 
-static void iptables_idempotent(char **check_argv, char **add_argv) {
+/* Add a rule setup depends on, unless it is there already. A rule that
+ * cannot be added ends setup: without it the network it reports as ready
+ * would not forward or isolate. */
+static void iptables_idempotent(const char *const check_argv[], const char *const add_argv[]) {
     if (iptables_check(check_argv) != 0)
-        run_cmd(tool_path_iptables(), add_argv);
+        require_cmd(tool_path_iptables(), add_argv);
 }
 
-static int iptables_ensure_rule(char *const check_argv[], char *const add_argv[]) {
+static int iptables_ensure_rule(const char *const check_argv[], const char *const add_argv[]) {
     if (iptables_check(check_argv) == 0)
         return 0;
     return run_cmd(tool_path_iptables(), add_argv);
 }
 
-static int iptables_remove_rule(char *const check_argv[], char *const del_argv[]) {
+static int iptables_remove_rule(const char *const check_argv[], const char *const del_argv[]) {
     if (iptables_check(check_argv) != 0)
         return 0;
     return run_cmd(tool_path_iptables(), del_argv);
@@ -58,23 +61,23 @@ int update_link_rules(const char *name, const char *ip, bool add_rules) {
 
             char link_ip[16];
             if (read_container_ip(link_name, link_ip, sizeof(link_ip)) == 0) {
-                char *c1[] = { "iptables", "-C", "FORWARD",
-                               "-s", (char *)ip, "-d", link_ip,
+                const char *c1[] = { "iptables", "-C", "FORWARD",
+                               "-s", ip, "-d", link_ip,
                                "-i", cfg_global.bridge, "-o", cfg_global.bridge,
                                "-j", "ACCEPT", NULL };
-                char *m1[] = { "iptables", add_rules ? "-I" : "-D", "FORWARD",
-                               "-s", (char *)ip, "-d", link_ip,
+                const char *m1[] = { "iptables", add_rules ? "-I" : "-D", "FORWARD",
+                               "-s", ip, "-d", link_ip,
                                "-i", cfg_global.bridge, "-o", cfg_global.bridge,
                                "-j", "ACCEPT", NULL };
                 if ((add_rules ? iptables_ensure_rule(c1, m1) : iptables_remove_rule(c1, m1)) != 0)
                     return -1;
 
-                char *c2[] = { "iptables", "-C", "FORWARD",
-                               "-s", link_ip, "-d", (char *)ip,
+                const char *c2[] = { "iptables", "-C", "FORWARD",
+                               "-s", link_ip, "-d", ip,
                                "-i", cfg_global.bridge, "-o", cfg_global.bridge,
                                "-j", "ACCEPT", NULL };
-                char *m2[] = { "iptables", add_rules ? "-I" : "-D", "FORWARD",
-                               "-s", link_ip, "-d", (char *)ip,
+                const char *m2[] = { "iptables", add_rules ? "-I" : "-D", "FORWARD",
+                               "-s", link_ip, "-d", ip,
                                "-i", cfg_global.bridge, "-o", cfg_global.bridge,
                                "-j", "ACCEPT", NULL };
                 if ((add_rules ? iptables_ensure_rule(c2, m2) : iptables_remove_rule(c2, m2)) != 0)
@@ -90,25 +93,9 @@ int update_link_rules(const char *name, const char *ip, bool add_rules) {
 
 static void detect_wan_interface(char *wan_if, size_t bufsz) {
     char route_buf[256];
-    int pipefd[2];
-    lc_kernel_create_pipe(pipefd, 0);
-    lc_sysret pid = lc_kernel_fork();
-    if (pid == 0) {
-        lc_kernel_close_file(pipefd[0]);
-        lc_kernel_duplicate_fd(pipefd[1], STDOUT, 0);
-        lc_kernel_close_file(pipefd[1]);
-        char *argv[] = { "ip", "route", "show", "default", NULL };
-        char *envp[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", NULL };
-        lc_kernel_execute(tool_path_ip(), argv, envp);
-        lc_kernel_exit(1);
-    }
-    lc_kernel_close_file(pipefd[1]);
-    lc_sysret n = lc_kernel_read_bytes(pipefd[0], route_buf, sizeof(route_buf) - 1);
-    lc_kernel_close_file(pipefd[0]);
-    int32_t status;
-    lc_kernel_wait_for_child((int32_t)pid, &status, 0);
-    if (n <= 0) die("Error: could not detect default network interface");
-    route_buf[n] = '\0';
+    const char *argv[] = { "ip", "route", "show", "default", NULL };
+    if (run_cmd_capture(tool_path_ip(), argv, route_buf, sizeof(route_buf)) != 0 || !route_buf[0])
+        die("Error: could not detect default network interface");
 
     const char *dev = NULL;
     for (char *p = route_buf; *p; p++) {
@@ -225,19 +212,19 @@ void cmd_setup(void) {
     ensure_private_dir(cfg_global.container_dir);
 
     {
-        char *show[] = { "ip", "link", "show", cfg_global.bridge, NULL };
+        const char *show[] = { "ip", "link", "show", cfg_global.bridge, NULL };
         if (run_cmd_quiet(tool_path_ip(), show) != 0) {
             print_str(STDOUT, "Creating bridge ");
             print_str(STDOUT, cfg_global.bridge);
             print_str(STDOUT, "...\n");
-            char *add[] = { "ip", "link", "add", "name", cfg_global.bridge, "type", "bridge", NULL };
+            const char *add[] = { "ip", "link", "add", "name", cfg_global.bridge, "type", "bridge", NULL };
             require_cmd(tool_path_ip(), add);
             char gw_cidr[20];
             str_copy(gw_cidr, cfg_global.gw, sizeof(gw_cidr));
             str_append(gw_cidr, lc_string_length(gw_cidr), "/24", sizeof(gw_cidr));
-            char *addr[] = { "ip", "addr", "add", gw_cidr, "dev", cfg_global.bridge, NULL };
+            const char *addr[] = { "ip", "addr", "add", gw_cidr, "dev", cfg_global.bridge, NULL };
             require_cmd(tool_path_ip(), addr);
-            char *up[] = { "ip", "link", "set", cfg_global.bridge, "up", NULL };
+            const char *up[] = { "ip", "link", "set", cfg_global.bridge, "up", NULL };
             require_cmd(tool_path_ip(), up);
         } else {
             print_str(STDOUT, "Bridge ");
@@ -255,35 +242,35 @@ void cmd_setup(void) {
     lc_print_char(STDOUT, '\n');
 
     {
-        char *chk[] = { "iptables", "-t", "nat", "-C", "POSTROUTING",
+        const char *chk[] = { "iptables", "-t", "nat", "-C", "POSTROUTING",
                         "-s", cfg_global.subnet, "-o", wan_if, "-j", "MASQUERADE", NULL };
-        char *add[] = { "iptables", "-t", "nat", "-A", "POSTROUTING",
+        const char *add[] = { "iptables", "-t", "nat", "-A", "POSTROUTING",
                         "-s", cfg_global.subnet, "-o", wan_if, "-j", "MASQUERADE", NULL };
         iptables_idempotent(chk, add);
     }
 
     {
-        char *chk[] = { "iptables", "-C", "FORWARD", "-i", cfg_global.bridge,
+        const char *chk[] = { "iptables", "-C", "FORWARD", "-i", cfg_global.bridge,
                         "-o", wan_if, "-j", "ACCEPT", NULL };
-        char *add[] = { "iptables", "-A", "FORWARD", "-i", cfg_global.bridge,
+        const char *add[] = { "iptables", "-A", "FORWARD", "-i", cfg_global.bridge,
                         "-o", wan_if, "-j", "ACCEPT", NULL };
         iptables_idempotent(chk, add);
     }
 
     {
-        char *chk[] = { "iptables", "-C", "FORWARD", "-i", wan_if,
+        const char *chk[] = { "iptables", "-C", "FORWARD", "-i", wan_if,
                         "-o", cfg_global.bridge, "-m", "state", "--state", "RELATED,ESTABLISHED",
                         "-j", "ACCEPT", NULL };
-        char *add[] = { "iptables", "-A", "FORWARD", "-i", wan_if,
+        const char *add[] = { "iptables", "-A", "FORWARD", "-i", wan_if,
                         "-o", cfg_global.bridge, "-m", "state", "--state", "RELATED,ESTABLISHED",
                         "-j", "ACCEPT", NULL };
         iptables_idempotent(chk, add);
     }
 
     {
-        char *chk[] = { "iptables", "-C", "FORWARD", "-i", cfg_global.bridge,
+        const char *chk[] = { "iptables", "-C", "FORWARD", "-i", cfg_global.bridge,
                         "-o", cfg_global.bridge, "-j", "DROP", NULL };
-        char *add[] = { "iptables", "-A", "FORWARD", "-i", cfg_global.bridge,
+        const char *add[] = { "iptables", "-A", "FORWARD", "-i", cfg_global.bridge,
                         "-o", cfg_global.bridge, "-j", "DROP", NULL };
         iptables_idempotent(chk, add);
     }

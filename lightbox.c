@@ -22,6 +22,7 @@
 #include <lightc/io.h>
 
 #include "lightbox.h"
+#include "lightbox_seccomp.h"
 
 /* ─── Compile-time limits ───────────────────────────────────────────────── */
 
@@ -45,27 +46,6 @@ global_config cfg_global;
 #define PR_CAPBSET_DROP      24
 #define PR_SET_SECCOMP       22
 
-/* seccomp constants */
-#define SECCOMP_MODE_FILTER    2
-#define SECCOMP_RET_ALLOW      0x7fff0000
-#define SECCOMP_RET_ERRNO      0x00050000
-#define SECCOMP_RET_KILL_PROCESS 0x80000000U
-
-/* seccomp/audit constants */
-#define AUDIT_ARCH_X86_64      0xc000003eU
-
-/* BPF instruction macros */
-#define BPF_LD   0x00
-#define BPF_JMP  0x05
-#define BPF_RET  0x06
-#define BPF_W    0x00
-#define BPF_ABS  0x20
-#define BPF_JEQ  0x10
-#define BPF_K    0x00
-
-#define BPF_STMT(code, k) { (uint16_t)(code), 0, 0, (uint32_t)(k) }
-#define BPF_JUMP(code, k, jt, jf) { (uint16_t)(code), (uint8_t)(jt), (uint8_t)(jf), (uint32_t)(k) }
-
 /* capability numbers */
 #define CAP_CHOWN            0
 #define CAP_DAC_OVERRIDE     1
@@ -85,18 +65,6 @@ global_config cfg_global;
 
 /* ─── Structs ───────────────────────────────────────────────────────────── */
 
-struct sock_filter {
-    uint16_t code;
-    uint8_t  jt;
-    uint8_t  jf;
-    uint32_t k;
-};
-
-struct sock_fprog {
-    uint16_t             len;
-    struct sock_filter  *filter;
-};
-
 struct user_cap_header {
     uint32_t version;
     int32_t pid;
@@ -107,10 +75,6 @@ struct user_cap_data {
     uint32_t permitted;
     uint32_t inheritable;
 };
-
-/* seccomp_data layout — offset of 'nr' is 0 */
-#define SECCOMP_DATA_NR_OFFSET 0
-#define SECCOMP_DATA_ARCH_OFFSET 4
 
 typedef struct {
     char name[NAME_MAX_LEN + 1];
@@ -305,16 +269,8 @@ static bool path_is_directory(const char *path) {
 }
 
 static void mkdir_p_or_die(const char *path) {
-    lc_sysret mp = lc_kernel_fork();
-    if (mp == 0) {
-        char *a[] = { "mkdir", "-p", (char *)path, NULL };
-        char *e[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", NULL };
-        lc_kernel_execute(tool_path_mkdir(), a, e);
-        lc_kernel_exit(1);
-    }
-    int32_t st;
-    lc_kernel_wait_for_child((int32_t)mp, &st, 0);
-    if (((st >> 8) & 0xff) != 0)
+    const char *a[] = { "mkdir", "-p", path, NULL };
+    if (run_cmd(tool_path_mkdir(), a) != 0)
         die2("Error: mkdir -p failed: ", path);
 }
 
@@ -366,8 +322,6 @@ static bool container_has_volume(const char *name, const volume_spec *needle) {
     return false;
 }
 
-#define STRINGIFY_(x) #x
-#define STRINGIFY(x)  STRINGIFY_(x)
 
 static void append_container_volume(const char *name, const volume_spec *vol) {
     char conf_path[MAX_PATH], conf_buf[CONF_MAX], new_buf[CONF_MAX];
@@ -409,17 +363,32 @@ static void append_container_volume(const char *name, const volume_spec *vol) {
     require_write_file_atomic(conf_path, new_buf);
 }
 
+static bool name_char_ok(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '_' || c == '-';
+}
+
 /* Validate container name: [a-zA-Z0-9_-], max 12 chars */
 void validate_name(const char *name) {
     if (!name || !name[0]) die("Error: container name required");
     size_t len = lc_string_length(name);
     if (len > NAME_MAX_LEN) die("Error: container name must be 12 characters or fewer");
     for (size_t i = 0; i < len; i++) {
-        char c = name[i];
-        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-              (c >= '0' && c <= '9') || c == '_' || c == '-'))
+        if (!name_char_ok(name[i]))
             die("Error: container name must only contain [a-zA-Z0-9_-]");
     }
+}
+
+/* The same rule as a question, for names lightbox finds instead of being given. */
+bool name_is_valid(const char *name) {
+    if (!name || !name[0])
+        return false;
+    size_t len = 0;
+    for (; name[len]; len++) {
+        if (len == NAME_MAX_LEN || !name_char_ok(name[len]))
+            return false;
+    }
+    return true;
 }
 
 static bool uid_ranges_overlap(int start_a, int start_b) {
@@ -429,43 +398,19 @@ static bool uid_ranges_overlap(int start_a, int start_b) {
 }
 
 static bool userns_range_in_use(const char *exclude_name, int uid_start) {
-    lc_sysret dirfd = lc_kernel_open_file(cfg_global.container_dir, O_RDONLY, 0);
-    if (dirfd < 0) return false;
+    static char names[MAX_LISTED][NAME_MAX_LEN + 1];
+    int count = list_containers(names, MAX_LISTED, NULL);
 
-    char dirbuf[4096];
-    bool in_use = false;
-
-    for (;;) {
-        lc_sysret n = lc_kernel_read_directory((int32_t)dirfd, dirbuf, sizeof(dirbuf));
-        if (n <= 0) break;
-
-        int64_t pos = 0;
-        while (pos < n) {
-            uint16_t reclen = *(uint16_t *)(dirbuf + pos + 16);
-            uint8_t dtype = *(uint8_t *)(dirbuf + pos + 18);
-            char *dname = dirbuf + pos + 19;
-
-            if (dtype == 4 /* DT_DIR */ && dname[0] != '.') {
-                if (exclude_name && streq(dname, exclude_name)) {
-                    pos += reclen;
-                    continue;
-                }
-
-                if (conf_get_int(dname, "userns", 0)) {
-                    int existing = conf_get_int(dname, "uid_start", 0);
-                    if (existing > 0 && uid_ranges_overlap(existing, uid_start)) {
-                        in_use = true;
-                        break;
-                    }
-                }
-            }
-            pos += reclen;
+    for (int i = 0; i < count; i++) {
+        if (exclude_name && streq(names[i], exclude_name))
+            continue;
+        if (conf_get_int(names[i], "userns", 0)) {
+            int existing = conf_get_int(names[i], "uid_start", 0);
+            if (existing > 0 && uid_ranges_overlap(existing, uid_start))
+                return true;
         }
-        if (in_use) break;
     }
-
-    lc_kernel_close_file((int32_t)dirfd);
-    return in_use;
+    return false;
 }
 
 static int allocate_uid_start(const char *exclude_name) {
@@ -601,128 +546,20 @@ static void drop_capabilities(void) {
 /* ─── Security: seccomp ─────────────────────────────────────────────────── */
 
 /*
- * x86_64 syscall numbers to block (Docker's default deny list), each with the
- * errno the caller gets. Almost all answer EPERM. clone3 answers ENOSYS: its
- * flags sit behind a pointer the filter cannot read, so it cannot be allowed
- * selectively, and ENOSYS is the one answer that makes a C library fall back
- * to clone. With EPERM, glibc 2.34 and later cannot create a thread.
+ * Install the profile: the deny table of lightbox_seccomp.h for this
+ * architecture, a refusal of the x32 range on x86_64, and clone without
+ * namespace flags. The caller has set no_new_privs or holds CAP_SYS_ADMIN.
  */
-struct seccomp_deny {
-    uint32_t nr;
-    uint16_t err;   /* the errno the caller sees */
-};
-
-#define SC_EPERM   1
-#define SC_ENOSYS  38
-
-static const struct seccomp_deny BLOCKED_SYSCALLS[] = {
-    /* x86_64 syscall numbers */
-    { 163, SC_EPERM },  /* acct */
-    { 248, SC_EPERM },  /* add_key */
-    { 321, SC_EPERM },  /* bpf */
-    { 305, SC_EPERM },  /* clock_adjtime */
-    { 227, SC_EPERM },  /* clock_settime */
-    { 174, SC_EPERM },  /* create_module */
-    { 176, SC_EPERM },  /* delete_module */
-    { 313, SC_EPERM },  /* finit_module */
-    { 177, SC_EPERM },  /* get_kernel_syms */
-    { 239, SC_EPERM },  /* get_mempolicy */
-    { 425, SC_EPERM },  /* io_uring_setup */
-    { 426, SC_EPERM },  /* io_uring_enter */
-    { 427, SC_EPERM },  /* io_uring_register */
-    { 175, SC_EPERM },  /* init_module */
-    { 173, SC_EPERM },  /* ioperm */
-    { 172, SC_EPERM },  /* iopl */
-    { 312, SC_EPERM },  /* kcmp */
-    { 320, SC_EPERM },  /* kexec_file_load */
-    { 246, SC_EPERM },  /* kexec_load */
-    { 250, SC_EPERM },  /* keyctl */
-    { 212, SC_EPERM },  /* lookup_dcookie */
-    { 237, SC_EPERM },  /* mbind */
-    { 256, SC_EPERM },  /* migrate_pages */
-    /* 40, mount — allowed for container setup, blocked by caps */
-    { 429, SC_EPERM },  /* move_mount */
-    { 279, SC_EPERM },  /* move_pages */
-    { 303, SC_EPERM },  /* name_to_handle_at */
-    { 180, SC_EPERM },  /* nfsservctl */
-    { 304, SC_EPERM },  /* open_by_handle_at */
-    { 428, SC_EPERM },  /* open_tree */
-    { 298, SC_EPERM },  /* perf_event_open */
-    { 135, SC_EPERM },  /* personality */
-    /* 155, pivot_root — blocked by caps after setup */
-    { 310, SC_EPERM },  /* process_vm_readv */
-    { 311, SC_EPERM },  /* process_vm_writev */
-    { 101, SC_EPERM },  /* ptrace */
-    { 178, SC_EPERM },  /* query_module */
-    { 179, SC_EPERM },  /* quotactl */
-    { 169, SC_EPERM },  /* reboot */
-    { 249, SC_EPERM },  /* request_key */
-    { 238, SC_EPERM },  /* set_mempolicy */
-    { 308, SC_EPERM },  /* setns */
-    { 164, SC_EPERM },  /* settimeofday */
-    /* 200, stime — doesn't exist on x86_64 */
-    { 167, SC_EPERM },  /* swapon */
-    { 168, SC_EPERM },  /* swapoff */
-    { 156, SC_EPERM },  /* _sysctl */
-    { 139, SC_EPERM },  /* sysfs */
-    { 166, SC_EPERM },  /* umount2 */
-    { 272, SC_EPERM },  /* unshare */
-    { 134, SC_EPERM },  /* uselib */
-    { 323, SC_EPERM },  /* userfaultfd */
-    { 136, SC_EPERM },  /* ustat */
-    /* vm86/vm86old don't exist on x86_64 */
-    { 435, SC_ENOSYS },  /* clone3: glibc falls back to clone only on ENOSYS */
-    { 442, SC_EPERM },  /* mount_setattr */
-    { 430, SC_EPERM },  /* fsopen */
-    { 431, SC_EPERM },  /* fsconfig */
-    { 432, SC_EPERM },  /* fsmount */
-    { 433, SC_EPERM },  /* fspick */
-};
-#define N_BLOCKED_SYSCALLS (sizeof(BLOCKED_SYSCALLS) / sizeof(BLOCKED_SYSCALLS[0]))
-
 static void apply_seccomp(void) {
-    /*
-     * Build a BPF program:
-     *   load syscall nr
-     *   for each blocked syscall: if equal, return ERRNO(its errno)
-     *   return ALLOW
-     *
-     * Total instructions:
-     *   1 arch load + 1 arch check + 1 kill +
-     *   1 nr load + 2*N (check+deny per syscall) + 1 allow
-     */
-    size_t n = N_BLOCKED_SYSCALLS;
-    size_t prog_len = 4 + 2 * n + 1;
-    struct sock_filter filter[256]; /* plenty of room */
-
-    if (prog_len > sizeof(filter) / sizeof(filter[0]))
-        die("Error: seccomp program too large");
-
-    size_t idx = 0;
-
-    /* kill mismatched syscall ABIs */
-    filter[idx++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_ARCH_OFFSET);
-    filter[idx++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0);
-    filter[idx++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
-
-    /* load syscall number */
-    filter[idx++] = (struct sock_filter)BPF_STMT(BPF_LD | BPF_W | BPF_ABS, SECCOMP_DATA_NR_OFFSET);
-
-    /* for each blocked syscall: check and deny */
-    for (size_t i = 0; i < n; i++) {
-        filter[idx++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, BLOCKED_SYSCALLS[i].nr, 0, 1);
-        filter[idx++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | BLOCKED_SYSCALLS[i].err);
-    }
-
-    /* default: allow */
-    filter[idx++] = (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
-
-    struct sock_fprog prog = {
-        .len = (uint16_t)idx,
+    struct lb_sock_filter filter[LB_SECCOMP_PROG_LEN];
+    struct lb_sock_fprog prog = {
+        .len = (uint16_t)lb_seccomp_build(filter),
         .filter = filter,
     };
 
-    if (lc_kernel_prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, (uint64_t)&prog, 0, 0) < 0)
+    if (prog.len != LB_SECCOMP_PROG_LEN)
+        die("Error: seccomp program has an unexpected length");
+    if (lc_kernel_prctl(PR_SET_SECCOMP, LB_SECCOMP_MODE_FILTER, (uint64_t)&prog, 0, 0) < 0)
         die("Error: failed to install seccomp filter");
 }
 
@@ -853,16 +690,8 @@ static void cmd_create(int argc, char **argv) {
          * that link, and everything written to it would land in the base. */
         char base_contents[MAX_PATH + 4];
         path_join(base_contents, sizeof(base_contents), cfg_global.rootfs, ".");
-        lc_sysret pid = lc_kernel_fork();
-        if (pid == 0) {
-            char *argv2[] = { "cp", "-a", base_contents, root, NULL };
-            char *envp[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", NULL };
-            lc_kernel_execute(tool_path_cp(), argv2, envp);
-            lc_kernel_exit(1);
-        }
-        int32_t status;
-        lc_kernel_wait_for_child((int32_t)pid, &status, 0);
-        if (((status >> 8) & 0xff) != 0) {
+        const char *cp_argv[] = { "cp", "-a", base_contents, root, NULL };
+        if (run_cmd(tool_path_cp(), cp_argv) != 0) {
             create_err = "failed to copy rootfs";
             goto fail_create;
         }
@@ -965,16 +794,8 @@ static void cmd_create(int argc, char **argv) {
         size_t pos = lc_string_length(uid_str);
         fmt_int(uid_str + pos, cfg.uid_start);
 
-        lc_sysret pid = lc_kernel_fork();
-        if (pid == 0) {
-            char *argv2[] = { "chown", "-R", "-h", uid_str, root, NULL };
-            char *envp[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", NULL };
-            lc_kernel_execute(tool_path_chown(), argv2, envp);
-            lc_kernel_exit(1);
-        }
-        int32_t status;
-        lc_kernel_wait_for_child((int32_t)pid, &status, 0);
-        if (((status >> 8) & 0xff) != 0) {
+        const char *chown_argv[] = { "chown", "-R", "-h", uid_str, root, NULL };
+        if (run_cmd(tool_path_chown(), chown_argv) != 0) {
             create_err = "failed to shift rootfs ownership";
             goto fail_create;
         }
@@ -1034,19 +855,10 @@ static void reap_children_nonblock(void) {
 static void run_init_hook_if_present(void) {
     if (!path_exists("/init.sh")) return;
 
-    lc_sysret p = lc_kernel_fork();
-    if (p == 0) {
-        uint64_t empty_mask = 0;
-        lc_kernel_set_signal_mask(LC_SIG_SETMASK, &empty_mask, NULL);
-        char *a[] = { "/bin/sh", "/init.sh", NULL };
-        char *e[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "HOME=/root", "TERM=xterm", NULL };
-        lc_kernel_execute("/bin/sh", a, e);
-        lc_kernel_exit(1);
-    }
-
-    int32_t st;
-    lc_kernel_wait_for_child((int32_t)p, &st, 0);
-    if (((st >> 8) & 0xff) != 0)
+    /* the hook runs with no signal blocked: the helper clears the mask */
+    const char *a[] = { "/bin/sh", "/init.sh", NULL };
+    const char *e[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "HOME=/root", "TERM=xterm", NULL };
+    if (run_cmd_env("/bin/sh", a, e) != 0)
         die("Error: /init.sh failed");
 }
 
@@ -1115,7 +927,7 @@ static int exec_inside_container(const char *name, int target_pid, int userns,
                                  int privileged, int uid, int gid,
                                  const char *home, const char *user_name,
                                  int ngroups, const uint32_t *groups,
-                                 char *const cmd_argv[]) {
+                                 const char *const cmd_argv[]) {
     int rootfd = open_target_path(target_pid, "/root");
     if (rootfd < 0)
         die("Error: failed to open target root");
@@ -1201,7 +1013,7 @@ static int exec_inside_container(const char *name, int target_pid, int userns,
             str_append(logname_env, 8, "root", sizeof(logname_env));
         }
 
-        char *envp[6];
+        const char *envp[6];
         int ei = 0;
         envp[ei++] = "PATH=/usr/bin:/bin:/usr/sbin:/sbin";
         envp[ei++] = home_env;
@@ -1209,12 +1021,13 @@ static int exec_inside_container(const char *name, int target_pid, int userns,
         if (user_env[5]) envp[ei++] = user_env;
         if (logname_env[8]) envp[ei++] = logname_env;
         envp[ei] = NULL;
-        lc_kernel_execute(cmd_argv[0], cmd_argv, envp);
+        exec_program(cmd_argv[0], cmd_argv, envp);
         die2("Error: failed to exec command: ", cmd_argv[0]);
     }
 
     int32_t status;
-    lc_kernel_wait_for_child((int32_t)child, &status, 0);
+    if (wait_child((int32_t)child, &status) < 0)
+        die("Error: failed to wait for the command");
     return status;
 }
 
@@ -1224,10 +1037,10 @@ static void cleanup_start_failure(const char *name, const char *ip, const char *
         lc_kernel_send_signal(child_pid, SIGKILL);
 
     if (veth_host && veth_host[0]) {
-        char *show[] = { "ip", "link", "show", (char *)veth_host, NULL };
+        const char *show[] = { "ip", "link", "show", veth_host, NULL };
         if (run_cmd_quiet(tool_path_ip(), show) == 0) {
-            char *del[] = { "ip", "link", "delete", (char *)veth_host, NULL };
-            run_cmd(tool_path_ip(), del);
+            const char *del[] = { "ip", "link", "delete", veth_host, NULL };
+            (void)run_cmd(tool_path_ip(), del);   /* clean-up: best effort */
         }
     }
 
@@ -1250,11 +1063,11 @@ static void cleanup_start_failure(const char *name, const char *ip, const char *
 }
 
 static int delete_veth_if_present(const char *ifname) {
-    char *show[] = { "ip", "link", "show", (char *)ifname, NULL };
+    const char *show[] = { "ip", "link", "show", ifname, NULL };
     if (run_cmd_quiet(tool_path_ip(), show) != 0)
         return 0;
 
-    char *del[] = { "ip", "link", "delete", (char *)ifname, NULL };
+    const char *del[] = { "ip", "link", "delete", ifname, NULL };
     return run_cmd(tool_path_ip(), del);
 }
 
@@ -1453,12 +1266,8 @@ static int container_child(void *arg) {
 
     /* bring up loopback */
     {
-        char *a[] = { "ip", "link", "set", "lo", "up", NULL };
-        char *e[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", NULL };
-        lc_sysret p = lc_kernel_fork();
-        if (p == 0) { lc_kernel_execute(tool_path_ip(), a, e); lc_kernel_exit(1); }
-        int32_t st; lc_kernel_wait_for_child((int32_t)p, &st, 0);
-        if (((st >> 8) & 0xff) != 0) die("Error: failed to bring up loopback");
+        const char *a[] = { "ip", "link", "set", "lo", "up", NULL };
+        if (run_cmd(tool_path_ip(), a) != 0) die("Error: failed to bring up loopback");
     }
 
     /* mount tmpfs for /tmp and /run before /init.sh so services started from
@@ -1543,11 +1352,11 @@ static void cmd_start(int argc, char **argv) {
     }
 
     /* create veth pair */
-    { char *a[] = { "ip", "link", "add", veth_cont, "type", "veth", "peer", "name", veth_host, NULL };
+    { const char *a[] = { "ip", "link", "add", veth_cont, "type", "veth", "peer", "name", veth_host, NULL };
       if (run_cmd(tool_path_ip(), a) != 0) { start_err = "failed to create veth pair"; goto fail_start; } }
-    { char *a[] = { "ip", "link", "set", veth_host, "master", cfg_global.bridge, NULL };
+    { const char *a[] = { "ip", "link", "set", veth_host, "master", cfg_global.bridge, NULL };
       if (run_cmd(tool_path_ip(), a) != 0) { start_err = "failed to attach veth to bridge"; goto fail_start; } }
-    { char *a[] = { "ip", "link", "set", veth_host, "up", NULL };
+    { const char *a[] = { "ip", "link", "set", veth_host, "up", NULL };
       if (run_cmd(tool_path_ip(), a) != 0) { start_err = "failed to bring host veth up"; goto fail_start; } }
 
     /* create sync pipe */
@@ -1633,7 +1442,7 @@ static void cmd_start(int argc, char **argv) {
     /* move veth into container network namespace */
     {
         char nsbuf[16]; fmt_int(nsbuf, (int)child_pid);
-        char *a[] = { "ip", "link", "set", veth_cont, "netns", nsbuf, NULL };
+        const char *a[] = { "ip", "link", "set", veth_cont, "netns", nsbuf, NULL };
         if (run_cmd(tool_path_ip(), a) != 0) { start_err = "failed to move veth into netns"; goto fail_start; }
     }
 
@@ -1644,11 +1453,11 @@ static void cmd_start(int argc, char **argv) {
         str_copy(ip_cidr, ip, sizeof(ip_cidr));
         str_append(ip_cidr, lc_string_length(ip_cidr), "/24", sizeof(ip_cidr));
 
-        char *a1[] = { "nsenter", "-t", nsbuf, "-n", "--", "ip", "link", "set", veth_cont, "up", NULL };
+        const char *a1[] = { "nsenter", "-t", nsbuf, "-n", "--", "ip", "link", "set", veth_cont, "up", NULL };
         if (run_cmd(tool_path_nsenter(), a1) != 0) { start_err = "failed to bring container veth up"; goto fail_start; }
-        char *a2[] = { "nsenter", "-t", nsbuf, "-n", "--", "ip", "addr", "add", ip_cidr, "dev", veth_cont, NULL };
+        const char *a2[] = { "nsenter", "-t", nsbuf, "-n", "--", "ip", "addr", "add", ip_cidr, "dev", veth_cont, NULL };
         if (run_cmd(tool_path_nsenter(), a2) != 0) { start_err = "failed to assign container IP"; goto fail_start; }
-        char *a3[] = { "nsenter", "-t", nsbuf, "-n", "--", "ip", "route", "add", "default", "via", cfg_global.gw, NULL };
+        const char *a3[] = { "nsenter", "-t", nsbuf, "-n", "--", "ip", "route", "add", "default", "via", cfg_global.gw, NULL };
         if (run_cmd(tool_path_nsenter(), a3) != 0) { start_err = "failed to install default route"; goto fail_start; }
     }
 
@@ -1827,10 +1636,10 @@ static void cmd_stop(int argc, char **argv) {
         char veth_host[16];
         size_t p = str_copy(veth_host, "vb-", sizeof(veth_host));
         str_append(veth_host, p, name, sizeof(veth_host));
-        char *show[] = { "ip", "link", "show", veth_host, NULL };
+        const char *show[] = { "ip", "link", "show", veth_host, NULL };
         if (run_cmd_quiet(tool_path_ip(), show) == 0) {
-            char *del[] = { "ip", "link", "delete", veth_host, NULL };
-            run_cmd(tool_path_ip(), del);
+            const char *del[] = { "ip", "link", "delete", veth_host, NULL };
+            (void)run_cmd(tool_path_ip(), del);   /* clean-up: best effort */
         }
     }
 
@@ -2231,7 +2040,7 @@ static void cmd_exec(int argc, char **argv) {
         }
     }
 
-    char *cmd_argv[32];
+    const char *cmd_argv[32];
     int ai = 0;
     if (cmd_start < argc) {
         for (int i = cmd_start; i < argc && ai < 31; i++)
@@ -2249,13 +2058,13 @@ static void cmd_exec(int argc, char **argv) {
         int status = exec_inside_container(name, pid, userns, privileged,
                                            uid, gid, home, user_name,
                                            ngroups, groups, cmd_argv);
-        int exit_code = (status & 0x7f) ? (128 + (status & 0x7f)) : ((status >> 8) & 0xff);
-        lc_kernel_exit(exit_code);
+        lc_kernel_exit(exit_code_from_status(status));
     }
 
     int32_t status;
-    lc_kernel_wait_for_child((int32_t)worker, &status, 0);
-    lc_kernel_exit((status & 0x7f) ? (128 + (status & 0x7f)) : ((status >> 8) & 0xff));
+    if (wait_child((int32_t)worker, &status) < 0)
+        die("Error: failed to wait for the exec worker");
+    lc_kernel_exit(exit_code_from_status(status));
 }
 
 /* ─── cmd_ls ────────────────────────────────────────────────────────────── */

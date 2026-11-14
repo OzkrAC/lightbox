@@ -332,54 +332,206 @@ bool path_exists(const char *path) {
     return lc_kernel_faccessat2(AT_FDCWD, path, F_OK, 0) == 0;
 }
 
+/* ─── Running programs ──────────────────────────────────────────────────── */
+
+/* The environment of every tool lightbox runs: a fixed PATH and nothing of
+ * the caller's. */
+const char *const TOOL_ENV[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", NULL };
+
+/* execve takes char *const[] for historical reasons and never writes to the
+ * strings. This is the one place that drops the const lightbox keeps on them;
+ * going through an integer says so to the compiler. */
+lc_sysret exec_program(const char *prog, const char *const argv[], const char *const envp[]) {
+    return lc_kernel_execute(prog, (char *const *)(uintptr_t)argv, (char *const *)(uintptr_t)envp);
+}
+
+/* Wait for one child, however often a signal interrupts the wait.
+ * 0 with *status filled in, or -1 when the child cannot be waited for. */
+int wait_child(int32_t pid, int32_t *status) {
+    for (;;) {
+        lc_sysret got = lc_kernel_wait_for_child(pid, status, 0);
+        if (got == pid)
+            return 0;
+        if (got != -LB_EINTR)
+            return -1;
+    }
+}
+
+/* A wait status as a shell would report it: the exit status, or 128 plus the
+ * number of the signal that ended the process. */
+int exit_code_from_status(int32_t status) {
+    int sig = status & 0x7f;
+    return sig ? 128 + sig : (status >> 8) & 0xff;
+}
+
+static lc_sysret read_retry(int32_t fd, void *buf, size_t len) {
+    for (;;) {
+        lc_sysret n = lc_kernel_read_bytes(fd, buf, len);
+        if (n != -LB_EINTR)
+            return n;
+    }
+}
+
+/* "Error: <before><prog><after><number>)" or, with after == NULL,
+ * "Error: <before><prog>". */
+static void report_run(const char *before, const char *prog, const char *after, int number) {
+    print_str(STDERR, "Error: ");
+    print_str(STDERR, before);
+    print_str(STDERR, prog);
+    if (after) {
+        char digits[16];
+        fmt_int(digits, number);
+        print_str(STDERR, after);
+        print_str(STDERR, digits);
+        print_str(STDERR, ")");
+    }
+    lc_print_char(STDERR, '\n');
+}
+
+struct run_opts {
+    const char *const *envp;    /* NULL: TOOL_ENV */
+    bool   quiet;               /* the program's stdout and stderr go to /dev/null */
+    char  *capture;             /* when set, its stdout is collected here as a string */
+    size_t capture_size;
+};
+
+/*
+ * Fork, execute prog and wait for it. The one place lightbox does this.
+ *
+ * Returns the program's exit status (0 to 255), or one of the RUN_* values of
+ * lightbox.h when there is no exit status to return: no child could be made,
+ * the program could not be executed, a signal ended it, or it could not be
+ * waited for. Those four are reported on stderr here, in quiet mode too,
+ * because no caller can tell them from each other otherwise. A non-zero exit
+ * status is not reported: the program has said why, and for some callers it
+ * is an answer ("no such interface"), not a failure.
+ *
+ * Whether execve worked is learned through a close-on-exec pipe: a successful
+ * execve closes it, a failed one is followed by its errno.
+ */
+static int run_program(const char *prog, const char *const argv[], const struct run_opts *opts) {
+    int32_t exec_pipe[2];
+    int32_t out_pipe[2] = { -1, -1 };
+
+    lc_sysret rc = lc_kernel_create_pipe(exec_pipe, O_CLOEXEC);
+    if (rc >= 0 && opts->capture) {
+        rc = lc_kernel_create_pipe(out_pipe, O_CLOEXEC);
+        if (rc < 0) {
+            lc_kernel_close_file(exec_pipe[0]);
+            lc_kernel_close_file(exec_pipe[1]);
+        }
+    }
+    if (rc < 0) {
+        report_run("cannot start ", prog, " (pipe failed, errno ", (int)-rc);
+        return RUN_FORK_FAILED;
+    }
+
+    lc_sysret pid = lc_kernel_fork();
+    if (pid < 0) {
+        lc_kernel_close_file(exec_pipe[0]);
+        lc_kernel_close_file(exec_pipe[1]);
+        if (opts->capture) {
+            lc_kernel_close_file(out_pipe[0]);
+            lc_kernel_close_file(out_pipe[1]);
+        }
+        report_run("cannot start ", prog, " (fork failed, errno ", (int)-pid);
+        return RUN_FORK_FAILED;
+    }
+
+    if (pid == 0) {
+        /* a tool starts with no signal blocked, whatever the caller blocks */
+        uint64_t no_signals = 0;
+        lc_kernel_set_signal_mask(LC_SIG_SETMASK, &no_signals, NULL);
+
+        if (opts->quiet) {
+            lc_sysret devnull = lc_kernel_open_file("/dev/null", O_WRONLY, 0);
+            if (devnull >= 0) {
+                lc_kernel_duplicate_fd((int32_t)devnull, STDOUT, 0);
+                lc_kernel_duplicate_fd((int32_t)devnull, STDERR, 0);
+            }
+        }
+        if (opts->capture)
+            lc_kernel_duplicate_fd(out_pipe[1], STDOUT, 0);
+
+        lc_sysret failed = exec_program(prog, argv, opts->envp ? opts->envp : TOOL_ENV);
+        int32_t exec_errno = (int32_t)-failed;
+        lc_kernel_write_bytes(exec_pipe[1], &exec_errno, sizeof(exec_errno));
+        lc_kernel_exit(127);
+    }
+
+    lc_kernel_close_file(exec_pipe[1]);
+
+    if (opts->capture) {
+        lc_kernel_close_file(out_pipe[1]);
+        size_t have = 0;
+        for (;;) {
+            /* keep what fits and read the rest away, so the program is never
+             * left blocked on a full pipe */
+            char spill[256];
+            bool room = have + 1 < opts->capture_size;
+            lc_sysret n = room
+                ? read_retry(out_pipe[0], opts->capture + have, opts->capture_size - 1 - have)
+                : read_retry(out_pipe[0], spill, sizeof(spill));
+            if (n <= 0)
+                break;
+            if (room)
+                have += (size_t)n;
+        }
+        if (opts->capture_size > 0)
+            opts->capture[have] = '\0';
+        lc_kernel_close_file(out_pipe[0]);
+    }
+
+    int32_t exec_errno = 0;
+    lc_sysret told = read_retry(exec_pipe[0], &exec_errno, sizeof(exec_errno));
+    lc_kernel_close_file(exec_pipe[0]);
+
+    int32_t status = 0;
+    if (wait_child((int32_t)pid, &status) < 0) {
+        report_run("lost track of ", prog, NULL, 0);
+        return RUN_WAIT_FAILED;
+    }
+    if (told == (lc_sysret)sizeof(exec_errno)) {
+        report_run("cannot execute ", prog, " (errno ", exec_errno);
+        return RUN_EXEC_FAILED;
+    }
+    if (status & 0x7f) {
+        report_run("", prog, " was killed (signal ", status & 0x7f);
+        return RUN_SIGNALED;
+    }
+    return (status >> 8) & 0xff;
+}
+
+int run_cmd(const char *prog, const char *const argv[]) {
+    return run_program(prog, argv, &(struct run_opts){ 0 });
+}
+
+int run_cmd_quiet(const char *prog, const char *const argv[]) {
+    return run_program(prog, argv, &(struct run_opts){ .quiet = true });
+}
+
+int run_cmd_env(const char *prog, const char *const argv[], const char *const envp[]) {
+    return run_program(prog, argv, &(struct run_opts){ .envp = envp });
+}
+
+int run_cmd_capture(const char *prog, const char *const argv[], char *out, size_t outsz) {
+    return run_program(prog, argv, &(struct run_opts){ .capture = out, .capture_size = outsz });
+}
+
 void require_rm_rf(const char *path) {
-    lc_sysret pid = lc_kernel_fork();
-    if (pid == 0) {
-        char *argv[] = { "rm", "-rf", (char *)path, NULL };
-        char *envp[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", NULL };
-        lc_kernel_execute(tool_path_rm(), argv, envp);
-        lc_kernel_exit(1);
-    }
-    int32_t status;
-    lc_kernel_wait_for_child((int32_t)pid, &status, 0);
-    if (((status >> 8) & 0xff) != 0)
+    const char *argv[] = { "rm", "-rf", path, NULL };
+    if (run_cmd(tool_path_rm(), argv) != 0)
         die2("Error: rm -rf failed: ", path);
-}
-
-int run_cmd(const char *prog, char *const argv[]) {
-    lc_sysret pid = lc_kernel_fork();
-    if (pid == 0) {
-        char *envp[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", NULL };
-        lc_kernel_execute(prog, argv, envp);
-        lc_kernel_exit(127);
-    }
-    int32_t status;
-    lc_kernel_wait_for_child((int32_t)pid, &status, 0);
-    return (status >> 8) & 0xff;
-}
-
-int run_cmd_quiet(const char *prog, char *const argv[]) {
-    lc_sysret pid = lc_kernel_fork();
-    if (pid == 0) {
-        lc_sysret devnull = lc_kernel_open_file("/dev/null", O_WRONLY, 0);
-        if (devnull >= 0) lc_kernel_duplicate_fd((int32_t)devnull, STDERR, 0);
-        char *envp[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", NULL };
-        lc_kernel_execute(prog, argv, envp);
-        lc_kernel_exit(127);
-    }
-    int32_t status;
-    lc_kernel_wait_for_child((int32_t)pid, &status, 0);
-    return (status >> 8) & 0xff;
 }
 
 int do_mount(const char *source, const char *target,
              const char *fstype, uint64_t flags, const char *data) {
-    char *argv[16];
+    const char *argv[16];
     int ai = 0;
     argv[ai++] = "mount";
     if ((flags & MS_PRIVATE) && (flags & MS_REC)) {
         argv[ai++] = "--make-rprivate";
-        argv[ai++] = (char *)target;
+        argv[ai++] = target;
         argv[ai] = NULL;
         return run_cmd(tool_path_mount(), argv);
     }
@@ -393,21 +545,21 @@ int do_mount(const char *source, const char *target,
         if (flags & MS_NODEV)  { remount_opts[rolen++] = ','; rolen += (int)str_copy(remount_opts + rolen, "nodev", sizeof(remount_opts) - (size_t)rolen); }
         if (flags & MS_NOEXEC) { remount_opts[rolen++] = ','; rolen += (int)str_copy(remount_opts + rolen, "noexec", sizeof(remount_opts) - (size_t)rolen); }
         argv[ai++] = remount_opts;
-        argv[ai++] = (char *)target;
+        argv[ai++] = target;
         argv[ai] = NULL;
         return run_cmd(tool_path_mount(), argv);
     }
     if ((flags & MS_BIND) && (flags & MS_REC)) {
         argv[ai++] = "--rbind";
-        argv[ai++] = (char *)source;
-        argv[ai++] = (char *)target;
+        argv[ai++] = source;
+        argv[ai++] = target;
         argv[ai] = NULL;
         return run_cmd(tool_path_mount(), argv);
     }
     if (flags & MS_BIND) {
         argv[ai++] = "--bind";
-        argv[ai++] = (char *)source;
-        argv[ai++] = (char *)target;
+        argv[ai++] = source;
+        argv[ai++] = target;
         argv[ai] = NULL;
         return run_cmd(tool_path_mount(), argv);
     }
@@ -419,10 +571,10 @@ int do_mount(const char *source, const char *target,
     if (flags & MS_NOEXEC)  { if (olen) opts[olen++] = ','; olen += (int)str_copy(opts + olen, "noexec", sizeof(opts) - (size_t)olen); }
     if (data && data[0])    { if (olen) opts[olen++] = ','; str_copy(opts + olen, data, sizeof(opts) - (size_t)olen); olen += (int)lc_string_length(data); }
     opts[olen] = '\0';
-    if (fstype && fstype[0]) { argv[ai++] = "-t"; argv[ai++] = (char *)fstype; }
+    if (fstype && fstype[0]) { argv[ai++] = "-t"; argv[ai++] = fstype; }
     if (olen > 0)            { argv[ai++] = "-o"; argv[ai++] = opts; }
-    if (source && source[0]) argv[ai++] = (char *)source;
-    argv[ai++] = (char *)target;
+    if (source && source[0]) argv[ai++] = source;
+    argv[ai++] = target;
     argv[ai] = NULL;
     return run_cmd(tool_path_mount(), argv);
 }

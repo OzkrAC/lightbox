@@ -86,7 +86,7 @@ lightbox: $(OBJS) $(LIGHTC_LIB)
 %.o: %.c | $(LIGHTC_HDR)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
--include $(DEPS) tests/seccomp_profile.d
+-include $(DEPS) tests/seccomp_profile.d tests/unit.d
 
 ifeq ($(LIGHTC_KIND),submodule)
 
@@ -115,11 +115,8 @@ endif
 # ─── Checks ─────────────────────────────────────────────────────────────────
 
 # -fanalyzer plus the strict warning set of the November 2026 review. Every
-# diagnostic is an error. Three warnings of that set are not in the gate yet;
-# each comes back with the roadmap item that makes the tree clean for it:
-#   -Wwrite-strings -Wcast-qual   3.1  (argv arrays built from string literals)
-#   -Wcast-align=strict           5.11 (directory entries read through casts)
-ANALYZE_FLAGS = -fanalyzer -Werror \
+# diagnostic is an error.
+ANALYZE_FLAGS = -fanalyzer -Werror -Wwrite-strings -Wcast-qual -Wcast-align=strict \
     -Wshadow -Wformat=2 -Wnull-dereference -Wuninitialized -Wmaybe-uninitialized \
     -Wstrict-overflow=2 -Wundef -Wunused-macros -Wredundant-decls \
     -Wmissing-prototypes -Wduplicated-cond -Wduplicated-branches -Wlogical-op \
@@ -131,8 +128,9 @@ analyze: | $(LIGHTC_HDR)
 	    $(CC) $(CFLAGS) $(ANALYZE_FLAGS) -c $$f -o /dev/null || rc=1; \
 	done; exit $$rc
 
-# lightbox_sys.h against the kernel's headers, for every compiler that is
-# installed. Compile-only: nothing is linked or run.
+# lightbox_sys.h and the seccomp table of lightbox_seccomp.h against the
+# kernel's headers, for every compiler that is installed. Compile-only: nothing
+# is linked or run.
 SYS_CHECK_CCS := $(sort $(CC) $(foreach c,aarch64-linux-gnu-gcc x86_64-linux-gnu-gcc,$(shell command -v $(c) >/dev/null 2>&1 && echo $(c))))
 
 check-sys:
@@ -142,17 +140,26 @@ check-sys:
 	done
 
 # ─── Tests ──────────────────────────────────────────────────────────────────
-# Both suites run as an ordinary user. An open finding is an expected failure
-# that names its ledger id in ROADMAP.md; see tests/lib.sh.
+# All three suites run as an ordinary user. An open finding is an expected
+# failure that names its ledger id in ROADMAP.md; see tests/lib.sh.
 
 # Compiler for the one hosted test program (it needs a C library and threads).
 HOSTCC ?= cc
+
+# lightbox's own helpers, called from the command line. Like the seccomp
+# harness below, it is lightbox.c itself with another main().
+tests/unit: tests/unit.c lightbox.c lightbox.h lightbox_sys.h lightbox_seccomp.h $(OBJS) $(LIGHTC_LIB)
+	$(CC) $(CFLAGS) -MMD -MP -c tests/unit.c -o tests/unit.o
+	$(CC) $(LDFLAGS) tests/unit.o $(filter-out lightbox.o,$(OBJS)) $(LIGHTC_LIB) -o $@
+
+test-unit: tests/unit
+	bash tests/unit_cases.sh tests/unit
 
 test-validation: lightbox
 	bash tests/validation.sh ./lightbox
 
 # The seccomp harness is lightbox.c itself with another main().
-tests/seccomp_profile: tests/seccomp_profile.c lightbox.c lightbox.h lightbox_sys.h $(OBJS) $(LIGHTC_LIB)
+tests/seccomp_profile: tests/seccomp_profile.c lightbox.c lightbox.h lightbox_sys.h lightbox_seccomp.h $(OBJS) $(LIGHTC_LIB)
 	$(CC) $(CFLAGS) -MMD -MP -c tests/seccomp_profile.c -o tests/seccomp_profile.o
 	$(CC) $(LDFLAGS) tests/seccomp_profile.o $(filter-out lightbox.o,$(OBJS)) $(LIGHTC_LIB) -o $@
 
@@ -160,10 +167,21 @@ tests/seccomp_profile: tests/seccomp_profile.c lightbox.c lightbox.h lightbox_sy
 tests/seccomp_thread: tests/seccomp_thread.c
 	-$(HOSTCC) -O1 -pthread $< -o $@
 
-test-seccomp: tests/seccomp_profile tests/seccomp_thread
+# The seccomp program of each architecture, interpreted on this machine: the
+# aarch64 program is checked on x86_64 and the other way round. Hosted too.
+tests/seccomp_filter_x86_64: tests/seccomp_filter.c lightbox_seccomp.h
+	-$(HOSTCC) -O1 -Wall -Wextra -DLB_SECCOMP_TARGET_X86_64 $< -o $@
+
+tests/seccomp_filter_aarch64: tests/seccomp_filter.c lightbox_seccomp.h
+	-$(HOSTCC) -O1 -Wall -Wextra -DLB_SECCOMP_TARGET_AARCH64 $< -o $@
+
+SECCOMP_TESTS = tests/seccomp_profile tests/seccomp_thread \
+                tests/seccomp_filter_x86_64 tests/seccomp_filter_aarch64
+
+test-seccomp: $(SECCOMP_TESTS)
 	bash tests/seccomp_cases.sh tests/seccomp_profile tests/seccomp_thread
 
-test: test-validation test-seccomp
+test: test-unit test-validation test-seccomp
 
 check: check-sys analyze test
 
@@ -198,6 +216,7 @@ uninstall:
 
 clean:
 	rm -f lightbox $(OBJS) $(DEPS)
-	rm -f tests/seccomp_profile tests/seccomp_profile.o tests/seccomp_profile.d tests/seccomp_thread
+	rm -f $(SECCOMP_TESTS) tests/seccomp_profile.o tests/seccomp_profile.d
+	rm -f tests/unit tests/unit.o tests/unit.d
 
-.PHONY: analyze check check-sys clean install test test-seccomp test-validation uninstall
+.PHONY: analyze check check-sys clean install test test-seccomp test-unit test-validation uninstall

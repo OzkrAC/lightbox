@@ -50,6 +50,7 @@
 /* ─── Kernel constants (the same on both architectures) ─────────────────── */
 
 #define LB_ENOENT                 2
+#define LB_EINTR  4
 #define LB_ESRCH                  3
 
 #define LB_S_IFMT                 0170000

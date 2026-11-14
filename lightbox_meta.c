@@ -6,19 +6,44 @@ static void print_padded(const char *s, int width) {
     for (int i = len; i < width; i++) lc_print_char(STDOUT, ' ');
 }
 
-static void json_str(const char *key, const char *val, bool comma) {
-    print_str(STDOUT, "\"");
-    print_str(STDOUT, key);
-    print_str(STDOUT, "\":\"");
-    print_str(STDOUT, val);
-    print_str(STDOUT, "\"");
-    if (comma) print_str(STDOUT, ",");
+/* A JSON string: quoted, with everything escaped that JSON requires, and any
+ * byte outside printable ASCII written as \u00XX. The values lightbox prints
+ * are ASCII by construction; escaping the rest keeps the output valid JSON
+ * whatever a damaged file holds. */
+static void json_string(const char *s) {
+    static const char hex[] = "0123456789abcdef";
+    lc_print_char(STDOUT, '"');
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c == '"' || c == '\\') {
+            lc_print_char(STDOUT, '\\');
+            lc_print_char(STDOUT, (char)c);
+        } else if (c < 0x20 || c >= 0x7f) {
+            print_str(STDOUT, "\\u00");
+            lc_print_char(STDOUT, hex[c >> 4]);
+            lc_print_char(STDOUT, hex[c & 0xf]);
+        } else {
+            lc_print_char(STDOUT, (char)c);
+        }
+    }
+    lc_print_char(STDOUT, '"');
+}
+
+/* "key": with the comma that separates it from the member before it */
+static void json_key(const char *key, bool first) {
+    if (!first) lc_print_char(STDOUT, ',');
+    json_string(key);
+    lc_print_char(STDOUT, ':');
 }
 
 void cmd_ls(int argc, char **argv) {
     bool json = false;
     for (int i = 0; i < argc; i++)
         if (streq(argv[i], "--json")) json = true;
+
+    static char names[MAX_LISTED][NAME_MAX_LEN + 1];
+    bool more = false;
+    int count = list_containers(names, MAX_LISTED, &more);
 
     if (!json) {
         print_padded("NAME", 20);
@@ -33,62 +58,44 @@ void cmd_ls(int argc, char **argv) {
         print_str(STDOUT, "[");
     }
 
-    lc_sysret dirfd = lc_kernel_open_file(cfg_global.container_dir, O_RDONLY, 0);
-    if (dirfd < 0) {
-        if (json) print_str(STDOUT, "]\n");
-        return;
-    }
+    for (int i = 0; i < count; i++) {
+        const char *name = names[i];
+        char ip_buf[16] = "-";
+        char state_buf[32];
+        const char *status = "stopped";
+        char pid_str[16] = "-";
 
-    bool first = true;
-    char dirbuf[4096];
-    for (;;) {
-        lc_sysret n = lc_kernel_read_directory((int32_t)dirfd, dirbuf, sizeof(dirbuf));
-        if (n <= 0) break;
+        (void)read_container_ip(name, ip_buf, sizeof(ip_buf));
 
-        int64_t pos = 0;
-        while (pos < n) {
-            uint16_t reclen = *(uint16_t *)(dirbuf + pos + 16);
-            uint8_t dtype = *(uint8_t *)(dirbuf + pos + 18);
-            char *dname = dirbuf + pos + 19;
+        container_liveness live = container_probe(name);
+        bool running = live == CONTAINER_RUNNING;
+        if (running)
+            fmt_int(pid_str, get_container_pid(name));
+        container_shown_state(name, live, state_buf, sizeof(state_buf));
+        if (state_buf[0] && !streq(state_buf, "unknown"))
+            status = state_buf;
 
-            if (dtype == 4 && dname[0] != '.') {
-                char ip_buf[16] = "-";
-                char state_buf[32];
-                const char *status = "stopped";
-                char pid_str[16] = "-";
-
-                (void)read_container_ip(dname, ip_buf, sizeof(ip_buf));
-
-                container_liveness live = container_probe(dname);
-                if (live == CONTAINER_RUNNING)
-                    fmt_int(pid_str, get_container_pid(dname));
-                container_shown_state(dname, live, state_buf, sizeof(state_buf));
-                if (state_buf[0] && !streq(state_buf, "unknown"))
-                    status = state_buf;
-
-                if (json) {
-                    if (!first) print_str(STDOUT, ",");
-                    print_str(STDOUT, "{");
-                    json_str("name", dname, true);
-                    json_str("ip", ip_buf, true);
-                    json_str("status", status, true);
-                    json_str("pid", pid_str, false);
-                    print_str(STDOUT, "}");
-                    first = false;
-                } else {
-                    print_padded(dname, 20);
-                    print_padded(ip_buf, 16);
-                    print_padded(status, 10);
-                    print_str(STDOUT, pid_str);
-                    lc_print_char(STDOUT, '\n');
-                }
-            }
-            pos += reclen;
+        if (json) {
+            if (i > 0) print_str(STDOUT, ",");
+            print_str(STDOUT, "{");
+            json_key("name", true);    json_string(name);
+            json_key("ip", false);     json_string(ip_buf);
+            json_key("status", false); json_string(status);
+            /* a number while the container runs, null otherwise */
+            json_key("pid", false);    print_str(STDOUT, running ? pid_str : "null");
+            print_str(STDOUT, "}");
+        } else {
+            print_padded(name, 20);
+            print_padded(ip_buf, 16);
+            print_padded(status, 10);
+            print_str(STDOUT, pid_str);
+            lc_print_char(STDOUT, '\n');
         }
     }
 
     if (json) print_str(STDOUT, "]\n");
-    lc_kernel_close_file((int32_t)dirfd);
+    if (more)
+        print_str(STDERR, "Warning: more than " STRINGIFY(MAX_LISTED) " containers; this list is incomplete\n");
 }
 
 static void print_kv(const char *key, const char *val) {
