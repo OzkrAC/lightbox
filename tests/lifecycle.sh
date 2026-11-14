@@ -496,6 +496,60 @@ echo x > /dev/null      # devices still come from the /dev that start mounts
 EOF
 }
 
+# What init mounts, and with which restrictions. /proc/sys is the row to watch:
+# it gets read-only added to a mount that is nosuid, nodev and noexec, and a
+# change of flags that did not keep those three would lose them.
+t_mount_table() {
+    mkdir -p "$T/vol/table"
+    up table --vol "$T/vol/table:/data:ro" || return 1
+    script_in table <<'EOF'
+bad=0
+want() { # mount point, filesystem type or "-" for any, the flags it must have
+    point=$1 type=$2
+    shift 2
+    line=$(awk -v m="$point" '$5 == m { for (i = 7; i <= NF; i++) if ($i == "-") break; l = $6 " " $(i + 1) } END { print l }' /proc/self/mountinfo)
+    [ -n "$line" ] || { echo "$point is not a mount"; bad=1; return; }
+    opts=${line% *}
+    [ "$type" = - ] || [ "${line##* }" = "$type" ] || { echo "$point is ${line##* }, not $type"; bad=1; }
+    for flag in "$@"; do
+        case ",$opts," in *",$flag,"*) ;; *) echo "$point lacks $flag: it has $opts"; bad=1 ;; esac
+    done
+}
+want /proc        proc   nosuid nodev noexec
+want /proc/sys    proc   ro nosuid nodev noexec
+for d in bus fs irq; do
+    [ ! -d "/proc/$d" ] || want "/proc/$d" proc ro nosuid nodev noexec     # not every kernel has all three
+done
+want /sys         sysfs  ro
+want /dev         tmpfs  nosuid noexec
+want /dev/pts     devpts nosuid noexec
+want /dev/shm     tmpfs  nosuid nodev noexec
+want /dev/null    -      nosuid noexec
+want /dev/urandom -      ro nosuid noexec
+want /tmp         tmpfs  nosuid nodev
+want /run         tmpfs  nosuid nodev
+want /data        -      ro nosuid nodev
+exit $bad
+EOF
+}
+
+# lightbox mounts by itself. With the host's mount turned into something that
+# only records being run, and none in the image, a container starts and stops.
+t_start_needs_no_mount_tool() {
+    box nomount || return 1
+    rm -f "$C/nomount/rootfs/bin/mount" "$C/nomount/rootfs/usr/bin/mount"
+    tool=$(type -P mount) || { echo "this host has no mount to stand in for"; return 77; }
+    shim "$tool" "echo \"\$*\" >> '$T/mount.ran'; exit 97" || return 1
+    start nomount || return 1
+    sh_in nomount 'echo x > /tmp/a && cat /proc/1/comm > /dev/null' || return 1
+    lb stop nomount || return 1
+    if [ -e "$T/mount.ran" ]; then
+        echo "the host's mount was run:"
+        cat "$T/mount.ran"
+        return 1
+    fi
+}
+
 t_image_without_mount_points() {
     box bare || return 1
     for d in dev proc sys tmp run var; do rm -rf -- "$C/bare/rootfs/$d"; done
@@ -629,13 +683,17 @@ t_start_returns_to_a_capture() {
     [ $rc -eq 0 ]
 }
 
+# The starter leads a session of its own here, so that its number is one this
+# PID namespace can see: a session led from outside it reads as 0.
 t_init_has_its_own_session() {
-    up session || return 1
-    pid=$(pid_of session)
-    mine=$(awk '{ print $6 }' "/proc/$$/stat")
-    its=$(awk '{ print $6 }' "/proc/$pid/stat")
-    echo "session of this shell: $mine; of the container's init: $its"
-    [ "$mine" != "$its" ]
+    box session || return 1
+    setsid --wait bash -c 'echo $$ > "$3"; exec "$1" start session >"$2" 2>&1 </dev/null' \
+        _ "$LB" "$OUT/session.start" "$T/starter.session" || { cat "$OUT/session.start"; return 1; }
+    settled session || return 1
+    starter=$(cat "$T/starter.session")
+    its=$(awk '{ print $6 }' "/proc/$(pid_of session)/stat")
+    echo "session of the command that started it: $starter; of the container's init: $its"
+    [ "$its" != "$starter" ] && [ "$its" != 0 ]
 }
 
 # What Ctrl-C does: SIGINT to the process group of the command that was typed.
@@ -986,7 +1044,7 @@ teardown() {
     [ -s "$T/firewall" ] && iptables-restore < "$T/firewall"
     [ -w "$BRNF" ] && echo 1 > "$BRNF"
     find "$C" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
-    rm -f "$T/nsenter.reached"
+    rm -f "$T/nsenter.reached" "$T/mount.ran"
 } 2>/dev/null
 
 # ─── Stage: one case ────────────────────────────────────────────────────────
@@ -1074,11 +1132,13 @@ if [ "$MODE" = inside ]; then
     check 'add-vol takes effect at the next start'                        t_addvol_applies_at_next_start
     xfail FS-vol-shadow        'a volume under /run is visible'                        t_volume_under_run
     check '--read-only closes the root and leaves /tmp, /run and /var/tmp writable' t_read_only_root
-    xfail FS-run-mode          '/run is mode 0755'                                     t_run_mode
+    check '/run is mode 0755'                                             t_run_mode
+    check 'init mounts everything with the restrictions it should have'   t_mount_table
+    check 'a container starts and stops without any mount tool'           t_start_needs_no_mount_tool
     xfail SB-no-devfilter      'the root filesystem is mounted nodev and nosuid'       t_rootfs_mount_flags
     check 'an image without /dev, /proc, /sys, /tmp and /run starts'      t_image_without_mount_points
-    xfail SB-image-tools       'an image of one static binary starts'                  t_image_with_one_binary
-    xfail SB-image-tools       'start runs nothing from the image'                     t_start_runs_nothing_from_the_image
+    check 'an image of one static binary starts'                          t_image_with_one_binary
+    check 'start runs nothing from the image'                             t_start_runs_nothing_from_the_image
 
     check 'limits reach the cgroup and the oom score reaches init'        t_limits
     check 'init and commands run by exec are in the container cgroup'     t_cgroup_membership

@@ -42,9 +42,9 @@ runs everything that needs no root:
 
 | Target | What it does |
 | --- | --- |
-| `make check-sys` | Compiles `tests/sys_check.c`, which compares every private syscall number and structure in `lightbox_sys.h`, and every number in the seccomp table of `lightbox_seccomp.h`, with the kernel's headers, for x86_64 and aarch64 |
+| `make check-sys` | Compiles `tests/sys_check.c` and `tests/sys_check_net.c`, which compare every private syscall number, constant and structure in `lightbox_sys.h`, and every number in the seccomp table of `lightbox_seccomp.h`, with the kernel's headers, for x86_64 and aarch64 |
 | `make analyze` | Compiles every file with `-fanalyzer` and a strict warning set; any diagnostic is an error |
-| `make test-unit` | Runs lightbox's helper for starting programs against real ones: exit statuses, signals, missing programs, quiet and captured output |
+| `make test-unit` | Runs lightbox's own helpers from the command line. The one that starts programs: exit statuses, signals, missing programs, quiet and captured output. The ones that mount, make directories and bring up loopback: in a user namespace of their own |
 | `make test-validation` | Runs the built binary as an ordinary user against a temporary directory tree |
 | `make test-seccomp` | Installs lightbox's real seccomp profile and probes every syscall in its deny table; also interprets the x86_64 and the aarch64 filter program for every syscall number |
 
@@ -70,7 +70,7 @@ sudo drops the environment, so options go on make's command line: `sudo make tes
 
 ### 1. Get a rootfs
 
-lightbox needs a Linux root filesystem to use as a base image. Any distro works — Alpine minirootfs is a good starting point (~3MB):
+lightbox needs a Linux root filesystem to use as a base image. Any distro works — Alpine minirootfs is a good starting point (~3MB). The image needs no tools of its own: lightbox mounts and configures everything itself, so a single static binary is an image too.
 
 ```sh
 mkdir -p /opt/rootfs/alpine
@@ -250,7 +250,7 @@ All security features are on by default. Pass `--privileged` to disable.
 - **Networking**: veth pair per container connected to a host bridge with NAT
 - **Resource limits**: cgroups v2 (memory, PIDs, CPU, I/O)
 - **Init**: lightbox remains PID 1 inside the container; if `/init.sh` exists in the rootfs it is run after `/tmp` and `/run` are mounted, then lightbox stays alive to reap children and handle shutdown
-- **External tools**: `ip` and `iptables` for networking (fork+exec); everything else is direct syscalls
+- **External tools**: on the host, `ip` and `nsenter` set up a container's network, `iptables` the firewall, and `cp` and `rm` create and remove a container. Everything else is direct syscalls, and nothing from the image is run before `/init.sh`
 - **Configuration**: optional `~/.config/lightbox/lightbox.conf` for all paths and defaults
 
 ## Volume Notes

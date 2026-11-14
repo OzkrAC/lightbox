@@ -170,7 +170,7 @@ static void ensure_cgroup2_root(void) {
     if (empty == 0)
         die_cgroup_root(root, "it is a directory that is not empty");
 
-    if (lb_sys_mount("none", root, "cgroup2", 0, NULL) < 0)
+    if (lc_kernel_mount("none", root, "cgroup2", 0, NULL) < 0)
         die2("Error: failed to mount cgroup2 at ", root);
     print_str(STDOUT, "Mounted cgroup2 at ");
     print_str(STDOUT, root);

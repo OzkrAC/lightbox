@@ -189,9 +189,6 @@ void cmd_doctor(void) {
     } bins[] = {
         { "bin.ip", tool_path_ip },
         { "bin.iptables", tool_path_iptables },
-        { "bin.mount", tool_path_mount },
-        { "bin.umount", tool_path_umount },
-        { "bin.mkdir", tool_path_mkdir },
         { "bin.cp", tool_path_cp },
         { "bin.chown", tool_path_chown },
         { "bin.rm", tool_path_rm },

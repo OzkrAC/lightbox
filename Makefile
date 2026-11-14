@@ -130,13 +130,16 @@ analyze: | $(LIGHTC_HDR)
 
 # lightbox_sys.h and the seccomp table of lightbox_seccomp.h against the
 # kernel's headers, for every compiler that is installed. Compile-only: nothing
-# is linked or run.
+# is linked or run. The second file holds what needs the C library's headers
+# beside the kernel's.
 SYS_CHECK_CCS := $(sort $(CC) $(foreach c,aarch64-linux-gnu-gcc x86_64-linux-gnu-gcc,$(shell command -v $(c) >/dev/null 2>&1 && echo $(c))))
 
 check-sys:
 	@for cc in $(SYS_CHECK_CCS); do \
 	    echo "  SYSCHECK $$cc"; \
-	    $$cc -std=c11 -ffreestanding -fsyntax-only -Wall -Wextra -Werror tests/sys_check.c || exit 1; \
+	    for f in tests/sys_check.c tests/sys_check_net.c; do \
+	        $$cc -std=c11 -ffreestanding -fsyntax-only -Wall -Wextra -Werror $$f || exit 1; \
+	    done; \
 	done
 
 # ─── Tests ──────────────────────────────────────────────────────────────────

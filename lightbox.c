@@ -260,18 +260,9 @@ static void parse_volume_spec_or_die(const char *spec, volume_spec *vol) {
     validate_volume_paths(vol->src, vol->dst);
 }
 
-static bool path_is_directory(const char *path) {
-    lc_sysret fd = lc_kernel_open_file(path, O_RDONLY | O_DIRECTORY, 0);
-    if (fd < 0)
-        return false;
-    lc_kernel_close_file((int32_t)fd);
-    return true;
-}
-
 static void mkdir_p_or_die(const char *path) {
-    const char *a[] = { "mkdir", "-p", path, NULL };
-    if (run_cmd(tool_path_mkdir(), a) != 0)
-        die2("Error: mkdir -p failed: ", path);
+    if (make_dirs(path) != 0)
+        lc_kernel_exit(1);      /* make_dirs has said what failed */
 }
 
 static void parent_dir(char *buf, size_t bufsz, const char *path) {
@@ -566,6 +557,9 @@ static void apply_seccomp(void) {
 /* ─── Security: /proc masking ───────────────────────────────────────────── */
 
 static void mask_proc_paths(void) {
+    /* A mount that fails here is reported and the start goes on: masking
+     * fails open until it is made to fail closed (SB-mask-failopen). */
+
     /* bind /dev/null over sensitive files */
     static const char *mask_files[] = {
         "/proc/kcore", "/proc/sysrq-trigger", "/proc/timer_list",
@@ -573,7 +567,7 @@ static void mask_proc_paths(void) {
     };
     for (size_t i = 0; i < sizeof(mask_files) / sizeof(mask_files[0]); i++) {
         if (path_exists(mask_files[i]))
-            do_mount("/dev/null", mask_files[i], NULL, MS_BIND, NULL);
+            (void)do_mount("/dev/null", mask_files[i], NULL, MS_BIND, NULL);
     }
 
     /* make sensitive subtrees read-only */
@@ -582,8 +576,8 @@ static void mask_proc_paths(void) {
     };
     for (size_t i = 0; i < sizeof(ro_dirs) / sizeof(ro_dirs[0]); i++) {
         if (path_exists(ro_dirs[i])) {
-            do_mount(ro_dirs[i], ro_dirs[i], NULL, MS_BIND, NULL);
-            do_mount(NULL, ro_dirs[i], NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL);
+            (void)do_mount(ro_dirs[i], ro_dirs[i], NULL, MS_BIND, NULL);
+            (void)do_mount(NULL, ro_dirs[i], NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL);
         }
     }
 }
@@ -1264,16 +1258,16 @@ static int container_child(void *arg) {
         require_mount(NULL, "/", NULL, MS_REMOUNT | MS_RDONLY | MS_BIND, NULL);
     }
 
-    /* bring up loopback */
-    {
-        const char *a[] = { "ip", "link", "set", "lo", "up", NULL };
-        if (run_cmd(tool_path_ip(), a) != 0) die("Error: failed to bring up loopback");
-    }
+    /* Bring up loopback. From the pivot to the hook nothing of the image is
+     * run: its tools are not needed, and not trusted with what init may do. */
+    if (loopback_up() != 0)
+        lc_kernel_exit(1);
 
     /* mount tmpfs for /tmp and /run before /init.sh so services started from
      * the init hook see the final runtime filesystem layout. */
     require_mount("tmpfs", "/tmp", "tmpfs", MS_NOSUID | MS_NODEV, NULL);
-    require_mount("tmpfs", "/run", "tmpfs", MS_NOSUID | MS_NODEV, NULL);
+    /* /tmp is for everyone; /run is for root's services to share with them */
+    require_mount("tmpfs", "/run", "tmpfs", MS_NOSUID | MS_NODEV, "mode=755");
     if (ca->read_only)
         require_mount("tmpfs", "/var/tmp", "tmpfs", MS_NOSUID | MS_NODEV, NULL);
 
@@ -1297,9 +1291,6 @@ static int container_child(void *arg) {
 static void cmd_start(int argc, char **argv) {
     require_tool("ip", tool_path_ip());
     require_tool("nsenter", tool_path_nsenter());
-    require_tool("mount", tool_path_mount());
-    require_tool("umount", tool_path_umount());
-    require_tool("mkdir", tool_path_mkdir());
     if (argc < 1) die("Usage: lightbox start <name>");
     const char *name = argv[0];
     validate_name(name);
