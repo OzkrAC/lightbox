@@ -70,6 +70,33 @@
 #define LB_ST_NODEV               4
 #define LB_ST_NOEXEC              8
 
+/* prctl(2) requests (linux/prctl.h) */
+#define LB_PR_SET_KEEPCAPS            8
+#define LB_PR_SET_SECCOMP             22
+#define LB_PR_CAPBSET_READ            23
+#define LB_PR_CAPBSET_DROP            24
+#define LB_PR_SET_NO_NEW_PRIVS        38
+#define LB_PR_CAP_AMBIENT             47
+#define LB_PR_CAP_AMBIENT_CLEAR_ALL   4
+
+/* The capabilities a sandboxed container keeps (linux/capability.h) */
+#define LB_CAP_CHOWN              0
+#define LB_CAP_DAC_OVERRIDE       1
+#define LB_CAP_FOWNER             3
+#define LB_CAP_FSETID             4
+#define LB_CAP_KILL               5
+#define LB_CAP_SETGID             6
+#define LB_CAP_SETUID             7
+#define LB_CAP_SETPCAP            8
+#define LB_CAP_NET_BIND_SERVICE   10
+#define LB_CAP_SYS_CHROOT         18
+#define LB_CAP_AUDIT_WRITE        29
+#define LB_CAP_SETFCAP            31
+
+/* capget(2) and capset(2), version 3: each set is two 32-bit words */
+#define LB_CAPABILITY_VERSION_3   0x20080522
+#define LB_CAPABILITY_WORDS       2
+
 /* A socket to carry interface requests, and the two requests that read and
  * write an interface's flags (sys/socket.h, linux/sockios.h, linux/if.h). */
 #define LB_AF_INET                2
@@ -79,6 +106,18 @@
 #define LB_IFF_UP                 0x1
 
 /* ─── Structures ────────────────────────────────────────────────────────── */
+
+/* struct __user_cap_header_struct and __user_cap_data_struct (linux/capability.h) */
+struct lb_cap_header {
+    uint32_t version;
+    int32_t  pid;
+};
+
+struct lb_cap_data {
+    uint32_t effective;
+    uint32_t permitted;
+    uint32_t inheritable;
+};
 
 /* struct ifreq (linux/if.h), as the two flag requests use it: the interface's
  * name and its flags. The rest of the kernel's union is padding here. */
@@ -152,11 +191,12 @@ static inline lc_sysret lb_sys_chroot(const char *path) {
     return lc_syscall1(LB_SYS_chroot, (int64_t)path);
 }
 
-static inline lc_sysret lb_sys_capget(void *header, void *data) {
+/* data points at LB_CAPABILITY_WORDS entries */
+static inline lc_sysret lb_sys_capget(struct lb_cap_header *header, struct lb_cap_data *data) {
     return lc_syscall2(LB_SYS_capget, (int64_t)header, (int64_t)data);
 }
 
-static inline lc_sysret lb_sys_capset(void *header, const void *data) {
+static inline lc_sysret lb_sys_capset(struct lb_cap_header *header, const struct lb_cap_data *data) {
     return lc_syscall2(LB_SYS_capset, (int64_t)header, (int64_t)data);
 }
 

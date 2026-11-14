@@ -142,7 +142,7 @@ settled() { # name
     if grep -qx 'readonly=1' "$C/$1/.conf"; then
         wait_until 5 mounted_in "$pid" /var/tmp || { echo "init $pid did not mount /var/tmp"; return 1; }
     fi
-    if [ ! -e "$C/$1/rootfs/init.sh" ] && ! grep -qx 'privileged=1' "$C/$1/.conf"; then
+    if ! grep -qx 'privileged=1' "$C/$1/.conf"; then
         wait_until 5 sandboxed "$pid" || { echo "init $pid did not apply its sandbox"; return 1; }
     fi
 }
@@ -480,12 +480,6 @@ t_run_mode() {
 }
 
 t_rootfs_mount_flags() {
-    host_opts=$(findmnt -n -o OPTIONS --target "$C" 2>/dev/null)
-    case ",$host_opts," in
-        *,nodev,*) case ",$host_opts," in *,nosuid,*)
-            echo "the work directory is on a filesystem that is nodev and nosuid already; nothing to observe"
-            return 77 ;; esac ;;
-    esac
     up flags || return 1
     script_in flags <<'EOF'
 opts=$(awk '$5 == "/" { print $6 }' /proc/self/mountinfo | tail -n 1)
@@ -515,6 +509,7 @@ want() { # mount point, filesystem type or "-" for any, the flags it must have
         case ",$opts," in *",$flag,"*) ;; *) echo "$point lacks $flag: it has $opts"; bad=1 ;; esac
     done
 }
+want /            -      nodev nosuid
 want /proc        proc   nosuid nodev noexec
 want /proc/sys    proc   ro nosuid nodev noexec
 for d in bus fs irq; do
@@ -638,6 +633,21 @@ EOF
     echo "the hook ran with Seccomp $(field Seccomp), NoNewPrivs $(field NoNewPrivs), CapEff $(field CapEff), CapBnd $(field CapBnd)"
     [ "$(field Seccomp)" = 2 ] && [ "$(field NoNewPrivs)" = 1 ] && [ "$(field CapBnd)" = "$ALLOWED_CAPS" ] &&
     [ "$(field CapEff)" = "$ALLOWED_CAPS" ] && [ "$(field CapPrm)" = "$ALLOWED_CAPS" ]
+}
+
+t_privileged_hook_is_not_sandboxed() {
+    box hookpriv --privileged || return 1
+    hook hookpriv <<'EOF'
+grep -E '^(NoNewPrivs|Seccomp|CapEff|CapBnd):' /proc/self/status > /hook.status
+EOF
+    start hookpriv || return 1
+    seen="$C/hookpriv/rootfs/hook.status"
+    wait_until 5 test -s "$seen" || { echo "the hook left no mark"; return 1; }
+    field() { awk -v k="$1:" '$1 == k { print $2 }' "$seen"; }
+    echo "the hook ran with Seccomp $(field Seccomp), NoNewPrivs $(field NoNewPrivs), CapEff $(field CapEff), CapBnd $(field CapBnd)"
+    # as unconfined as this shell is
+    [ "$(field Seccomp)" = "$(status_field $$ Seccomp)" ] && [ "$(field NoNewPrivs)" = "$(status_field $$ NoNewPrivs)" ] &&
+    [ "$(field CapEff)" = "$(status_field $$ CapEff)" ] && [ "$(field CapBnd)" = "$(status_field $$ CapBnd)" ]
 }
 
 # A hook that fails only after start's fixed half-second wait.
@@ -767,18 +777,20 @@ t_sandbox_on_init() {
 
 t_sandbox_on_exec() {
     up sandboxed || return 1
-    said=$(sh_in sandboxed 'grep -E "^(NoNewPrivs|Seccomp|CapEff|CapPrm|CapBnd):" /proc/self/status')
+    said=$(sh_in sandboxed 'grep -E "^(NoNewPrivs|Seccomp|Cap(Inh|Prm|Eff|Bnd|Amb)):" /proc/self/status')
     printf '%s\n' "$said"
     value() { printf '%s\n' "$said" | awk -v k="$1:" '$1 == k { print $2 }'; }
     [ "$(value Seccomp)" = 2 ] && [ "$(value NoNewPrivs)" = 1 ] && [ "$(value CapBnd)" = "$ALLOWED_CAPS" ] &&
-    [ "$(value CapEff)" = "$ALLOWED_CAPS" ] && [ "$(value CapPrm)" = "$ALLOWED_CAPS" ]
+    [ "$(value CapEff)" = "$ALLOWED_CAPS" ] && [ "$(value CapPrm)" = "$ALLOWED_CAPS" ] &&
+    [ "$(value CapInh)" = 0000000000000000 ] && [ "$(value CapAmb)" = 0000000000000000 ]
 }
 
 t_init_holds_only_allowed_capabilities() {
     up initcaps || return 1
     pid=$(pid_of initcaps)
-    echo "init holds CapEff $(status_field "$pid" CapEff), CapPrm $(status_field "$pid" CapPrm); allowed is $ALLOWED_CAPS"
-    [ "$(status_field "$pid" CapEff)" = "$ALLOWED_CAPS" ] && [ "$(status_field "$pid" CapPrm)" = "$ALLOWED_CAPS" ]
+    echo "init holds CapEff $(status_field "$pid" CapEff), CapPrm $(status_field "$pid" CapPrm), CapInh $(status_field "$pid" CapInh), CapAmb $(status_field "$pid" CapAmb); allowed is $ALLOWED_CAPS"
+    [ "$(status_field "$pid" CapEff)" = "$ALLOWED_CAPS" ] && [ "$(status_field "$pid" CapPrm)" = "$ALLOWED_CAPS" ] &&
+    [ "$(status_field "$pid" CapInh)" = 0000000000000000 ] && [ "$(status_field "$pid" CapAmb)" = 0000000000000000 ]
 }
 
 t_privileged_is_not_sandboxed() {
@@ -789,7 +801,17 @@ t_privileged_is_not_sandboxed() {
     # as unconfined as this shell is
     [ "$(status_field "$pid" Seccomp)" = "$(status_field $$ Seccomp)" ] &&
     [ "$(status_field "$pid" NoNewPrivs)" = "$(status_field $$ NoNewPrivs)" ] &&
-    [ "$(status_field "$pid" CapBnd)" = "$(status_field $$ CapBnd)" ]
+    [ "$(status_field "$pid" CapBnd)" = "$(status_field $$ CapBnd)" ] || return 1
+    # and it sees /proc and /sys as they are
+    script_in priv <<'EOF'
+for p in /proc/kcore /proc/interrupts /proc/sys /sys/firmware; do
+    [ -e "$p" ] || continue
+    if awk -v m="$p" '$5 == m { found = 1 } END { exit !found }' /proc/self/mountinfo; then
+        echo "$p is covered in a privileged container"
+        exit 1
+    fi
+done
+EOF
 }
 
 t_proc_is_masked() {
@@ -812,13 +834,20 @@ EOF
 t_docker_masks() {
     up dmasked || return 1
     script_in dmasked <<'EOF'
-bad=0
+bad=0 seen=""
 for p in /proc/acpi /proc/asound /proc/interrupts /proc/latency_stats /proc/timer_stats /proc/scsi \
          /sys/firmware /sys/devices/virtual/powercap; do
     [ -e "$p" ] || continue
+    seen="$seen $p"
     awk -v m="$p" '$5 == m { found = 1 } END { exit !found }' /proc/self/mountinfo ||
-        { echo "$p is not masked"; bad=1; }
+        { echo "$p is not masked"; bad=1; continue; }
+    if [ -d "$p" ]; then
+        [ -z "$(ls -A "$p")" ] || { echo "$p is not empty"; bad=1; }
+    else
+        [ -z "$(head -c 1 "$p" 2>/dev/null)" ] || { echo "$p can be read"; bad=1; }
+    fi
 done
+echo "masked here:$seen"
 exit $bad
 EOF
 }
@@ -1135,7 +1164,7 @@ if [ "$MODE" = inside ]; then
     check '/run is mode 0755'                                             t_run_mode
     check 'init mounts everything with the restrictions it should have'   t_mount_table
     check 'a container starts and stops without any mount tool'           t_start_needs_no_mount_tool
-    xfail SB-no-devfilter      'the root filesystem is mounted nodev and nosuid'       t_rootfs_mount_flags
+    check 'the root filesystem is mounted nodev and nosuid'               t_rootfs_mount_flags
     check 'an image without /dev, /proc, /sys, /tmp and /run starts'      t_image_without_mount_points
     check 'an image of one static binary starts'                          t_image_with_one_binary
     check 'start runs nothing from the image'                             t_start_runs_nothing_from_the_image
@@ -1145,7 +1174,8 @@ if [ "$MODE" = inside ]; then
 
     check 'the init hook runs with /tmp and /run mounted'                 t_hook_runs
     check 'a service the hook starts outlives the start command'          t_service_outlives_start
-    xfail SB-hook-order        'the init hook runs inside the sandbox'                 t_hook_is_sandboxed
+    check 'the init hook runs inside the sandbox'                         t_hook_is_sandboxed
+    check 'in a privileged container the hook is not sandboxed'           t_privileged_hook_is_not_sandboxed
     xfail RT-ready-sleep       'a hook that fails later still fails the start'         t_failing_hook_fails_start
     xfail RT-hook-blocks       'init answers SIGTERM while its hook runs'              t_stop_during_hook
     xfail RT-not-detached      'said=$(lightbox start x) returns'                      t_start_returns_to_a_capture
@@ -1157,10 +1187,10 @@ if [ "$MODE" = inside ]; then
 
     check 'init has the seccomp filter, no_new_privs and the bounding set' t_sandbox_on_init
     check 'a command run by exec has them too, and only the allowed capabilities' t_sandbox_on_exec
-    xfail SB-caps-bounding     'init holds only the allowed capabilities'              t_init_holds_only_allowed_capabilities
-    check 'a privileged container is not sandboxed'                       t_privileged_is_not_sandboxed
+    check 'init holds only the allowed capabilities and passes none on'   t_init_holds_only_allowed_capabilities
+    check 'a privileged container is not sandboxed and sees /proc as it is' t_privileged_is_not_sandboxed
     check '/proc is masked and its system trees are read-only'            t_proc_is_masked
-    xfail SB-mask-failopen     'the paths Docker masks are masked'                     t_docker_masks
+    check 'the paths Docker masks are masked and show nothing'            t_docker_masks
     check 'another user cannot reach container files'                     t_storage_closed_to_others
 
     check 'a container has loopback, its address and a default route'     t_network_inside

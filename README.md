@@ -231,13 +231,16 @@ lightbox <command> [args]
 
 All security features are on by default. Pass `--privileged` to disable.
 
+The sandbox covers everything in a container: init, the `/init.sh` hook and all it starts, and every `exec`. A hook that mounts filesystems or configures the network therefore needs `--privileged`.
+
 | Feature | Implementation |
 |---------|---------------|
-| Capability dropping | `prctl(PR_CAPBSET_DROP)` — keeps Docker's 14 default caps |
+| Capability dropping | The bounding, effective and permitted sets are reduced to 12 capabilities: Docker's default 14 without `NET_RAW` and `MKNOD`. The inheritable and ambient sets are emptied |
 | Seccomp | BPF filter denying 56 syscalls on x86_64 (47 on aarch64), the x32 range, and `clone` with namespace flags |
 | no_new_privs | Prevents SUID escalation |
-| /proc masking | Bind-mounts `/dev/null` over kcore, sysrq-trigger, etc. |
+| /proc and /sys masking | The paths Docker masks by default are covered, files with `/dev/null` and directories with an empty read-only tmpfs. A mask that cannot be made fails the start |
 | /proc read-only | Remounts /proc/sys, /proc/bus, /proc/fs, /proc/irq read-only |
+| Root filesystem | Mounted `nodev`, and `nosuid` unless privileged. Devices come from the `/dev` that lightbox builds |
 | Container isolation | iptables drops br0-to-br0 traffic by default |
 | User namespaces | Planned future improvement |
 | OOM priority | Containers scored higher for OOM killer |
@@ -249,7 +252,7 @@ All security features are on by default. Pass `--privileged` to disable.
 - **Devices**: bind-mounted from host (`/dev/null`, `/dev/zero`, `/dev/random`, etc.)
 - **Networking**: veth pair per container connected to a host bridge with NAT
 - **Resource limits**: cgroups v2 (memory, PIDs, CPU, I/O)
-- **Init**: lightbox remains PID 1 inside the container; if `/init.sh` exists in the rootfs it is run after `/tmp` and `/run` are mounted, then lightbox stays alive to reap children and handle shutdown
+- **Init**: lightbox remains PID 1 inside the container; if `/init.sh` exists in the rootfs it is run after `/tmp` and `/run` are mounted and the sandbox is on, then lightbox stays alive to reap children and handle shutdown
 - **External tools**: on the host, `ip` and `nsenter` set up a container's network, `iptables` the firewall, and `cp` and `rm` create and remove a container. Everything else is direct syscalls, and nothing from the image is run before `/init.sh`
 - **Configuration**: optional `~/.config/lightbox/lightbox.conf` for all paths and defaults
 

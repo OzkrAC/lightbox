@@ -98,7 +98,7 @@ static int64_t in_child(int64_t (*probe)(void)) {
 }
 
 static void install_profile(void) {
-    if (lc_kernel_prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
+    if (lc_kernel_prctl(LB_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
         die("seccomp_profile: failed to set no_new_privs");
     apply_seccomp();
 }
