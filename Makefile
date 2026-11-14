@@ -191,10 +191,19 @@ test: test-unit test-validation test-seccomp
 # the environment, so its options go on make's command line:
 #     sudo make test-lifecycle V=1 KEEP=1
 # It builds nothing, so that sudo leaves no file of root's in the tree.
+REQUIRE_BUILT = $(MAKE) -q --no-print-directory lightbox || { \
+    echo "lightbox is missing or older than its sources: run make first, without sudo" >&2; exit 2; }
+
 test-lifecycle:
-	@$(MAKE) -q --no-print-directory lightbox || { \
-	    echo "lightbox is missing or older than its sources: run make first, without sudo" >&2; exit 2; }
+	@$(REQUIRE_BUILT)
 	bash tests/lifecycle.sh ./lightbox
+
+# Wall time of create, start, exec, stop and rm, and the processes one start
+# makes. As root, in the lifecycle suite's namespaces. bench/baseline.txt holds
+# the numbers from before Phase 1 of ROADMAP.md.
+bench:
+	@$(REQUIRE_BUILT)
+	bash bench/bench.sh ./lightbox
 
 check: check-sys analyze test
 
@@ -232,4 +241,4 @@ clean:
 	rm -f $(SECCOMP_TESTS) tests/seccomp_profile.o tests/seccomp_profile.d
 	rm -f tests/unit tests/unit.o tests/unit.d
 
-.PHONY: analyze check check-sys clean install test test-lifecycle test-seccomp test-unit test-validation uninstall
+.PHONY: analyze bench check check-sys clean install test test-lifecycle test-seccomp test-unit test-validation uninstall

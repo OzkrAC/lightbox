@@ -19,7 +19,6 @@ jobs:
   check:
     name: Checks (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
-    continue-on-error: ${{ matrix.experimental }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -31,7 +30,6 @@ jobs:
             cc: gcc-14
             packages: gcc-14 gcc-aarch64-linux-gnu libc6-dev-arm64-cross
             targets: check
-            experimental: false
           # What Ubuntu 24.04 installs as gcc: GCC 13, which knows C23 as
           # -std=c2x. An analyzer's findings change from release to release,
           # so the gate is not run with this one.
@@ -40,20 +38,15 @@ jobs:
             cc: gcc
             packages: gcc
             targets: check-sys test
-            experimental: false
-          # lightbox had never been run on aarch64 when this workflow was
-          # written: its seccomp numbers were compared with the kernel's
-          # headers and the filter was interpreted, nothing more. Until this
-          # job has been green once, a failure here is reported and does not
-          # fail the workflow. Remove "experimental" then.
+          # A native arm64 runner. qemu-user would not do: it refuses to
+          # install a seccomp filter.
           - name: aarch64
             runner: ubuntu-24.04-arm
             cc: gcc-14
             packages: gcc-14
             targets: check
-            experimental: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - name: Install the toolchain
@@ -79,7 +72,6 @@ jobs:
   lifecycle:
     name: Lifecycle suite (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
-    continue-on-error: ${{ matrix.experimental }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -87,13 +79,10 @@ jobs:
         include:
           - name: x86_64
             runner: ubuntu-24.04
-            experimental: false
-          # See the aarch64 note in the job above.
           - name: aarch64
             runner: ubuntu-24.04-arm
-            experimental: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - name: Install the toolchain and what the suite needs
@@ -131,6 +120,12 @@ jobs:
       # sudo drops the environment, so the suite's options are make variables.
       - name: Lifecycle suite
         run: sudo make CC=gcc-14 test-lifecycle GITHUB_ACTIONS=true LIGHTBOX_TEST_MODPROBE=1
+      # Wall time of the basic commands and the processes one start makes, to
+      # set beside bench/baseline.txt. A shared runner's clock is rough, so
+      # this reports and compares nothing. The numbers are a notice on the
+      # run's page.
+      - name: Timing
+        run: sudo make CC=gcc-14 bench GITHUB_ACTIONS=true
       - name: Kernel log
         if: ${{ failure() }}
         run: sudo dmesg | tail -n 80
@@ -142,7 +137,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - name: Install the toolchain

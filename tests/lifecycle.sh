@@ -34,6 +34,12 @@
 # that hangs, or a container that holds a pipe open, fails its case and not
 # the run.
 #
+#   tests/lifecycle.sh --program <script> [path/to/lightbox]
+#
+# runs another script in place of the cases: it is sourced inside the private
+# namespaces once the fixture stands, with the helpers of this file, and its
+# status is the run's. bench/bench.sh measures that way.
+#
 # Findings whose test would be a walk through the weakness itself have no case
 # here (SB-vol-host-resolve, SB-create-host-write, SB-exec-self). Their fixes
 # bring cases that state the safe behaviour.
@@ -47,6 +53,11 @@ MODE=outer
 case ${1:-} in
     --inside) MODE=inside; shift ;;
     --case)   MODE=case;   shift ;;
+    --program)
+        [ -r "${2:-}" ] || { echo "lifecycle: --program needs a script it can read" >&2; exit 2; }
+        LIFECYCLE_PROGRAM=$(cd "$(dirname "$2")" && pwd)/$(basename "$2")
+        export LIFECYCLE_PROGRAM
+        shift 2 ;;
 esac
 
 # ─── Names used by every stage ──────────────────────────────────────────────
@@ -497,7 +508,7 @@ t_image_with_one_binary() {
     mkdir -p "$T/base-one"
     cp "$BB" "$T/base-one/busybox"
     lb create one "$(next_ip)" --rootfs "$T/base-one" || return 1
-    start one || return 1
+    start one || { echo "an image without mount, ip and sh did not start"; return 1; }
     [ "$(lb exec one /busybox echo runs </dev/null)" = runs ] && lb stop one
 }
 
@@ -569,12 +580,10 @@ EOF
     start hooksbx || return 1
     seen="$C/hooksbx/rootfs/hook.status"
     wait_until 5 test -s "$seen" || { echo "the hook left no mark"; return 1; }
-    cat "$seen"
-    [ "$(awk '$1 == "Seccomp:" { print $2 }' "$seen")" = 2 ] &&
-    [ "$(awk '$1 == "NoNewPrivs:" { print $2 }' "$seen")" = 1 ] &&
-    [ "$(awk '$1 == "CapBnd:" { print $2 }' "$seen")" = "$ALLOWED_CAPS" ] &&
-    [ "$(awk '$1 == "CapEff:" { print $2 }' "$seen")" = "$ALLOWED_CAPS" ] &&
-    [ "$(awk '$1 == "CapPrm:" { print $2 }' "$seen")" = "$ALLOWED_CAPS" ]
+    field() { awk -v k="$1:" '$1 == k { print $2 }' "$seen"; }
+    echo "the hook ran with Seccomp $(field Seccomp), NoNewPrivs $(field NoNewPrivs), CapEff $(field CapEff), CapBnd $(field CapBnd)"
+    [ "$(field Seccomp)" = 2 ] && [ "$(field NoNewPrivs)" = 1 ] && [ "$(field CapBnd)" = "$ALLOWED_CAPS" ] &&
+    [ "$(field CapEff)" = "$ALLOWED_CAPS" ] && [ "$(field CapPrm)" = "$ALLOWED_CAPS" ]
 }
 
 # A hook that fails only after start's fixed half-second wait.
@@ -710,7 +719,7 @@ t_sandbox_on_exec() {
 t_init_holds_only_allowed_capabilities() {
     up initcaps || return 1
     pid=$(pid_of initcaps)
-    grep -E '^Cap(Eff|Prm|Bnd):' "/proc/$pid/status"
+    echo "init holds CapEff $(status_field "$pid" CapEff), CapPrm $(status_field "$pid" CapPrm); allowed is $ALLOWED_CAPS"
     [ "$(status_field "$pid" CapEff)" = "$ALLOWED_CAPS" ] && [ "$(status_field "$pid" CapPrm)" = "$ALLOWED_CAPS" ]
 }
 
@@ -998,6 +1007,20 @@ if [ "$MODE" = inside ]; then
 
     fixture || { echo "lifecycle: the fixture could not be built" >&2; exit 2; }
 
+    if [ -e "$BRNF" ]; then filtering="br_netfilter is loaded"; else filtering="br_netfilter is not loaded"; fi
+    echo "lifecycle: $(uname -sr) on $(uname -m); $(iptables --version 2>&1 | head -n 1); $filtering"
+    if [ -n "$BB" ]; then
+        echo "lifecycle: root filesystem from $BB ($("$BB" 2>&1 | head -n 1))"
+    else
+        echo "lifecycle: root filesystem copied from $LIGHTBOX_TEST_ROOTFS"
+    fi
+    echo
+
+    if [ -n "${LIFECYCLE_PROGRAM:-}" ]; then
+        . "$LIFECYCLE_PROGRAM"
+        exit $?
+    fi
+
     CASE_TIMEOUT=${CASE_TIMEOUT:-90}
     SHOW_LINES=60
     SHOW_FILTER="s#$T#<T>#g"
@@ -1015,15 +1038,6 @@ if [ "$MODE" = inside ]; then
         fi
         teardown
     }
-
-    if [ -e "$BRNF" ]; then filtering="br_netfilter is loaded"; else filtering="br_netfilter is not loaded"; fi
-    echo "lifecycle: $(uname -sr) on $(uname -m); $(iptables --version 2>&1 | head -n 1); $filtering"
-    if [ -n "$BB" ]; then
-        echo "lifecycle: root filesystem from $BB ($("$BB" 2>&1 | head -n 1))"
-    else
-        echo "lifecycle: root filesystem copied from $LIGHTBOX_TEST_ROOTFS"
-    fi
-    echo
 
     check 'setup makes the bridge, the forwarding and the firewall rules, and closes storage' t_setup
     if [ "$failed" -ne 0 ]; then
@@ -1218,7 +1232,7 @@ interrupted() { remove_cgroups; restore_controllers; remove_work_dir; }
 LIFECYCLE_LB=${1:-./lightbox}
 [ -x "$LIFECYCLE_LB" ] || stop_early "$LIFECYCLE_LB is not an executable; run make first"
 LIFECYCLE_LB=$(cd "$(dirname "$LIFECYCLE_LB")" && pwd)/$(basename "$LIFECYCLE_LB")
-[ "$(id -u)" -eq 0 ] || stop_early "this suite starts containers and needs root: sudo make test-lifecycle"
+[ "$(id -u)" -eq 0 ] || stop_early "this starts containers and needs root: run it with sudo, as in sudo make test-lifecycle"
 
 preflight
 

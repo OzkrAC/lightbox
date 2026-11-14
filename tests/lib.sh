@@ -21,9 +21,14 @@
 # (40 unless set). A suite may also replace run_case after sourcing this file.
 #
 # Under GitHub Actions a failed case and an unexpected pass are also written as
-# error annotations, which the run's summary page lists without the log.
+# error annotations, and the totals as a notice that names every skipped case.
+# A second notice gives the last line each expected failure printed, so that a
+# reader can see it fails for the reason its name gives and not for another.
+# The run's summary page lists annotations without the log.
 
 n=0 passed=0 failed=0 xfailed=0 xpassed=0 skipped=0
+skipped_names=""
+xfail_last_lines=""
 
 run_case() { # function -> sets rc and out
     n=$((n + 1))
@@ -56,6 +61,7 @@ check() { # name, function
         [ "${V:-0}" = 1 ] && show
     elif [ $rc -eq 77 ]; then
         skipped=$((skipped + 1)); printf 'skip   %s\n' "$1"; show
+        skipped_names="${skipped_names:+$skipped_names; }$1"
     else
         failed=$((failed + 1)); printf 'FAIL   %s\n' "$1"; show
         annotate "FAIL: $1"
@@ -67,9 +73,13 @@ xfail() { # ledger id, name, function
     run_case "$3"
     if [ $rc -eq 77 ]; then
         skipped=$((skipped + 1)); printf 'skip   %s\n' "$2"; show
+        skipped_names="${skipped_names:+$skipped_names; }$2"
     elif [ $rc -ne 0 ]; then
         xfailed=$((xfailed + 1)); printf 'xfail  %-22s %s\n' "$1" "$2"
         [ "${V:-0}" = 1 ] && show
+        xfail_last_lines="$xfail_last_lines$1 | $2 | $(printf '%s\n' "$out" | sed -e "${SHOW_FILTER:-s/^//}" |
+            awk 'NF { last = $0 } END { print substr(last, 1, 200) }')
+"
     else
         xpassed=$((xpassed + 1))
         printf 'XPASS  %-22s %s\n' "$1" "$2"
@@ -81,7 +91,16 @@ xfail() { # ledger id, name, function
 }
 
 summary() { # suite name
-    printf '\n%s: %d passed, %d expected failures, %d failed, %d unexpected passes, %d skipped\n' \
-        "$1" "$passed" "$xfailed" "$failed" "$xpassed" "$skipped"
+    local totals
+    totals="$passed passed, $xfailed expected failures, $failed failed, $xpassed unexpected passes, $skipped skipped"
+    printf '\n%s: %s\n' "$1" "$totals"
+    if [ "${GITHUB_ACTIONS:-}" = true ]; then
+        printf '::notice title=%s suite::%s\n' "$1" \
+            "$(printf '%s' "$totals${skipped_names:+. Skipped: $skipped_names}" | sed -e 's/%/%25/g')"
+        if [ -n "$xfail_last_lines" ]; then
+            printf '::notice title=%s suite - last line of each expected failure::%s\n' "$1" \
+                "$(printf '%s' "$xfail_last_lines" | sed -e 's/%/%25/g' | awk '{ printf "%s%%0A", $0 }')"
+        fi
+    fi
     [ "$failed" -eq 0 ] && [ "$xpassed" -eq 0 ]
 }

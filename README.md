@@ -62,7 +62,9 @@ The suite works in private network, mount and PID namespaces with a configuratio
 
 sudo drops the environment, so options go on make's command line: `sudo make test-lifecycle V=1 KEEP=1`. Build first, as yourself; the target builds nothing.
 
-`.github/workflows/ci.yml` runs `make check` and the lifecycle suite on every push to `main` and every pull request, on x86_64 and on aarch64.
+`sudo make bench` works in the same namespaces and measures the wall time of `create`, `start`, `exec`, `stop` and `rm`, and the number of processes one start makes.
+
+`.github/workflows/ci.yml` runs `make check`, the lifecycle suite and the timing on every push to `main` and every pull request, on x86_64 and on aarch64. A run's page lists each suite's totals, the cases it skipped and why each expected failure fails, without opening a log.
 
 ## Quick start
 
