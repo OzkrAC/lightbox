@@ -15,8 +15,9 @@
 # process it starts dies with the PID namespace. cgroups cannot be private in
 # that way, so its containers live in one directory of the real hierarchy,
 # /sys/fs/cgroup/lightbox-test-<pid>, which is removed at the end. The host's
-# interfaces, firewall rules and cgroups are compared before and after, and a
-# difference fails the run.
+# virtual interfaces, firewall rules and cgroups are compared before and after,
+# and a difference fails the run. A network card that the machine gains or
+# loses meanwhile is reported and does not count.
 #
 #   LIGHTBOX_TEST_ROOTFS=/path  use a copy of this root filesystem (Alpine, Debian ...)
 #   BUSYBOX=/path               the static busybox to build the root filesystem from
@@ -1290,9 +1291,34 @@ preflight() {
     fi
 }
 
+# The host's interfaces of one kind: virtual or hardware. What lightbox and the
+# suite can make is virtual, a bridge and veth pairs, and that must not be left
+# behind. A network card is the machine's: a cloud VM is given one, or loses
+# one, whenever its own host decides, and one arrived during a run on GitHub.
+interfaces() { # kind
+    local path name kind
+    for path in /sys/class/net/*; do
+        [ -d "$path" ] || continue
+        name=${path##*/}
+        kind=hardware
+        [ -e "/sys/devices/virtual/net/$name" ] && kind=virtual
+        [ "$kind" = "$1" ] && printf '%s ' "$name"
+    done
+    echo
+}
+
+# Network cards that came or went are reported and do not count.
+cards_note() { # before, after
+    [ "$1" = "$2" ] && return 0
+    echo "lifecycle: the machine's network cards changed during the run, which is not the suite's doing: '${1% }' before, '${2% }' after"
+    if [ "${GITHUB_ACTIONS:-}" = true ]; then
+        echo "::notice title=lifecycle%3A the machine's network cards changed::Before the run '${1% }', after it '${2% }'. Not counted as a change the suite made."
+    fi
+}
+
 # What the suite must leave as it found it.
 host_state() {
-    echo "interfaces: $(ip -o link show | awk -F': ' '{ sub(/@.*/, "", $2); print $2 }' | sort | tr '\n' ' ')"
+    echo "virtual interfaces: $(interfaces virtual)"
     echo "forwarding: $(cat /proc/sys/net/ipv4/ip_forward)"
     echo "bridged traffic through iptables: $(cat "$BRNF" 2>/dev/null || echo 'br_netfilter not loaded')"
     echo "lightbox cgroups: $(find /sys/fs/cgroup -maxdepth 1 -name 'lightbox*' | sort | tr '\n' ' ')"
@@ -1353,6 +1379,7 @@ export LIFECYCLE_LB LIFECYCLE_T LIFECYCLE_BB
 trap interrupted EXIT
 
 host_state > "$LIFECYCLE_T/host.before"
+CARDS_BEFORE=$(interfaces hardware)
 
 unshare --net --mount --pid --fork --kill-child --mount-proc -- bash "$SELF" --inside
 rc=$?
@@ -1362,9 +1389,10 @@ trap remove_work_dir EXIT
 remove_cgroups
 restore_controllers
 host_state > "$LIFECYCLE_T/host.after"
+cards_note "$CARDS_BEFORE" "$(interfaces hardware)"
 
 if cmp -s "$LIFECYCLE_T/host.before" "$LIFECYCLE_T/host.after"; then
-    echo "lifecycle: the host's interfaces, firewall rules, cgroups and mounts are as they were"
+    echo "lifecycle: the host's virtual interfaces, firewall rules, cgroups and mounts are as they were"
 else
     echo "lifecycle: THE HOST CHANGED (-: before, +: after)"
     diff -u "$LIFECYCLE_T/host.before" "$LIFECYCLE_T/host.after" | sed '1,2d'
