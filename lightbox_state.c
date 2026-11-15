@@ -284,6 +284,84 @@ void container_shown_state(const char *name, container_liveness live, char *buf,
         str_copy(buf, "exited", bufsz);
 }
 
+/* ─── Locks ─────────────────────────────────────────────────────────────── */
+
+/*
+ * A lock on a directory, taken with flock on a descriptor that stays open
+ * until the process ends. The descriptor is close-on-exec, so no tool this
+ * process runs holds the lock on; a container's init closes everything it
+ * inherits. The descriptor, or a negative errno when the directory cannot be
+ * opened.
+ */
+static lc_sysret lock_directory(const char *path, bool shared, bool wait, const char *whose) {
+    lc_sysret fd = lc_kernel_open_file(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+    if (fd < 0)
+        return fd;
+
+    int32_t kind = shared ? LB_LOCK_SH : LB_LOCK_EX;
+    lc_sysret rc = lb_sys_flock((int32_t)fd, kind | LB_LOCK_NB);
+    if (rc == -LB_EAGAIN && wait) {
+        print_str(STDERR, "Waiting for another lightbox command to finish with ");
+        print_str(STDERR, whose);
+        print_str(STDERR, "...\n");
+        do {
+            rc = lb_sys_flock((int32_t)fd, kind);
+        } while (rc == -LB_EINTR);
+    }
+    if (rc < 0) {
+        lc_kernel_close_file((int32_t)fd);
+        return rc;
+    }
+    return fd;
+}
+
+/* Is the directory a descriptor is open on still the one at this path? rm
+ * removes a container while others may wait for its lock. */
+static bool still_at(int32_t fd, const char *path) {
+    struct lb_statx held, there;
+    if (lb_sys_statx(fd, "", LB_AT_EMPTY_PATH, LB_STATX_INO, &held) < 0 ||
+        lb_sys_statx(AT_FDCWD, path, AT_SYMLINK_NOFOLLOW, LB_STATX_INO, &there) < 0)
+        return false;
+    return held.stx_ino == there.stx_ino && held.stx_dev_major == there.stx_dev_major &&
+           held.stx_dev_minor == there.stx_dev_minor;
+}
+
+void container_lock(const char *name) {
+    char dir[MAX_PATH], whose[NAME_MAX_LEN + 16];
+    container_dir_path(dir, name);
+    size_t pos = str_copy(whose, "container '", sizeof(whose));
+    pos = str_append(whose, pos, name, sizeof(whose));
+    str_append(whose, pos, "'", sizeof(whose));
+
+    lc_sysret fd = lock_directory(dir, false, true, whose);
+    if (fd == -LB_ENOENT || (fd >= 0 && !still_at((int32_t)fd, dir)))
+        die2("Error: container does not exist: ", name);
+    if (fd < 0)
+        die2("Error: cannot lock container ", name);
+}
+
+void container_lock_if_free(const char *name) {
+    char dir[MAX_PATH];
+    container_dir_path(dir, name);
+    (void)lock_directory(dir, true, false, "");
+}
+
+void store_lock(void) {
+    lc_sysret fd = lock_directory(cfg_global.container_dir, false, true, "the container store");
+    /* a store that is not there yet is locked by nobody; what needs it says so itself */
+    if (fd < 0 && fd != -LB_ENOENT)
+        die2("Error: cannot lock ", cfg_global.container_dir);
+}
+
+void require_root(const char *command) {
+    if (lb_sys_geteuid() == 0)
+        return;
+    print_str(STDERR, "Error: lightbox ");
+    print_str(STDERR, command);
+    print_str(STDERR, " must be run as root\n");
+    lc_kernel_exit(1);
+}
+
 /* ─── Listing ───────────────────────────────────────────────────────────── */
 
 /* struct linux_dirent64, as getdents64 fills a buffer with it: d_ino and d_off

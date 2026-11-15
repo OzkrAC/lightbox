@@ -367,6 +367,37 @@ t_start_after_init_died() {
     [ "$(sh_in crash 'echo back')" = back ]
 }
 
+# stop is a command that changes a container, so it is where the record of a
+# dead init gets cleaned up, as start is.
+t_stop_of_a_dead_container_cleans_up() {
+    up dead || return 1
+    pid=$(pid_of dead)
+    kill -KILL "$pid"
+    wait_until 5 gone "$pid" || { echo "init $pid survived SIGKILL"; return 1; }
+    refused lb stop dead || { echo "stop of a container whose init is gone succeeded"; return 1; }
+    echo "state after stop: $(state_of dead)"
+    [ ! -e "$C/dead/.pid" ] && [ ! -e "$C/dead/.pid_start" ] && [ "$(state_of dead)" = failed ]
+}
+
+# Two starts of one container at once: one starts it, and the other waits for
+# the first to be done and then finds it running.
+t_two_starts_at_once() {
+    box twice || return 1
+    "$LB" start twice >"$OUT/twice.1" 2>&1 </dev/null &
+    first=$!
+    "$LB" start twice >"$OUT/twice.2" 2>&1 </dev/null &
+    second=$!
+    wait "$first"; a=$?
+    wait "$second"; b=$?
+    echo "--- one (status $a):"; cat "$OUT/twice.1"
+    echo "--- the other (status $b):"; cat "$OUT/twice.2"
+    [ $((a + b)) -eq 1 ] || { echo "not exactly one of the two succeeded"; return 1; }
+    cat "$OUT/twice.1" "$OUT/twice.2" | grep -q 'container is already running: twice' || { echo "the one that lost does not say why"; return 1; }
+    settled twice || return 1
+    [ "$(state_of twice)" = running ] || return 1
+    [ "$(wc -l < "$CG/twice/cgroup.procs")" = 1 ] || { echo "the container's cgroup holds $(wc -l < "$CG/twice/cgroup.procs") processes"; return 1; }
+}
+
 t_failed_start_leaves_nothing() {
     box broken --vol "$T/vol/does-not-exist:/data" || return 1
     if said=$(start broken); then
@@ -1663,6 +1694,8 @@ if [ "$MODE" = inside ]; then
     check 'a running container cannot be started again or removed'        t_running_container_is_protected
     check 'a stopped container starts again and keeps its files'          t_restart_keeps_files
     check 'a container whose init died starts again'                      t_start_after_init_died
+    check 'stop of a container whose init died cleans up its record'      t_stop_of_a_dead_container_cleans_up
+    check 'of two starts at once, one starts the container and one finds it running' t_two_starts_at_once
     check 'a start that fails leaves no interface, cgroup or runtime file' t_failed_start_leaves_nothing
 
     check 'exec --user takes a name or a number and sets groups and HOME' t_exec_user

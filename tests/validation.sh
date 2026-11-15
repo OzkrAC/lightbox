@@ -362,13 +362,75 @@ t_dead_container_shown_as_exited() {
     lb inspect web | grep -x 'running: no'
 }
 
-# stop is a command that changes a container, so it is where the record of a
-# dead init gets cleaned up.
-t_stop_cleans_a_dead_record() {
+# setup, start, stop and exec need root. They say so before they look at
+# anything, and change nothing: the record of a dead init, which stop would
+# clean up, is as it was.
+t_root_is_asked_for_first() {
+    [ "$(id -u)" -ne 0 ] || return 77
     stale_record || return 1
-    refused lb stop web || return 1
-    echo "state is now: $(cat "$C/web/.state")"
-    [ ! -e "$C/web/.pid" ] && [ ! -e "$C/web/.pid_start" ] && [ "$(cat "$C/web/.state")" = failed ]
+    chmod 755 "$W/data" "$C"
+    before=$(tree_sum "$W/data")
+    bad=0
+    for words in setup 'start web' 'stop web' 'exec web /bin/true'; do
+        # shellcheck disable=SC2086
+        msg=$(lb $words 2>&1) && { echo "lightbox $words succeeded"; bad=1; }
+        echo "lightbox $words: $msg"
+        [ "$msg" = "Error: lightbox ${words%% *} must be run as root" ] || bad=1
+    done
+    [ "$before" = "$(tree_sum "$W/data")" ] || { echo "something under $W/data changed"; bad=1; }
+    [ "$(mode_of "$C")" = 755 ] || { echo "setup changed the mode of container_dir"; bad=1; }
+    return $bad
+}
+
+# Two commands that change one container do it one after the other. Eight
+# add-vol at once all get their volume in: each reads the configuration,
+# adds to it and writes it back, and without a lock some would write over
+# what another had just added.
+t_commands_take_turns() {
+    lb create web 10.0.0.2 || return 1
+    for i in 1 2 3 4 5 6 7 8; do
+        lb add-vol web "$W/vol:/data/$i" >"$W/addvol.$i" 2>&1 &
+    done
+    wait
+    echo "volumes after eight add-vol at once: $(vol_count web)"
+    [ "$(vol_count web)" = 8 ] || { cat "$W"/addvol.*; return 1; }
+    for i in 1 2 3 4 5 6 7 8; do conf_has web "vol=$W/vol:/data/$i" || return 1; done
+}
+
+# A command waits for the lock and says that it does; a query never waits.
+t_lock_is_waited_for() {
+    command -v flock >/dev/null 2>&1 || { echo "no flock(1) to hold a lock with"; return 77; }
+    lb create web 10.0.0.2 || return 1
+    flock "$C/web" sleep 2 &
+    holder=$!
+    sleep 0.3
+    began=$SECONDS
+    listed=$(lb ls) || return 1
+    [ $((SECONDS - began)) -lt 2 ] || { echo "ls waited for the lock"; return 1; }
+    printf '%s\n' "$listed" | grep -q '^web ' || return 1
+    msg=$(lb add-vol web "$W/vol:/data" 2>&1) || { echo "$msg"; return 1; }
+    printf '%s\n' "$msg"
+    wait "$holder"
+    case $msg in *"Waiting for another lightbox command to finish with container 'web'"*) ;; *) echo "it did not say that it waited"; return 1 ;; esac
+    conf_has web "vol=$W/vol:/data" || return 1
+
+    # create waits for the lock of the whole store
+    flock "$C" sleep 1 &
+    holder=$!
+    sleep 0.3
+    msg=$(lb create db 10.0.0.3 2>&1) || { echo "$msg"; return 1; }
+    wait "$holder"
+    printf '%s\n' "$msg"
+    case $msg in *"Waiting for another lightbox command to finish with the container store"*) ;; *) return 1 ;; esac
+
+    # a container that is removed while a command waits for it is gone for that command
+    flock "$C/db" sh -c "sleep 1; rm -rf '$C/db'" &
+    holder=$!
+    sleep 0.3
+    msg=$(lb add-vol db "$W/vol:/data" 2>&1) && { echo "add-vol worked on a container that was removed meanwhile"; return 1; }
+    wait "$holder"
+    printf '%s\n' "$msg"
+    case $msg in *'container does not exist: db'*) ;; *) return 1 ;; esac
 }
 
 t_ls_json_escapes_names() {
@@ -542,8 +604,8 @@ t_stop_options_are_checked() {
     said -t        && case $msg in *'number of seconds'*) ;; *) return 1 ;; esac || return 1
     said --bogus   && case $msg in *'unknown option'*--bogus*) ;; *) return 1 ;; esac || return 1
     said another   && case $msg in *'unexpected argument'*another*) ;; *) return 1 ;; esac || return 1
-    # with options that are fine it gets as far as the container, which is not running
-    said -t 3      && case $msg in *'not running'*) ;; *) return 1 ;; esac || return 1
+    # with options that are fine it goes on: to who runs it, and as root to the container, which is not running
+    said -t 3      && case $msg in *'must be run as root'*|*'not running'*) ;; *) return 1 ;; esac || return 1
     [ "$before" = "$(tree_sum "$C/web")" ] || { echo "the container's records changed"; return 1; }
 }
 
@@ -695,15 +757,6 @@ t_storage_is_private() {
 
 # setup restricts storage directories that an older installation left open. As
 # an ordinary user setup still fails later, at the bridge, which is expected.
-t_setup_restricts_existing_storage() {
-    [ "$(id -u)" -ne 0 ] || return 77
-    [ "$(stat -f -c %T /sys/fs/cgroup 2>/dev/null)" = cgroup2fs ] || return 77
-    sed -i 's#^cgroup_root = .*#cgroup_root = /sys/fs/cgroup#' "$CONF"
-    chmod 755 "$W/data" "$C"
-    lb setup 2>&1 | head -6
-    echo "modes after setup: lightbox_dir $(mode_of "$W/data"), container_dir $(mode_of "$C")"
-    [ "$(mode_of "$W/data")" = 700 ] && [ "$(mode_of "$C")" = 700 ]
-}
 
 # ─── The list ───────────────────────────────────────────────────────────────
 
@@ -727,7 +780,9 @@ check 'ls writes nothing'                                   t_ls_writes_nothing
 check 'inspect writes nothing'                              t_inspect_writes_nothing
 check 'a process owned by another user is not gone'         t_other_users_process_is_not_gone
 check 'a dead container is shown as exited'                 t_dead_container_shown_as_exited
-check 'stop cleans up the record of a dead container'       t_stop_cleans_a_dead_record
+check 'setup, start, stop and exec ask for root first'      t_root_is_asked_for_first
+check 'eight add-vol at once all take effect'               t_commands_take_turns
+check 'a command waits for a lock and says so; ls does not' t_lock_is_waited_for
 check 'start checks its options before it does anything'    t_start_options_are_checked
 check 'a timeout setting that cannot be read is a warning'  t_start_timeout_setting
 check 'stop checks its options before it does anything'     t_stop_options_are_checked
@@ -737,7 +792,6 @@ check 'a command with its standard streams closed is harmless' t_closed_streams_
 check 'create writes name servers, hostname and hosts'      t_create_writes_names
 check 'what create writes stays in the new root filesystem' t_create_writes_stay_in_the_rootfs
 check 'container storage is private to root'                t_storage_is_private
-check 'setup restricts existing storage directories'        t_setup_restricts_existing_storage
 check 'create keeps every volume or refuses'                t_create_keeps_every_volume
 check 'add-vol stores whole lines and fails honestly'       t_addvol_fails_honestly
 check 'add-vol respects the volume limit'                   t_addvol_respects_the_volume_limit
@@ -769,6 +823,6 @@ xfail CFG-parse            'configuration: inline comments are stripped'     t_c
 xfail CFG-parse            'configuration: unknown keys are reported'        t_config_reports_unknown_keys
 xfail CLI-help             '--help exits 0'                                  t_help_exits_zero
 xfail CLI-extra-args       'rm handles every argument or none'               t_rm_handles_every_argument
-xfail RT-no-root-check     'start without root is a clean error'             t_start_without_root_is_a_clean_error
+check 'start without root is a clean error'                   t_start_without_root_is_a_clean_error
 
 summary validation

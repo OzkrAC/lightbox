@@ -211,6 +211,7 @@ static void ensure_private_dir(const char *path) {
 }
 
 void cmd_setup(void) {
+    require_root("setup");
     require_tool("ip", tool_path_ip());
     require_tool("iptables", tool_path_iptables());
 
@@ -222,6 +223,9 @@ void cmd_setup(void) {
 
     ensure_private_dir(cfg_global.lightbox_dir);
     ensure_private_dir(cfg_global.container_dir);
+
+    /* one setup at a time, and no create while the bridge is being made */
+    store_lock();
 
     {
         const char *show[] = { "ip", "link", "show", cfg_global.bridge, NULL };

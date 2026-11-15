@@ -2,6 +2,19 @@
 
 What changed for someone who uses lightbox, newest first. `ROADMAP.md` has the reasons and the finding each change closes.
 
+## 0.5.0
+
+Not tagged yet, and not complete: the part of Phase 5 that is written so far.
+
+### Changes you may have to act on
+
+- **`setup`, `start`, `stop` and `exec` refuse to run as an ordinary user**, with "must be run as root", before they look at anything. `start` used to go ahead, fail at its first privileged step and record the container as failed; `setup` changed the modes of the storage directories before it failed.
+- **Commands wait for each other.** `start`, `stop`, `rm` and `add-vol` on the same container, and `create` and `setup` on the store, run one after the other; the one that waits prints "Waiting for another lightbox command to finish". A `stop` typed while a `start` is still waiting for the init hook waits for that `start`. `ls` and `inspect` never wait.
+
+### Fixed
+
+- Two commands working on one container at the same time could both go ahead: two `start` could each set up an interface and a cgroup for the same container, and of two `add-vol` one could write over what the other had just added.
+
 ## 0.4.0
 
 Not tagged yet. Phase 4 of the roadmap: who `exec` runs a command as, how it finds it and what terminal it gives it, where volumes are mounted, and what `create` writes into a new container.

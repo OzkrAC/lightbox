@@ -67,6 +67,7 @@ void cmd_ls(int argc, char **argv) {
 
         (void)read_container_ip(name, ip_buf, sizeof(ip_buf));
 
+        container_lock_if_free(name);   /* a command that changes it waits until this has read */
         container_liveness live = container_probe(name);
         bool running = live == CONTAINER_RUNNING;
         if (running)
@@ -213,6 +214,7 @@ void cmd_inspect(int argc, char **argv) {
     container_pid_start_path(pid_start_path, name);
     container_state_path(state_path, name);
 
+    container_lock_if_free(name);
     if (read_container_ip(name, ip, sizeof(ip)) < 0)
         str_copy(ip, "-", sizeof(ip));
     container_liveness live = container_probe(name);

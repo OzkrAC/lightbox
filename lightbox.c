@@ -926,12 +926,18 @@ static void cmd_create(int argc, char **argv) {
     const char *create_err = NULL;
     bool created_dir = false;
 
+    /* One create at a time: what one decides about names and addresses holds
+     * until it is done. */
+    store_lock();
+
     /* create container directory and copy rootfs into it */
     if (lc_kernel_mkdirat(AT_FDCWD, cdir, MODE_PRIVATE_DIR) < 0) {
         create_err = "failed to create container dir";
         goto fail_create;
     }
     created_dir = true;
+    /* nobody starts or removes it while it is half made */
+    container_lock(name);
     if (record_container_state(name, "creating\n") != 0) {
         create_err = "failed to record the container's state";
         goto fail_create;
@@ -3213,8 +3219,12 @@ static void cmd_start(int argc, char **argv) {
             die2("Error: not a number of seconds from 0 to " STRINGIFY(SECONDS_MAX) ": ", argv[i]);
     }
 
+    require_root("start");
     require_tool("ip", tool_path_ip());
     require_tool("nsenter", tool_path_nsenter());
+
+    /* from here to the end, no other command works on this container */
+    container_lock(name);
 
     char root[MAX_PATH];
     container_root(root, name);
@@ -3586,6 +3596,9 @@ static void cmd_stop(int argc, char **argv) {
             die2("Error: not a number of seconds from 0 to " STRINGIFY(SECONDS_MAX) ": ", argv[i]);
     }
 
+    require_root("stop");
+    container_lock(name);
+
     if (!is_running(name)) {
         container_reap_if_dead(name);
         die2("Error: container is not running: ", name);
@@ -3670,12 +3683,11 @@ static void cmd_add_vol(int argc, char **argv) {
     const char *name = argv[0];
     validate_name(name);
 
-    char cdir[MAX_PATH];
-    container_dir_path(cdir, name);
-    if (!path_exists(cdir)) die2("Error: container does not exist: ", name);
-
     volume_spec vol = {0};
     parse_volume_spec_or_die(argv[1], &vol);
+
+    /* read, add and write back as one step: a second add-vol waits for it */
+    container_lock(name);
 
     if (!path_exists(vol.src))
         die2("Error: volume source does not exist: ", vol.src);
@@ -3712,11 +3724,12 @@ static void cmd_rm(int argc, char **argv) {
     const char *name = argv[0];
     validate_name(name);
 
+    container_lock(name);
+
     if (is_running(name)) die2("Error: container is running (stop it first): ", name);
 
     char cdir[MAX_PATH];
     container_dir_path(cdir, name);
-    if (!path_exists(cdir)) die2("Error: container does not exist: ", name);
 
     print_str(STDOUT,"Removing container '");
     print_str(STDOUT,name);
@@ -3756,6 +3769,8 @@ static void cmd_exec(int argc, char **argv) {
      * as they are, however many */
     req.argv = command < argc ? (const char *const *)(uintptr_t)(argv + command) : shell;
     request_term(&req);
+
+    require_root("exec");
 
     if (!is_running(name)) die2("Error: container is not running: ", name);
 

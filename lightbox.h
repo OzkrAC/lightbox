@@ -196,6 +196,23 @@ container_liveness container_probe(const char *name);
 bool is_running(const char *name);
 void container_reap_if_dead(const char *name);
 void container_shown_state(const char *name, container_liveness live, char *buf, size_t bufsz);
+
+/*
+ * Locks. Each is held from the call to the end of the process, and by
+ * nothing the process starts.
+ *
+ * A command that changes a container takes that container's lock, so that
+ * two of them do their work one after the other and each sees what the other
+ * left. It waits for the lock, and says so when it has to. create and setup
+ * take the lock of the whole store. A query takes a container's lock shared,
+ * and only if it is free: a query never waits.
+ */
+void container_lock(const char *name);          /* ends the process when there is no such container */
+void container_lock_if_free(const char *name);
+void store_lock(void);
+
+/* Ends the process, saying which command it was, unless it runs as root. */
+void require_root(const char *command);
 int read_container_ip(const char *name, char *ip, size_t ipsz);
 int update_link_rules(const char *name, const char *ip, bool add_rules);
 /* does iptables see what the bridge switches between containers? */
