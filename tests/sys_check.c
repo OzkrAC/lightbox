@@ -22,10 +22,13 @@
 #include <stdint.h>
 
 #include <asm/errno.h>
+#include <asm/ioctls.h>
 #include <asm/poll.h>
 #include <asm/siginfo.h>
 #include <asm/signal.h>
 #include <asm/statfs.h>
+#include <asm/termbits.h>
+#include <asm/termios.h>
 #include <asm/unistd.h>
 #include <linux/audit.h>
 #include <linux/capability.h>
@@ -99,6 +102,39 @@ SAME_VALUE(LB_F_SEAL_WRITE, F_SEAL_WRITE);
 SAME_VALUE(LB_MOUNT_ATTR_RDONLY, MOUNT_ATTR_RDONLY);
 SAME_VALUE(LB_SIGPIPE, SIGPIPE);
 SAME_VALUE(LB_SIGCONT, SIGCONT);
+SAME_VALUE(LB_SIGTTOU, SIGTTOU);
+SAME_VALUE(LB_SIGWINCH, SIGWINCH);
+SAME_VALUE(LB_EAGAIN, EAGAIN);
+SAME_VALUE(LB_POLLOUT, POLLOUT);
+SAME_VALUE(LB_TCGETS, TCGETS);
+SAME_VALUE(LB_TCSETS, TCSETS);
+SAME_VALUE(LB_TIOCSCTTY, TIOCSCTTY);
+SAME_VALUE(LB_TIOCGWINSZ, TIOCGWINSZ);
+SAME_VALUE(LB_TIOCSWINSZ, TIOCSWINSZ);
+SAME_VALUE(LB_TIOCSPTLCK, TIOCSPTLCK);
+SAME_VALUE(LB_TIOCGPTPEER, TIOCGPTPEER);
+SAME_VALUE(LB_O_NOCTTY, O_NOCTTY);
+SAME_VALUE(LB_F_GETFL, F_GETFL);
+SAME_VALUE(LB_F_SETFL, F_SETFL);
+SAME_VALUE(LB_IGNBRK, IGNBRK);
+SAME_VALUE(LB_BRKINT, BRKINT);
+SAME_VALUE(LB_PARMRK, PARMRK);
+SAME_VALUE(LB_ISTRIP, ISTRIP);
+SAME_VALUE(LB_INLCR, INLCR);
+SAME_VALUE(LB_IGNCR, IGNCR);
+SAME_VALUE(LB_ICRNL, ICRNL);
+SAME_VALUE(LB_IXON, IXON);
+SAME_VALUE(LB_OPOST, OPOST);
+SAME_VALUE(LB_ISIG, ISIG);
+SAME_VALUE(LB_ICANON, ICANON);
+SAME_VALUE(LB_ECHO, ECHO);
+SAME_VALUE(LB_ECHONL, ECHONL);
+SAME_VALUE(LB_IEXTEN, IEXTEN);
+SAME_VALUE(LB_CSIZE, CSIZE);
+SAME_VALUE(LB_CS8, CS8);
+SAME_VALUE(LB_PARENB, PARENB);
+SAME_VALUE(LB_VTIME, VTIME);
+SAME_VALUE(LB_VMIN, VMIN);
 SAME_VALUE(LB_SI_QUEUE, SI_QUEUE);
 SAME_VALUE(LB_POLLIN, POLLIN);
 SAME_VALUE(LB_POLLERR, POLLERR);
@@ -181,6 +217,20 @@ SAME_SIGINFO(code, si_code);
 SAME_SIGINFO(pid, si_pid);
 SAME_SIGINFO(uid, si_uid);
 SAME_SIGINFO(value, si_int);
+
+SAME_SIZE(lb_termios, termios);
+_Static_assert(offsetof(struct lb_termios, iflag) == offsetof(struct termios, c_iflag) &&
+               offsetof(struct lb_termios, oflag) == offsetof(struct termios, c_oflag) &&
+               offsetof(struct lb_termios, cflag) == offsetof(struct termios, c_cflag) &&
+               offsetof(struct lb_termios, lflag) == offsetof(struct termios, c_lflag) &&
+               offsetof(struct lb_termios, line) == offsetof(struct termios, c_line) &&
+               offsetof(struct lb_termios, cc) == offsetof(struct termios, c_cc) &&
+               sizeof(((struct lb_termios *)0)->cc) == sizeof(((struct termios *)0)->c_cc),
+               "struct lb_termios does not match the kernel's struct termios");
+SAME_SIZE(lb_winsize, winsize);
+_Static_assert(offsetof(struct lb_winsize, row) == offsetof(struct winsize, ws_row) &&
+               offsetof(struct lb_winsize, col) == offsetof(struct winsize, ws_col),
+               "struct lb_winsize does not match the kernel's struct winsize");
 
 SAME_SIZE(lb_mount_attr, mount_attr);
 SAME_FIELD(lb_mount_attr, mount_attr, attr_set);

@@ -73,6 +73,7 @@
 #define LB_ENOENT                 2
 #define LB_ESRCH                  3
 #define LB_EINTR                  4
+#define LB_EAGAIN                 11
 #define LB_EACCES                 13
 #define LB_EBUSY                  16
 #define LB_EEXIST                 17
@@ -82,6 +83,8 @@
 /* The signals lightbox names that lightc does not (asm/signal.h) */
 #define LB_SIGPIPE                13
 #define LB_SIGCONT                18
+#define LB_SIGTTOU                22
+#define LB_SIGWINCH               28
 
 /* si_code of a signal that was queued with a value (asm-generic/siginfo.h) */
 #define LB_SI_QUEUE               (-1)
@@ -89,6 +92,7 @@
 /* What ppoll(2) is asked to wait for, and what it reports (asm-generic/poll.h).
  * A pipe whose other end was closed reports POLLHUP, with or without POLLIN. */
 #define LB_POLLIN                 0x0001
+#define LB_POLLOUT                0x0004
 #define LB_POLLERR                0x0008
 #define LB_POLLHUP                0x0010
 
@@ -112,6 +116,43 @@
 #define LB_ST_NOSUID              2
 #define LB_ST_NODEV               4
 #define LB_ST_NOEXEC              8
+
+/* Terminals (asm-generic/ioctls.h, termbits.h, fcntl.h).
+ *
+ * TIOCGPTPEER opens the other end of a pseudo-terminal from the descriptor of
+ * the one end, without a path for anything to stand in. */
+#define LB_TCGETS                     0x5401
+#define LB_TCSETS                     0x5402
+#define LB_TIOCSCTTY                  0x540E
+#define LB_TIOCGWINSZ                 0x5413
+#define LB_TIOCSWINSZ                 0x5414
+#define LB_TIOCSPTLCK                 0x40045431
+#define LB_TIOCGPTPEER                0x5441
+
+#define LB_O_NOCTTY                   0400
+#define LB_F_GETFL                    3
+#define LB_F_SETFL                    4
+
+/* what "raw" takes away from a terminal's modes, and the two characters it sets */
+#define LB_IGNBRK                     0x001
+#define LB_BRKINT                     0x002
+#define LB_PARMRK                     0x008
+#define LB_ISTRIP                     0x020
+#define LB_INLCR                      0x040
+#define LB_IGNCR                      0x080
+#define LB_ICRNL                      0x100
+#define LB_IXON                       0x400
+#define LB_OPOST                      0x01
+#define LB_ISIG                       0x00001
+#define LB_ICANON                     0x00002
+#define LB_ECHO                       0x00008
+#define LB_ECHONL                     0x00040
+#define LB_IEXTEN                     0x08000
+#define LB_CSIZE                      0x00000030
+#define LB_CS8                        0x00000030
+#define LB_PARENB                     0x00000100
+#define LB_VTIME                      5
+#define LB_VMIN                       6
 
 /* memfd_create(2) (linux/memfd.h). MFD_EXEC, Linux 6.3, says that the file
  * is meant to be executed; an older kernel does not know the flag. */
@@ -209,6 +250,24 @@ struct lb_siginfo_queue {
     uint32_t uid;
     int32_t  value;
     uint8_t  pad1[100];
+};
+
+/* struct termios, as TCGETS and TCSETS take it, and struct winsize
+ * (asm-generic/termbits.h, termios.h) */
+struct lb_termios {
+    uint32_t iflag;
+    uint32_t oflag;
+    uint32_t cflag;
+    uint32_t lflag;
+    uint8_t  line;
+    uint8_t  cc[19];
+};
+
+struct lb_winsize {
+    uint16_t row;
+    uint16_t col;
+    uint16_t xpixel;
+    uint16_t ypixel;
 };
 
 /* struct mount_attr (linux/mount.h) */

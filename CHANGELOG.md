@@ -4,7 +4,7 @@ What changed for someone who uses lightbox, newest first. `ROADMAP.md` has the r
 
 ## 0.4.0
 
-Not tagged yet, and not complete: the part of Phase 4 that is written so far, which is who `exec` runs a command as and how it finds it, where volumes are mounted, and what `create` writes into a new container.
+Not tagged yet. Phase 4 of the roadmap: who `exec` runs a command as, how it finds it and what terminal it gives it, where volumes are mounted, and what `create` writes into a new container.
 
 ### Changes you may have to act on
 
@@ -12,6 +12,8 @@ Not tagged yet, and not complete: the part of Phase 4 that is written so far, wh
 - **A `--user` value that begins with a digit must be numbers.** `--user 0x10` ran as uid 0, `--user 1000:` as gid 0, and `--user 12abc` as uid 12; a uid too large to be one wrapped around. All of these are refused.
 - **A command no longer has the groups of whoever ran `exec`.** Its supplementary groups are the ones the container's `/etc/group` lists for its user, and none for a uid without an account. Before, a uid without an account, and root when `--user` was not given, kept the caller's groups.
 - **`exec` exits with 127 for a command that is not there, and 126 for one that cannot be run.** Both were 1.
+- **A command run by `exec` has a terminal of its own, or none.** Typed at a terminal, `exec` gives the command a pseudo-terminal of the container and puts your terminal into raw mode until the command ends: Ctrl-C, Ctrl-Z and Ctrl-\\ go to the command, not to `exec`. With a terminal on one side only, as in `lightbox exec x cat file | less`, the command gets a pipe there and sees no terminal, so a program that asks whether it writes to a terminal will answer no. Before, the command had your terminal itself.
+- **A command run by `exec` leads a session of its own**, and is given nothing that was open where `exec` was run but its three streams. A signal sent to `exec` is passed on to it; before, SIGTERM for `exec` ended `exec` and left the command running.
 - **A new container asks the name servers this host asks.** It used to get 1.1.1.1 and 8.8.8.8 whatever the host used. It still gets those two when the host's only resolver is on its own loopback, as with systemd-resolved, and the servers behind that stub cannot be found. `create --dns <address>` and the `dns` setting choose others. Existing containers keep the file they have.
 - **A volume path with `..` is refused**, by `create`, by `add-vol`, and by `start` for a container that already has one. A path is stored in one spelling, so `/data//x/` becomes `/data/x`.
 - **A volume whose destination leads nowhere in the container fails the start.** A destination is now looked up inside the container. Where the image has a link on the way that points to a path the container lacks, the old code followed it on the host instead.
@@ -24,6 +26,7 @@ Not tagged yet, and not complete: the part of Phase 4 that is written so far, wh
 - `USER` and `LOGNAME` were cut to 12 characters.
 - `exec` read the container's `/etc/passwd` and `/etc/group` through their path on the host, where a link in the container's files leads wherever it says. They are read inside the container now, and only if they are regular files.
 - `exec x --user`, with the value missing, ran `--user` as a command.
+- A command run by `exec` held the terminal `exec` was typed at: it could read what was typed there and write to it for as long as anything it started kept the terminal open, also after `exec` had returned.
 - `exec` entered a container as the installed binary, which a process in the container can reach through `/proc` for as long as the worker runs. `exec` now executes itself again from a sealed copy in memory first, as runc does since CVE-2019-5736, and its worker is closed to other processes until the command starts. If neither a sealed copy nor a read-only mount of the binary can be had, `exec` does not run; `lightbox doctor` says which it is.
 - A volume's destination was made and mounted through its path on the host, before the container had its own root. A link in the image on that path was followed on the host, so `start` could make a directory or an empty file outside the container. Volumes are now attached after the container has its own root and the host's is out of its sight.
 - A volume below `/run` or `/tmp` was hidden by the tmpfs that is mounted there afterwards.

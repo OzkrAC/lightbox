@@ -463,6 +463,85 @@ t_exec_passes_every_argument() {
     [ "$said" = "${words% }" ]
 }
 
+# Run a command line on a terminal: its output, without the carriage returns
+# a terminal adds. script(1) makes the terminal. It passes the end of its own
+# input on as an end of input on the terminal, so its input is held open until
+# it is done: by the feeder a case names, or by nothing being typed at all.
+on_a_terminal() { # command line [feeder function]
+    command -v script >/dev/null 2>&1 || { echo "no script(1) to make a terminal with"; return 77; }
+    rm -f "$OUT/script.done"
+    {
+        [ -z "${2:-}" ] || "$2"
+        while [ ! -e "$OUT/script.done" ]; do sleep 0.1; done
+    } | {
+        timeout -k 2 40 script -qec "$1" /dev/null
+        : > "$OUT/script.done"
+    } | tr -d '\r'
+}
+
+# Typed at a terminal, exec gives the command a terminal of the container's:
+# not the caller's, whose number and device are another's.
+t_exec_on_a_terminal() {
+    up term || return 1
+    out=$(on_a_terminal "tty; stty rows 31 cols 97; stty -g > '$OUT/term.before'
+        '$LB' exec term /bin/sh -c 'tty; stty size; echo \"devices: \$(stat -c %d /dev/pts) \$(stat -L -c %d /proc/self/fd/0) \$(stat -L -c %d /proc/self/fd/2)\"; ls /proc/self/fd | tr \"\\n\" \" \"; echo; exit 6'
+        echo status \$?; stty -g > '$OUT/term.after'") || return $?
+    printf '%s\n' "$out"
+    outer=$(printf '%s\n' "$out" | sed -n 1p)
+    inner=$(printf '%s\n' "$out" | sed -n 2p)
+    case $outer in /dev/*) ;; *) echo "script gave no terminal"; return 1 ;; esac
+    case $inner in /dev/pts/[0-9]*) ;; *) echo "the command has no terminal of the container's: $inner"; return 1 ;; esac
+    devices=$(printf '%s\n' "$out" | sed -n 's/^devices: //p')
+    # shellcheck disable=SC2086
+    set -- $devices
+    [ $# -eq 3 ] && [ "$1" = "$2" ] && [ "$1" = "$3" ] || { echo "the command's streams are not on the container's devpts: $devices"; return 1; }
+    printf '%s\n' "$out" | grep -qx '31 97' || { echo "the command's terminal does not have the caller's size"; return 1; }
+    printf '%s\n' "$out" | grep -qx '0 1 2 3 ' || { echo "the command has more than its three streams"; return 1; }
+    printf '%s\n' "$out" | grep -qx 'status 6' || return 1
+    cmp -s "$OUT/term.before" "$OUT/term.after" || { echo "the caller's terminal did not get its modes back"; return 1; }
+}
+
+# What is typed reaches the command, the key that interrupts is the command's
+# to get, and a pipe stands in where only one side is a terminal.
+t_exec_terminal_input_and_keys() {
+    up keys || return 1
+    feeder() {
+        wait_until 10 test -e "$C/keys/rootfs/reading" && printf 'hello\n'
+        wait_until 10 test -e "$C/keys/rootfs/waiting" && printf '\003'
+    }
+    out=$(on_a_terminal "'$LB' exec keys /bin/sh -c 'trap \"echo got-SIGINT; exit 3\" INT; : > /reading; read -r line; echo \"read: \$line\"; : > /waiting; sleep 20 & wait'
+        echo status \$?" feeder) || return $?
+    printf '%s\n' "$out"
+    printf '%s\n' "$out" | grep -qx 'read: hello' && printf '%s\n' "$out" | grep -q 'got-SIGINT' &&
+    printf '%s\n' "$out" | grep -qx 'status 3' || return 1
+
+    out=$(on_a_terminal "echo piped | '$LB' exec keys /bin/sh -c 'cat; test -t 1 && echo stdout-is-a-terminal; test -t 2 && echo stderr-is-a-terminal; echo to-stderr >&2'") || return $?
+    printf '%s\n' "$out"
+    [ "$out" = "piped
+to-stderr" ]
+}
+
+# Without a terminal the command gets lightbox's streams as they are, leads a
+# session of its own, and hears of a signal that asks exec to end.
+t_exec_session_and_signals() {
+    up session2 || return 1
+    # the command is given none of what else the caller has open: here a file on descriptor 9
+    said=$(echo typed | lb exec session2 /bin/sh -c 'cat; read -r pid _ _ _ _ sid _ < /proc/self/stat; [ "$pid" = "$sid" ] && echo "leads its session"; ls /proc/self/fd | tr "\n" " "' 9< "$C/session2/.conf")
+    printf '%s\n' "$said"
+    [ "$said" = "typed
+leads its session
+0 1 2 3 " ] || return 1
+
+    "$LB" exec session2 /bin/sh -c 'trap "echo asked > /asked; exit 9" TERM; : > /started; sleep 20 & wait' >"$OUT/session2.exec" 2>&1 </dev/null &
+    front=$!
+    wait_until 5 test -e "$C/session2/rootfs/started" || { echo "the command did not start:"; cat "$OUT/session2.exec"; return 1; }
+    kill -TERM "$front"
+    wait "$front"
+    rc=$?
+    echo "exec returned $rc; the command: $(cat "$C/session2/rootfs/asked" 2>&1)"
+    [ $rc -eq 9 ] && [ "$(cat "$C/session2/rootfs/asked")" = asked ]
+}
+
 # While a command runs, the lightbox processes that put it there are not the
 # installed binary: they run from a sealed copy in memory.
 t_exec_runs_from_a_sealed_copy() {
@@ -1594,6 +1673,9 @@ if [ "$MODE" = inside ]; then
     check 'exec passes every argument'                                    t_exec_passes_every_argument
     check 'exec sets --env and --workdir, and passes TERM and nothing else' t_exec_environment
     check 'exec runs from a sealed copy of the binary'                    t_exec_runs_from_a_sealed_copy
+    check 'on a terminal, exec gives the command a terminal of the container'"'"'s' t_exec_on_a_terminal
+    check 'typed input and the interrupt key reach the command; a pipe for half a terminal' t_exec_terminal_input_and_keys
+    check 'a command leads its own session, and a signal for exec reaches it' t_exec_session_and_signals
 
     check 'a directory volume is shared in both directions'               t_volume_directory
     check 'a file volume is mounted'                                      t_volume_file

@@ -274,6 +274,14 @@ Options come before the command. A command that begins with a dash goes after `-
 | `--env <KEY=VALUE>`, `-e` | — | Set a variable in the command's environment (repeatable; the later of two for one variable wins) |
 | `--workdir <dir>`, `-w` | `/` | The directory the command runs in, as an absolute path in the container |
 
+What the command gets as its standard streams depends on what `exec` itself was given, and is never a terminal of yours:
+
+- **Typed at a terminal** (stdin and stdout are both a terminal): the command gets a terminal of its own, a pseudo-terminal of the container, as its controlling terminal. Your terminal is raw for as long as the command runs, so every key goes to the command: Ctrl-C interrupts what runs in the container, not `exec`. The window's size is passed on, also when it changes.
+- **With a terminal on one side only**, as in `lightbox exec x cat file | less` or `lightbox exec x cat > notes`: the command gets a pipe in the place of the terminal, which `exec` reads or fills. Bytes arrive as they were sent.
+- **Without a terminal**, as in a script or a pipeline: the three streams as they are.
+
+In every case the command leads a session of its own and is given nothing else that was open where `exec` was run. SIGINT, SIGTERM, SIGHUP and SIGQUIT sent to `exec` are passed on to the command.
+
 The command is found as a shell finds it: a name without a slash is looked for in the directories of `PATH`. Its environment is `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, `HOME`, `USER` and `LOGNAME` for its user, and the `TERM` of the terminal `exec` was typed on; nothing else of your environment goes into the container. Its groups are the ones the container's `/etc/group` lists for its user, and none for a uid the container has no account for. `exec` exits with the command's status, with 127 when the command is not there and 126 when it cannot be run.
 
 ## Security
@@ -291,6 +299,7 @@ The sandbox covers everything in a container: init, the `/init.sh` hook and all 
 | /proc read-only | Remounts /proc/sys, /proc/bus, /proc/fs, /proc/irq read-only |
 | Root filesystem | Mounted `nodev`, and `nosuid` unless privileged. Devices come from the `/dev` that lightbox builds |
 | Container isolation | A container without `--link` has an isolated port on the bridge: it reaches the host and the outside, and no other container. IPv6 is off inside containers. A container with `--link` shares the bridge, is kept to its links by iptables, and does not start unless `br_netfilter` lets iptables see bridged traffic |
+| The terminal of whoever runs `exec` | A command never holds it. Typed at a terminal, `exec` gives the command a pseudo-terminal of the container and carries the bytes; where only one of its streams is a terminal, a pipe stands in for it |
 | The binary `exec` enters with | `exec` executes itself again from a sealed copy in memory before it enters a container, so the processes it puts there are never the installed binary. Where the kernel refuses executable memfds (`vm.memfd_noexec=2`) it takes the binary through a read-only mount of its own instead. Its worker is not dumpable. `lightbox doctor` says which of the two is in use |
 | User namespaces | Planned future improvement |
 | OOM priority | Containers scored higher for OOM killer |

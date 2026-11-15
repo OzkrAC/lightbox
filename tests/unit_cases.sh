@@ -931,6 +931,203 @@ t_name_servers_of_the_host() {
     return $rc
 }
 
+# ─── exec: the command's standard streams ───────────────────────────────────
+
+# "unit relay" does about a command's streams what exec does once it is in a
+# container, with the host's /dev/ptmx for the container's. A terminal for it
+# to be run on comes from script(1), which runs a command on a pseudo-terminal
+# of its own.
+
+SH_PATH=$(type -P sh)
+
+in_scratch_dir() { # function
+    local rc
+    D=$(mktemp -d "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    ( "$1" )
+    rc=$?
+    rm -rf -- "$D"
+    return $rc
+}
+
+# Run a command line on a terminal: its output, without the carriage returns
+# a terminal adds. script passes the end of its own input on as an end of
+# input on the terminal, so its input is held open until it is done, by
+# whatever the case gives as the feeder, or by nothing being typed at all.
+on_a_terminal() { # command line [feeder function]
+    command -v script >/dev/null 2>&1 || { echo "no script(1) to make a terminal with"; return 77; }
+    rm -f "$D/script.done"
+    {
+        [ -z "${2:-}" ] || "$2"
+        while [ ! -e "$D/script.done" ]; do sleep 0.1; done
+    } | {
+        timeout -k 2 30 script -qec "$1" /dev/null
+        : > "$D/script.done"
+    } | tr -d '\r'
+}
+
+await_file() { # path : up to five seconds
+    local i=0
+    while [ ! -e "$1" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+    [ -e "$1" ]
+}
+
+h_streams_without_a_terminal() {
+    : > "$D/open-in-the-caller"
+    out=$(echo typed | "$UNIT" relay /dev/ptmx -- "$SH_PATH" -c '
+        cat
+        test -t 0 && echo "stdin is a terminal"
+        read -r pid _ _ _ _ session _ < /proc/self/stat
+        [ "$pid" = "$session" ] && echo "leads its session"
+        echo "descriptors: $(ls /proc/self/fd | tr "\n" " ")"
+        exit 7' 9< "$D/open-in-the-caller")
+    rc=$?
+    printf '%s\n' "$out"
+    echo "status $rc"
+    # ls has the directory it lists on 3; the caller had a file on 9
+    [ $rc -eq 7 ] && [ "$out" = "typed
+leads its session
+descriptors: 0 1 2 3 " ]
+}
+
+h_a_terminal_of_its_own() {
+    out=$(on_a_terminal "tty; stty rows 31 cols 97; stty -g > $D/before
+        '$UNIT' relay /dev/ptmx -- $SH_PATH -c 'tty; stty size; test -t 2 && echo stderr-is-a-terminal; ls /proc/self/fd | tr \"\\n\" \" \"; echo; exit 5'
+        echo status \$?; stty -g > $D/after") || return $?
+    printf '%s\n' "$out"
+    outer=$(printf '%s\n' "$out" | sed -n 1p)
+    inner=$(printf '%s\n' "$out" | sed -n 2p)
+    case $outer:$inner in /dev/*:/dev/*) ;; *) echo "no two terminals"; return 1 ;; esac
+    [ "$outer" != "$inner" ] || { echo "the command has the caller's terminal"; return 1; }
+    printf '%s\n' "$out" | grep -qx '31 97' || { echo "the command's terminal does not have the caller's size"; return 1; }
+    printf '%s\n' "$out" | grep -qx 'stderr-is-a-terminal' && printf '%s\n' "$out" | grep -qx '0 1 2 3 ' &&
+    printf '%s\n' "$out" | grep -qx 'status 5' || return 1
+    cmp -s "$D/before" "$D/after" || { echo "the caller's terminal did not get its modes back"; return 1; }
+
+    # The terminal is the command's controlling terminal, and the command is in its foreground:
+    # fields 5, 7 and 8 of its stat. A program that does nothing about terminals is asked,
+    # because some shells take a controlling terminal by themselves when they have none.
+    out=$(on_a_terminal "'$UNIT' relay /dev/ptmx -- $(type -P cat) /proc/self/stat") || return $?
+    # shellcheck disable=SC2086
+    set -- ${out##*) }
+    echo "the command's process group $3, terminal $5, foreground group of that terminal $6"
+    [ "$5" != 0 ] && [ "$3" = "$6" ] || { echo "the terminal is not the command's controlling terminal"; return 1; }
+}
+
+# The worker is in the container's cgroup, and ends without a word when the
+# container is stopped. The process that ran exec puts the terminal's modes
+# back then: here the command kills the worker, which is its parent.
+h_terminal_modes_survive_the_worker() {
+    out=$(on_a_terminal "stty -g > $D/before
+        '$UNIT' relay /dev/ptmx -- $SH_PATH -c 'kill -KILL \$PPID; sleep 5'
+        echo status \$?; stty -g > $D/after") || return $?
+    printf '%s\n' "$out"
+    printf '%s\n' "$out" | grep -qx 'status 137' || { echo "the first process did not report its worker's end"; return 1; }
+    cmp -s "$D/before" "$D/after" || { echo "the terminal was left as the worker had it: $(cat "$D/after") instead of $(cat "$D/before")"; return 1; }
+}
+
+# What is typed reaches the command, and the key that interrupts is the
+# command's to get: as SIGINT, from its own terminal.
+h_terminal_input_and_keys() {
+    feeder() {
+        await_file "$D/reading" && printf 'hello\n'
+        await_file "$D/waiting" && printf '\003'
+    }
+    out=$(on_a_terminal "'$UNIT' relay /dev/ptmx -- $SH_PATH -c 'trap \"echo got-SIGINT; exit 3\" INT; : > $D/reading; read -r line; echo \"read: \$line\"; : > $D/waiting; sleep 20 & wait'
+        echo status \$?" feeder) || return $?
+    printf '%s\n' "$out"
+    printf '%s\n' "$out" | grep -qx 'read: hello' && printf '%s\n' "$out" | grep -q 'got-SIGINT' &&
+    printf '%s\n' "$out" | grep -qx 'status 3'
+}
+
+# When the caller's terminal changes its size, so does the command's.
+h_terminal_follows_the_window() {
+    out=$(on_a_terminal "stty rows 20 cols 80
+        ( while [ ! -e $D/first ]; do sleep 0.1; done; stty rows 44 cols 120 < /dev/tty; : > $D/resized ) &
+        '$UNIT' relay /dev/ptmx -- $SH_PATH -c 'stty size; : > $D/first
+            i=0; while [ ! -e $D/resized ] && [ \$i -lt 50 ]; do sleep 0.1; i=\$((i + 1)); done
+            i=0; while [ \"\$(stty size)\" = \"20 80\" ] && [ \$i -lt 30 ]; do sleep 0.1; i=\$((i + 1)); done
+            stty size'") || return $?
+    printf '%s\n' "$out"
+    [ "$(printf '%s\n' "$out" | grep -E '^[0-9]+ [0-9]+$' | paste -sd' ' -)" = "20 80 44 120" ]
+}
+
+# With a terminal on one side only, the command gets a pipe in its place:
+# nothing of the caller's terminal, and bytes that arrive as they were sent.
+h_pipes_for_half_a_terminal() {
+    out=$(on_a_terminal "echo piped | '$UNIT' relay /dev/ptmx -- $SH_PATH -c 'cat; test -t 1 && echo stdout-is-a-terminal; test -t 2 && echo stderr-is-a-terminal; echo to-stderr >&2'") || return $?
+    printf '%s\n' "$out"
+    [ "$out" = "piped
+to-stderr" ] || return 1
+    # the end of what is typed is the end of the command's input: it must end, and say so
+    feeder() { await_file "$D/reading" && printf 'one\ntwo\n\004'; }
+    on_a_terminal "'$UNIT' relay /dev/ptmx -- $SH_PATH -c 'test -t 0 && echo stdin-is-a-terminal >&2; : > $D/reading; cat' > $D/typed; echo \$? > $D/status" feeder >/dev/null || return $?
+    echo "what the command read from the keyboard: $(od -An -c "$D/typed" | tr -s ' \n' ' '); status $(cat "$D/status" 2>&1)"
+    [ "$(cat "$D/status" 2>/dev/null)" = 0 ] || { echo "the command did not come to the end of its input"; return 1; }
+    [ "$(cat "$D/typed")" = "one
+two" ] && ! grep -q "$(printf '\r')" "$D/typed"
+}
+
+# A signal that asks exec to end is passed on, to the worker and by it to the
+# command, which leads a session of its own and would not hear of it.
+h_signals_are_passed_on() {
+    "$UNIT" relay /dev/ptmx -- "$SH_PATH" -c "trap 'echo asked > $D/asked; exit 9' TERM; : > $D/started; sleep 20 & wait" </dev/null >/dev/null 2>&1 &
+    front=$!
+    await_file "$D/started" || { echo "the command did not start"; kill -KILL "$front"; return 1; }
+    kill -TERM "$front"
+    wait "$front"
+    rc=$?
+    echo "status $rc; the command: $(cat "$D/asked" 2>&1)"
+    [ $rc -eq 9 ] && [ "$(cat "$D/asked")" = asked ] || return 1
+    # and a command that does nothing about it ends of it, which is the status that comes back.
+    # (SIGHUP and not SIGINT: a shell starts what it runs with & ignoring SIGINT, and what
+    # is ignored stays ignored in everything that is started from there.)
+    "$UNIT" relay /dev/ptmx -- "$SH_PATH" -c ": > $D/started2; exec sleep 20" </dev/null >/dev/null 2>&1 &
+    front=$!
+    await_file "$D/started2" || { kill -KILL "$front"; return 1; }
+    kill -HUP "$front"
+    wait "$front"
+    rc=$?
+    echo "status of a command that SIGHUP ended: $rc"
+    [ $rc -eq 129 ]
+}
+
+# More than a pipe or a terminal holds at once, in both directions.
+h_plenty_goes_through() {
+    seq 1 30000 > "$D/numbers"
+    "$UNIT" relay /dev/ptmx -- "$SH_PATH" -c 'cat' < "$D/numbers" > "$D/through" || return 1
+    cmp -s "$D/numbers" "$D/through" || { echo "what went through pipes of the caller's is not what was sent"; return 1; }
+    out=$(on_a_terminal "'$UNIT' relay /dev/ptmx -- $SH_PATH -c 'cat $D/numbers | wc -l; cat $D/numbers | tail -n 1; cat $D/numbers' | tail -n 3") || return $?
+    printf '%s\n' "$out" | tail -n 3
+    [ "$(printf '%s\n' "$out" | tail -n 1)" = 30000 ] || return 1
+
+    # What a command wrote just before it ended is still delivered: 170 KB through a pipe that
+    # stands in for the terminal, of which a pipe's worth is still on its way when the command ends.
+    out=$(on_a_terminal "echo x | '$UNIT' relay /dev/ptmx -- $(type -P cat) $D/numbers") || return $?
+    echo "lines that arrived of 30000: $(printf '%s\n' "$out" | grep -c .), the last: $(printf '%s\n' "$out" | tail -n 1)"
+    [ "$(printf '%s\n' "$out" | tail -n 1)" = 30000 ] && [ "$(printf '%s\n' "$out" | grep -c .)" = 30000 ] || return 1
+
+    # What is typed faster than the command reads waits for it, and none of it is lost: 3000
+    # lines before the command reads its first, into a terminal of its own and into a pipe.
+    lines() { await_file "$D/ready" && seq -f 'line %.0f' 1 3000 && printf 'END\n'; }
+    out=$(on_a_terminal "'$UNIT' relay /dev/ptmx -- $SH_PATH -c 'stty -echo; : > $D/ready; sleep 1; n=0; while read -r l; do [ \"\$l\" = END ] && break; n=\$((n + 1)); done; echo read \$n lines'" lines) || return $?
+    printf '%s\n' "$out" | tail -n 1
+    printf '%s\n' "$out" | grep -qx 'read 3000 lines' || return 1
+    rm -f "$D/ready"
+    lines() { await_file "$D/ready" && seq -f 'line %.0f' 1 3000 && printf '\004'; }
+    on_a_terminal "'$UNIT' relay /dev/ptmx -- $SH_PATH -c ': > $D/ready; sleep 1; wc -l' > $D/count" lines >/dev/null || return $?
+    echo "lines counted through a pipe: $(cat "$D/count")"
+    [ "$(tr -d ' ' < "$D/count")" = 3000 ]
+}
+
+t_streams_without_a_terminal()  { in_scratch_dir h_streams_without_a_terminal; }
+t_streams_terminal()            { in_scratch_dir h_a_terminal_of_its_own; }
+t_streams_modes_survive()       { in_scratch_dir h_terminal_modes_survive_the_worker; }
+t_streams_input_and_keys()      { in_scratch_dir h_terminal_input_and_keys; }
+t_streams_window()              { in_scratch_dir h_terminal_follows_the_window; }
+t_streams_half_a_terminal()     { in_scratch_dir h_pipes_for_half_a_terminal; }
+t_streams_signals()             { in_scratch_dir h_signals_are_passed_on; }
+t_streams_plenty()              { in_scratch_dir h_plenty_goes_through; }
+
 # ─── exec: the binary it runs from ──────────────────────────────────────────
 
 # exec begins by executing itself again from a sealed copy in memory. What
@@ -1338,6 +1535,15 @@ check 'a volume through a link that leads nowhere ends the start' t_volume_throu
 check 'a volume that cannot be had ends the start'               t_volume_that_cannot_be_had
 
 check 'the name servers of a host are the ones a container can ask' t_name_servers_of_the_host
+
+check 'without a terminal a command gets the streams as they are, and a session' t_streams_without_a_terminal
+check 'on a terminal a command gets a terminal of its own'       t_streams_terminal
+check 'the caller'"'"'s terminal gets its modes back when the worker is killed' t_streams_modes_survive
+check 'what is typed, and the key that interrupts, reach the command' t_streams_input_and_keys
+check 'the command'"'"'s terminal follows the size of the caller'"'"'s'    t_streams_window
+check 'a pipe stands in where only one side is a terminal'       t_streams_half_a_terminal
+check 'a signal that asks exec to end reaches the command'       t_streams_signals
+check 'plenty of data goes through, both ways'                   t_streams_plenty
 
 check 'exec executes itself again from a sealed copy in memory'  t_exec_runs_from_a_sealed_copy
 check 'a read-only mount of the binary does where memfds may not' t_exec_sealing_by_a_read_only_mount

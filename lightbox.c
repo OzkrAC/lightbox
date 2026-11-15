@@ -2216,6 +2216,388 @@ static void run_sealed(void) {
     lc_kernel_exit(1);
 }
 
+/* ─── exec: the command's standard streams ──────────────────────────────── */
+
+/*
+ * A command in a container does not get a terminal of the host's. Whoever
+ * holds a terminal can read what is typed on it and write what is shown on
+ * it, and a container's command is not to have that over the terminal of the
+ * person who started it. So what the command gets depends on what lightbox
+ * itself was given:
+ *
+ *   stdin and stdout are both a terminal
+ *       a terminal of its own: a pseudo-terminal of the container's devpts,
+ *       as its controlling terminal and its three streams. The caller's
+ *       terminal is put into raw mode, and lightbox carries the bytes both
+ *       ways and passes on the window's size when it changes.
+ *   some of the three are a terminal
+ *       a pipe in the place of each that is, which lightbox reads or fills;
+ *       the others as they are.
+ *   none is
+ *       all three as they are: files, pipes, /dev/null.
+ *
+ * In every case the command leads a session of its own, so no signal that a
+ * terminal sends to lightbox's process group reaches it by itself. lightbox
+ * passes on the ones that ask a command to end.
+ */
+
+/* One direction of what lightbox carries: from a descriptor to a descriptor,
+ * with what has been read and not yet written in between. */
+struct channel {
+    int32_t from, to;
+    bool    reading;            /* from has not come to its end */
+    bool    close_at_end;       /* to is a pipe of the command's: its end is the command's end of input */
+    size_t  have, sent;
+    char    buf[4096];
+};
+
+struct exec_streams {
+    int32_t command_fd[3];      /* what the command gets as 0, 1 and 2; -1: lightbox's own */
+    int32_t terminal;           /* >= 0: the command's end of the pseudo-terminal */
+    int32_t master;             /* >= 0: lightbox's end of it */
+    int     nchannels;
+    struct channel channels[3];
+};
+
+static bool is_terminal(int32_t fd) {
+    struct lb_termios modes;
+    return lc_kernel_device_control(fd, LB_TCGETS, &modes) >= 0;
+}
+
+/* The modes of a terminal that passes every byte on as it is and leaves
+ * every key to the other side: what cfmakeraw makes of them. */
+static void make_raw(struct lb_termios *modes) {
+    modes->iflag &= ~(uint32_t)(LB_IGNBRK | LB_BRKINT | LB_PARMRK | LB_ISTRIP | LB_INLCR | LB_IGNCR |
+                                LB_ICRNL | LB_IXON);
+    modes->oflag &= ~(uint32_t)LB_OPOST;
+    modes->lflag &= ~(uint32_t)(LB_ECHO | LB_ECHONL | LB_ICANON | LB_ISIG | LB_IEXTEN);
+    modes->cflag &= ~(uint32_t)(LB_CSIZE | LB_PARENB);
+    modes->cflag |= LB_CS8;
+    modes->cc[LB_VMIN] = 1;
+    modes->cc[LB_VTIME] = 0;
+}
+
+static void copy_window_size(int32_t from, int32_t to) {
+    struct lb_winsize size;
+    if (lc_kernel_device_control(from, LB_TIOCGWINSZ, &size) >= 0)
+        lc_kernel_device_control(to, LB_TIOCSWINSZ, &size);
+}
+
+static void set_nonblocking(int32_t fd, bool on) {
+    lc_sysret flags = lb_sys_fcntl(fd, LB_F_GETFL, 0);
+    if (flags >= 0)
+        lb_sys_fcntl(fd, LB_F_SETFL, on ? ((uint64_t)flags | O_NONBLOCK) : ((uint64_t)flags & ~(uint64_t)O_NONBLOCK));
+}
+
+static struct channel *add_channel(struct exec_streams *st, int32_t from, int32_t to, bool close_at_end) {
+    struct channel *c = &st->channels[st->nchannels++];
+    c->from = from;
+    c->to = to;
+    c->reading = true;
+    c->close_at_end = close_at_end;
+    c->have = c->sent = 0;
+    return c;
+}
+
+/*
+ * Decide what the command gets, and make it. ptmx is the container's
+ * /dev/pts/ptmx, by a path that is looked up with the container's root as
+ * the root; the command's end of the pseudo-terminal is opened from the
+ * descriptor of lightbox's end, by no path at all. The terminal is given to
+ * the user the command runs as, the way a login gives a terminal to its user.
+ */
+static void prepare_streams(struct exec_streams *st, const char *ptmx, int uid, int gid) {
+    st->command_fd[0] = st->command_fd[1] = st->command_fd[2] = -1;
+    st->terminal = st->master = -1;
+    st->nchannels = 0;
+
+    bool tty[3] = { is_terminal(STDIN), is_terminal(STDOUT), is_terminal(STDERR) };
+
+    if (tty[0] && tty[1]) {
+        lc_sysret master = lc_kernel_open_file(ptmx, O_RDWR | LB_O_NOCTTY | O_NONBLOCK | O_CLOEXEC, 0);
+        int unlocked = 0;
+        if (master < 0 || lc_kernel_device_control((int32_t)master, LB_TIOCSPTLCK, &unlocked) < 0)
+            die2("Error: the container has no pseudo-terminals to give the command one from: ", ptmx);
+        lc_sysret terminal = lc_kernel_device_control((int32_t)master, LB_TIOCGPTPEER,
+                                                      (void *)(uintptr_t)(O_RDWR | LB_O_NOCTTY | O_CLOEXEC));
+        if (terminal < 0)
+            die("Error: failed to open the command's terminal");
+        (void)lc_kernel_fchownat((int32_t)terminal, "", (uint32_t)uid, (uint32_t)gid, LB_AT_EMPTY_PATH);
+        copy_window_size(STDIN, (int32_t)master);
+
+        st->master = (int32_t)master;
+        st->terminal = (int32_t)terminal;
+        st->command_fd[0] = st->command_fd[1] = st->command_fd[2] = (int32_t)terminal;
+        add_channel(st, STDIN, (int32_t)master, false);
+        add_channel(st, (int32_t)master, STDOUT, false);
+        return;
+    }
+
+    for (int i = 0; i < 3; i++) {
+        if (!tty[i])
+            continue;
+        int32_t ends[2];
+        if (lc_kernel_create_pipe(ends, O_CLOEXEC) < 0)
+            die("Error: failed to make a pipe for the command");
+        if (i == STDIN) {
+            /* typed on the terminal, read by the command */
+            st->command_fd[i] = ends[0];
+            set_nonblocking(ends[1], true);
+            add_channel(st, STDIN, ends[1], true);
+        } else {
+            /* written by the command, shown on the terminal */
+            st->command_fd[i] = ends[1];
+            set_nonblocking(ends[0], true);
+            add_channel(st, ends[0], i, false);
+        }
+    }
+}
+
+/*
+ * In the command's process, before anything else: no signal held back, a
+ * session of its own, the terminal if it gets one as its controlling
+ * terminal, its three streams, and nothing else that was open in whoever ran
+ * lightbox.
+ */
+static void take_streams(const struct exec_streams *st) {
+    uint64_t no_signals = 0;
+    lc_kernel_set_signal_mask(LC_SIG_SETMASK, &no_signals, NULL);
+
+    if (lc_kernel_create_session() < 0)
+        die("Error: failed to give the command a session of its own");
+    if (st->terminal >= 0 && lc_kernel_device_control(st->terminal, LB_TIOCSCTTY, NULL) < 0)
+        die("Error: failed to make the terminal the command's own");
+    for (int i = 0; i < 3; i++) {
+        if (st->command_fd[i] >= 0 && lc_kernel_duplicate_fd(st->command_fd[i], i, 0) < 0)
+            die("Error: failed to set up the command's standard streams");
+    }
+    close_all_but(NULL, 0);
+}
+
+/* In lightbox, once the command has its copies: its ends are the command's
+ * alone, so that each pipe ends when the command is done with it. */
+static void release_command_ends(struct exec_streams *st) {
+    for (int i = 0; i < 3; i++) {
+        int32_t fd = st->command_fd[i];
+        if (fd < 0)
+            continue;
+        lc_kernel_close_file(fd);
+        for (int j = i; j < 3; j++) {
+            if (st->command_fd[j] == fd)
+                st->command_fd[j] = -1;
+        }
+    }
+    st->terminal = -1;
+}
+
+static void channel_end_of_input(struct channel *c) {
+    c->reading = false;
+    if (c->close_at_end && c->to >= 0 && c->have == c->sent) {
+        lc_kernel_close_file(c->to);
+        c->to = -1;
+    }
+}
+
+/* Read what there is. An end of file, and an error that is not "nothing yet",
+ * end the direction: a pseudo-terminal says EIO when its other end is gone. */
+static void channel_read(struct channel *c) {
+    lc_sysret n = lc_kernel_read_bytes(c->from, c->buf, sizeof(c->buf));
+    if (n > 0) {
+        c->have = (size_t)n;
+        c->sent = 0;
+    } else if (n != -LB_EAGAIN && n != -LB_EINTR) {
+        channel_end_of_input(c);
+    }
+}
+
+/* Write what is waiting, or as much of it as is taken. A descriptor that can
+ * no longer be written to ends the direction, and what was waiting is dropped. */
+static void channel_write(struct channel *c) {
+    lc_sysret n = c->to >= 0 ? lc_kernel_write_bytes(c->to, c->buf + c->sent, c->have - c->sent) : -1;
+    if (n > 0) {
+        c->sent += (size_t)n;
+    } else if (n != -LB_EAGAIN && n != -LB_EINTR) {
+        c->sent = c->have;
+        c->reading = false;
+        if (c->close_at_end && c->to >= 0) {
+            lc_kernel_close_file(c->to);
+            c->to = -1;
+        }
+    }
+    if (c->sent == c->have) {
+        c->have = c->sent = 0;
+        if (!c->reading)
+            channel_end_of_input(c);
+    }
+}
+
+/* The signals the process that carries a command's streams reads itself. */
+static uint64_t relay_signal_mask(void) {
+    return sigmask_from_signal(SIGCHLD) | sigmask_from_signal(LB_SIGWINCH) |
+           sigmask_from_signal(SIGINT) | sigmask_from_signal(SIGTERM) |
+           sigmask_from_signal(SIGHUP) | sigmask_from_signal(SIGQUIT);
+}
+
+/*
+ * Carry the command's streams until the command has ended: its wait status.
+ *
+ * A direction is read only when nothing of it is waiting to be written, and
+ * written only when its descriptor takes something, so neither side can hold
+ * up the other. A signal that asks to end is passed on to the command, and a
+ * change of the window's size to its terminal. When the command has ended,
+ * what it wrote last is still delivered; what something it left behind may
+ * write later is not waited for.
+ */
+static int32_t relay_until_exit(struct exec_streams *st, int32_t command, int32_t signal_fd) {
+    int32_t status = 0;
+    bool ended = false;
+
+    while (!ended) {
+        struct lb_pollfd fds[4];
+        struct channel *of[4];
+        bool writing[4];
+        uint64_t count = 0;
+
+        fds[count] = (struct lb_pollfd){ .fd = signal_fd, .events = LB_POLLIN, .revents = 0 };
+        of[count++] = NULL;
+        for (int i = 0; i < st->nchannels; i++) {
+            struct channel *c = &st->channels[i];
+            if (c->have > c->sent && c->to >= 0) {
+                fds[count] = (struct lb_pollfd){ .fd = c->to, .events = LB_POLLOUT, .revents = 0 };
+                writing[count] = true;
+                of[count++] = c;
+            } else if (c->reading) {
+                fds[count] = (struct lb_pollfd){ .fd = c->from, .events = LB_POLLIN, .revents = 0 };
+                writing[count] = false;
+                of[count++] = c;
+            }
+        }
+
+        lc_sysret ready = lb_sys_ppoll(fds, count, NULL);
+        if (ready < 0 && ready != -LB_EINTR)
+            die("Error: failed to wait on the command's streams");
+        if (ready <= 0)
+            continue;
+
+        if (fds[0].revents & LB_POLLIN) {
+            lc_signal_info si;
+            if (lc_kernel_read_retry(signal_fd, &si, sizeof(si)) == (lc_sysret)sizeof(si)) {
+                if (si.signal == SIGCHLD) {
+                    if (lc_kernel_wait_for_child(command, &status, WNOHANG) == command)
+                        ended = true;
+                } else if (si.signal == LB_SIGWINCH) {
+                    if (st->master >= 0)
+                        copy_window_size(STDIN, st->master);
+                } else {
+                    lc_kernel_send_signal(command, (int32_t)si.signal);
+                }
+            }
+        }
+        for (uint64_t i = 1; i < count; i++) {
+            if (!fds[i].revents)
+                continue;
+            if (writing[i])
+                channel_write(of[i]);
+            else
+                channel_read(of[i]);
+        }
+    }
+
+    /* what the command wrote before it ended */
+    for (int i = 0; i < st->nchannels; i++) {
+        struct channel *c = &st->channels[i];
+        if (c->to != STDOUT && c->to != STDERR)
+            continue;
+        for (int rounds = 0; rounds < 256; rounds++) {
+            if (c->have > c->sent)
+                (void)lc_kernel_write_all(c->to, c->buf + c->sent, c->have - c->sent);
+            c->have = c->sent = 0;
+            lc_sysret n = lc_kernel_read_bytes(c->from, c->buf, sizeof(c->buf));
+            if (n <= 0)
+                break;
+            c->have = (size_t)n;
+        }
+    }
+    return status;
+}
+
+/*
+ * In lightbox, with the command started: carry its streams until it ends.
+ * With a terminal for the command, the caller's terminal is raw for that
+ * time, and gets its modes back at the end; the process that ran exec keeps
+ * them too and puts them back once more, in case this one is killed.
+ */
+static int32_t serve_command(struct exec_streams *st, int32_t command, int32_t signal_fd) {
+    release_command_ends(st);
+
+    struct lb_termios saved, raw;
+    bool restore = st->master >= 0 && lc_kernel_device_control(STDIN, LB_TCGETS, &saved) >= 0;
+    if (restore) {
+        raw = saved;
+        make_raw(&raw);
+        lc_kernel_device_control(STDIN, LB_TCSETS, &raw);
+    }
+
+    int32_t status = relay_until_exit(st, command, signal_fd);
+
+    if (restore)
+        lc_kernel_device_control(STDIN, LB_TCSETS, &saved);
+    return status;
+}
+
+/* Hold back the signals that a command's streams are carried around, and
+ * the two that would otherwise end or stop the carrier at a bad moment: a
+ * descriptor to read the first from, or -1. */
+static int32_t hold_relay_signals(void) {
+    uint64_t read_here = relay_signal_mask();
+    uint64_t blocked = read_here | sigmask_from_signal(LB_SIGPIPE) | sigmask_from_signal(LB_SIGTTOU);
+    if (lc_kernel_set_signal_mask(LC_SIG_BLOCK, &blocked, NULL) < 0)
+        return -1;
+    lc_sysret fd = lc_kernel_create_signal_fd(-1, &read_here, SFD_CLOEXEC);
+    return fd < 0 ? -1 : (int32_t)fd;
+}
+
+/*
+ * In the process that ran exec: wait for the worker, and pass on what asks
+ * it to end. A signal that the terminal sent has reached the worker by
+ * itself, since both are in the terminal's foreground, so only the ones a
+ * process sent are passed on. The worker's wait status.
+ */
+static int32_t attend_worker(int32_t worker, int32_t signal_fd) {
+    int32_t status = 0;
+    for (;;) {
+        struct lb_pollfd one = { .fd = signal_fd, .events = LB_POLLIN, .revents = 0 };
+        lc_sysret ready = lb_sys_ppoll(&one, 1, NULL);
+        if (ready < 0 && ready != -LB_EINTR)
+            die("Error: failed to wait for the exec worker");
+        if (ready <= 0)
+            continue;
+        lc_signal_info si;
+        if (lc_kernel_read_retry(signal_fd, &si, sizeof(si)) != (lc_sysret)sizeof(si))
+            continue;
+        if (si.signal == SIGCHLD) {
+            if (lc_kernel_wait_for_child(worker, &status, WNOHANG) == worker)
+                return status;
+        } else if (si.signal != LB_SIGWINCH && si.code <= 0) {
+            lc_kernel_send_signal(worker, (int32_t)si.signal);
+        }
+    }
+}
+
+/*
+ * The rest of what the process that ran exec does: attend to the worker, put
+ * the terminal's modes back as they were before the worker touched them, and
+ * give the exit status to end with. modes is NULL when stdin is no terminal.
+ */
+static int finish_exec(int32_t worker, int32_t signal_fd, const struct lb_termios *modes) {
+    int32_t status = attend_worker(worker, signal_fd);
+    if (modes) {
+        struct lb_termios back = *modes;
+        lc_kernel_device_control(STDIN, LB_TCSETS, &back);
+    }
+    return exit_code_from_status(status);
+}
+
 /* ─── exec: entering the container ──────────────────────────────────────── */
 
 static int exec_inside_container(const char *name, int target_pid, int userns,
@@ -2269,15 +2651,24 @@ static int exec_inside_container(const char *name, int target_pid, int userns,
     struct identity id;
     resolve_identity(req, "/etc/passwd", "/etc/group", &id);
 
+    /* What the command gets in the place of a terminal of the caller's: made
+     * here, where /dev/pts is the container's. */
+    static struct exec_streams streams;
+    prepare_streams(&streams, "/dev/pts/ptmx", id.uid, id.gid);
+
     require_setns_fd(pidfd, CLONE_NEWPID, "pid");
+
+    /* held back before the fork, so that the command's end is never missed */
+    int32_t signal_fd = hold_relay_signals();
+    if (signal_fd < 0)
+        die("Error: failed to take over the signals of an exec");
 
     lc_sysret child = lc_kernel_fork();
     if (child < 0)
         die("Error: exec helper fork failed");
 
     if (child == 0) {
-        uint64_t empty_mask = 0;
-        lc_kernel_set_signal_mask(LC_SIG_SETMASK, &empty_mask, NULL);
+        take_streams(&streams);
 
         if (!privileged)
             apply_sandbox();
@@ -2285,10 +2676,7 @@ static int exec_inside_container(const char *name, int target_pid, int userns,
         run_command(req, &id);
     }
 
-    int32_t status;
-    if (wait_child((int32_t)child, &status) < 0)
-        die("Error: failed to wait for the command");
-    return status;
+    return serve_command(&streams, (int32_t)child, signal_fd);
 }
 
 /* ─── Starting: the command's side ──────────────────────────────────────── */
@@ -3378,19 +3766,29 @@ static void cmd_exec(int argc, char **argv) {
     if (userns)
         die("Error: exec into userns containers is not supported yet");
 
+    /* The terminal's modes as they are now. The worker makes the terminal
+     * raw while a command has a terminal of its own, and puts the modes back;
+     * this process puts them back as well, because the worker is in the
+     * container's cgroup and ends without a word when the container is
+     * stopped. */
+    struct lb_termios modes;
+    bool restore = lc_kernel_device_control(STDIN, LB_TCGETS, &modes) >= 0;
+
+    int32_t signal_fd = hold_relay_signals();
+    if (signal_fd < 0)
+        die("Error: failed to take over the signals of an exec");
+
     lc_sysret worker = lc_kernel_fork();
     if (worker < 0)
         die("Error: failed to fork exec worker");
 
     if (worker == 0) {
+        lc_kernel_close_file(signal_fd);
         int status = exec_inside_container(name, pid, userns, privileged, &req);
         lc_kernel_exit(exit_code_from_status(status));
     }
 
-    int32_t status;
-    if (wait_child((int32_t)worker, &status) < 0)
-        die("Error: failed to wait for the exec worker");
-    lc_kernel_exit(exit_code_from_status(status));
+    lc_kernel_exit(finish_exec((int32_t)worker, signal_fd, restore ? &modes : NULL));
 }
 
 /* ─── cmd_ls ────────────────────────────────────────────────────────────── */

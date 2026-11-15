@@ -33,6 +33,8 @@
  *                                             whether its own binary can be opened for writing
  *   unit sealed-readonly [words...]           the same from readonly_clone, the way exec takes
  *                                             where an executable memfd is refused
+ *   unit relay <ptmx> -- <command...>         what exec does about a command's standard streams,
+ *                                             without a container: see below
  *   unit nameservers <resolv.conf>            name_servers_of: a line for each, then the count
  *   unit dnslist <text>                       name_servers_listed: the same for the dns setting
  *   unit userspec <text>                      parse_user_spec: "name <n>", "uid <n>",
@@ -73,6 +75,12 @@
  * once it is ready, as in a container; with "-" it keeps the harness's.
  * <grace> is how many seconds init gives its processes when a SIGTERM comes
  * without a number of its own; 10 when it is not given.
+ *
+ * relay runs a command the way exec does once it is in a container: a first
+ * process as the one that ran exec, which keeps the terminal's modes and
+ * attends to a second, the worker, which gives the command a pseudo-terminal
+ * from <ptmx>, or pipes, or its own streams, and carries them until the
+ * command ends. The harness ends with the command's exit status.
  *
  * volumes does to <root> what init does to a container's root filesystem,
  * as far as volumes go: open_volume for each spec, pivot_root into <root>,
@@ -575,6 +583,34 @@ int main(int argc, char **argv, char **envp) {
             unit_probe(argv[i]);
         return 0;
     }
+    if (argc >= 5 && streq(argv[1], "relay") && streq(argv[3], "--")) {
+        struct lb_termios modes;
+        bool restore = lc_kernel_device_control(STDIN, LB_TCGETS, &modes) >= 0;
+        int32_t signal_fd = hold_relay_signals();
+        if (signal_fd < 0)
+            die("unit: cannot hold signals back");
+
+        lc_sysret worker = lc_kernel_fork();
+        if (worker < 0)
+            die("unit: fork failed");
+        if (worker == 0) {
+            lc_kernel_close_file(signal_fd);
+            static struct exec_streams streams;
+            prepare_streams(&streams, argv[2], (int)lc_kernel_getuid(), -1);
+            int32_t worker_signals = hold_relay_signals();
+            lc_sysret command = lc_kernel_fork();
+            if (command < 0 || worker_signals < 0)
+                die("unit: cannot start the command");
+            if (command == 0) {
+                take_streams(&streams);
+                exec_program(argv[4], (const char *const *)(uintptr_t)(argv + 4), (const char *const *)(uintptr_t)envp);
+                die2("unit: cannot execute ", argv[4]);
+            }
+            lc_kernel_exit(exit_code_from_status(serve_command(&streams, (int32_t)command, worker_signals)));
+        }
+
+        return finish_exec((int32_t)worker, signal_fd, restore ? &modes : NULL);
+    }
     if (argc >= 2 && streq(argv[1], "sealed")) {
         run_sealed();
         unit_report_sealed(argc, argv);
@@ -655,5 +691,6 @@ int main(int argc, char **argv, char **envp) {
         "       unit volspec <spec> | unit volumes <root> <spec>... [-- <probe>...]\n"
         "       unit nameservers <resolv.conf> | unit dnslist <text>\n"
         "       unit sealed [words...] | unit sealed-readonly [words...]\n"
+        "       unit relay <ptmx> -- <command...>\n"
         "       unit identity|command <passwd> <group> <exec's options...>");
 }
