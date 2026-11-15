@@ -24,6 +24,14 @@
  *   unit stop    <pid> <seconds>              ask_init_to_stop, then wait as stop does:
  *                                             "asked" or "gone", then "ended" or "still there"
  *   unit pids    <file>                       each_listed_pid: a line for each, then the count
+ *   unit userspec <text>                      parse_user_spec: "name <n>", "uid <n>",
+ *                                             "uid <n> gid <m>" or "invalid"
+ *   unit identity <passwd> <group> <exec's options...>
+ *                                             resolve_identity for those options, from the two
+ *                                             files: "uid <n> gid <m> name <x> home <h> groups ..."
+ *   unit command <passwd> <group> <exec's options and command...>
+ *                                             the same, and then run_command in the harness's
+ *                                             place, without taking the identity on
  *
  * For mount, "-" stands for an argument that is not given, and the flags are
  * names joined by commas: ro, nosuid, nodev, noexec, remount, bind, rec,
@@ -299,7 +307,24 @@ static void unit_init(const char *how, bool confined, int seconds, const char *s
     init_abandon(&link);
 }
 
-int main(int argc, char **argv) {
+static void put_int(int number) {
+    char buf[16];
+    fmt_int(buf, number);
+    put(buf);
+}
+
+/* exec's own parsing and resolving, with the account files where the case
+ * put them instead of in a container. */
+static void unit_request(int argc, char **argv, struct exec_request *req, struct identity *id) {
+    static const char *const shell[] = { "/bin/sh", NULL };
+    int command = parse_exec_options(argc, argv, 4, req);
+    req->argv = command < argc ? (const char *const *)(uintptr_t)(argv + command) : shell;
+    request_term(req);
+    resolve_identity(req, argv[2], argv[3], id);
+}
+
+int main(int argc, char **argv, char **envp) {
+    caller_env = envp;
     if (argc >= 3 && streq(argv[1], "run")) {
         put_result(run_cmd(argv[2], (const char *const *)(argv + 2)));
         return 0;
@@ -392,6 +417,47 @@ int main(int argc, char **argv) {
         put(readable_within((int32_t)pidfd, (int64_t)seconds * 1000 + STOP_MARGIN_MS) ? "ended\n" : "still there\n");
         return 0;
     }
+    if (argc == 3 && streq(argv[1], "userspec")) {
+        struct exec_request req = { .as = AS_ROOT, .gid = -1 };
+        if (!parse_user_spec(argv[2], &req)) {
+            put("invalid\n");
+        } else if (req.as == AS_NAME) {
+            put("name ");
+            put(req.user);
+            put("\n");
+        } else {
+            put("uid ");
+            put_int(req.uid);
+            if (req.gid >= 0) {
+                put(" gid ");
+                put_int(req.gid);
+            }
+            put("\n");
+        }
+        return 0;
+    }
+    if (argc >= 4 && (streq(argv[1], "identity") || streq(argv[1], "command"))) {
+        struct exec_request req = { .as = AS_ROOT, .gid = -1 };
+        static struct identity id;
+        unit_request(argc, argv, &req, &id);
+        if (streq(argv[1], "command"))
+            run_command(&req, &id);
+        put("uid ");
+        put_int(id.uid);
+        put(" gid ");
+        put_int(id.gid);
+        put(" name ");
+        put(id.name[0] ? id.name : "-");
+        put(" home ");
+        put(id.home[0] ? id.home : "-");
+        put(" groups");
+        for (int i = 0; i < id.ngroups; i++) {
+            put(" ");
+            put_int((int)id.groups[i]);
+        }
+        put("\n");
+        return 0;
+    }
     if (argc == 3 && streq(argv[1], "pids")) {
         put_result(each_listed_pid(argv[2], put_pid));
         return 0;
@@ -400,5 +466,6 @@ int main(int argc, char **argv) {
         "       unit mount <source> <target> <fstype> <flags> <data> | unit mkdirs <path> | unit loopback\n"
         "       unit caps | unit sandbox <program> [args...] | unit maskproc | unit noipv6 <pid>\n"
         "       unit seconds <text> | unit streams <file> | unit init <how> confined|open <seconds> <hook script | -> <log file | -> [<grace>]\n"
-        "       unit stop <pid> <seconds> | unit pids <file>");
+        "       unit stop <pid> <seconds> | unit pids <file> | unit userspec <text>\n"
+        "       unit identity|command <passwd> <group> <exec's options...>");
 }

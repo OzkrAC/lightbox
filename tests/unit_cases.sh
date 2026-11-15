@@ -792,6 +792,264 @@ t_handshake_hook_inherits()     { in_handshake_dir h_hook_inherits_nothing; }
 t_handshake_log()               { in_handshake_dir h_output_goes_to_the_log; }
 t_handshake_detached()          { in_handshake_dir h_command_returns_and_init_stays; }
 
+# ─── exec: who a command runs as ────────────────────────────────────────────
+
+t_user_spec() {
+    bad=0
+    expect() { # text, what parse_user_spec makes of it
+        got=$("$UNIT" userspec "$1")
+        [ "$got" = "$2" ] || { echo "--user '$1' -> $got, expected $2"; bad=1; }
+    }
+    expect 0 'uid 0'
+    expect 1000 'uid 1000'
+    expect 1000:50 'uid 1000 gid 50'
+    expect 2147483647 'uid 2147483647'
+    expect lbuser 'name lbuser'
+    expect _svc-1.x 'name _svc-1.x'
+    expect "$(printf 'n%.0s' $(seq 1 255))" "name $(printf 'n%.0s' $(seq 1 255))"
+    # numbers that are not numbers, parts that are missing, names that cannot be
+    for spec in 0x10 1000: :5 1000:x 12abc 1000:50:7 99999999999 2147483648 1000:99999999999 \
+                a:b a/b 'a b' "$(printf 'n%.0s' $(seq 1 256))"; do
+        expect "$spec" invalid
+    done
+    expect '' invalid
+    return $bad
+}
+
+# Account files for a case: sets $P and $G, in a directory of its own.
+accounts() {
+    A=$(mktemp -d "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    P=$A/passwd G=$A/group
+    {
+        echo 'root:x:0:0:root:/root:/bin/sh'
+        echo 'a line that is not an account'
+        echo 'short:x:5'
+        echo 'fourfields:x:4804:4804'
+        # a name and a home directory that are too long to be anyone's
+        printf '%s:x:4802:4802::/home/longname:/bin/sh\n' "$(printf 'n%.0s' $(seq 1 300))"
+        printf 'longhome:x:4803:4803::/%s:/bin/sh\n' "$(printf 'h%.0s' $(seq 1 600))"
+        echo 'badnumber:x:12abc:12:bad:/home/bad:/bin/sh'
+        echo 'lbuser:x:4711:4711:lightbox test:/home/lbuser:/bin/sh'
+        # a comment field far longer than any buffer, then the account after it
+        printf 'wordy:x:4800:4800:%s:/home/wordy:/bin/sh\n' "$(head -c 10000 /dev/zero | tr '\0' c)"
+        echo 'afterwordy:x:4801:4801::/home/afterwordy:/bin/sh'
+        # accounts enough to put the next ones beyond the first reads of the file
+        for i in $(seq 1 300); do echo "filler$i:x:$((10000 + i)):$((10000 + i)):filler account:/home/filler$i:/bin/sh"; done
+        echo 'a-user-whose-name-is-longer-than-twelve:x:4900:4900::/home/long:/bin/sh'
+        echo 'second4711:x:4711:1::/home/second:/bin/sh'
+        printf 'last:x:4999:4999::/home/last'        # no shell, and no newline
+    } > "$P"
+    {
+        echo 'root:x:0:'
+        echo 'lbuser:x:4711:lbuser'
+        echo 'lbgroup:x:4712:lbuser'
+        echo 'others:x:4713:lbuserx,xlbuser,lbuse,root'
+        echo 'again:x:4712:someone,lbuser'
+        printf 'crowd:x:4714:%s,lbuser\n' "$(seq -f 'member%.0f' -s , 1 3000)"
+        echo 'badgid:x:47x:lbuser'
+        printf 'tail:x:4715:root,lbuser'                # no newline
+    } > "$G"
+}
+
+t_accounts_are_found() {
+    accounts || return 1
+    (
+        bad=0
+        expect() { # exec's options, what resolve_identity makes of them
+            local want=$1
+            shift
+            got=$("$UNIT" identity "$P" "$G" "$@" 2>&1)
+            [ "$got" = "$want" ] || { echo "$*: $got"; echo "   expected: $want"; bad=1; }
+        }
+        echo "passwd is $(wc -c < "$P") bytes, group $(wc -c < "$G")"
+        # without --user: root, with what the container says about root
+        expect 'uid 0 gid 0 name root home /root groups 4713 4715'
+        expect 'uid 4711 gid 4711 name lbuser home /home/lbuser groups 4712 4714 4715' --user lbuser
+        expect 'uid 4711 gid 4711 name lbuser home /home/lbuser groups 4712 4714 4715' --user 4711
+        # with another primary group, the user's own group is one of the others it is listed in
+        expect 'uid 4711 gid 9 name lbuser home /home/lbuser groups 4711 4712 4714 4715' --user 4711:9
+        # beyond a line of 10 000 characters, beyond the first reads, and at the very end
+        expect 'uid 4801 gid 4801 name afterwordy home /home/afterwordy groups' --user afterwordy
+        expect 'uid 4900 gid 4900 name a-user-whose-name-is-longer-than-twelve home /home/long groups' --user 4900
+        expect 'uid 4900 gid 4900 name a-user-whose-name-is-longer-than-twelve home /home/long groups' --user a-user-whose-name-is-longer-than-twelve
+        expect 'uid 4999 gid 4999 name last home /home/last groups' --user last
+        # a uid the container has no account for: itself as its group, and no other group
+        expect 'uid 1234 gid 1234 name - home - groups' --user 1234
+        expect 'uid 1234 gid 7 name - home - groups' --user 1234:7
+        # lines that are not accounts are not accounts
+        expect 'uid 12 gid 12 name - home - groups' --user 12
+        expect 'uid 5 gid 5 name - home - groups' --user 5
+        expect 'uid 4804 gid 4804 name - home - groups' --user 4804
+        # nor is a line whose name or home was too long to keep whole
+        expect 'uid 4802 gid 4802 name - home - groups' --user 4802
+        expect 'uid 4803 gid 4803 name - home - groups' --user 4803
+        expect 'Error: user not found in container: longhome' --user longhome
+        expect 'Error: user not found in container: badnumber' --user badnumber
+        expect 'Error: user not found in container: nosuch' --user nosuch
+        exit $bad
+    )
+    rc=$?
+    rm -rf -- "$A"
+    return $rc
+}
+
+# A name that is the beginning of another, or its end, is another name.
+t_group_members_match_whole() {
+    accounts || return 1
+    (
+        printf 'lbuser:x:4711:4711::/h:/s\nlbuse:x:4720:4720::/h:/s\n' > "$P"
+        got=$("$UNIT" identity "$P" "$G" --user lbuse)
+        echo "$got"
+        [ "$got" = 'uid 4720 gid 4720 name lbuse home /h groups 4713' ] || exit 1
+        # more groups than a command can be given is said, not cut
+        for i in $(seq 1 70); do echo "g$i:x:$((5000 + i)):lbuser"; done > "$G"
+        got=$("$UNIT" identity "$P" "$G" --user lbuser 2>&1)
+        echo "$got"
+        case $got in 'Error: the container lists more than 64 groups for user lbuser') ;; *) exit 1 ;; esac
+    )
+    rc=$?
+    rm -rf -- "$A"
+    return $rc
+}
+
+# What the container puts at /etc/passwd is the container's choice. Only a
+# regular file is read: a pipe would never end, a device would never stop.
+t_account_file_must_be_a_file() {
+    accounts || return 1
+    (
+        rm -f "$P" && mkfifo "$P" || exit 77
+        got=$(timeout 5 "$UNIT" identity "$P" "$G" --user 1234 2>&1) || { echo "a pipe for passwd: status $?, $got"; exit 1; }
+        echo "passwd is a pipe: $got"
+        [ "$got" = 'uid 1234 gid 1234 name - home - groups' ] || exit 1
+        # and a pipe that has an account waiting in it is not asked either
+        exec 7<> "$P"
+        printf 'planted:x:1234:0::/:/bin/sh\n' >&7
+        got=$(timeout 5 "$UNIT" identity "$P" "$G" --user 1234 2>&1) || { echo "a pipe with a line in it: status $?, $got"; exit 1; }
+        exec 7>&-
+        echo "passwd is a pipe with an account in it: $got"
+        [ "$got" = 'uid 1234 gid 1234 name - home - groups' ] || exit 1
+        rm -f "$P" && ln -s /dev/zero "$P"
+        got=$(timeout 5 "$UNIT" identity "$P" "$G" 2>&1) || { echo "a link to /dev/zero for passwd: status $?, $got"; exit 1; }
+        echo "passwd is a link to /dev/zero: $got"
+        [ "$got" = 'uid 0 gid 0 name - home - groups' ] || exit 1
+        rm -f "$P"
+        got=$("$UNIT" identity "$P" "$G" --user 7 2>&1)
+        echo "no passwd at all: $got"
+        [ "$got" = 'uid 7 gid 7 name - home - groups' ]
+    )
+    rc=$?
+    rm -rf -- "$A"
+    return $rc
+}
+
+# ─── exec: the command, its arguments and its environment ───────────────────
+
+t_command_environment() {
+    accounts || return 1
+    (
+        run() { env -i "$@"; }          # the harness with exactly this environment
+        got=$(run TERM=vt220 "$UNIT" command "$P" "$G" --user lbuser /usr/bin/env | sort | paste -sd' ' -)
+        echo "as lbuser: $got"
+        [ "$got" = "HOME=/home/lbuser LOGNAME=lbuser PATH=/usr/bin:/bin:/usr/sbin:/sbin TERM=vt220 USER=lbuser" ] || exit 1
+        # a uid without an account has no name to give, and a TERM that is not a plain name is not passed on
+        got=$(run 'TERM=x$(reboot)' "$UNIT" command "$P" "$G" --user 1234 /usr/bin/env | sort | paste -sd' ' -)
+        echo "as 1234: $got"
+        [ "$got" = "HOME=/ PATH=/usr/bin:/bin:/usr/sbin:/sbin TERM=xterm" ] || exit 1
+        got=$(run "$UNIT" command "$P" "$G" /usr/bin/env | sort | paste -sd' ' -)
+        echo "as root: $got"
+        [ "$got" = "HOME=/root LOGNAME=root PATH=/usr/bin:/bin:/usr/sbin:/sbin TERM=xterm USER=root" ] || exit 1
+        # --env adds, replaces what is there, and the later of two wins; nothing else of the caller's gets in
+        got=$(run SECRET=1 "$UNIT" command "$P" "$G" --env A=1 --env HOME=/elsewhere -e A=2 --env B= /usr/bin/env | sort | paste -sd' ' -)
+        echo "with --env: $got"
+        [ "$got" = "A=2 B= HOME=/elsewhere LOGNAME=root PATH=/usr/bin:/bin:/usr/sbin:/sbin TERM=xterm USER=root" ]
+    )
+    rc=$?
+    rm -rf -- "$A"
+    return $rc
+}
+
+t_command_is_found_on_path() {
+    accounts || return 1
+    (
+        cd /
+        # by name, as the README shows it
+        [ "$("$UNIT" command "$P" "$G" echo found)" = found ] || { echo "echo was not found on PATH"; exit 1; }
+        mkdir "$A/bin" "$A/other"
+        printf '#!/bin/sh\necho mine\n' > "$A/bin/tool"
+        chmod 755 "$A/bin/tool"
+        : > "$A/other/tool"                 # there, and not a program
+        [ "$("$UNIT" command "$P" "$G" --env "PATH=/nonexistent:$A/other:$A/bin" tool)" = mine ] || { echo "a later directory of PATH was not tried"; exit 1; }
+        "$UNIT" command "$P" "$G" --env "PATH=$A/other" tool 2>"$A/err"
+        rc=$?
+        echo "not a program: status $rc, $(cat "$A/err")"
+        [ $rc -eq 126 ] || exit 1
+        "$UNIT" command "$P" "$G" no-such-command-anywhere 2>"$A/err"
+        rc=$?
+        echo "not there: status $rc, $(cat "$A/err")"
+        [ $rc -eq 127 ] && grep -q 'command not found: no-such-command-anywhere' "$A/err" || exit 1
+        "$UNIT" command "$P" "$G" /no/such/program 2>"$A/err"
+        rc=$?
+        echo "a path that is not there: status $rc, $(cat "$A/err")"
+        [ $rc -eq 127 ] || exit 1
+        # a name with a slash is a path and is not looked for; an empty entry of PATH is not this directory
+        cd "$A/bin" || exit 1
+        "$UNIT" command "$P" "$G" --env "PATH=:/usr/bin:/bin" tool 2>/dev/null && { echo "the current directory was searched"; exit 1; }
+        [ "$("$UNIT" command "$P" "$G" ./tool)" = mine ]
+    )
+    rc=$?
+    rm -rf -- "$A"
+    return $rc
+}
+
+t_command_gets_every_argument() {
+    accounts || return 1
+    (
+        # shellcheck disable=SC2046
+        got=$("$UNIT" command "$P" "$G" /bin/sh -c 'echo "$# $1 ${537} ${1000}"' sh $(seq 1 1000))
+        echo "1000 arguments in; their number, the first, the 537th and the last: $got"
+        [ "$got" = "1000 1 537 1000" ] || exit 1
+        # after --, a word that looks like an option is the command's
+        got=$("$UNIT" command "$P" "$G" --env X=1 -- echo --user -e)
+        [ "$got" = "--user -e" ] || { echo "after --: $got"; exit 1; }
+        got=$("$UNIT" command "$P" "$G" --workdir /usr /bin/sh -c pwd)
+        [ "$got" = /usr ] || { echo "--workdir /usr: $got"; exit 1; }
+        "$UNIT" command "$P" "$G" --workdir /no/such/directory /bin/true 2>"$A/err"
+        rc=$?
+        echo "a directory that is not there: status $rc, $(cat "$A/err")"
+        [ $rc -eq 126 ]
+    )
+    rc=$?
+    rm -rf -- "$A"
+    return $rc
+}
+
+t_command_options_are_checked() {
+    accounts || return 1
+    (
+        bad=0
+        refuse() { # what the message must say, exec's options...
+            local want=$1
+            shift
+            got=$("$UNIT" command "$P" "$G" "$@" 2>&1) && { echo "$* ran: $got"; bad=1; return; }
+            case $got in *"$want"*) echo "$*: $got" ;; *) echo "$*: $got"; echo "   expected to read: $want"; bad=1 ;; esac
+        }
+        refuse 'option --user requires a value' --user
+        refuse 'option --env requires a value' --env X=1 --env
+        refuse 'option -w requires a value' -w
+        refuse 'unknown option: --bogus' --bogus echo
+        refuse 'goes after --' -n echo
+        refuse '--env takes KEY=VALUE' --env novalue echo
+        refuse '--env takes KEY=VALUE' --env =value echo
+        refuse '--workdir takes an absolute path' --workdir relative echo
+        refuse 'this is none of them: 0x10' --user 0x10 echo
+        refuse 'this is none of them: 1000:' --user 1000: echo
+        exit $bad
+    )
+    rc=$?
+    rm -rf -- "$A"
+    return $rc
+}
+
 # ─── parse_seconds, and the shape of cmd_start ──────────────────────────────
 
 t_seconds() {
@@ -900,6 +1158,15 @@ check 'a SIGTERM without a number uses init'"'"'s own limit'          t_stop_pla
 check 'a stopped process is continued so that it can end'        t_stop_stopped_process
 check 'a process that is not init'"'"'s child is ended and waited for' t_stop_guest
 check 'a list of PIDs is read whole, across reads'               t_pid_list_is_read_whole
+
+check '--user is a name, a uid or uid:gid, and nothing else'     t_user_spec
+check 'accounts are found wherever they are in the file'         t_accounts_are_found
+check 'a group member is a whole name, and too many groups is an error' t_group_members_match_whole
+check 'an account file that is not a regular file is not read'   t_account_file_must_be_a_file
+check 'a command gets a fixed environment, and what --env adds'  t_command_environment
+check 'a command without a slash is looked for on PATH'          t_command_is_found_on_path
+check 'a command gets every argument, its directory, and what follows --' t_command_gets_every_argument
+check 'exec'"'"'s options are checked, and a missing value names its option' t_command_options_are_checked
 
 check 'a number of seconds is digits within the limit'           t_seconds
 check 'a file never gets the number of a closed standard stream' t_standard_streams_are_reserved

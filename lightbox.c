@@ -1362,11 +1362,535 @@ static void require_setns_fd(int fd, int nstype, const char *name) {
         die2("Error: failed to join namespace: ", name);
 }
 
+/* ─── exec: who the command runs as ─────────────────────────────────────── */
+
+#define USER_NAME_MAX     255
+#define MAX_EXEC_GROUPS   64
+#define MAX_EXEC_ENV      64
+/* An account file is read to its end, but not without end. */
+#define ACCOUNT_FILE_MAX  (16u * 1024 * 1024)
+
+enum exec_as { AS_ROOT, AS_NAME, AS_ID };
+
+/* What exec was asked for. */
+struct exec_request {
+    enum exec_as as;
+    const char  *user;                  /* AS_NAME */
+    int          uid, gid;              /* AS_ID; gid is -1 when only a uid was given */
+    const char  *env[MAX_EXEC_ENV];     /* --env, in the order given */
+    int          nenv;
+    const char  *workdir;               /* --workdir, or NULL */
+    const char  *term;                  /* the caller's TERM, or NULL */
+    const char *const *argv;            /* the command, NULL at its end */
+};
+
+/* Who the command runs as, once the container's own files have been asked. */
+struct identity {
+    int      uid, gid;
+    char     name[USER_NAME_MAX + 1];   /* empty: no account has this uid */
+    char     home[MAX_PATH];
+    uint32_t groups[MAX_EXEC_GROUPS];
+    int      ngroups;
+};
+
+/* A uid or a gid as text: digits and nothing else, and a number that a
+ * process can have. "0x10" is not 0, "1000:" has no gid, and eleven nines
+ * are not whatever they wrap around to. */
+static bool parse_id(const char *text, size_t len, int *out) {
+    if (len == 0 || len > 10)
+        return false;
+    int64_t value = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (text[i] < '0' || text[i] > '9')
+            return false;
+        value = value * 10 + (text[i] - '0');
+    }
+    if (value > INT32_MAX)
+        return false;
+    *out = (int)value;
+    return true;
+}
+
+/* --user: uid, uid:gid, or a name. A value that begins with a digit is
+ * numbers and must be nothing but numbers. */
+static bool parse_user_spec(const char *spec, struct exec_request *req) {
+    size_t len = lc_string_length(spec);
+    if (len == 0)
+        return false;
+
+    if (spec[0] >= '0' && spec[0] <= '9') {
+        size_t uid_len = 0;
+        while (uid_len < len && spec[uid_len] != ':')
+            uid_len++;
+        req->gid = -1;
+        if (!parse_id(spec, uid_len, &req->uid))
+            return false;
+        if (uid_len < len && !parse_id(spec + uid_len + 1, len - uid_len - 1, &req->gid))
+            return false;
+        req->as = AS_ID;
+        return true;
+    }
+
+    if (len > USER_NAME_MAX)
+        return false;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)spec[i];
+        if (c <= ' ' || c == 127 || c == ':' || c == '/')
+            return false;
+    }
+    req->as = AS_NAME;
+    req->user = spec;
+    return true;
+}
+
+/* A file read a byte at a time, through a buffer. */
+struct reader {
+    int32_t  fd;
+    size_t   len, pos;
+    uint64_t total;
+    char     buf[4096];
+};
+
+/*
+ * Open one of a container's account files. The container decides what is at
+ * that path, so only a regular file will do: a pipe would never end, and a
+ * device could say anything for ever.
+ */
+static bool reader_open(struct reader *r, const char *path) {
+    lc_sysret fd = lc_kernel_open_file(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC, 0);
+    if (fd < 0)
+        return false;
+    struct lb_statx stx;
+    if (lb_sys_statx((int32_t)fd, "", LB_AT_EMPTY_PATH, LB_STATX_TYPE, &stx) < 0 ||
+        (stx.stx_mode & LB_S_IFMT) != LB_S_IFREG) {
+        lc_kernel_close_file((int32_t)fd);
+        return false;
+    }
+    r->fd = (int32_t)fd;
+    r->len = r->pos = 0;
+    r->total = 0;
+    return true;
+}
+
+/* The next byte, or -1 at the end of the file or of what will be read of it. */
+static int reader_next(struct reader *r) {
+    if (r->pos == r->len) {
+        if (r->total >= ACCOUNT_FILE_MAX)
+            return -1;
+        lc_sysret n = lc_kernel_read_retry(r->fd, r->buf, sizeof(r->buf));
+        if (n <= 0)
+            return -1;
+        r->len = (size_t)n;
+        r->pos = 0;
+        r->total += (uint64_t)n;
+    }
+    return (unsigned char)r->buf[r->pos++];
+}
+
+/* One field of the line being read: kept while it fits, and marked when it
+ * does not, so that a field that was cut is never taken for a shorter one. */
+struct field {
+    char  *buf;
+    size_t size, len;
+    bool   cut;
+};
+
+static void field_add(struct field *f, int c) {
+    if (f->len + 1 < f->size)
+        f->buf[f->len++] = (char)c;
+    else
+        f->cut = true;
+}
+
+struct account {
+    char name[USER_NAME_MAX + 1];
+    int  uid, gid;
+    char home[MAX_PATH];
+};
+
+/*
+ * The first line of a passwd file with this name or, when want_name is NULL,
+ * this uid: name:password:uid:gid:comment:home[:shell]. The file is read to
+ * its end, a line of any length is one line, and a line that is short of a
+ * field, or whose numbers are not numbers, is not an account.
+ */
+static bool find_account(const char *passwd_path, const char *want_name, int want_uid,
+                         struct account *out) {
+    struct reader r;
+    if (!reader_open(&r, passwd_path))
+        return false;
+
+    bool found = false;
+    char uid_text[12], gid_text[12];
+    for (bool more = true; more && !found; ) {
+        struct field name = { out->name, sizeof(out->name), 0, false };
+        struct field uid  = { uid_text, sizeof(uid_text), 0, false };
+        struct field gid  = { gid_text, sizeof(gid_text), 0, false };
+        struct field home = { out->home, sizeof(out->home), 0, false };
+        int index = 0;
+        for (;;) {
+            int c = reader_next(&r);
+            if (c < 0) {
+                more = false;
+                break;
+            }
+            if (c == '\n')
+                break;
+            if (c == ':') {
+                index++;
+                continue;
+            }
+            switch (index) {
+                case 0: field_add(&name, c); break;
+                case 2: field_add(&uid, c); break;
+                case 3: field_add(&gid, c); break;
+                case 5: field_add(&home, c); break;
+                default: break;
+            }
+        }
+        if (index < 5 || name.len == 0 || name.cut || uid.cut || gid.cut || home.cut)
+            continue;
+        out->name[name.len] = '\0';
+        out->home[home.len] = '\0';
+        if (!parse_id(uid_text, uid.len, &out->uid) || !parse_id(gid_text, gid.len, &out->gid))
+            continue;
+        found = want_name ? streq(out->name, want_name) : out->uid == want_uid;
+    }
+    lc_kernel_close_file(r.fd);
+    return found;
+}
+
+/*
+ * The groups a group file lists this user in, other than the primary one:
+ * name:password:gid:member,member,... The members are compared as they are
+ * read, so a group may have any number of them. How many groups, or -1 when
+ * they are more than max.
+ */
+static int find_groups(const char *group_path, const char *user, int primary_gid,
+                       uint32_t *out, int max) {
+    struct reader r;
+    if (!reader_open(&r, group_path))
+        return 0;
+
+    size_t user_len = lc_string_length(user);
+    int count = 0;
+    char gid_text[12];
+    for (bool more = true; more; ) {
+        struct field gid = { gid_text, sizeof(gid_text), 0, false };
+        int index = 0;
+        size_t at = 0;              /* how much of the member being read has matched */
+        bool differs = false, member = false;
+        for (;;) {
+            int c = reader_next(&r);
+            if (c < 0) {
+                more = false;
+                break;
+            }
+            if (c == '\n')
+                break;
+            if (c == ':' && index < 3) {
+                index++;
+                continue;
+            }
+            if (index == 2) {
+                field_add(&gid, c);
+            } else if (index == 3) {
+                if (c == ',') {
+                    if (!differs && at == user_len)
+                        member = true;
+                    at = 0;
+                    differs = false;
+                } else {
+                    if (at >= user_len || user[at] != (char)c)
+                        differs = true;
+                    at++;
+                }
+            }
+        }
+        if (index == 3 && !differs && at == user_len)
+            member = true;          /* the last name on the line */
+
+        int id;
+        if (!member || gid.cut || !parse_id(gid_text, gid.len, &id) || id == primary_gid)
+            continue;
+        bool listed = false;
+        for (int i = 0; i < count; i++) {
+            if (out[i] == (uint32_t)id)
+                listed = true;
+        }
+        if (listed)
+            continue;
+        if (count == max) {
+            count = -1;
+            break;
+        }
+        out[count++] = (uint32_t)id;
+    }
+    lc_kernel_close_file(r.fd);
+    return count;
+}
+
+/*
+ * Who the command runs as: the request, completed from the container's own
+ * passwd and group files. Called with the container's root as this process's
+ * root, so the two paths, and any link in them, stay inside the container.
+ *
+ * The supplementary groups are always decided here: the ones the container
+ * gives the user, and none for a uid it has no account for. What groups the
+ * person who typed the command is in on the host has nothing to do with it.
+ */
+static void resolve_identity(const struct exec_request *req, const char *passwd_path,
+                             const char *group_path, struct identity *id) {
+    struct account account;
+    bool known = false;
+
+    switch (req->as) {
+        case AS_NAME:
+            known = find_account(passwd_path, req->user, 0, &account);
+            if (!known)
+                die2("Error: user not found in container: ", req->user);
+            id->uid = account.uid;
+            id->gid = account.gid;
+            break;
+        case AS_ID:
+            known = find_account(passwd_path, NULL, req->uid, &account);
+            id->uid = req->uid;
+            id->gid = req->gid >= 0 ? req->gid : (known ? account.gid : req->uid);
+            break;
+        case AS_ROOT:
+        default:
+            known = find_account(passwd_path, NULL, 0, &account);
+            id->uid = 0;
+            id->gid = known ? account.gid : 0;
+            break;
+    }
+
+    id->name[0] = '\0';
+    id->home[0] = '\0';
+    id->ngroups = 0;
+    if (known) {
+        str_copy(id->name, account.name, sizeof(id->name));
+        str_copy(id->home, account.home, sizeof(id->home));
+        id->ngroups = find_groups(group_path, id->name, id->gid, id->groups, MAX_EXEC_GROUPS);
+        if (id->ngroups < 0)
+            die2("Error: the container lists more than " STRINGIFY(MAX_EXEC_GROUPS) " groups for user ", id->name);
+    }
+}
+
+/* Take the identity on: the groups first, while there is the right to. */
+static void become(const struct identity *id) {
+    if (lc_kernel_setgroups((size_t)id->ngroups, id->groups) < 0)
+        die("Error: failed to set supplementary groups for exec");
+    if (lc_kernel_setgid(id->gid) < 0)
+        die("Error: failed to setgid for exec");
+    if (lc_kernel_setuid(id->uid) < 0)
+        die("Error: failed to setuid for exec");
+}
+
+/* ─── exec: the command and its environment ─────────────────────────────── */
+
+/* Do two "KEY=VALUE" strings set the same variable? */
+static bool same_variable(const char *a, const char *b) {
+    size_t i = 0;
+    while (a[i] && a[i] != '=' && a[i] == b[i])
+        i++;
+    return a[i] == '=' && b[i] == '=';
+}
+
+[[noreturn]] static void exec_failed(const char *before, const char *what, int exit_code) {
+    print_str(STDERR, "Error: ");
+    print_str(STDERR, before);
+    print_str(STDERR, what);
+    lc_print_char(STDERR, '\n');
+    lc_kernel_exit(exit_code);
+}
+
+/*
+ * Execute a command as a shell would find it: a name with a slash is a path,
+ * and any other is looked for in each directory of PATH. Does not return: on
+ * failure it says why and exits with what a shell exits with, 127 for a
+ * command that is not there and 126 for one that cannot be run.
+ */
+[[noreturn]] static void exec_command(const char *const argv[], const char *const envp[]) {
+    const char *command = argv[0];
+
+    bool is_path = false;
+    for (const char *p = command; *p; p++) {
+        if (*p == '/')
+            is_path = true;
+    }
+    if (is_path) {
+        lc_sysret failed = exec_program(command, argv, envp);
+        exec_failed(failed == -LB_ENOENT || failed == -LB_ENOTDIR ? "no such command: " : "cannot execute: ",
+                    command, failed == -LB_ENOENT || failed == -LB_ENOTDIR ? 127 : 126);
+    }
+
+    const char *path = "";
+    for (int i = 0; envp[i]; i++) {
+        if (same_variable(envp[i], "PATH="))
+            path = envp[i] + 5;
+    }
+
+    bool was_there = false;         /* found somewhere, and not allowed or not a program */
+    size_t command_len = lc_string_length(command);
+    for (const char *dir = path; *dir; ) {
+        size_t dir_len = 0;
+        while (dir[dir_len] && dir[dir_len] != ':')
+            dir_len++;
+
+        char candidate[MAX_PATH];
+        /* an empty entry would mean the directory the command is run from:
+         * not something to look in on a container's behalf */
+        if (dir_len > 0 && dir_len + 1 + command_len < sizeof(candidate)) {
+            lc_bytes_copy(candidate, dir, dir_len);
+            candidate[dir_len] = '/';
+            lc_bytes_copy(candidate + dir_len + 1, command, command_len + 1);
+            lc_sysret failed = exec_program(candidate, argv, envp);
+            if (failed != -LB_ENOENT && failed != -LB_ENOTDIR)
+                was_there = true;
+        }
+
+        dir += dir_len;
+        if (*dir == ':')
+            dir++;
+    }
+    exec_failed(was_there ? "cannot execute: " : "command not found: ", command, was_there ? 126 : 127);
+}
+
+/*
+ * Run the command of a request as the identity that was resolved for it: its
+ * environment, its directory, and the command itself. Does not return.
+ *
+ * The environment is PATH, HOME, TERM, and USER and LOGNAME for a uid that
+ * has a name; --env adds to it and replaces what it names, the later of two
+ * for the same variable winning.
+ */
+[[noreturn]] static void run_command(const struct exec_request *req, const struct identity *id) {
+    char home_env[MAX_PATH + 6] = "HOME=";
+    if (id->home[0])
+        str_append(home_env, 5, id->home, sizeof(home_env));
+    else
+        str_append(home_env, 5, id->uid > 0 ? "/" : "/root", sizeof(home_env));
+
+    char user_env[USER_NAME_MAX + 6] = "USER=";
+    char logname_env[USER_NAME_MAX + 9] = "LOGNAME=";
+    const char *name = id->name[0] ? id->name : (id->uid == 0 ? "root" : "");
+    str_append(user_env, 5, name, sizeof(user_env));
+    str_append(logname_env, 8, name, sizeof(logname_env));
+
+    char term_env[80] = "TERM=";
+    str_append(term_env, 5, req->term ? req->term : "xterm", sizeof(term_env));
+
+    const char *base[5];
+    int nbase = 0;
+    base[nbase++] = "PATH=/usr/bin:/bin:/usr/sbin:/sbin";
+    base[nbase++] = home_env;
+    base[nbase++] = term_env;
+    if (name[0]) {
+        base[nbase++] = user_env;
+        base[nbase++] = logname_env;
+    }
+
+    const char *envp[5 + MAX_EXEC_ENV + 1];
+    int n = 0;
+    for (int i = 0; i < nbase; i++) {
+        bool replaced = false;
+        for (int j = 0; j < req->nenv; j++) {
+            if (same_variable(base[i], req->env[j]))
+                replaced = true;
+        }
+        if (!replaced)
+            envp[n++] = base[i];
+    }
+    for (int i = 0; i < req->nenv; i++) {
+        bool replaced = false;
+        for (int j = i + 1; j < req->nenv; j++) {
+            if (same_variable(req->env[i], req->env[j]))
+                replaced = true;
+        }
+        if (!replaced)
+            envp[n++] = req->env[i];
+    }
+    envp[n] = NULL;
+
+    if (req->workdir && lc_kernel_chdir(req->workdir) < 0)
+        exec_failed("cannot change to directory: ", req->workdir, 126);
+
+    exec_command(req->argv, envp);
+}
+
+/*
+ * exec's options, from argv[first] to where the command begins. Returns the
+ * index of the command's first word, which is argc when there is none. Ends
+ * the process on an option it does not know, a value that is missing, or one
+ * that is malformed.
+ */
+static int parse_exec_options(int argc, char **argv, int first, struct exec_request *req) {
+    int i = first;
+    for (; i < argc; i++) {
+        const char *arg = argv[i];
+        if (streq(arg, "--"))
+            return i + 1;
+        if (arg[0] != '-')
+            break;
+
+        bool user = streq(arg, "--user") || streq(arg, "-u");
+        bool env = streq(arg, "--env") || streq(arg, "-e");
+        bool workdir = streq(arg, "--workdir") || streq(arg, "-w");
+        if (!user && !env && !workdir) {
+            print_str(STDERR, "Error: unknown option: ");
+            print_str(STDERR, arg);
+            print_str(STDERR, "\nA command that begins with a dash goes after --.\n");
+            lc_kernel_exit(1);
+        }
+        if (i + 1 >= argc) {
+            print_str(STDERR, "Error: option ");
+            print_str(STDERR, arg);
+            print_str(STDERR, " requires a value\n");
+            lc_kernel_exit(1);
+        }
+        const char *value = argv[++i];
+
+        if (user) {
+            if (!parse_user_spec(value, req))
+                die2("Error: --user takes a name, a uid or uid:gid, and this is none of them: ", value);
+        } else if (env) {
+            size_t eq = 0;
+            while (value[eq] && value[eq] != '=')
+                eq++;
+            if (eq == 0 || value[eq] != '=')
+                die2("Error: --env takes KEY=VALUE: ", value);
+            if (req->nenv == MAX_EXEC_ENV)
+                die("Error: more than " STRINGIFY(MAX_EXEC_ENV) " --env options");
+            req->env[req->nenv++] = value;
+        } else {
+            if (value[0] != '/')
+                die2("Error: --workdir takes an absolute path: ", value);
+            req->workdir = value;
+        }
+    }
+    return i;
+}
+
+/* A TERM worth passing into a container: a short name of ordinary characters. */
+static bool term_is_plain(const char *term) {
+    size_t len = lc_string_length(term);
+    if (len == 0 || len > 64)
+        return false;
+    for (size_t i = 0; i < len; i++) {
+        char c = term[i];
+        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                  c == '-' || c == '_' || c == '.' || c == '+';
+        if (!ok)
+            return false;
+    }
+    return true;
+}
+
+/* ─── exec: entering the container ──────────────────────────────────────── */
+
 static int exec_inside_container(const char *name, int target_pid, int userns,
-                                 int privileged, int uid, int gid,
-                                 const char *home, const char *user_name,
-                                 int ngroups, const uint32_t *groups,
-                                 const char *const cmd_argv[]) {
+                                 int privileged, const struct exec_request *req) {
     int rootfd = open_target_path(target_pid, "/root");
     if (rootfd < 0)
         die("Error: failed to open target root");
@@ -1404,6 +1928,11 @@ static int exec_inside_container(const char *name, int target_pid, int userns,
     if (lc_kernel_chdir("/") < 0)
         die("Error: failed to chdir to container root");
 
+    /* The container's root is this process's root now: its account files
+     * are read here, where no path in them leads out of the container. */
+    struct identity id;
+    resolve_identity(req, "/etc/passwd", "/etc/group", &id);
+
     require_setns_fd(pidfd, CLONE_NEWPID, "pid");
 
     lc_sysret child = lc_kernel_fork();
@@ -1416,48 +1945,8 @@ static int exec_inside_container(const char *name, int target_pid, int userns,
 
         if (!privileged)
             apply_sandbox();
-
-        if (ngroups >= 0) {
-            if (lc_kernel_setgroups((size_t)ngroups, groups) < 0)
-                die("Error: failed to set supplementary groups for exec");
-        }
-        if (gid >= 0) {
-            if (lc_kernel_setgid(gid) < 0)
-                die("Error: failed to setgid for exec");
-        }
-        if (uid >= 0) {
-            if (lc_kernel_setuid(uid) < 0)
-                die("Error: failed to setuid for exec");
-        }
-
-        char home_env[MAX_PATH + 6] = "HOME=";
-        if (home && home[0])
-            str_append(home_env, 5, home, sizeof(home_env));
-        else if (uid > 0)
-            str_append(home_env, 5, "/", sizeof(home_env));
-        else
-            str_append(home_env, 5, "/root", sizeof(home_env));
-
-        char user_env[NAME_MAX_LEN + 6] = "USER=";
-        char logname_env[NAME_MAX_LEN + 9] = "LOGNAME=";
-        if (user_name && user_name[0]) {
-            str_append(user_env, 5, user_name, sizeof(user_env));
-            str_append(logname_env, 8, user_name, sizeof(logname_env));
-        } else if (uid == 0) {
-            str_append(user_env, 5, "root", sizeof(user_env));
-            str_append(logname_env, 8, "root", sizeof(logname_env));
-        }
-
-        const char *envp[6];
-        int ei = 0;
-        envp[ei++] = "PATH=/usr/bin:/bin:/usr/sbin:/sbin";
-        envp[ei++] = home_env;
-        envp[ei++] = "TERM=xterm";
-        if (user_env[5]) envp[ei++] = user_env;
-        if (logname_env[8]) envp[ei++] = logname_env;
-        envp[ei] = NULL;
-        exec_program(cmd_argv[0], cmd_argv, envp);
-        die2("Error: failed to exec command: ", cmd_argv[0]);
+        become(&id);
+        run_command(req, &id);
     }
 
     int32_t status;
@@ -2459,248 +2948,30 @@ static void cmd_rm(int argc, char **argv) {
 
 /* ─── cmd_exec ──────────────────────────────────────────────────────────── */
 
-/* Resolve a username from the container's /etc/passwd.
- * Returns 0 on success, -1 if user not found. */
-static int resolve_passwd_user(const char *name, const char *username,
-                               int *out_uid, int *out_gid,
-                               char *out_home, size_t home_sz) {
-    char root[MAX_PATH];
-    container_root(root, name);
+/* The environment of whoever ran lightbox, for the one thing exec takes from
+ * it: the kind of terminal. */
+static char **caller_env;
 
-    char passwd_path[MAX_PATH];
-    path_join(passwd_path, sizeof(passwd_path), root, "etc/passwd");
-
-    char buf[4096];
-    if (read_file(passwd_path, buf, sizeof(buf)) < 0)
-        return -1;
-
-    size_t ulen = lc_string_length(username);
-
-    /* scan line by line: user:x:uid:gid:gecos:home:shell */
-    char *p = buf;
-    while (*p) {
-        char *line = p;
-        /* find end of line */
-        while (*p && *p != '\n') p++;
-        if (*p == '\n') *p++ = '\0';
-
-        /* match username before first colon */
-        char *c1 = NULL;
-        for (char *q = line; *q; q++) {
-            if (*q == ':') { c1 = q; break; }
-        }
-        if (!c1) continue;
-        if ((size_t)(c1 - line) != ulen) continue;
-
-        bool match = true;
-        for (size_t i = 0; i < ulen; i++) {
-            if (line[i] != username[i]) { match = false; break; }
-        }
-        if (!match) continue;
-
-        /* skip password field (field 2) */
-        char *f = c1 + 1;
-        char *c2 = NULL;
-        for (char *q = f; *q; q++) {
-            if (*q == ':') { c2 = q; break; }
-        }
-        if (!c2) continue;
-
-        /* uid field (field 3) */
-        f = c2 + 1;
-        char *c3 = NULL;
-        for (char *q = f; *q; q++) {
-            if (*q == ':') { c3 = q; break; }
-        }
-        if (!c3) continue;
-        *c3 = '\0';
-        *out_uid = parse_int(f);
-
-        /* gid field (field 4) */
-        f = c3 + 1;
-        char *c4 = NULL;
-        for (char *q = f; *q; q++) {
-            if (*q == ':') { c4 = q; break; }
-        }
-        if (!c4) continue;
-        *c4 = '\0';
-        *out_gid = parse_int(f);
-
-        /* skip gecos (field 5) */
-        f = c4 + 1;
-        char *c5 = NULL;
-        for (char *q = f; *q; q++) {
-            if (*q == ':') { c5 = q; break; }
-        }
-        if (!c5) continue;
-
-        /* home field (field 6) */
-        f = c5 + 1;
-        char *c6 = NULL;
-        for (char *q = f; *q; q++) {
-            if (*q == ':') { c6 = q; break; }
-        }
-        if (c6) *c6 = '\0';
-        str_copy(out_home, f, home_sz);
-
-        return 0;
-    }
-    return -1;
-}
-
-/* Resolve an account by numeric UID from the container's /etc/passwd.
- * Returns 0 on success, -1 if user not found. */
-static int resolve_passwd_uid(const char *name, int uid,
-                              char *out_user, size_t user_sz,
-                              int *out_gid,
-                              char *out_home, size_t home_sz) {
-    char root[MAX_PATH];
-    container_root(root, name);
-
-    char passwd_path[MAX_PATH];
-    path_join(passwd_path, sizeof(passwd_path), root, "etc/passwd");
-
-    char buf[4096];
-    if (read_file(passwd_path, buf, sizeof(buf)) < 0)
-        return -1;
-
-    char *p = buf;
-    while (*p) {
-        char *line = p;
-        while (*p && *p != '\n') p++;
-        if (*p == '\n') *p++ = '\0';
-
-        char *c1 = NULL;
-        for (char *q = line; *q; q++) {
-            if (*q == ':') { c1 = q; break; }
-        }
-        if (!c1) continue;
-        *c1 = '\0';
-
-        char *f = c1 + 1;
-        char *c2 = NULL;
-        for (char *q = f; *q; q++) {
-            if (*q == ':') { c2 = q; break; }
-        }
-        if (!c2) continue;
-
-        f = c2 + 1;
-        char *c3 = NULL;
-        for (char *q = f; *q; q++) {
-            if (*q == ':') { c3 = q; break; }
-        }
-        if (!c3) continue;
-        *c3 = '\0';
-        if (parse_int(f) != uid)
-            continue;
-
-        f = c3 + 1;
-        char *c4 = NULL;
-        for (char *q = f; *q; q++) {
-            if (*q == ':') { c4 = q; break; }
-        }
-        if (!c4) continue;
-        *c4 = '\0';
-        *out_gid = parse_int(f);
-
-        f = c4 + 1;
-        char *c5 = NULL;
-        for (char *q = f; *q; q++) {
-            if (*q == ':') { c5 = q; break; }
-        }
-        if (!c5) continue;
-
-        f = c5 + 1;
-        char *c6 = NULL;
-        for (char *q = f; *q; q++) {
-            if (*q == ':') { c6 = q; break; }
-        }
-        if (c6) *c6 = '\0';
-
-        str_copy(out_user, line, user_sz);
-        str_copy(out_home, f, home_sz);
-        return 0;
-    }
-
-    return -1;
-}
-
-static int resolve_group_memberships(const char *name, const char *username,
-                                     int primary_gid, uint32_t *out_groups,
-                                     int max_groups) {
-    char root[MAX_PATH];
-    container_root(root, name);
-
-    char group_path[MAX_PATH];
-    path_join(group_path, sizeof(group_path), root, "etc/group");
-
-    char buf[4096];
-    if (read_file(group_path, buf, sizeof(buf)) < 0)
-        return 0;
-
-    size_t ulen = lc_string_length(username);
-    int count = 0;
-    char *p = buf;
-    while (*p) {
-        char *line = p;
-        while (*p && *p != '\n') p++;
-        if (*p == '\n') *p++ = '\0';
-        if (!line[0]) continue;
-
-        char *c1 = NULL, *c2 = NULL, *c3 = NULL;
-        for (char *q = line; *q; q++) {
-            if (*q == ':') {
-                if (!c1) c1 = q;
-                else if (!c2) c2 = q;
-                else { c3 = q; break; }
-            }
-        }
-        if (!c1 || !c2 || !c3) continue;
-
-        char *gid_field = c2 + 1;
-        *c3 = '\0';
-        int gid = parse_int(gid_field);
-        if (gid == primary_gid)
-            continue;
-
-        char *members = c3 + 1;
-        bool member = false;
-        while (*members) {
-            char *entry = members;
-            while (*members && *members != ',') members++;
-            char saved = *members;
-            *members = '\0';
-
-            size_t len = lc_string_length(entry);
-            if (len == ulen) {
-                member = true;
-                for (size_t i = 0; i < ulen; i++) {
-                    if (entry[i] != username[i]) {
-                        member = false;
-                        break;
-                    }
-                }
-                if (member) break;
-            }
-
-            *members = saved;
-            if (saved == ',') members++;
-        }
-
-        if (member) {
-            if (count >= max_groups)
-                die("Error: too many supplementary groups for exec user");
-            out_groups[count++] = (uint32_t)gid;
-        }
-    }
-
-    return count;
+/* The caller's TERM goes with the command, when it is a plain name. */
+static void request_term(struct exec_request *req) {
+    const char *term = env_get(caller_env, "TERM");
+    if (term && term_is_plain(term))
+        req->term = term;
 }
 
 static void cmd_exec(int argc, char **argv) {
-    if (argc < 1) die("Usage: lightbox exec <name> [--user <uid[:gid]>] [cmd...]");
+    if (argc < 1)
+        die("Usage: lightbox exec <name> [--user <name|uid[:gid]>] [--env KEY=VALUE]... [--workdir <dir>] [--] [cmd [args...]]");
     const char *name = argv[0];
     validate_name(name);
+
+    static const char *const shell[] = { "/bin/sh", NULL };
+    struct exec_request req = { .as = AS_ROOT, .gid = -1 };
+    int command = parse_exec_options(argc, argv, 1, &req);
+    /* the kernel ends argv with a NULL, so the command's words are passed on
+     * as they are, however many */
+    req.argv = command < argc ? (const char *const *)(uintptr_t)(argv + command) : shell;
+    request_term(&req);
 
     if (!is_running(name)) die2("Error: container is not running: ", name);
 
@@ -2711,87 +2982,12 @@ static void cmd_exec(int argc, char **argv) {
     if (userns)
         die("Error: exec into userns containers is not supported yet");
 
-    /* parse exec options */
-    int uid = -1;
-    int gid = -1;
-    char home[MAX_PATH] = {0};
-    char user_name[NAME_MAX_LEN + 1] = {0};
-    uint32_t groups[32];
-    int ngroups = -1;
-    int cmd_start = 1;
-
-    for (int i = 1; i < argc; i++) {
-        if (streq(argv[i], "--user") && i + 1 < argc) {
-            const char *spec = argv[++i];
-
-            /* check if spec starts with a digit — numeric uid[:gid] */
-            bool numeric = (spec[0] >= '0' && spec[0] <= '9');
-
-            if (numeric) {
-                const char *colon = NULL;
-                bool explicit_gid = false;
-                for (const char *p = spec; *p; p++) {
-                    if (*p == ':') { colon = p; break; }
-                }
-                if (colon) {
-                    explicit_gid = true;
-                    char uid_buf[16];
-                    size_t uid_len = (size_t)(colon - spec);
-                    if (uid_len == 0 || uid_len >= sizeof(uid_buf))
-                        die("Error: invalid uid in --user");
-                    for (size_t j = 0; j < uid_len; j++)
-                        uid_buf[j] = spec[j];
-                    uid_buf[uid_len] = '\0';
-                    uid = parse_int(uid_buf);
-                    gid = parse_int(colon + 1);
-                } else {
-                    uid = parse_int(spec);
-                    gid = uid;
-                }
-                if (uid < 0) die("Error: invalid uid in --user");
-                if (gid < 0) die("Error: invalid gid in --user");
-
-                int passwd_gid = gid;
-                if (resolve_passwd_uid(name, uid, user_name, sizeof(user_name), &passwd_gid,
-                                       home, sizeof(home)) == 0) {
-                    int primary_gid = explicit_gid ? gid : passwd_gid;
-                    if (!explicit_gid)
-                        gid = passwd_gid;
-                    ngroups = resolve_group_memberships(name, user_name, primary_gid, groups,
-                                                        (int)(sizeof(groups) / sizeof(groups[0])));
-                }
-            } else {
-                /* resolve username from container's /etc/passwd */
-                if (resolve_passwd_user(name, spec, &uid, &gid, home, sizeof(home)) < 0)
-                    die2("Error: user not found in container: ", spec);
-                str_copy(user_name, spec, sizeof(user_name));
-                ngroups = resolve_group_memberships(name, spec, gid, groups, (int)(sizeof(groups) / sizeof(groups[0])));
-            }
-            cmd_start = i + 1;
-        } else {
-            cmd_start = i;
-            break;
-        }
-    }
-
-    const char *cmd_argv[32];
-    int ai = 0;
-    if (cmd_start < argc) {
-        for (int i = cmd_start; i < argc && ai < 31; i++)
-            cmd_argv[ai++] = argv[i];
-    } else {
-        cmd_argv[ai++] = "/bin/sh";
-    }
-    cmd_argv[ai] = NULL;
-
     lc_sysret worker = lc_kernel_fork();
     if (worker < 0)
         die("Error: failed to fork exec worker");
 
     if (worker == 0) {
-        int status = exec_inside_container(name, pid, userns, privileged,
-                                           uid, gid, home, user_name,
-                                           ngroups, groups, cmd_argv);
+        int status = exec_inside_container(name, pid, userns, privileged, &req);
         lc_kernel_exit(exit_code_from_status(status));
     }
 
@@ -2828,8 +3024,10 @@ static void cmd_exec(int argc, char **argv) {
         "         -t <seconds>            How long its processes get to end (default: 10)\n"
         "  add-vol <name> <src:dst[:ro]> Add a volume to an existing container\n"
         "  rm     <name>                 Remove a container (must be stopped)\n"
-        "  exec   <name> [options] [cmd...]  Execute a command in a running container\n"
-        "         --user <name|uid[:gid]> Run as specified user/group (default: root)\n"
+        "  exec   <name> [options] [--] [cmd [args...]]  Run a command in a running container\n"
+        "         --user <name|uid[:gid]> Who to run it as (default: root)\n"
+        "         --env <KEY=VALUE>       Set a variable in its environment (repeatable)\n"
+        "         --workdir <dir>         The directory to run it in (default: /)\n"
         "  logs   <name> [-f]            Show what the container has printed; -f follows it\n"
         "  inspect <name>                Show container metadata and runtime state\n"
         "  doctor                        Show host/runtime dependency status\n"
@@ -2861,6 +3059,7 @@ static void reserve_standard_streams(void) {
 
 int main(int argc, char **argv, char **envp) {
     reserve_standard_streams();
+    caller_env = envp;
     if (argc < 2) usage();
 
     /* load configuration: built-in defaults → lightbox.conf → env vars */

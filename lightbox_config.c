@@ -2,7 +2,7 @@
 
 #define CONF_BUF_SIZE 2048
 
-static const char *env_get(char **envp, const char *name) {
+const char *env_get(char **envp, const char *name) {
     if (!envp) return NULL;
     size_t nlen = lc_string_length(name);
     for (int i = 0; envp[i]; i++) {

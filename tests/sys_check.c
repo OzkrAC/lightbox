@@ -29,6 +29,7 @@
 #include <asm/unistd.h>
 #include <linux/audit.h>
 #include <linux/capability.h>
+#include <linux/fcntl.h>
 #include <linux/filter.h>
 #include <linux/magic.h>
 #include <linux/mount.h>
@@ -65,6 +66,10 @@ SAME_VALUE(LB_ENOENT, ENOENT);
 SAME_VALUE(LB_ESRCH, ESRCH);
 SAME_VALUE(LB_EINTR, EINTR);
 SAME_VALUE(LB_EEXIST, EEXIST);
+SAME_VALUE(LB_EACCES, EACCES);
+SAME_VALUE(LB_ENOTDIR, ENOTDIR);
+SAME_VALUE(LB_S_IFREG, S_IFREG);
+SAME_VALUE(LB_AT_EMPTY_PATH, AT_EMPTY_PATH);
 SAME_VALUE(LB_EBUSY, EBUSY);
 SAME_VALUE(LB_SIGPIPE, SIGPIPE);
 SAME_VALUE(LB_SIGCONT, SIGCONT);

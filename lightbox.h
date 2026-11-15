@@ -80,6 +80,8 @@ int write_file_atomic(const char *path, const char *data, int32_t mode);
 /* For lightbox's own records: always MODE_PRIVATE_FILE. */
 void require_write_file_atomic(const char *path, const char *data);
 void cfg_global_init(void);
+/* the value of a variable in an environment, or NULL */
+const char *env_get(char **envp, const char *name);
 void cfg_global_load(char **envp);
 
 int read_file(const char *path, char *buf, size_t bufsz);

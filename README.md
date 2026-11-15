@@ -151,6 +151,9 @@ This creates:
 ./lightbox create api 10.0.0.10 --link db
 ./lightbox create db  10.0.0.11
 
+# Run a command as one of the container's users, with a variable set, in a directory
+./lightbox exec app --user www-data --env MODE=debug --workdir /var/www -- ls -la
+
 # Add a volume to an existing container configuration
 ./lightbox add-vol app /srv/config/app.conf:/etc/app.conf:ro
 # Restart if the container is already running
@@ -232,7 +235,7 @@ lightbox <command> [args]
   stop   <name> [-t <seconds>]  Stop a running container
   add-vol <name> <src>:<dst>[:ro]  Add a volume to an existing container
   rm     <name>                 Remove a container
-  exec   <name> [cmd...]        Run a command in a container
+  exec   <name> [options] [--] [cmd [args...]]   Run a command in a container
   logs   <name> [-f]            Show what a container has printed; -f follows it
   ls                            List all containers
 ```
@@ -252,6 +255,18 @@ lightbox <command> [args]
 | `--privileged` | off | Disable security sandbox |
 | `--oom-score <n>` | `500` | OOM score adjustment |
 | `--link <name>` | — | Allow network to another container (repeatable) |
+
+### Exec options
+
+Options come before the command. A command that begins with a dash goes after `--`; without a command, `exec` runs `/bin/sh`.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--user <name\|uid[:gid]>`, `-u` | root | Who the command runs as. A name is looked up in the container's `/etc/passwd`. A value that begins with a digit must be a uid, or a uid and a gid, and nothing else |
+| `--env <KEY=VALUE>`, `-e` | — | Set a variable in the command's environment (repeatable; the later of two for one variable wins) |
+| `--workdir <dir>`, `-w` | `/` | The directory the command runs in, as an absolute path in the container |
+
+The command is found as a shell finds it: a name without a slash is looked for in the directories of `PATH`. Its environment is `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, `HOME`, `USER` and `LOGNAME` for its user, and the `TERM` of the terminal `exec` was typed on; nothing else of your environment goes into the container. Its groups are the ones the container's `/etc/group` lists for its user, and none for a uid the container has no account for. `exec` exits with the command's status, with 127 when the command is not there and 126 when it cannot be run.
 
 ## Security
 

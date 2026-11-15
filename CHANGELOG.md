@@ -2,6 +2,31 @@
 
 What changed for someone who uses lightbox, newest first. `ROADMAP.md` has the reasons and the finding each change closes.
 
+## 0.4.0
+
+Not tagged yet, and not complete: the part of Phase 4 that is written so far, which is who `exec` runs a command as and how it finds it.
+
+### Changes you may have to act on
+
+- **`exec`'s options come before the command, and one it does not know is an error.** Anything that was not `--user` used to be taken as the start of the command. A command that begins with a dash now goes after `--`.
+- **A `--user` value that begins with a digit must be numbers.** `--user 0x10` ran as uid 0, `--user 1000:` as gid 0, and `--user 12abc` as uid 12; a uid too large to be one wrapped around. All of these are refused.
+- **A command no longer has the groups of whoever ran `exec`.** Its supplementary groups are the ones the container's `/etc/group` lists for its user, and none for a uid without an account. Before, a uid without an account, and root when `--user` was not given, kept the caller's groups.
+- **`exec` exits with 127 for a command that is not there, and 126 for one that cannot be run.** Both were 1.
+
+### Fixed
+
+- `lightbox exec x cat /etc/os-release`, as the README shows it, failed: a command without a slash was not looked for in `PATH`.
+- A command got its first 31 arguments, and the rest were dropped without a word.
+- A user defined beyond the first 4 KB of the container's `/etc/passwd` was not found, and neither was a group beyond the first 4 KB of `/etc/group`.
+- `USER` and `LOGNAME` were cut to 12 characters.
+- `exec` read the container's `/etc/passwd` and `/etc/group` through their path on the host, where a link in the container's files leads wherever it says. They are read inside the container now, and only if they are regular files.
+- `exec x --user`, with the value missing, ran `--user` as a command.
+
+### Added
+
+- `exec --env KEY=VALUE`, `exec --workdir <dir>`, `--` to end the options, and `-u`, `-e` and `-w` for short.
+- The command gets the `TERM` of the terminal `exec` was typed on.
+
 ## 0.3.0
 
 Not tagged yet. Phase 3 of the roadmap: how a container starts, where its output goes, and how it stops.

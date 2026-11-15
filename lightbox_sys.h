@@ -59,8 +59,10 @@
 #define LB_ENOENT                 2
 #define LB_ESRCH                  3
 #define LB_EINTR                  4
+#define LB_EACCES                 13
 #define LB_EBUSY                  16
 #define LB_EEXIST                 17
+#define LB_ENOTDIR                20
 
 /* The signals lightbox names that lightc does not (asm/signal.h) */
 #define LB_SIGPIPE                13
@@ -77,6 +79,10 @@
 
 #define LB_S_IFMT                 0170000
 #define LB_S_IFDIR                0040000
+#define LB_S_IFREG                0100000
+
+/* statx of the file a descriptor is open on, given an empty path (linux/fcntl.h) */
+#define LB_AT_EMPTY_PATH          0x1000
 
 #define LB_STATX_TYPE             0x00000001U
 #define LB_STATX_MODE             0x00000002U

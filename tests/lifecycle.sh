@@ -395,40 +395,87 @@ lbuser" ] || return 1
     done
 }
 
-# A uid with no passwd entry: its groups are its own, whatever groups the
-# person running lightbox is in.
+# The groups of a command are what the container's files give its user, and
+# none for a uid the container has no account for. The groups of whoever runs
+# lightbox are not among them, with --user or without.
 t_exec_unknown_uid_drops_groups() {
     command -v setpriv >/dev/null 2>&1 || { echo "no setpriv to put the caller in a group with"; return 77; }
     up nogroups || return 1
     said=$(setpriv --groups 4242 timeout -k 5 60 "$LB" exec nogroups --user 1234 /bin/sh -c 'id -G' </dev/null) || return 1
     echo "groups of uid 1234 in the container: $said (the caller was in group 4242)"
-    [ "$said" = 1234 ]
+    [ "$said" = 1234 ] || return 1
+    said=$(setpriv --groups 4242 timeout -k 5 60 "$LB" exec nogroups /bin/sh -c 'id -u; id -G' </dev/null | tr '\n' ' ') || return 1
+    echo "uid and groups without --user: $said"
+    [ "$said" = "0 0 " ]
 }
 
 t_exec_user_is_strict() {
     up strict || return 1
     bad=0
-    for spec in 0x10 1000: 12abc; do
+    for spec in 0x10 1000: 12abc 99999999999 :5; do
         if said=$(lb exec strict --user "$spec" /bin/sh -c 'echo "$(id -u):$(id -g)"' </dev/null 2>&1); then
             echo "--user $spec was accepted and ran as $said"
             bad=1
         fi
     done
+    said=$(lb exec strict --user 2>&1 </dev/null) && { echo "--user without a value was accepted"; bad=1; }
+    printf '%s\n' "$said"
+    case $said in *'option --user requires a value'*) ;; *) echo "a missing value is not named"; bad=1 ;; esac
     [ $bad -eq 0 ]
+}
+
+# An account is found wherever it is in the container's passwd, and is the
+# container's: the file is read inside it, to its end.
+t_exec_finds_a_late_account() {
+    up late || return 1
+    {
+        for i in $(seq 1 200); do echo "filler$i:x:$((20000 + i)):$((20000 + i)):an account to fill the file:/home/filler$i:/bin/sh"; done
+        echo 'a-late-user-with-a-long-name:x:4800:4800::/home/late:/bin/sh'
+    } >> "$C/late/rootfs/etc/passwd"
+    echo 'lategroup:x:4801:a-late-user-with-a-long-name' >> "$C/late/rootfs/etc/group"
+    echo "the container's passwd is $(wc -c < "$C/late/rootfs/etc/passwd") bytes"
+    said=$(lb exec late --user a-late-user-with-a-long-name /bin/sh -c 'id -u; id -G; echo "$USER $HOME"' </dev/null | tr '\n' ' ')
+    echo "by name: $said"
+    [ "$said" = "4800 4800 4801 a-late-user-with-a-long-name /home/late " ] || return 1
+    said=$(lb exec late --user 4800 /bin/sh -c 'echo "$USER"' </dev/null)
+    [ "$said" = a-late-user-with-a-long-name ]
 }
 
 t_exec_searches_path() {
     up path || return 1
     said=$(lb exec path echo found </dev/null)
-    [ "$said" = found ]
+    [ "$said" = found ] || return 1
+    # with an argument, as the README shows it
+    echo from a file > "$C/path/rootfs/etc/a-file"
+    [ "$(lb exec path cat /etc/a-file </dev/null)" = "from a file" ] || return 1
+    lb exec path no-such-command </dev/null 2>"$OUT/path.err"
+    rc=$?
+    echo "a command that is not there: status $rc, $(cat "$OUT/path.err")"
+    [ $rc -eq 127 ] && grep -q 'command not found: no-such-command' "$OUT/path.err"
 }
 
 t_exec_passes_every_argument() {
     up argv || return 1
-    words=$(seq 1 40 | tr '\n' ' ')
+    words=$(seq 1 100 | tr '\n' ' ')
+    # shellcheck disable=SC2086
     said=$(lb exec argv /bin/echo $words </dev/null)
-    echo "40 arguments in, $(printf '%s' "$said" | wc -w) out"
+    echo "100 arguments in, $(printf '%s' "$said" | wc -w) out"
     [ "$said" = "${words% }" ]
+}
+
+# --env, --workdir, the caller's TERM, and -- before a command of any shape.
+t_exec_environment() {
+    up envs || return 1
+    said=$(TERM=vt220 timeout -k 5 60 "$LB" exec envs --env GREETING=hello --env GREETING=hi --workdir /tmp -- \
+               /bin/sh -c 'echo "$GREETING $TERM $(pwd) $PATH"' </dev/null)
+    echo "$said"
+    [ "$said" = "hi vt220 /tmp /usr/bin:/bin:/usr/sbin:/sbin" ] || return 1
+    # nothing else of the caller's environment goes in
+    said=$(NOT_FOR_THE_CONTAINER=1 timeout -k 5 60 "$LB" exec envs /bin/sh -c 'env | sort' </dev/null | tr '\n' ' ')
+    echo "the environment of a command: $said"
+    case $said in *NOT_FOR_THE_CONTAINER*) return 1 ;; esac
+    case $said in *'HOME=/root '*'LOGNAME=root '*'USER=root '*) ;; *) return 1 ;; esac
+    refused lb exec envs --bogus /bin/true </dev/null
 }
 
 # ─── Cases: volumes and the root filesystem ─────────────────────────────────
@@ -1435,10 +1482,12 @@ if [ "$MODE" = inside ]; then
     check 'a start that fails leaves no interface, cgroup or runtime file' t_failed_start_leaves_nothing
 
     check 'exec --user takes a name or a number and sets groups and HOME' t_exec_user
-    xfail SB-exec-groups       'exec as a uid without an account keeps none of the caller'"'"'s groups' t_exec_unknown_uid_drops_groups
-    xfail SB-exec-user-parse   'exec --user refuses a malformed value'                 t_exec_user_is_strict
-    xfail CLI-exec-path        'exec finds a command on PATH'                          t_exec_searches_path
-    xfail CLI-exec-argv        'exec passes every argument'                            t_exec_passes_every_argument
+    check 'exec keeps none of the caller'"'"'s groups, with --user or without' t_exec_unknown_uid_drops_groups
+    check 'exec --user refuses a malformed value, and names a missing one' t_exec_user_is_strict
+    check 'exec finds an account late in the container'"'"'s passwd'           t_exec_finds_a_late_account
+    check 'exec finds a command on PATH'                                  t_exec_searches_path
+    check 'exec passes every argument'                                    t_exec_passes_every_argument
+    check 'exec sets --env and --workdir, and passes TERM and nothing else' t_exec_environment
 
     check 'a directory volume is shared in both directions'               t_volume_directory
     check 'a file volume is mounted'                                      t_volume_file
