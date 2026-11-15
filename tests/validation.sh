@@ -490,6 +490,116 @@ t_start_without_root_is_a_clean_error() {
     printf '%s\n' "$msg" | grep -qi 'root' && [ "$(cat "$C/web/.state")" = "$before" ]
 }
 
+# start reads its options before it touches anything, so a mistyped one
+# changes nothing, with or without root.
+t_start_options_are_checked() {
+    lb create web 10.0.0.2 || return 1
+    before=$(tree_sum "$C/web")
+    said() { msg=$(lb start web "$@" 2>&1) && { echo "start web $* succeeded"; return 1; }; echo "start web $*: $msg"; }
+    said -t soon   && case $msg in *soon*) ;; *) return 1 ;; esac || return 1
+    said -t 86401  && case $msg in *86401*) ;; *) return 1 ;; esac || return 1
+    said -t -1     && case $msg in *'number of seconds'*) ;; *) return 1 ;; esac || return 1
+    said -t        && case $msg in *'number of seconds'*) ;; *) return 1 ;; esac || return 1
+    said --bogus   && case $msg in *'unknown option'*--bogus*) ;; *) return 1 ;; esac || return 1
+    said another   && case $msg in *'unexpected argument'*another*) ;; *) return 1 ;; esac || return 1
+    [ "$before" = "$(tree_sum "$C/web")" ] || { echo "the container's records changed"; return 1; }
+}
+
+# A start_timeout or stop_timeout that cannot be read is said so, and stops
+# no command.
+t_start_timeout_setting() {
+    lb create web 10.0.0.2 || return 1
+    printf 'start_timeout = soon\nstop_timeout = 1m\n' >> "$CONF"
+    out=$(lb ls 2>"$W/err")
+    rc=$?
+    cat "$W/err"
+    [ $rc -eq 0 ] && grep -q 'start_timeout.*soon; using 30' "$W/err" && grep -q 'stop_timeout.*1m; using 10' "$W/err" || return 1
+    printf '%s\n' "$out" | grep -q '^web ' || return 1
+    # ones that can be read are not mentioned
+    sed -i -e 's/^start_timeout = soon$/start_timeout = 5/' -e 's/^stop_timeout = 1m$/stop_timeout = 60/' "$CONF"
+    err=$(lb ls 2>&1 >/dev/null)
+    [ -z "$err" ] || { echo "with settings that can be read: $err"; return 1; }
+}
+
+# stop reads its options before it looks at the container.
+t_stop_options_are_checked() {
+    lb create web 10.0.0.2 || return 1
+    before=$(tree_sum "$C/web")
+    said() { msg=$(lb stop web "$@" 2>&1) && { echo "stop web $* succeeded"; return 1; }; echo "stop web $*: $msg"; }
+    said -t soon   && case $msg in *soon*) ;; *) return 1 ;; esac || return 1
+    said -t        && case $msg in *'number of seconds'*) ;; *) return 1 ;; esac || return 1
+    said --bogus   && case $msg in *'unknown option'*--bogus*) ;; *) return 1 ;; esac || return 1
+    said another   && case $msg in *'unexpected argument'*another*) ;; *) return 1 ;; esac || return 1
+    # with options that are fine it gets as far as the container, which is not running
+    said -t 3      && case $msg in *'not running'*) ;; *) return 1 ;; esac || return 1
+    [ "$before" = "$(tree_sum "$C/web")" ] || { echo "the container's records changed"; return 1; }
+}
+
+# logs prints the container's log, and nothing for a container that has none.
+t_logs_prints_the_log() {
+    lb create web 10.0.0.2 || return 1
+    out=$(lb logs web) || { echo "logs failed for a container that was never started"; return 1; }
+    [ -z "$out" ] || { echo "a container without a log printed: $out"; return 1; }
+    printf 'one\ntwo\n' > "$C/web/console.log"
+    [ "$(lb logs web)" = "one
+two" ] || return 1
+    # a container that is not running has nothing to follow
+    followed=$(HOME="$W/home" timeout 5 "$LB" logs web -f) || { echo "logs -f of a stopped container did not end by itself"; return 1; }
+    [ "$followed" = "one
+two" ] || return 1
+    refused lb logs missing || return 1
+    msg=$(lb logs web --bogus 2>&1) && return 1
+    case $msg in *'unknown option'*--bogus*) ;; *) return 1 ;; esac
+    # the log is never followed through a link
+    ln -sf "$CONF" "$C/web/console.log"
+    refused lb logs web
+}
+
+# logs -f goes on while the container runs and ends when it has ended, with
+# what was written last. An ordinary user's own process stands in for init:
+# to such a user it reads as running, since PID 1 is not theirs to look at.
+t_logs_follows() {
+    [ "$(id -u)" -ne 0 ] || return 77
+    lb create web 10.0.0.2 || return 1
+    sleep 30 &
+    holder=$!
+    printf '%s' "$holder" > "$C/web/.pid"
+    awk '{ printf "%s", $22 }' "/proc/$holder/stat" > "$C/web/.pid_start"
+    printf 'running\n' > "$C/web/.state"
+    lb inspect web | grep -qx 'running: yes' || { echo "the stand-in does not read as running"; kill "$holder"; return 77; }
+    printf 'first\n' > "$C/web/console.log"
+    lb logs web -f > "$W/followed" 2>&1 &
+    follower=$!
+    sleep 0.5
+    printf 'second\n' >> "$C/web/console.log"
+    sleep 0.5
+    kill -0 "$follower" 2>/dev/null || { echo "logs -f ended while the container was running:"; cat "$W/followed"; kill "$holder"; return 1; }
+    printf 'last\n' >> "$C/web/console.log"
+    kill "$holder"
+    wait "$holder" 2>/dev/null
+    i=0
+    while kill -0 "$follower" 2>/dev/null && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+    if kill -0 "$follower" 2>/dev/null; then
+        echo "logs -f did not end with the container"
+        kill "$follower"
+        return 1
+    fi
+    cat "$W/followed"
+    [ "$(cat "$W/followed")" = "first
+second
+last" ]
+}
+
+# A command that is run with its standard streams closed must not take a file
+# of its own for one of them: its messages would be written into the file.
+t_closed_streams_are_harmless() {
+    HOME="$W/home" "$LB" create web 10.0.0.2 <&- >&- 2>&- || { echo "create failed with status $?"; return 1; }
+    echo "state: $(cat "$C/web/.state"), ip: $(cat "$C/web/.ip")"
+    [ "$(cat "$C/web/.state")" = stopped ] && [ "$(cat "$C/web/.ip")" = 10.0.0.2 ] && conf_has web 'mem=256M' || return 1
+    ! grep -rl "Creating container" "$C/web" "$W/home" 2>/dev/null | grep -q . || { echo "a message was written into a file"; return 1; }
+    lb ls | grep -q '^web '
+}
+
 t_storage_is_private() {
     lb create web 10.0.0.2 || return 1
     echo "modes: dir $(mode_of "$C/web"), .conf $(mode_of "$C/web/.conf"), .ip $(mode_of "$C/web/.ip"), .state $(mode_of "$C/web/.state")"
@@ -534,6 +644,12 @@ check 'inspect writes nothing'                              t_inspect_writes_not
 check 'a process owned by another user is not gone'         t_other_users_process_is_not_gone
 check 'a dead container is shown as exited'                 t_dead_container_shown_as_exited
 check 'stop cleans up the record of a dead container'       t_stop_cleans_a_dead_record
+check 'start checks its options before it does anything'    t_start_options_are_checked
+check 'a timeout setting that cannot be read is a warning'  t_start_timeout_setting
+check 'stop checks its options before it does anything'     t_stop_options_are_checked
+check 'logs prints the log, and nothing where there is none' t_logs_prints_the_log
+check 'logs -f follows a running container and ends with it' t_logs_follows
+check 'a command with its standard streams closed is harmless' t_closed_streams_are_harmless
 check 'container storage is private to root'                t_storage_is_private
 check 'setup restricts existing storage directories'        t_setup_restricts_existing_storage
 check 'create keeps every volume or refuses'                t_create_keeps_every_volume

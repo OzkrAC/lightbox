@@ -32,16 +32,24 @@
 #define LB_SYS_statfs     137
 #define LB_SYS_chroot     161
 #define LB_SYS_renameat   264
+#define LB_SYS_ppoll      271
 #define LB_SYS_statx      332
+#define LB_SYS_pidfd_send_signal 424
+#define LB_SYS_pidfd_open 434
+#define LB_SYS_close_range 436
 #elif defined(__aarch64__)
 #define LB_SYS_renameat   38
 #define LB_SYS_statfs     43
 #define LB_SYS_fchdir     50
 #define LB_SYS_chroot     51
+#define LB_SYS_ppoll      73
 #define LB_SYS_fsync      82
 #define LB_SYS_capget     90
 #define LB_SYS_capset     91
 #define LB_SYS_statx      291
+#define LB_SYS_pidfd_send_signal 424
+#define LB_SYS_pidfd_open 434
+#define LB_SYS_close_range 436
 #else
 #error "lightbox supports x86_64 and aarch64 only"
 #endif
@@ -51,7 +59,21 @@
 #define LB_ENOENT                 2
 #define LB_ESRCH                  3
 #define LB_EINTR                  4
+#define LB_EBUSY                  16
 #define LB_EEXIST                 17
+
+/* The signals lightbox names that lightc does not (asm/signal.h) */
+#define LB_SIGPIPE                13
+#define LB_SIGCONT                18
+
+/* si_code of a signal that was queued with a value (asm-generic/siginfo.h) */
+#define LB_SI_QUEUE               (-1)
+
+/* What ppoll(2) is asked to wait for, and what it reports (asm-generic/poll.h).
+ * A pipe whose other end was closed reports POLLHUP, with or without POLLIN. */
+#define LB_POLLIN                 0x0001
+#define LB_POLLERR                0x0008
+#define LB_POLLHUP                0x0010
 
 #define LB_S_IFMT                 0170000
 #define LB_S_IFDIR                0040000
@@ -117,6 +139,26 @@ struct lb_cap_data {
     uint32_t effective;
     uint32_t permitted;
     uint32_t inheritable;
+};
+
+/* siginfo_t (asm-generic/siginfo.h) as a signal queued with a value fills
+ * it: the three numbers every signal has, then who sent it and the value. */
+struct lb_siginfo_queue {
+    int32_t  signo;
+    int32_t  err;
+    int32_t  code;
+    int32_t  pad0;
+    int32_t  pid;
+    uint32_t uid;
+    int32_t  value;
+    uint8_t  pad1[100];
+};
+
+/* struct pollfd (asm-generic/poll.h) */
+struct lb_pollfd {
+    int32_t fd;
+    int16_t events;
+    int16_t revents;
 };
 
 /* struct ifreq (linux/if.h), as the two flag requests use it: the interface's
@@ -203,6 +245,30 @@ static inline lc_sysret lb_sys_capset(struct lb_cap_header *header, const struct
 /* socket(2). The number is lightc's own, which its library uses too. */
 static inline lc_sysret lb_sys_socket(int32_t domain, int32_t type, int32_t protocol) {
     return lc_syscall3(SYS_socket, domain, type, protocol);
+}
+
+/* ppoll(2) with the caller's signal mask left as it is: wait until one of the
+ * descriptors has something, or for as long as timeout says. The number of
+ * descriptors that have something, 0 when the time ran out. */
+static inline lc_sysret lb_sys_ppoll(struct lb_pollfd *fds, uint64_t count, lc_timespec *timeout) {
+    return lc_syscall5(LB_SYS_ppoll, (int64_t)fds, (int64_t)count, (int64_t)timeout, 0, 0);
+}
+
+/* pidfd_open(2), Linux 5.3: a descriptor for a process, which stays that
+ * process's whatever becomes of its number, and reads as ready when it ends */
+static inline lc_sysret lb_sys_pidfd_open(int32_t pid, uint32_t flags) {
+    return lc_syscall2(LB_SYS_pidfd_open, pid, flags);
+}
+
+/* pidfd_send_signal(2), Linux 5.1. info may be NULL, for a plain signal. */
+static inline lc_sysret lb_sys_pidfd_send_signal(int32_t pidfd, int32_t sig,
+                                                 const struct lb_siginfo_queue *info, uint32_t flags) {
+    return lc_syscall4(LB_SYS_pidfd_send_signal, pidfd, sig, (int64_t)info, flags);
+}
+
+/* close_range(2), Linux 5.9: close every descriptor from first to last */
+static inline lc_sysret lb_sys_close_range(uint32_t first, uint32_t last, uint32_t flags) {
+    return lc_syscall3(LB_SYS_close_range, first, last, flags);
 }
 
 static inline lc_sysret lb_sys_statfs(const char *path, struct lb_statfs *buf) {

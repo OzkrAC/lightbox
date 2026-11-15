@@ -27,6 +27,27 @@ void cfg_global_init(void) {
     str_copy(cfg_global.default_pids, "128", sizeof(cfg_global.default_pids));
     str_copy(cfg_global.default_cpu, "1", sizeof(cfg_global.default_cpu));
     cfg_global.default_oom = 500;
+    cfg_global.start_timeout = START_TIMEOUT_DEFAULT;
+    cfg_global.stop_timeout = STOP_TIMEOUT_DEFAULT;
+}
+
+/* A setting in seconds. One that cannot be read must not stop every command,
+ * stop among them: say so and keep what the setting was. */
+static void cfg_set_seconds(const char *key, const char *val, int *setting) {
+    int seconds;
+    if (parse_seconds(val, &seconds)) {
+        *setting = seconds;
+        return;
+    }
+    char kept[16];
+    fmt_int(kept, *setting);
+    print_str(STDERR, "Warning: ");
+    print_str(STDERR, key);
+    print_str(STDERR, " in lightbox.conf is not a number of seconds from 0 to " STRINGIFY(SECONDS_MAX) ": ");
+    print_str(STDERR, val);
+    print_str(STDERR, "; using ");
+    print_str(STDERR, kept);
+    print_str(STDERR, "\n");
 }
 
 static void cfg_set(const char *key, const char *val, bool derived[3]) {
@@ -61,6 +82,10 @@ static void cfg_set(const char *key, const char *val, bool derived[3]) {
         str_copy(cfg_global.default_cpu, val, sizeof(cfg_global.default_cpu));
     } else if (streq(key, "default_oom")) {
         cfg_global.default_oom = parse_int(val);
+    } else if (streq(key, "start_timeout")) {
+        cfg_set_seconds(key, val, &cfg_global.start_timeout);
+    } else if (streq(key, "stop_timeout")) {
+        cfg_set_seconds(key, val, &cfg_global.stop_timeout);
     }
 }
 

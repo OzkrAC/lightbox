@@ -2,6 +2,40 @@
 
 What changed for someone who uses lightbox, newest first. `ROADMAP.md` has the reasons and the finding each change closes.
 
+## 0.3.0
+
+Not tagged yet. Phase 3 of the roadmap: how a container starts, where its output goes, and how it stops.
+
+### Changes you may have to act on
+
+- **`start` waits for `/init.sh` to end.** It returned after a fixed half second before, whatever the hook was doing. It now returns when the hook has ended, or after 30 seconds with a note that the hook is still running; the container stays up either way. A hook that runs its service in the foreground makes every start take those 30 seconds: start the service in the background, or set the wait with `start <name> -t <seconds>` or `start_timeout` in `lightbox.conf`. 0 does not wait at all.
+- **A hook that fails, fails the start.** `start` exits with an error that names the hook's exit status, and the container is stopped and cleaned up. Before, this happened only when the hook failed within the first half second.
+- **A container's output goes to a log, not to your terminal.** What `/init.sh` and the services print used to appear wherever `start` was run, and the container kept that terminal or pipe open for as long as it ran. It is now appended to `console.log` in the container's directory, and `lightbox logs <name>` prints it. A hook that reads from standard input gets nothing: its input is `/dev/null`.
+- **Ctrl-C no longer stops a running container.** A container used to stay in the process group of the shell that started it, so Ctrl-C at that shell, or closing the terminal, ended it. It now has a session of its own; use `lightbox stop`.
+- **`stop` asks before it kills.** Every process in the container gets SIGTERM and 10 seconds to end, and `stop` returns as soon as they have. Before, only lightbox's own init was asked, and everything else was killed at once. A service that does not end on SIGTERM now makes `stop` take those 10 seconds: `stop <name> -t <seconds>` or `stop_timeout` in `lightbox.conf` sets the time, and `-t 0` kills at once.
+- **`stop` exits with 1 when it could not remove everything.** A cgroup or an interface that is still there afterwards is an error, with a message that names it. Before, `stop` reported success whatever was left.
+- **`start` and `stop` refuse arguments they do not know.** `start web extra` was accepted, and `extra` ignored.
+- **A signal undoes a start.** SIGINT, SIGTERM and SIGHUP no longer end `start` where it stands. It stops the container it was starting, removes what it had set up, and exits with 128 plus the signal's number.
+
+### Fixed
+
+- `out=$(lightbox start x)` and `lightbox start x | cat` never returned: the container held the pipe open.
+- A container inherited every file the command that started it had open.
+- A command run with standard input, output or error closed could write its messages into one of its own files.
+- A `start` that was killed could leave a container running that no record named, and that `stop` and `ls` did not see. Init now exits unless the command that starts it is there, and a container is on record before anything of its image runs.
+- Init did not react to a signal while its hook ran, so a container with a long-running hook could not be stopped except by force, and nothing reaped its processes meanwhile.
+- A start took half a second longer than the work needed, and a stop a fifth of a second.
+- `stop` could signal a process that was not in the container: it took the PIDs to kill from one read of the cgroup's list, and a list longer than that read was cut in the middle of a number. It also removed the cgroup without waiting for it to be empty, which fails while a process is still ending.
+- `stop` and `start` could fail, or print an error from `ip`, when the kernel removed a stopped container's interface at the moment they looked at it.
+- A `.pid_start` file left over from an earlier run made every later start fail with "unexpected stale pid starttime metadata".
+- `start` and `create` could exit in the middle of their work without undoing it: a failed allocation or clone left an interface behind, and a state that could not be written left a half-made container directory.
+
+### Added
+
+- `lightbox logs <name> [-f]` prints a container's log; with `-f` it follows the log until the container stops.
+- `start -t <seconds>` and the `start_timeout` setting.
+- `stop -t <seconds>` and the `stop_timeout` setting.
+
 ## 0.2.0
 
 Not tagged yet. Everything after commit `2320a8d`: Phases 1 and 2 of the roadmap.

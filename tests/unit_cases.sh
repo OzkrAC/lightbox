@@ -14,6 +14,10 @@
 # directories and bring up loopback, "result 0" or "result -1". The sandbox's
 # helpers end the process when they fail, as they do in a container.
 #
+# "unit init" runs both sides of a start: a real init in a PID namespace of
+# its own, and the code of the command that starts it. tests/unit.c says what
+# it prints.
+#
 # The case runner (check, xfail, summary) is tests/lib.sh.
 
 set -u
@@ -402,6 +406,443 @@ t_ipv6_failure_is_an_error() {
     [ "$out" = "result -1" ]
 }
 
+# ─── The start handshake ────────────────────────────────────────────────────
+
+# Both sides of a start, without a container: "unit init" clones the init of
+# lightbox.c into a PID namespace and plays the command that starts it. That
+# takes the root of a user namespace. Each case gets an empty directory, $D,
+# for its hook and for what the hook leaves; a hook runs with init's fixed
+# environment, so its script names $D in full.
+in_handshake_dir() { # function
+    unshare -r --pid --fork true 2>/dev/null ||
+        { echo "this user cannot make a PID namespace in a user namespace"; return 77; }
+    local rc
+    D=$(mktemp -d "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    ( "$1" )
+    rc=$?
+    rm -rf -- "$D"
+    return $rc
+}
+
+# The command's side in the foreground, under a time limit: sets $out.
+handshake() { # how, confined|open, seconds, hook | -, log | -
+    out=$(timeout -k 2 30 unshare -r "$UNIT" init "$@" 2>&1)
+    printf '%s\n' "$out"
+}
+
+# The same in the background, for a case that does something meanwhile. unshare
+# runs the harness in its own place, so $command is the harness.
+handshake_begins() { # how, confined|open, seconds, hook | -, log | -
+    unshare -r "$UNIT" init "$@" > "$D/out" 2>&1 &
+    command=$!
+}
+handshake_ends() { # sets $out
+    local i=0
+    while kill -0 "$command" 2>/dev/null && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+    if kill -0 "$command" 2>/dev/null; then
+        echo "the command was still there after 10 seconds"
+        kill -KILL "$command"
+    fi
+    wait "$command" 2>/dev/null
+    out=$(cat "$D/out")
+    printf '%s\n' "$out"
+}
+
+# What the command saw, on one line, without the PID of init.
+story() { printf '%s\n' "$out" | sed 1d | paste -sd' ' -; }
+
+wait_for() { # seconds, command...
+    local limit=$(($1 * 10)) i=0
+    shift
+    until "$@"; do
+        [ "$i" -lt "$limit" ] || return 1
+        sleep 0.1
+        i=$((i + 1))
+    done
+}
+
+# Is "sleep <seconds>" running? The odd number of seconds is what tells a
+# case's own sleep from every other process, so the whole command line has to
+# be that and nothing else: a shell or an editor that merely names the number
+# does not count.
+NAP=31.4159
+sleeping() {
+    local f
+    for f in /proc/[0-9]*/cmdline; do
+        [ "$(tr '\0' ' ' < "$f" 2>/dev/null)" = "sleep $NAP " ] && return 0
+    done
+    return 1
+}
+
+h_without_hook() {
+    handshake whole confined 5 - -
+    [ "$(story)" = "ready hook 0 sent SIGTERM init-exit 0" ] || return 1
+    # and without the sandbox, as in a privileged container
+    handshake whole open 5 - -
+    [ "$(story)" = "ready hook 0 sent SIGTERM init-exit 0" ]
+}
+
+# The first byte is what tells init that its cgroup and its network are in
+# place. Until it comes init does nothing: here the command takes a second.
+h_init_waits_for_its_first_byte() {
+    printf ': > %s/ran\n' "$D" > "$D/hook"
+    handshake late-first-byte confined 5 "$D/hook" -
+    [ "$(story)" = "init waits ready hook 0 sent SIGTERM init-exit 0" ] && [ -e "$D/ran" ]
+}
+
+h_hook_runs_and_reports() {
+    printf 'echo ran > %s/mark\n' "$D" > "$D/hook"
+    handshake whole confined 5 "$D/hook" -
+    [ "$(story)" = "ready hook 0 sent SIGTERM init-exit 0" ] && [ "$(cat "$D/mark")" = ran ]
+}
+
+h_hook_failure() {
+    printf 'exit 3\n' > "$D/hook"
+    handshake whole confined 5 "$D/hook" -
+    [ "$(story)" = "ready hook 3 init-exit 1" ] || return 1
+    # a hook that a signal ends has failed as well
+    printf 'kill -KILL $$\n' > "$D/hook"
+    handshake whole confined 5 "$D/hook" -
+    [ "$(story)" = "ready hook 137 init-exit 1" ]
+}
+
+# The report of a hook is the hook's own end, not the end of what it started.
+h_hook_with_a_service() {
+    printf 'sleep %s &\necho started > %s/mark\n' "$NAP" "$D" > "$D/hook"
+    began=$SECONDS
+    handshake whole confined 20 "$D/hook" -
+    echo "took $((SECONDS - began)) s"
+    [ "$(story)" = "ready hook 0 sent SIGTERM init-exit 0" ] && [ -e "$D/mark" ] &&
+    [ $((SECONDS - began)) -lt 10 ] || return 1
+    # init took its PID namespace with it
+    ! sleeping || { echo "the service is still running"; return 1; }
+}
+
+# The hook is still running when the command stops waiting, and init still
+# hears SIGTERM: before, init sat in a wait for the hook and nothing reached it.
+h_slow_hook() {
+    printf ': > %s/started\nsleep %s\n: > %s/finished\n' "$D" "$NAP" "$D" > "$D/hook"
+    began=$SECONDS
+    handshake whole confined 1 "$D/hook" -
+    echo "took $((SECONDS - began)) s"
+    [ "$(story)" = "ready hook-timeout sent SIGTERM init-exit 0" ] && [ -e "$D/started" ] &&
+    [ ! -e "$D/finished" ] && [ $((SECONDS - began)) -lt 10 ] || return 1
+    ! sleeping || { echo "the hook is still running"; return 1; }
+}
+
+# SIGTERM for init while the command waits for the hook: init goes, and the
+# command sees its pipe close.
+h_init_stops_during_hook() {
+    printf ': > %s/started\nsleep %s\n' "$D" "$NAP" > "$D/hook"
+    handshake_begins whole confined 20 "$D/hook" -
+    wait_for 5 test -e "$D/started" || { echo "the hook did not start"; handshake_ends; return 1; }
+    init=$(sed -n 's/^init //p' "$D/out")
+    kill -TERM "$init"
+    handshake_ends
+    [ "$(story)" = "ready closed init-exit 0" ] && ! sleeping
+}
+
+# SIGTERM for the command while it waits: it kills init and what init started.
+h_interrupted_command() {
+    printf ': > %s/started\nsleep %s\n' "$D" "$NAP" > "$D/hook"
+    handshake_begins whole confined 20 "$D/hook" -
+    wait_for 5 test -e "$D/started" || { echo "the hook did not start"; handshake_ends; return 1; }
+    kill -TERM "$command"
+    handshake_ends
+    [ "$(story)" = "ready signal 15 abandoned" ] && ! sleeping
+}
+
+# A command that is gone, at each point where init looks: init exits, and the
+# hook has not run.
+h_command_gone() {
+    printf ': > %s/ran\n' "$D" > "$D/hook"
+    handshake no-first-byte confined 5 "$D/hook" -
+    [ "$(story)" = "init-exit 1" ] || return 1
+    handshake deaf confined 5 "$D/hook" -
+    [ "$(story)" = "init-exit 1" ] || return 1
+    handshake no-second-byte confined 5 "$D/hook" -
+    [ "$(story)" = "ready init-exit 1" ] || return 1
+    [ ! -e "$D/ran" ] || { echo "the hook ran"; return 1; }
+}
+
+# The hook gets three standard streams and nothing else: not init's pipes to
+# the command, not its signalfd, no blocked signal, and nothing that was open
+# in the command, which here has a file on descriptor 9.
+h_hook_inherits_nothing() {
+    printf 'grep SigBlk: /proc/self/status > %s/blocked\nexec ls /proc/self/fd > %s/fds\n' "$D" "$D" > "$D/hook"
+    : > "$D/open-in-the-command"
+    handshake whole confined 5 "$D/hook" - 9< "$D/open-in-the-command"
+    # ls itself has the directory it lists on 3
+    echo "descriptors in the hook: $(tr '\n' ' ' < "$D/fds")"
+    echo "blocked in the hook: $(cat "$D/blocked")"
+    [ "$(story)" = "ready hook 0 sent SIGTERM init-exit 0" ] &&
+    [ "$(tr '\n' ' ' < "$D/fds")" = "0 1 2 3 " ] && [ "$(awk '{ print $2 }' "$D/blocked")" = 0000000000000000 ]
+}
+
+# With a log, init reads nothing and writes to the log, and so does the hook.
+# Nothing the hook prints reaches the command's own output.
+h_output_goes_to_the_log() {
+    printf 'echo printed by the hook\necho complained by the hook >&2\nreadlink /proc/self/fd/0 > %s/stdin\n' "$D" > "$D/hook"
+    handshake whole confined 5 "$D/hook" "$D/log"
+    echo "the log:"; sed 's/^/  /' "$D/log"
+    echo "the hook reads from: $(cat "$D/stdin")"
+    [ "$(story)" = "ready hook 0 sent SIGTERM init-exit 0" ] || return 1
+    case $out in *'by the hook'*) echo "the hook's output reached the command"; return 1 ;; esac
+    [ "$(cat "$D/log")" = "printed by the hook
+complained by the hook" ] && [ "$(cat "$D/stdin")" -ef /dev/null ] || return 1
+    [ "$(stat -c %a "$D/log")" = 600 ] || { echo "the log has mode $(stat -c %a "$D/log")"; return 1; }
+    # a second start appends
+    handshake whole confined 5 "$D/hook" "$D/log" >/dev/null
+    [ "$(grep -c 'printed by the hook' "$D/log")" = 2 ]
+}
+
+# A start that worked ends and leaves init running. A shell that captures the
+# command's output must get it then: init holds nothing of the command, is in
+# a session and a process group of its own, and has only its three streams and
+# its signalfd open.
+#
+# The command writes to a pipe here, as it does under $( ). What reads the
+# pipe ends when nothing has it open any more, and is given ten seconds: an
+# init that held on to the pipe must fail this case, not stall it.
+h_command_returns_and_init_stays() {
+    : > "$D/open-in-the-command"
+    ( unshare -r "$UNIT" init leave confined 5 - "$D/log" 2>&1 9< "$D/open-in-the-command" | cat > "$D/out" ) &
+    reader=$!
+    i=0
+    while kill -0 "$reader" 2>/dev/null && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+    out=$(cat "$D/out")
+    printf '%s\n' "$out"
+    init=$(sed -n 's/^init //p' "$D/out")
+    bad=0
+    if kill -0 "$reader" 2>/dev/null; then
+        echo "the pipe the command wrote to is still open ten seconds later: init holds it"
+        bad=1
+    fi
+    if [ -z "$init" ] || ! kill -0 "$init" 2>/dev/null; then
+        echo "init is not running"
+        kill "$reader" 2>/dev/null
+        return 1
+    fi
+    [ "$(story)" = "ready hook 0 left" ] || bad=1
+    read -r _ _ _ _ group session _ < "/proc/$init/stat"
+    echo "init $init is in process group $group and session $session; this shell is $$"
+    [ "$session" = "$init" ] && [ "$group" = "$init" ] || { echo "init does not lead a session of its own"; bad=1; }
+    for fd in "/proc/$init/fd"/*; do
+        n=${fd##*/}
+        to=$(readlink "$fd")
+        echo "  descriptor $n: $to"
+        # the same file, however its path is spelled
+        if [ "$n" = 0 ] && [ "$fd" -ef /dev/null ]; then continue; fi
+        if { [ "$n" = 1 ] || [ "$n" = 2 ]; } && [ "$fd" -ef "$D/log" ]; then continue; fi
+        if [ "$n" -gt 2 ] && [ "$to" = 'anon_inode:[signalfd]' ]; then continue; fi
+        echo "  init should not have that"
+        bad=1
+    done
+    [ -e "/proc/$init/fd/0" ] && [ -e "/proc/$init/fd/1" ] && [ -e "/proc/$init/fd/2" ] || { echo "  init lacks a standard stream"; bad=1; }
+    kill -KILL "$init"
+    wait "$reader" 2>/dev/null
+    return $bad
+}
+
+# ─── Stopping: init ends what runs in the container, and stop waits ─────────
+
+# An init that goes on running after the command has left, as after a start
+# that worked: sets $init. Its processes get $2 seconds when a SIGTERM comes
+# without a number of its own.
+init_with() { # hook | -, grace
+    out=$(timeout -k 2 10 unshare -r "$UNIT" init leave confined 5 "$1" "$D/log" "$2" 2>&1)
+    printf '%s\n' "$out"
+    init=$(printf '%s\n' "$out" | sed -n 's/^init //p')
+    [ "$(story)" = "ready hook 0 left" ] && [ -n "$init" ] && kill -0 "$init" 2>/dev/null
+}
+
+# What stop does to init, timed: sets $said and $ms.
+stop_init() { # seconds
+    local t0=${EPOCHREALTIME/[.,]/}
+    said=$("$UNIT" stop "$init" "$1" 2>&1 | paste -sd' ' -)
+    ms=$(((${EPOCHREALTIME/[.,]/} - t0) / 1000))
+    echo "stop $1: $said, after $ms ms"
+}
+
+init_is_gone() {
+    wait_for 5 eval '! kill -0 "$init" 2>/dev/null' || { echo "init $init is still there"; kill -KILL "$init"; return 1; }
+}
+
+# A service that does what a service should on SIGTERM, and one that will not.
+service() { # polite | stubborn | stopped
+    case $1 in
+        polite)   printf 'trap "echo asked to stop > %s/stopped; exit 0" TERM\n: > %s/started\nwhile :; do sleep 1 & wait $!; done\n' "$D" "$D" ;;
+        stubborn) printf 'trap "" TERM\n: > %s/started\nwhile :; do sleep %s; done\n' "$D" "$NAP" ;;
+        stopped)  printf ': > %s/started\nkill -STOP $$\nsleep %s\n' "$D" "$NAP" ;;
+    esac > "$D/service"
+    printf '/bin/sh %s/service &\n' "$D" > "$D/hook"
+}
+
+h_stop_idle() {
+    [ -n "${EPOCHREALTIME:-}" ] || { echo "this needs bash 5 or later, for its clock"; return 77; }
+    init_with - 10 || return 1
+    stop_init 5
+    [ "$said" = "asked ended" ] && [ "$ms" -lt 1000 ] && init_is_gone
+}
+
+h_stop_lets_a_service_end() {
+    [ -n "${EPOCHREALTIME:-}" ] || { echo "this needs bash 5 or later, for its clock"; return 77; }
+    service polite
+    init_with "$D/hook" 10 || return 1
+    wait_for 5 test -e "$D/started" || { echo "the service did not start"; kill -KILL "$init"; return 1; }
+    stop_init 5
+    # the service had its say by the time stop returned, and nobody waited out the five seconds
+    [ "$said" = "asked ended" ] && [ "$(cat "$D/stopped" 2>/dev/null)" = "asked to stop" ] && [ "$ms" -lt 3000 ] && init_is_gone
+}
+
+# stop -t 1 against an init whose own limit is 30 seconds: the number travels
+# with the signal. The service is killed when the second is over, not before.
+h_stop_kills_after_the_limit() {
+    [ -n "${EPOCHREALTIME:-}" ] || { echo "this needs bash 5 or later, for its clock"; return 77; }
+    service stubborn
+    init_with "$D/hook" 30 || return 1
+    wait_for 5 test -e "$D/started" || { echo "the service did not start"; kill -KILL "$init"; return 1; }
+    stop_init 1
+    echo "the log: $(cat "$D/log")"
+    [ "$said" = "asked ended" ] && [ "$ms" -ge 1000 ] && [ "$ms" -lt 2900 ] && init_is_gone || return 1
+    grep -q 'within 1 s of SIGTERM' "$D/log" || { echo "init does not say that it had to kill"; return 1; }
+    ! sleeping || { echo "the service is still running"; return 1; }
+}
+
+# A SIGTERM that brings no number, as from kill: init's own limit holds.
+h_plain_sigterm_uses_inits_limit() {
+    [ -n "${EPOCHREALTIME:-}" ] || { echo "this needs bash 5 or later, for its clock"; return 77; }
+    service stubborn
+    init_with "$D/hook" 1 || return 1
+    wait_for 5 test -e "$D/started" || { echo "the service did not start"; kill -KILL "$init"; return 1; }
+    t0=${EPOCHREALTIME/[.,]/}
+    kill -TERM "$init"
+    init_is_gone || return 1
+    ms=$(((${EPOCHREALTIME/[.,]/} - t0) / 1000))
+    echo "init went $ms ms after a plain SIGTERM; the log: $(cat "$D/log")"
+    [ "$ms" -ge 1000 ] && [ "$ms" -lt 4000 ] && ! sleeping
+}
+
+# A process that is stopped cannot act on SIGTERM until it is continued.
+h_stop_wakes_a_stopped_process() {
+    [ -n "${EPOCHREALTIME:-}" ] || { echo "this needs bash 5 or later, for its clock"; return 77; }
+    service stopped
+    init_with "$D/hook" 30 || return 1
+    wait_for 5 test -e "$D/started" || { echo "the service did not start"; kill -KILL "$init"; return 1; }
+    sleep 0.3
+    stop_init 20
+    [ "$said" = "asked ended" ] && [ "$ms" -lt 3000 ] && init_is_gone
+}
+
+# What exec puts into a container is in its PID namespace and is nobody's
+# child there. Init sends it the SIGTERM with the rest and waits for it too:
+# this one takes a moment over ending, and has ended when stop returns.
+h_stop_ends_what_is_not_inits_child() {
+    [ -n "${EPOCHREALTIME:-}" ] || { echo "this needs bash 5 or later, for its clock"; return 77; }
+    command -v nsenter >/dev/null 2>&1 || { echo "no nsenter to put a process into the namespace with"; return 77; }
+    init_with - 30 || return 1
+    printf 'trap "sleep 0.4; echo ended in its own time > %s/guest.stopped; exit 0" TERM\n: > %s/guest.started\nwhile :; do sleep 1 & wait $!; done\n' "$D" "$D" > "$D/guest"
+    nsenter --user --pid --preserve-credentials -t "$init" /bin/sh "$D/guest" >"$D/guest.out" 2>&1 &
+    guest=$!
+    wait_for 3 test -e "$D/guest.started" || { echo "nsenter could not put a process there: $(cat "$D/guest.out")"; kill -KILL "$init"; return 77; }
+    stop_init 5
+    [ "$said" = "asked ended" ] && [ "$ms" -ge 400 ] && [ "$ms" -lt 3000 ] && init_is_gone || return 1
+    wait "$guest" 2>/dev/null
+    [ "$(cat "$D/guest.stopped" 2>/dev/null)" = "ended in its own time" ] || { echo "init did not wait for the process that was put there"; return 1; }
+}
+
+# The list of a cgroup's processes is read whole, and a number is never cut
+# where one read ends and the next begins: 3000 numbers are 18 891 bytes,
+# which is more than four reads.
+t_pid_list_is_read_whole() {
+    dir=$(mktemp -d "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    (
+        seq 100001 103000 > "$dir/procs"
+        out=$("$UNIT" pids "$dir/procs")
+        echo "bytes in the list: $(wc -c < "$dir/procs"); numbers read: $(result_of "$out")"
+        [ "$(result_of "$out")" = 3000 ] && [ "$(printf '%s\n' "$out" | sed '$d')" = "$(cat "$dir/procs")" ] || exit 1
+        # a last line without its newline, an empty list, and a list that is not there
+        printf '41\n42' > "$dir/short"
+        [ "$("$UNIT" pids "$dir/short" | paste -sd' ' -)" = "41 42 result 2" ] || exit 1
+        : > "$dir/empty"
+        [ "$("$UNIT" pids "$dir/empty")" = "result 0" ] && [ "$("$UNIT" pids "$dir/missing")" = "result -1" ]
+    )
+    rc=$?
+    rm -rf -- "$dir"
+    return $rc
+}
+
+t_stop_idle()                   { in_handshake_dir h_stop_idle; }
+t_stop_graceful()               { in_handshake_dir h_stop_lets_a_service_end; }
+t_stop_limit()                  { in_handshake_dir h_stop_kills_after_the_limit; }
+t_stop_plain_sigterm()          { in_handshake_dir h_plain_sigterm_uses_inits_limit; }
+t_stop_stopped_process()        { in_handshake_dir h_stop_wakes_a_stopped_process; }
+t_stop_guest()                  { in_handshake_dir h_stop_ends_what_is_not_inits_child; }
+
+t_handshake_without_hook()      { in_handshake_dir h_without_hook; }
+t_handshake_first_byte()        { in_handshake_dir h_init_waits_for_its_first_byte; }
+t_handshake_hook()              { in_handshake_dir h_hook_runs_and_reports; }
+t_handshake_hook_failure()      { in_handshake_dir h_hook_failure; }
+t_handshake_service()           { in_handshake_dir h_hook_with_a_service; }
+t_handshake_slow_hook()         { in_handshake_dir h_slow_hook; }
+t_handshake_stop_during_hook()  { in_handshake_dir h_init_stops_during_hook; }
+t_handshake_interrupted()       { in_handshake_dir h_interrupted_command; }
+t_handshake_command_gone()      { in_handshake_dir h_command_gone; }
+t_handshake_hook_inherits()     { in_handshake_dir h_hook_inherits_nothing; }
+t_handshake_log()               { in_handshake_dir h_output_goes_to_the_log; }
+t_handshake_detached()          { in_handshake_dir h_command_returns_and_init_stays; }
+
+# ─── parse_seconds, and the shape of cmd_start ──────────────────────────────
+
+t_seconds() {
+    bad=0
+    for pair in 0:0 7:7 30:30 86400:86400 86401:-1 -1:-1 5s:-1 s5:-1 1.5:-1 ' 5':-1 99999999999999999999:-1; do
+        got=$(result_of "$("$UNIT" seconds "${pair%:*}")")
+        [ "$got" = "${pair##*:}" ] || { echo "'${pair%:*}' -> $got, expected ${pair##*:}"; bad=1; }
+    done
+    got=$(result_of "$("$UNIT" seconds '')")
+    [ "$got" = -1 ] || { echo "an empty value -> $got"; bad=1; }
+    return $bad
+}
+
+# Whatever of its three standard streams a caller leaves closed, the first
+# file lightbox opens is not given that number: a message meant for the
+# terminal would be written into the file.
+t_standard_streams_are_reserved() {
+    dir=$(mktemp -d "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    (
+        "$UNIT" streams "$dir/all" <&- >&- 2>&-
+        "$UNIT" streams "$dir/out" >&-
+        "$UNIT" streams "$dir/none"
+        echo "next descriptor with all three closed: $(cat "$dir/all"); with stdout closed: $(cat "$dir/out"); with none closed: $(cat "$dir/none")"
+        [ "$(cat "$dir/all")" = 3 ] && [ "$(cat "$dir/out")" = 3 ] && [ "$(cat "$dir/none")" = 3 ]
+    )
+    rc=$?
+    rm -rf -- "$dir"
+    return $rc
+}
+
+# From its first change to the host on, cmd_start has one way out, which undoes
+# what was done. A call that ends the process where it stands would leave an
+# interface, a cgroup or an init behind.
+t_start_has_one_way_out() {
+    src=$HERE/../lightbox.c
+    region=$(awk '/^static void cmd_start\(/ { inside = 1 }
+                  inside && /const char \*start_err = NULL;/ { on = 1 }
+                  on { print }
+                  inside && /^}/ { exit }' "$src")
+    [ -n "$region" ] || { echo "cmd_start, or the start of its guarded part, was not found in $src"; return 1; }
+    echo "lines looked at: $(printf '%s\n' "$region" | wc -l)"
+    bad=0
+    if printf '%s\n' "$region" | grep -nE '\b(die|die2|require_[a-z_]+|set_container_state|usage)\(' ; then
+        echo "these end the process where it stands"; bad=1
+    fi
+    exits=$(printf '%s\n' "$region" | grep -c 'lc_kernel_exit(')
+    [ "$exits" = 1 ] || { echo "lc_kernel_exit is called $exits times; the one in fail_start is the only one there may be"; bad=1; }
+    printf '%s\n' "$region" | grep -q 'goto fail_start' || { echo "nothing goes to fail_start"; bad=1; }
+    return $bad
+}
+
 check 'a program that succeeds gives 0'                          t_success
 check 'a non-zero exit status is returned as it is'              t_exit_status
 check 'a program killed by a signal is a failure, and reported'  t_killed_by_signal
@@ -438,5 +879,30 @@ check 'paths of /proc and /sys are masked or made read-only'     t_paths_are_mas
 
 check 'IPv6 is switched off in another network namespace'        t_ipv6_switched_off
 check 'a namespace that cannot be joined is an error'            t_ipv6_failure_is_an_error
+
+check 'init reports ready, then the end of a hook it does not have' t_handshake_without_hook
+check 'init does nothing until the command sends its first byte' t_handshake_first_byte
+check 'the hook runs once init is on record, and is reported'    t_handshake_hook
+check 'a hook that fails or is killed ends init'                 t_handshake_hook_failure
+check 'a service the hook leaves does not hold up the report'    t_handshake_service
+check 'init hears SIGTERM while a slow hook runs'                t_handshake_slow_hook
+check 'the command sees init go while it waits for the hook'     t_handshake_stop_during_hook
+check 'a signal for the command undoes the start'                t_handshake_interrupted
+check 'init exits when the command is gone, and runs no hook'    t_handshake_command_gone
+check 'the hook inherits three streams and no blocked signal'    t_handshake_hook_inherits
+check 'init and the hook write to the log, and read nothing'     t_handshake_log
+check 'the command returns to a capture, and init is detached'   t_handshake_detached
+
+check 'init with nothing to end goes at once'                    t_stop_idle
+check 'a service gets SIGTERM and time to act on it'             t_stop_graceful
+check 'a service that ignores SIGTERM is killed after the limit' t_stop_limit
+check 'a SIGTERM without a number uses init'"'"'s own limit'          t_stop_plain_sigterm
+check 'a stopped process is continued so that it can end'        t_stop_stopped_process
+check 'a process that is not init'"'"'s child is ended and waited for' t_stop_guest
+check 'a list of PIDs is read whole, across reads'               t_pid_list_is_read_whole
+
+check 'a number of seconds is digits within the limit'           t_seconds
+check 'a file never gets the number of a closed standard stream' t_standard_streams_are_reserved
+check 'cmd_start has one way out once it has changed the host'   t_start_has_one_way_out
 
 summary unit

@@ -33,3 +33,13 @@
 # default_pids = 128
 # default_cpu = 1
 # default_oom = 500
+
+# Seconds that `lightbox start` waits for a container's /init.sh to end.
+# When they have passed it says so and returns; the container stays up.
+# 0 does not wait at all. `start -t <seconds>` overrides this for one start.
+# start_timeout = 30
+
+# Seconds that a container's processes get to end after `lightbox stop` has
+# sent them SIGTERM. What is still running then is killed. `stop -t <seconds>`
+# overrides this for one stop; 0 kills at once.
+# stop_timeout = 10

@@ -129,6 +129,73 @@ static void print_conf_kv(const char *name, const char *key, const char *fallbac
     print_kv(key, buf);
 }
 
+/*
+ * logs <name> [-f]: what the container's init, its hook and its services
+ * wrote to stdout and stderr, from every start since the container was made.
+ * With -f it goes on for as long as the container runs.
+ */
+void cmd_logs(int argc, char **argv) {
+    if (argc < 1) die("Usage: lightbox logs <name> [-f]");
+    const char *name = argv[0];
+    validate_name(name);
+
+    bool follow = false;
+    for (int i = 1; i < argc; i++) {
+        if (streq(argv[i], "-f") || streq(argv[i], "--follow"))
+            follow = true;
+        else
+            die2(argv[i][0] == '-' ? "Error: unknown option: " : "Error: unexpected argument: ", argv[i]);
+    }
+
+    char path[MAX_PATH];
+    container_dir_path(path, name);
+    if (!path_exists(path)) die2("Error: container does not exist: ", name);
+    container_log_path(path, name);
+
+    lc_sysret fd = -LB_ENOENT;
+    for (;;) {
+        /* Look whether the container runs before reading, not after: what it
+         * wrote before it ended is then in the file by the time of the read. */
+        bool running = follow && is_running(name);
+
+        if (fd == -LB_ENOENT)
+            fd = lc_kernel_open_file(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC, 0);
+        if (fd < 0 && fd != -LB_ENOENT) {
+            char digits[16];
+            fmt_int(digits, (int)-fd);
+            print_str(STDERR, "Error: cannot read the log of container '");
+            print_str(STDERR, name);
+            print_str(STDERR, "' (errno ");
+            print_str(STDERR, digits);
+            print_str(STDERR, ")\n");
+            lc_kernel_exit(1);
+        }
+
+        /* a container that was never started has no log, which is an empty one */
+        bool got_some = false;
+        while (fd >= 0) {
+            char buf[4096];
+            lc_sysret n = lc_kernel_read_retry((int32_t)fd, buf, sizeof(buf));
+            if (n < 0)
+                die("Error: reading the log failed");
+            if (n == 0)
+                break;
+            if (lc_kernel_write_all(STDOUT, buf, (size_t)n) < 0)
+                lc_kernel_exit(1);          /* nobody reads this any more */
+            got_some = true;
+        }
+
+        if (!running)
+            break;
+        if (!got_some) {
+            lc_timespec nap = { .seconds = 0, .nanoseconds = 100000000 };
+            lc_kernel_sleep(&nap);
+        }
+    }
+    if (fd >= 0)
+        lc_kernel_close_file((int32_t)fd);
+}
+
 void cmd_inspect(int argc, char **argv) {
     if (argc < 1) die("Usage: lightbox inspect <name>");
     const char *name = argv[0];
