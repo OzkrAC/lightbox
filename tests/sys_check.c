@@ -22,16 +22,22 @@
 #include <stdint.h>
 
 #include <asm/errno.h>
+#include <asm/ioctls.h>
 #include <asm/poll.h>
 #include <asm/siginfo.h>
 #include <asm/signal.h>
 #include <asm/statfs.h>
+#include <asm/termbits.h>
+#include <asm/termios.h>
 #include <asm/unistd.h>
 #include <linux/audit.h>
 #include <linux/capability.h>
+#include <linux/fcntl.h>
 #include <linux/filter.h>
 #include <linux/magic.h>
+#include <linux/memfd.h>
 #include <linux/mount.h>
+#include <linux/openat2.h>
 #include <linux/prctl.h>
 #include <linux/sched.h>
 #include <linux/seccomp.h>
@@ -55,6 +61,13 @@ SAME_NR(renameat);
 SAME_NR(ppoll);
 SAME_NR(close_range);
 SAME_NR(pidfd_open);
+SAME_NR(open_tree);
+SAME_NR(openat2);
+SAME_NR(fcntl);
+SAME_NR(memfd_create);
+SAME_NR(execveat);
+SAME_NR(mount_setattr);
+SAME_NR(move_mount);
 SAME_NR(pidfd_send_signal);
 SAME_NR(statx);
 
@@ -65,9 +78,63 @@ SAME_VALUE(LB_ENOENT, ENOENT);
 SAME_VALUE(LB_ESRCH, ESRCH);
 SAME_VALUE(LB_EINTR, EINTR);
 SAME_VALUE(LB_EEXIST, EEXIST);
+SAME_VALUE(LB_EACCES, EACCES);
+SAME_VALUE(LB_ENOTDIR, ENOTDIR);
+SAME_VALUE(LB_S_IFREG, S_IFREG);
+SAME_VALUE(LB_AT_EMPTY_PATH, AT_EMPTY_PATH);
+SAME_VALUE(LB_O_EXCL, O_EXCL);
+SAME_VALUE(LB_RESOLVE_IN_ROOT, RESOLVE_IN_ROOT);
+SAME_VALUE(LB_OPEN_TREE_CLONE, OPEN_TREE_CLONE);
+SAME_VALUE(LB_OPEN_TREE_CLOEXEC, OPEN_TREE_CLOEXEC);
+SAME_VALUE(LB_MOVE_MOUNT_F_EMPTY_PATH, MOVE_MOUNT_F_EMPTY_PATH);
+SAME_VALUE(LB_MOVE_MOUNT_T_SYMLINKS, MOVE_MOUNT_T_SYMLINKS);
 SAME_VALUE(LB_EBUSY, EBUSY);
+SAME_VALUE(LB_EINVAL, EINVAL);
+SAME_VALUE(LB_MFD_CLOEXEC, MFD_CLOEXEC);
+SAME_VALUE(LB_MFD_ALLOW_SEALING, MFD_ALLOW_SEALING);
+SAME_VALUE(LB_MFD_EXEC, MFD_EXEC);
+SAME_VALUE(LB_F_ADD_SEALS, F_ADD_SEALS);
+SAME_VALUE(LB_F_GET_SEALS, F_GET_SEALS);
+SAME_VALUE(LB_F_SEAL_SEAL, F_SEAL_SEAL);
+SAME_VALUE(LB_F_SEAL_SHRINK, F_SEAL_SHRINK);
+SAME_VALUE(LB_F_SEAL_GROW, F_SEAL_GROW);
+SAME_VALUE(LB_F_SEAL_WRITE, F_SEAL_WRITE);
+SAME_VALUE(LB_MOUNT_ATTR_RDONLY, MOUNT_ATTR_RDONLY);
 SAME_VALUE(LB_SIGPIPE, SIGPIPE);
 SAME_VALUE(LB_SIGCONT, SIGCONT);
+SAME_VALUE(LB_SIGTTOU, SIGTTOU);
+SAME_VALUE(LB_SIGWINCH, SIGWINCH);
+SAME_VALUE(LB_EAGAIN, EAGAIN);
+SAME_VALUE(LB_POLLOUT, POLLOUT);
+SAME_VALUE(LB_TCGETS, TCGETS);
+SAME_VALUE(LB_TCSETS, TCSETS);
+SAME_VALUE(LB_TIOCSCTTY, TIOCSCTTY);
+SAME_VALUE(LB_TIOCGWINSZ, TIOCGWINSZ);
+SAME_VALUE(LB_TIOCSWINSZ, TIOCSWINSZ);
+SAME_VALUE(LB_TIOCSPTLCK, TIOCSPTLCK);
+SAME_VALUE(LB_TIOCGPTPEER, TIOCGPTPEER);
+SAME_VALUE(LB_O_NOCTTY, O_NOCTTY);
+SAME_VALUE(LB_F_GETFL, F_GETFL);
+SAME_VALUE(LB_F_SETFL, F_SETFL);
+SAME_VALUE(LB_IGNBRK, IGNBRK);
+SAME_VALUE(LB_BRKINT, BRKINT);
+SAME_VALUE(LB_PARMRK, PARMRK);
+SAME_VALUE(LB_ISTRIP, ISTRIP);
+SAME_VALUE(LB_INLCR, INLCR);
+SAME_VALUE(LB_IGNCR, IGNCR);
+SAME_VALUE(LB_ICRNL, ICRNL);
+SAME_VALUE(LB_IXON, IXON);
+SAME_VALUE(LB_OPOST, OPOST);
+SAME_VALUE(LB_ISIG, ISIG);
+SAME_VALUE(LB_ICANON, ICANON);
+SAME_VALUE(LB_ECHO, ECHO);
+SAME_VALUE(LB_ECHONL, ECHONL);
+SAME_VALUE(LB_IEXTEN, IEXTEN);
+SAME_VALUE(LB_CSIZE, CSIZE);
+SAME_VALUE(LB_CS8, CS8);
+SAME_VALUE(LB_PARENB, PARENB);
+SAME_VALUE(LB_VTIME, VTIME);
+SAME_VALUE(LB_VMIN, VMIN);
 SAME_VALUE(LB_SI_QUEUE, SI_QUEUE);
 SAME_VALUE(LB_POLLIN, POLLIN);
 SAME_VALUE(LB_POLLERR, POLLERR);
@@ -83,6 +150,8 @@ SAME_VALUE(LB_CGROUP_SUPER_MAGIC, CGROUP_SUPER_MAGIC);
 SAME_VALUE(LB_CGROUP2_SUPER_MAGIC, CGROUP2_SUPER_MAGIC);
 
 SAME_VALUE(LB_PR_SET_KEEPCAPS, PR_SET_KEEPCAPS);
+SAME_VALUE(LB_PR_SET_DUMPABLE, PR_SET_DUMPABLE);
+SAME_VALUE(LB_PR_SET_NAME, PR_SET_NAME);
 SAME_VALUE(LB_PR_SET_SECCOMP, PR_SET_SECCOMP);
 SAME_VALUE(LB_PR_CAPBSET_READ, PR_CAPBSET_READ);
 SAME_VALUE(LB_PR_CAPBSET_DROP, PR_CAPBSET_DROP);
@@ -148,6 +217,29 @@ SAME_SIGINFO(code, si_code);
 SAME_SIGINFO(pid, si_pid);
 SAME_SIGINFO(uid, si_uid);
 SAME_SIGINFO(value, si_int);
+
+SAME_SIZE(lb_termios, termios);
+_Static_assert(offsetof(struct lb_termios, iflag) == offsetof(struct termios, c_iflag) &&
+               offsetof(struct lb_termios, oflag) == offsetof(struct termios, c_oflag) &&
+               offsetof(struct lb_termios, cflag) == offsetof(struct termios, c_cflag) &&
+               offsetof(struct lb_termios, lflag) == offsetof(struct termios, c_lflag) &&
+               offsetof(struct lb_termios, line) == offsetof(struct termios, c_line) &&
+               offsetof(struct lb_termios, cc) == offsetof(struct termios, c_cc) &&
+               sizeof(((struct lb_termios *)0)->cc) == sizeof(((struct termios *)0)->c_cc),
+               "struct lb_termios does not match the kernel's struct termios");
+SAME_SIZE(lb_winsize, winsize);
+_Static_assert(offsetof(struct lb_winsize, row) == offsetof(struct winsize, ws_row) &&
+               offsetof(struct lb_winsize, col) == offsetof(struct winsize, ws_col),
+               "struct lb_winsize does not match the kernel's struct winsize");
+
+SAME_SIZE(lb_mount_attr, mount_attr);
+SAME_FIELD(lb_mount_attr, mount_attr, attr_set);
+SAME_FIELD(lb_mount_attr, mount_attr, attr_clr);
+
+SAME_SIZE(lb_open_how, open_how);
+SAME_FIELD(lb_open_how, open_how, flags);
+SAME_FIELD(lb_open_how, open_how, mode);
+SAME_FIELD(lb_open_how, open_how, resolve);
 
 SAME_SIZE(lb_pollfd, pollfd);
 SAME_FIELD(lb_pollfd, pollfd, fd);

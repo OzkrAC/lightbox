@@ -31,6 +31,7 @@
 #define NAME_MAX_LEN     12
 #define USERNS_RANGE_SIZE 65536
 #define USERNS_MIN_START 100000
+#define MAX_DNS          3       /* as many as a resolver reads from resolv.conf */
 #define CHILD_STACK_SIZE (1024 * 1024) /* 1 MiB */
 
 /* ─── Configurable defaults ─────────────────────────────────────────────── */
@@ -63,6 +64,8 @@ typedef struct {
     int  vol_ro[MAX_VOLS];
     int  nlinks;
     char links[MAX_LINKS][NAME_MAX_LEN + 1];
+    int  ndns;
+    char dns[MAX_DNS][16];
 } container_config;
 
 typedef struct {
@@ -161,53 +164,135 @@ static void validate_positive_integer_option(const char *label, const char *valu
         die2(label, value);
 }
 
+/* Is this an address a container can ask for names: IPv4, and not this
+ * host's own loopback, which in a container is the container's? */
+static bool usable_name_server(const char *text) {
+    uint8_t ip[4];
+    return parse_ipv4(text, ip) && ip[0] != 127 && ipv4_to_u32(ip) != 0;
+}
+
+/*
+ * The name servers a resolv.conf lists that a container can use, in its
+ * order: how many, at most MAX_DNS. A resolver on the host's loopback is
+ * left out, and so is IPv6, which containers do not have.
+ */
+static int name_servers_of(const char *resolv_path, char out[][16]) {
+    static char text[8192];
+    if (read_file(resolv_path, text, sizeof(text)) <= 0)
+        return 0;
+
+    int count = 0;
+    for (char *line = text; *line && count < MAX_DNS; ) {
+        char *end = line;
+        while (*end && *end != '\n') end++;
+        bool last = *end == '\0';
+        *end = '\0';
+
+        while (*line == ' ' || *line == '\t') line++;
+        if (lc_string_starts_with(line, lc_string_length(line), "nameserver", 10) &&
+            (line[10] == ' ' || line[10] == '\t')) {
+            char *address = line + 10;
+            while (*address == ' ' || *address == '\t') address++;
+            size_t len = 0;
+            while (address[len] && address[len] != ' ' && address[len] != '\t' && address[len] != '\r')
+                len++;
+            address[len] = '\0';
+            if (len < 16 && usable_name_server(address))
+                str_copy(out[count++], address, 16);
+        }
+        line = last ? end : end + 1;
+    }
+    return count;
+}
+
+/* A list of addresses as the dns setting has it, separated by commas or
+ * spaces: how many, or -1 when something in it is not a usable address or
+ * there are more than MAX_DNS. */
+static int name_servers_listed(const char *list, char out[][16]) {
+    int count = 0;
+    for (const char *p = list; *p; ) {
+        while (*p == ' ' || *p == '\t' || *p == ',') p++;
+        size_t len = 0;
+        while (p[len] && p[len] != ' ' && p[len] != '\t' && p[len] != ',') len++;
+        if (len == 0)
+            break;
+        char address[16];
+        if (len >= sizeof(address) || count == MAX_DNS)
+            return -1;
+        lc_bytes_copy(address, p, len);
+        address[len] = '\0';
+        if (!usable_name_server(address))
+            return -1;
+        str_copy(out[count++], address, 16);
+        p += len;
+    }
+    return count;
+}
+
 static void validate_oom_score(int oom_score) {
     if (oom_score < -1000 || oom_score > 1000)
         die("Error: oom-score must be between -1000 and 1000");
 }
 
-static void validate_volume_paths(const char *src, const char *dst) {
-    if (!src[0]) die("Error: volume source must not be empty");
-    if (src[0] != '/') die2("Error: volume source must be an absolute path: ", src);
-    if (lc_string_starts_with(src, lc_string_length(src), "/proc", 5) &&
-        (src[5] == '\0' || src[5] == '/'))
-        die2("Error: volume source under /proc is not allowed: ", src);
-    if (lc_string_starts_with(src, lc_string_length(src), "/sys", 4) &&
-        (src[4] == '\0' || src[4] == '/'))
-        die2("Error: volume source under /sys is not allowed: ", src);
-    if (lc_string_starts_with(src, lc_string_length(src), "/dev", 4) &&
-        (src[4] == '\0' || src[4] == '/'))
-        die2("Error: volume source under /dev is not allowed: ", src);
-    if (lc_string_starts_with(src, lc_string_length(src), "/.old_root", 10))
-        die2("Error: reserved volume source: ", src);
-    if (!dst[0]) die("Error: volume destination must not be empty");
-    if (dst[0] != '/') die2("Error: volume destination must be an absolute container path: ", dst);
-    if (streq(dst, "/")) die("Error: mounting over / is not allowed");
-    if (lc_string_starts_with(dst, lc_string_length(dst), "/proc", 5) &&
-        (dst[5] == '\0' || dst[5] == '/'))
-        die2("Error: volume destination under /proc is not allowed: ", dst);
-    if (lc_string_starts_with(dst, lc_string_length(dst), "/sys", 4) &&
-        (dst[4] == '\0' || dst[4] == '/'))
-        die2("Error: volume destination under /sys is not allowed: ", dst);
-    if (lc_string_starts_with(dst, lc_string_length(dst), "/dev", 4) &&
-        (dst[4] == '\0' || dst[4] == '/'))
-        die2("Error: volume destination under /dev is not allowed: ", dst);
-    if (lc_string_starts_with(dst, lc_string_length(dst), "/.old_root", 10))
-        die2("Error: reserved volume destination: ", dst);
+/*
+ * Bring an absolute path to one spelling: single slashes, no "." component,
+ * no slash at the end. False for a path that is not absolute or that has a
+ * ".." component: where that leads depends on what is in the directories
+ * before it, and a volume's paths are to mean what they say.
+ */
+static bool normalise_path(char *path) {
+    if (path[0] != '/')
+        return false;
+
+    size_t out = 0;
+    for (size_t in = 0; path[in]; ) {
+        while (path[in] == '/')
+            in++;
+        size_t len = 0;
+        while (path[in + len] && path[in + len] != '/')
+            len++;
+        if (len == 0)
+            break;
+        if (len == 2 && path[in] == '.' && path[in + 1] == '.')
+            return false;
+        if (!(len == 1 && path[in] == '.')) {
+            path[out++] = '/';
+            for (size_t i = 0; i < len; i++)
+                path[out++] = path[in + i];
+        }
+        in += len;
+    }
+    if (out == 0)
+        path[out++] = '/';
+    path[out] = '\0';
+    return true;
 }
 
-static void parse_volume_spec_or_die(const char *spec, volume_spec *vol) {
+/* Is a normalised path this directory, or something inside it? */
+static bool path_is_under(const char *path, const char *dir) {
+    size_t len = lc_string_length(dir);
+    return lc_string_starts_with(path, lc_string_length(path), dir, len) &&
+           (path[len] == '\0' || path[len] == '/');
+}
+
+/*
+ * A volume as it is written: src:dst[:ro]. NULL when it is one, with both
+ * paths normalised in vol; otherwise what is wrong with it. create, add-vol
+ * and start all read a volume through this, so they agree on what one is.
+ */
+static const char *parse_volume_spec(const char *spec, volume_spec *vol) {
     const char *colon1 = NULL, *colon2 = NULL;
     for (size_t i = 0; spec[i]; i++) {
         if (spec[i] != ':') continue;
         if (!colon1) colon1 = spec + i;
         else if (!colon2) colon2 = spec + i;
     }
-    if (!colon1) die("Error: volume format is src:dst[:ro]");
+    if (!colon1)
+        return "a volume is written src:dst[:ro]";
 
     size_t slen = (size_t)(colon1 - spec);
     if (slen == 0 || slen >= sizeof(vol->src))
-        die2("Error: invalid volume source in spec: ", spec);
+        return "the volume's source is empty or too long";
     lc_bytes_copy(vol->src, spec, slen);
     vol->src[slen] = '\0';
 
@@ -215,7 +300,7 @@ static void parse_volume_spec_or_die(const char *spec, volume_spec *vol) {
     const char *dst_end = colon2 ? colon2 : spec + lc_string_length(spec);
     size_t dlen = (size_t)(dst_end - dst_start);
     if (dlen == 0 || dlen >= sizeof(vol->dst))
-        die2("Error: invalid volume destination in spec: ", spec);
+        return "the volume's destination is empty or too long";
     lc_bytes_copy(vol->dst, dst_start, dlen);
     vol->dst[dlen] = '\0';
 
@@ -224,15 +309,36 @@ static void parse_volume_spec_or_die(const char *spec, volume_spec *vol) {
         if (colon2[1] == 'r' && colon2[2] == 'o' && colon2[3] == '\0')
             vol->ro = 1;
         else
-            die2("Error: invalid volume mode in spec: ", spec);
+            return "after the volume's destination only :ro may follow";
     }
 
-    validate_volume_paths(vol->src, vol->dst);
+    if (!normalise_path(vol->src))
+        return "the volume's source must be an absolute path without ..";
+    if (!normalise_path(vol->dst))
+        return "the volume's destination must be an absolute path without ..";
+    if (path_is_under(vol->src, "/proc") || path_is_under(vol->src, "/sys") ||
+        path_is_under(vol->src, "/dev"))
+        return "a volume's source may not be under /proc, /sys or /dev";
+    if (streq(vol->dst, "/"))
+        return "a volume may not be mounted over /";
+    if (path_is_under(vol->dst, "/.old_root"))
+        return "/.old_root is a name lightbox uses itself while it builds a container";
+    if (path_is_under(vol->dst, "/proc") || path_is_under(vol->dst, "/sys") ||
+        path_is_under(vol->dst, "/dev"))
+        return "a volume's destination may not be under /proc, /sys or /dev";
+    return NULL;
 }
 
-static void mkdir_p_or_die(const char *path) {
-    if (make_dirs(path) != 0)
-        lc_kernel_exit(1);      /* make_dirs has said what failed */
+static void parse_volume_spec_or_die(const char *spec, volume_spec *vol) {
+    const char *wrong = parse_volume_spec(spec, vol);
+    if (wrong) {
+        print_str(STDERR, "Error: ");
+        print_str(STDERR, wrong);
+        print_str(STDERR, ": ");
+        print_str(STDERR, spec);
+        lc_print_char(STDERR, '\n');
+        lc_kernel_exit(1);
+    }
 }
 
 static void parent_dir(char *buf, size_t bufsz, const char *path) {
@@ -269,8 +375,8 @@ static bool container_has_volume(const char *name, const volume_spec *needle) {
                 lc_bytes_copy(line, p + 4, len);
                 line[len] = '\0';
                 volume_spec existing = {0};
-                parse_volume_spec_or_die(line, &existing);
-                if (streq(existing.src, needle->src) &&
+                if (parse_volume_spec(line, &existing) == NULL &&
+                    streq(existing.src, needle->src) &&
                     streq(existing.dst, needle->dst) &&
                     existing.ro == needle->ro)
                     return true;
@@ -777,6 +883,11 @@ static void cmd_create(int argc, char **argv) {
             str_copy(cfg.vol_dst[cfg.nvols], vol.dst, sizeof(cfg.vol_dst[cfg.nvols]));
             cfg.vol_ro[cfg.nvols] = vol.ro;
             cfg.nvols++;
+        } else if (streq(argv[i], "--dns") && i + 1 < argc) {
+            if (cfg.ndns >= MAX_DNS) die("Error: more than " STRINGIFY(MAX_DNS) " --dns options: a resolver reads no more");
+            if (!usable_name_server(argv[i + 1]))
+                die2("Error: --dns takes an IPv4 address that a container can reach: ", argv[i + 1]);
+            str_copy(cfg.dns[cfg.ndns++], argv[++i], 16);
         } else if (streq(argv[i], "--link") && i + 1 < argc) {
             if (cfg.nlinks >= MAX_LINKS) die("Error: too many links");
             validate_name(argv[i + 1]);
@@ -912,16 +1023,75 @@ static void cmd_create(int argc, char **argv) {
         goto fail_create;
     }
 
-    /* write resolv.conf */
-    char resolv[MAX_PATH];
-    char etc_dir[MAX_PATH];
-    path_join(etc_dir, MAX_PATH, root, "etc");
-    lc_kernel_mkdirat(AT_FDCWD, etc_dir, 0755);
-    path_join(resolv, MAX_PATH, root, "etc/resolv.conf");
-    /* inside the container's own filesystem, so readable by its users */
-    if (write_file_atomic(resolv, "nameserver 1.1.1.1\nnameserver 8.8.8.8\n", MODE_PUBLIC_FILE) < 0) {
-        create_err = "failed to write resolv.conf";
-        goto fail_create;
+    /*
+     * What the container asks for names, what it is called, and that its name
+     * is its own address. These go into the copy of the image, which is the
+     * image's to shape: its etc may be a link, and so may any of the three
+     * files. They are written as the container will see them, with the new
+     * root as the root, so a link in the image cannot put them anywhere else.
+     *
+     * The name servers are the ones --dns gave; or the dns setting; or the
+     * ones this host asks, without its own loopback; or two public ones.
+     */
+    {
+        if (cfg.ndns == 0 && cfg_global.dns[0]) {
+            cfg.ndns = name_servers_listed(cfg_global.dns, cfg.dns);
+            if (cfg.ndns <= 0) {
+                create_err = "the dns setting in lightbox.conf is not a list of up to " STRINGIFY(MAX_DNS) " IPv4 addresses";
+                goto fail_create;
+            }
+        }
+        if (cfg.ndns == 0)
+            cfg.ndns = name_servers_of("/etc/resolv.conf", cfg.dns);
+        if (cfg.ndns == 0)      /* behind systemd-resolved's stub, the servers it asks */
+            cfg.ndns = name_servers_of("/run/systemd/resolve/resolv.conf", cfg.dns);
+        if (cfg.ndns == 0) {
+            str_copy(cfg.dns[0], "1.1.1.1", 16);
+            str_copy(cfg.dns[1], "8.8.8.8", 16);
+            cfg.ndns = 2;
+        }
+
+        char text[4096];
+        bool cut = false;
+        size_t pos = 0;
+        text[0] = '\0';
+        for (int i = 0; i < cfg.ndns; i++) {
+            pos = str_append_whole(text, pos, "nameserver ", sizeof(text), &cut);
+            pos = str_append_whole(text, pos, cfg.dns[i], sizeof(text), &cut);
+            pos = str_append_whole(text, pos, "\n", sizeof(text), &cut);
+        }
+        /* inside the container's own filesystem, so readable by its users */
+        if (cut || write_file_in_root(root, "etc", "resolv.conf", text, MODE_PUBLIC_FILE) < 0) {
+            create_err = "failed to write resolv.conf";
+            goto fail_create;
+        }
+
+        pos = str_copy(text, name, sizeof(text));
+        str_append(text, pos, "\n", sizeof(text));
+        if (write_file_in_root(root, "etc", "hostname", text, MODE_PUBLIC_FILE) < 0) {
+            create_err = "failed to write the container's hostname file";
+            goto fail_create;
+        }
+
+        /* the image's hosts file, with the container's name added to it */
+        int had = read_file_in_root(root, "etc", "hosts", text, sizeof(text) - 64);
+        if (had < 0) {
+            print_str(STDERR, "Warning: the image's /etc/hosts is not a file that can be added to; it is left as it is\n");
+        } else {
+            pos = (size_t)had;
+            if (had == 0)
+                pos = str_append_whole(text, pos, "127.0.0.1\tlocalhost\n", sizeof(text), &cut);
+            else if (text[pos - 1] != '\n')
+                pos = str_append_whole(text, pos, "\n", sizeof(text), &cut);
+            pos = str_append_whole(text, pos, ip, sizeof(text), &cut);
+            pos = str_append_whole(text, pos, "\t", sizeof(text), &cut);
+            pos = str_append_whole(text, pos, name, sizeof(text), &cut);
+            str_append_whole(text, pos, "\n", sizeof(text), &cut);
+            if (cut || write_file_in_root(root, "etc", "hosts", text, MODE_PUBLIC_FILE) < 0) {
+                create_err = "failed to write the container's hosts file";
+                goto fail_create;
+            }
+        }
     }
 
     /* shift rootfs ownership for user namespace */
@@ -1362,11 +1532,1083 @@ static void require_setns_fd(int fd, int nstype, const char *name) {
         die2("Error: failed to join namespace: ", name);
 }
 
+/* ─── exec: who the command runs as ─────────────────────────────────────── */
+
+#define USER_NAME_MAX     255
+#define MAX_EXEC_GROUPS   64
+#define MAX_EXEC_ENV      64
+/* An account file is read to its end, but not without end. */
+#define ACCOUNT_FILE_MAX  (16u * 1024 * 1024)
+
+enum exec_as { AS_ROOT, AS_NAME, AS_ID };
+
+/* What exec was asked for. */
+struct exec_request {
+    enum exec_as as;
+    const char  *user;                  /* AS_NAME */
+    int          uid, gid;              /* AS_ID; gid is -1 when only a uid was given */
+    const char  *env[MAX_EXEC_ENV];     /* --env, in the order given */
+    int          nenv;
+    const char  *workdir;               /* --workdir, or NULL */
+    const char  *term;                  /* the caller's TERM, or NULL */
+    const char *const *argv;            /* the command, NULL at its end */
+};
+
+/* Who the command runs as, once the container's own files have been asked. */
+struct identity {
+    int      uid, gid;
+    char     name[USER_NAME_MAX + 1];   /* empty: no account has this uid */
+    char     home[MAX_PATH];
+    uint32_t groups[MAX_EXEC_GROUPS];
+    int      ngroups;
+};
+
+/* A uid or a gid as text: digits and nothing else, and a number that a
+ * process can have. "0x10" is not 0, "1000:" has no gid, and eleven nines
+ * are not whatever they wrap around to. */
+static bool parse_id(const char *text, size_t len, int *out) {
+    if (len == 0 || len > 10)
+        return false;
+    int64_t value = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (text[i] < '0' || text[i] > '9')
+            return false;
+        value = value * 10 + (text[i] - '0');
+    }
+    if (value > INT32_MAX)
+        return false;
+    *out = (int)value;
+    return true;
+}
+
+/* --user: uid, uid:gid, or a name. A value that begins with a digit is
+ * numbers and must be nothing but numbers. */
+static bool parse_user_spec(const char *spec, struct exec_request *req) {
+    size_t len = lc_string_length(spec);
+    if (len == 0)
+        return false;
+
+    if (spec[0] >= '0' && spec[0] <= '9') {
+        size_t uid_len = 0;
+        while (uid_len < len && spec[uid_len] != ':')
+            uid_len++;
+        req->gid = -1;
+        if (!parse_id(spec, uid_len, &req->uid))
+            return false;
+        if (uid_len < len && !parse_id(spec + uid_len + 1, len - uid_len - 1, &req->gid))
+            return false;
+        req->as = AS_ID;
+        return true;
+    }
+
+    if (len > USER_NAME_MAX)
+        return false;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)spec[i];
+        if (c <= ' ' || c == 127 || c == ':' || c == '/')
+            return false;
+    }
+    req->as = AS_NAME;
+    req->user = spec;
+    return true;
+}
+
+/* A file read a byte at a time, through a buffer. */
+struct reader {
+    int32_t  fd;
+    size_t   len, pos;
+    uint64_t total;
+    char     buf[4096];
+};
+
+/*
+ * Open one of a container's account files. The container decides what is at
+ * that path, so only a regular file will do: a pipe would never end, and a
+ * device could say anything for ever.
+ */
+static bool reader_open(struct reader *r, const char *path) {
+    lc_sysret fd = lc_kernel_open_file(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC, 0);
+    if (fd < 0)
+        return false;
+    struct lb_statx stx;
+    if (lb_sys_statx((int32_t)fd, "", LB_AT_EMPTY_PATH, LB_STATX_TYPE, &stx) < 0 ||
+        (stx.stx_mode & LB_S_IFMT) != LB_S_IFREG) {
+        lc_kernel_close_file((int32_t)fd);
+        return false;
+    }
+    r->fd = (int32_t)fd;
+    r->len = r->pos = 0;
+    r->total = 0;
+    return true;
+}
+
+/* The next byte, or -1 at the end of the file or of what will be read of it. */
+static int reader_next(struct reader *r) {
+    if (r->pos == r->len) {
+        if (r->total >= ACCOUNT_FILE_MAX)
+            return -1;
+        lc_sysret n = lc_kernel_read_retry(r->fd, r->buf, sizeof(r->buf));
+        if (n <= 0)
+            return -1;
+        r->len = (size_t)n;
+        r->pos = 0;
+        r->total += (uint64_t)n;
+    }
+    return (unsigned char)r->buf[r->pos++];
+}
+
+/* One field of the line being read: kept while it fits, and marked when it
+ * does not, so that a field that was cut is never taken for a shorter one. */
+struct field {
+    char  *buf;
+    size_t size, len;
+    bool   cut;
+};
+
+static void field_add(struct field *f, int c) {
+    if (f->len + 1 < f->size)
+        f->buf[f->len++] = (char)c;
+    else
+        f->cut = true;
+}
+
+struct account {
+    char name[USER_NAME_MAX + 1];
+    int  uid, gid;
+    char home[MAX_PATH];
+};
+
+/*
+ * The first line of a passwd file with this name or, when want_name is NULL,
+ * this uid: name:password:uid:gid:comment:home[:shell]. The file is read to
+ * its end, a line of any length is one line, and a line that is short of a
+ * field, or whose numbers are not numbers, is not an account.
+ */
+static bool find_account(const char *passwd_path, const char *want_name, int want_uid,
+                         struct account *out) {
+    struct reader r;
+    if (!reader_open(&r, passwd_path))
+        return false;
+
+    bool found = false;
+    char uid_text[12], gid_text[12];
+    for (bool more = true; more && !found; ) {
+        struct field name = { out->name, sizeof(out->name), 0, false };
+        struct field uid  = { uid_text, sizeof(uid_text), 0, false };
+        struct field gid  = { gid_text, sizeof(gid_text), 0, false };
+        struct field home = { out->home, sizeof(out->home), 0, false };
+        int index = 0;
+        for (;;) {
+            int c = reader_next(&r);
+            if (c < 0) {
+                more = false;
+                break;
+            }
+            if (c == '\n')
+                break;
+            if (c == ':') {
+                index++;
+                continue;
+            }
+            switch (index) {
+                case 0: field_add(&name, c); break;
+                case 2: field_add(&uid, c); break;
+                case 3: field_add(&gid, c); break;
+                case 5: field_add(&home, c); break;
+                default: break;
+            }
+        }
+        if (index < 5 || name.len == 0 || name.cut || uid.cut || gid.cut || home.cut)
+            continue;
+        out->name[name.len] = '\0';
+        out->home[home.len] = '\0';
+        if (!parse_id(uid_text, uid.len, &out->uid) || !parse_id(gid_text, gid.len, &out->gid))
+            continue;
+        found = want_name ? streq(out->name, want_name) : out->uid == want_uid;
+    }
+    lc_kernel_close_file(r.fd);
+    return found;
+}
+
+/*
+ * The groups a group file lists this user in, other than the primary one:
+ * name:password:gid:member,member,... The members are compared as they are
+ * read, so a group may have any number of them. How many groups, or -1 when
+ * they are more than max.
+ */
+static int find_groups(const char *group_path, const char *user, int primary_gid,
+                       uint32_t *out, int max) {
+    struct reader r;
+    if (!reader_open(&r, group_path))
+        return 0;
+
+    size_t user_len = lc_string_length(user);
+    int count = 0;
+    char gid_text[12];
+    for (bool more = true; more; ) {
+        struct field gid = { gid_text, sizeof(gid_text), 0, false };
+        int index = 0;
+        size_t at = 0;              /* how much of the member being read has matched */
+        bool differs = false, member = false;
+        for (;;) {
+            int c = reader_next(&r);
+            if (c < 0) {
+                more = false;
+                break;
+            }
+            if (c == '\n')
+                break;
+            if (c == ':' && index < 3) {
+                index++;
+                continue;
+            }
+            if (index == 2) {
+                field_add(&gid, c);
+            } else if (index == 3) {
+                if (c == ',') {
+                    if (!differs && at == user_len)
+                        member = true;
+                    at = 0;
+                    differs = false;
+                } else {
+                    if (at >= user_len || user[at] != (char)c)
+                        differs = true;
+                    at++;
+                }
+            }
+        }
+        if (index == 3 && !differs && at == user_len)
+            member = true;          /* the last name on the line */
+
+        int id;
+        if (!member || gid.cut || !parse_id(gid_text, gid.len, &id) || id == primary_gid)
+            continue;
+        bool listed = false;
+        for (int i = 0; i < count; i++) {
+            if (out[i] == (uint32_t)id)
+                listed = true;
+        }
+        if (listed)
+            continue;
+        if (count == max) {
+            count = -1;
+            break;
+        }
+        out[count++] = (uint32_t)id;
+    }
+    lc_kernel_close_file(r.fd);
+    return count;
+}
+
+/*
+ * Who the command runs as: the request, completed from the container's own
+ * passwd and group files. Called with the container's root as this process's
+ * root, so the two paths, and any link in them, stay inside the container.
+ *
+ * The supplementary groups are always decided here: the ones the container
+ * gives the user, and none for a uid it has no account for. What groups the
+ * person who typed the command is in on the host has nothing to do with it.
+ */
+static void resolve_identity(const struct exec_request *req, const char *passwd_path,
+                             const char *group_path, struct identity *id) {
+    struct account account;
+    bool known = false;
+
+    switch (req->as) {
+        case AS_NAME:
+            known = find_account(passwd_path, req->user, 0, &account);
+            if (!known)
+                die2("Error: user not found in container: ", req->user);
+            id->uid = account.uid;
+            id->gid = account.gid;
+            break;
+        case AS_ID:
+            known = find_account(passwd_path, NULL, req->uid, &account);
+            id->uid = req->uid;
+            id->gid = req->gid >= 0 ? req->gid : (known ? account.gid : req->uid);
+            break;
+        case AS_ROOT:
+        default:
+            known = find_account(passwd_path, NULL, 0, &account);
+            id->uid = 0;
+            id->gid = known ? account.gid : 0;
+            break;
+    }
+
+    id->name[0] = '\0';
+    id->home[0] = '\0';
+    id->ngroups = 0;
+    if (known) {
+        str_copy(id->name, account.name, sizeof(id->name));
+        str_copy(id->home, account.home, sizeof(id->home));
+        id->ngroups = find_groups(group_path, id->name, id->gid, id->groups, MAX_EXEC_GROUPS);
+        if (id->ngroups < 0)
+            die2("Error: the container lists more than " STRINGIFY(MAX_EXEC_GROUPS) " groups for user ", id->name);
+    }
+}
+
+/* Take the identity on: the groups first, while there is the right to. */
+static void become(const struct identity *id) {
+    if (lc_kernel_setgroups((size_t)id->ngroups, id->groups) < 0)
+        die("Error: failed to set supplementary groups for exec");
+    if (lc_kernel_setgid(id->gid) < 0)
+        die("Error: failed to setgid for exec");
+    if (lc_kernel_setuid(id->uid) < 0)
+        die("Error: failed to setuid for exec");
+}
+
+/* ─── exec: the command and its environment ─────────────────────────────── */
+
+/* Do two "KEY=VALUE" strings set the same variable? */
+static bool same_variable(const char *a, const char *b) {
+    size_t i = 0;
+    while (a[i] && a[i] != '=' && a[i] == b[i])
+        i++;
+    return a[i] == '=' && b[i] == '=';
+}
+
+[[noreturn]] static void exec_failed(const char *before, const char *what, int exit_code) {
+    print_str(STDERR, "Error: ");
+    print_str(STDERR, before);
+    print_str(STDERR, what);
+    lc_print_char(STDERR, '\n');
+    lc_kernel_exit(exit_code);
+}
+
+/*
+ * Execute a command as a shell would find it: a name with a slash is a path,
+ * and any other is looked for in each directory of PATH. Does not return: on
+ * failure it says why and exits with what a shell exits with, 127 for a
+ * command that is not there and 126 for one that cannot be run.
+ */
+[[noreturn]] static void exec_command(const char *const argv[], const char *const envp[]) {
+    const char *command = argv[0];
+
+    bool is_path = false;
+    for (const char *p = command; *p; p++) {
+        if (*p == '/')
+            is_path = true;
+    }
+    if (is_path) {
+        lc_sysret failed = exec_program(command, argv, envp);
+        exec_failed(failed == -LB_ENOENT || failed == -LB_ENOTDIR ? "no such command: " : "cannot execute: ",
+                    command, failed == -LB_ENOENT || failed == -LB_ENOTDIR ? 127 : 126);
+    }
+
+    const char *path = "";
+    for (int i = 0; envp[i]; i++) {
+        if (same_variable(envp[i], "PATH="))
+            path = envp[i] + 5;
+    }
+
+    bool was_there = false;         /* found somewhere, and not allowed or not a program */
+    size_t command_len = lc_string_length(command);
+    for (const char *dir = path; *dir; ) {
+        size_t dir_len = 0;
+        while (dir[dir_len] && dir[dir_len] != ':')
+            dir_len++;
+
+        char candidate[MAX_PATH];
+        /* an empty entry would mean the directory the command is run from:
+         * not something to look in on a container's behalf */
+        if (dir_len > 0 && dir_len + 1 + command_len < sizeof(candidate)) {
+            lc_bytes_copy(candidate, dir, dir_len);
+            candidate[dir_len] = '/';
+            lc_bytes_copy(candidate + dir_len + 1, command, command_len + 1);
+            lc_sysret failed = exec_program(candidate, argv, envp);
+            if (failed != -LB_ENOENT && failed != -LB_ENOTDIR)
+                was_there = true;
+        }
+
+        dir += dir_len;
+        if (*dir == ':')
+            dir++;
+    }
+    exec_failed(was_there ? "cannot execute: " : "command not found: ", command, was_there ? 126 : 127);
+}
+
+/*
+ * Run the command of a request as the identity that was resolved for it: its
+ * environment, its directory, and the command itself. Does not return.
+ *
+ * The environment is PATH, HOME, TERM, and USER and LOGNAME for a uid that
+ * has a name; --env adds to it and replaces what it names, the later of two
+ * for the same variable winning.
+ */
+[[noreturn]] static void run_command(const struct exec_request *req, const struct identity *id) {
+    char home_env[MAX_PATH + 6] = "HOME=";
+    if (id->home[0])
+        str_append(home_env, 5, id->home, sizeof(home_env));
+    else
+        str_append(home_env, 5, id->uid > 0 ? "/" : "/root", sizeof(home_env));
+
+    char user_env[USER_NAME_MAX + 6] = "USER=";
+    char logname_env[USER_NAME_MAX + 9] = "LOGNAME=";
+    const char *name = id->name[0] ? id->name : (id->uid == 0 ? "root" : "");
+    str_append(user_env, 5, name, sizeof(user_env));
+    str_append(logname_env, 8, name, sizeof(logname_env));
+
+    char term_env[80] = "TERM=";
+    str_append(term_env, 5, req->term ? req->term : "xterm", sizeof(term_env));
+
+    const char *base[5];
+    int nbase = 0;
+    base[nbase++] = "PATH=/usr/bin:/bin:/usr/sbin:/sbin";
+    base[nbase++] = home_env;
+    base[nbase++] = term_env;
+    if (name[0]) {
+        base[nbase++] = user_env;
+        base[nbase++] = logname_env;
+    }
+
+    const char *envp[5 + MAX_EXEC_ENV + 1];
+    int n = 0;
+    for (int i = 0; i < nbase; i++) {
+        bool replaced = false;
+        for (int j = 0; j < req->nenv; j++) {
+            if (same_variable(base[i], req->env[j]))
+                replaced = true;
+        }
+        if (!replaced)
+            envp[n++] = base[i];
+    }
+    for (int i = 0; i < req->nenv; i++) {
+        bool replaced = false;
+        for (int j = i + 1; j < req->nenv; j++) {
+            if (same_variable(req->env[i], req->env[j]))
+                replaced = true;
+        }
+        if (!replaced)
+            envp[n++] = req->env[i];
+    }
+    envp[n] = NULL;
+
+    if (req->workdir && lc_kernel_chdir(req->workdir) < 0)
+        exec_failed("cannot change to directory: ", req->workdir, 126);
+
+    exec_command(req->argv, envp);
+}
+
+/*
+ * exec's options, from argv[first] to where the command begins. Returns the
+ * index of the command's first word, which is argc when there is none. Ends
+ * the process on an option it does not know, a value that is missing, or one
+ * that is malformed.
+ */
+static int parse_exec_options(int argc, char **argv, int first, struct exec_request *req) {
+    int i = first;
+    for (; i < argc; i++) {
+        const char *arg = argv[i];
+        if (streq(arg, "--"))
+            return i + 1;
+        if (arg[0] != '-')
+            break;
+
+        bool user = streq(arg, "--user") || streq(arg, "-u");
+        bool env = streq(arg, "--env") || streq(arg, "-e");
+        bool workdir = streq(arg, "--workdir") || streq(arg, "-w");
+        if (!user && !env && !workdir) {
+            print_str(STDERR, "Error: unknown option: ");
+            print_str(STDERR, arg);
+            print_str(STDERR, "\nA command that begins with a dash goes after --.\n");
+            lc_kernel_exit(1);
+        }
+        if (i + 1 >= argc) {
+            print_str(STDERR, "Error: option ");
+            print_str(STDERR, arg);
+            print_str(STDERR, " requires a value\n");
+            lc_kernel_exit(1);
+        }
+        const char *value = argv[++i];
+
+        if (user) {
+            if (!parse_user_spec(value, req))
+                die2("Error: --user takes a name, a uid or uid:gid, and this is none of them: ", value);
+        } else if (env) {
+            size_t eq = 0;
+            while (value[eq] && value[eq] != '=')
+                eq++;
+            if (eq == 0 || value[eq] != '=')
+                die2("Error: --env takes KEY=VALUE: ", value);
+            if (req->nenv == MAX_EXEC_ENV)
+                die("Error: more than " STRINGIFY(MAX_EXEC_ENV) " --env options");
+            req->env[req->nenv++] = value;
+        } else {
+            if (value[0] != '/')
+                die2("Error: --workdir takes an absolute path: ", value);
+            req->workdir = value;
+        }
+    }
+    return i;
+}
+
+/* A TERM worth passing into a container: a short name of ordinary characters. */
+static bool term_is_plain(const char *term) {
+    size_t len = lc_string_length(term);
+    if (len == 0 || len > 64)
+        return false;
+    for (size_t i = 0; i < len; i++) {
+        char c = term[i];
+        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                  c == '-' || c == '_' || c == '.' || c == '+';
+        if (!ok)
+            return false;
+    }
+    return true;
+}
+
+/* ─── exec: a binary the container cannot write to ──────────────────────── */
+
+/*
+ * A process that enters a container is, to the container, one of its own:
+ * until it executes the command, it is this binary, and a file that is being
+ * executed can be reached by other processes through /proc/<pid>/exe. So exec
+ * does not enter a container as the installed binary. It first executes
+ * itself again from a copy that nothing can write to:
+ *
+ *   a sealed memfd    a copy in memory, whose seals forbid writing, growing
+ *                     and shrinking, and forbid taking the seals off;
+ *   a read-only mount where the kernel is set to refuse executable memfds
+ *                     (vm.memfd_noexec = 2): the binary itself, seen through
+ *                     a mount of its own that is read-only.
+ *
+ * runc has done the same since CVE-2019-5736. If neither can be had, exec
+ * does not run.
+ */
+#define SELF_SEALS (LB_F_SEAL_SEAL | LB_F_SEAL_SHRINK | LB_F_SEAL_GROW | LB_F_SEAL_WRITE)
+
+/* what main was given: exec passes it on when it executes itself again */
+static char **caller_argv;
+static char **caller_env;
+
+/* Does this process run from a file that cannot be written to? */
+static bool runs_sealed(void) {
+    lc_sysret fd = lc_kernel_open_file("/proc/self/exe", O_RDONLY | O_CLOEXEC, 0);
+    if (fd < 0)
+        return false;
+    lc_sysret seals = lb_sys_fcntl((int32_t)fd, LB_F_GET_SEALS, 0);
+    lc_kernel_close_file((int32_t)fd);
+    if (seals >= 0 && (seals & SELF_SEALS) == SELF_SEALS)
+        return true;
+
+    /* or through a read-only mount: what the path of the running binary
+     * says about its mount is what holds for anyone who reaches it there */
+    struct lb_statfs fs;
+    return lb_sys_statfs("/proc/self/exe", &fs) >= 0 && (fs.f_flags & LB_ST_RDONLY);
+}
+
+/* A sealed copy of this binary in memory: a descriptor to execute, or a
+ * negative errno. */
+static lc_sysret sealed_copy(void) {
+    lc_sysret self = lc_kernel_open_file("/proc/self/exe", O_RDONLY | O_CLOEXEC, 0);
+    if (self < 0)
+        return self;
+
+    lc_sysret copy = lb_sys_memfd_create("lightbox", LB_MFD_CLOEXEC | LB_MFD_ALLOW_SEALING | LB_MFD_EXEC);
+    if (copy == -LB_EINVAL)     /* a kernel from before the flag */
+        copy = lb_sys_memfd_create("lightbox", LB_MFD_CLOEXEC | LB_MFD_ALLOW_SEALING);
+
+    lc_sysret rc = copy;
+    while (rc >= 0) {
+        static char block[65536];
+        lc_sysret n = lc_kernel_read_retry((int32_t)self, block, sizeof(block));
+        if (n == 0)
+            break;
+        rc = n < 0 ? n : lc_kernel_write_all((int32_t)copy, block, (size_t)n);
+        if (rc >= 0 && rc != n)
+            rc = -LB_EINVAL;
+    }
+    if (rc >= 0)
+        rc = lb_sys_fcntl((int32_t)copy, LB_F_ADD_SEALS, SELF_SEALS);
+    lc_kernel_close_file((int32_t)self);
+    if (rc < 0) {
+        if (copy >= 0)
+            lc_kernel_close_file((int32_t)copy);
+        return rc;
+    }
+    return copy;
+}
+
+/* This binary on a mount of its own, made read-only: a descriptor to
+ * execute, or a negative errno. */
+static lc_sysret readonly_clone(void) {
+    lc_sysret tree = lb_sys_open_tree(AT_FDCWD, "/proc/self/exe", LB_OPEN_TREE_CLONE | LB_OPEN_TREE_CLOEXEC);
+    if (tree < 0)
+        return tree;
+    struct lb_mount_attr attr = { .attr_set = LB_MOUNT_ATTR_RDONLY };
+    lc_sysret rc = lb_sys_mount_setattr((int32_t)tree, "", LB_AT_EMPTY_PATH, &attr);
+    if (rc < 0) {
+        lc_kernel_close_file((int32_t)tree);
+        return rc;
+    }
+    return tree;
+}
+
+/*
+ * Would executing this descriptor be refused for what it is? A memfd that is
+ * not allowed to be executed is refused at execve, not before, so the only
+ * way to know without executing is to ask the setting that decides.
+ */
+static bool memfd_exec_refused(void) {
+    char value[8];
+    return read_file("/proc/sys/vm/memfd_noexec", value, sizeof(value)) > 0 && value[0] == '2';
+}
+
+seal_method exec_seal_method(void) {
+    lc_sysret fd = memfd_exec_refused() ? -LB_EACCES : sealed_copy();
+    if (fd >= 0) {
+        lc_kernel_close_file((int32_t)fd);
+        return SEAL_MEMFD;
+    }
+    fd = readonly_clone();
+    if (fd >= 0) {
+        lc_kernel_close_file((int32_t)fd);
+        return SEAL_READONLY;
+    }
+    return SEAL_NONE;
+}
+
+/* The mark, in the environment, of a process that has executed itself once. */
+#define SEALED_MARK "LIGHTBOX_EXEC_SEALED=1"
+
+/*
+ * Make sure this process runs from a file that cannot be written to, by
+ * executing itself again from one if it does not. Returns in the process
+ * that does; ends the process when no such file can be had.
+ */
+static void run_sealed(void) {
+    if (runs_sealed()) {
+        /* executed through a descriptor, a process is named after the
+         * descriptor's number: give it its name back */
+        lc_kernel_prctl(LB_PR_SET_NAME, (uint64_t)(uintptr_t)"lightbox", 0, 0, 0);
+        return;
+    }
+
+    /* Once is enough: a second arrival here means that the copy was executed
+     * and still does not look sealed, and trying again would not end. */
+    if (env_get(caller_env, "LIGHTBOX_EXEC_SEALED"))
+        die("Error: exec runs from a copy of lightbox, and cannot tell that the copy is one that cannot be written to");
+
+    static char *env[256];
+    size_t n = 0;
+    for (; caller_env && caller_env[n] && n < 254; n++)
+        env[n] = caller_env[n];
+    static char mark[] = SEALED_MARK;
+    env[n++] = mark;
+    env[n] = NULL;
+
+    lc_sysret failed = -LB_EACCES;
+    if (!memfd_exec_refused()) {
+        lc_sysret copy = sealed_copy();
+        failed = copy;
+        if (copy >= 0) {
+            failed = lb_sys_execveat((int32_t)copy, "", caller_argv, env, LB_AT_EMPTY_PATH);
+            lc_kernel_close_file((int32_t)copy);
+        }
+    }
+    lc_sysret clone = readonly_clone();
+    if (clone >= 0)
+        failed = lb_sys_execveat((int32_t)clone, "", caller_argv, env, LB_AT_EMPTY_PATH);
+
+    say_with_number("Error: exec enters a container only from a copy of lightbox that the container cannot\n"
+                    "write to, and could not make one here (errno ", (int)-failed,
+                    "). lightbox doctor says more.\n");
+    lc_kernel_exit(1);
+}
+
+/* ─── exec: the command's standard streams ──────────────────────────────── */
+
+/*
+ * A command in a container does not get a terminal of the host's. Whoever
+ * holds a terminal can read what is typed on it and write what is shown on
+ * it, and a container's command is not to have that over the terminal of the
+ * person who started it. So what the command gets depends on what lightbox
+ * itself was given:
+ *
+ *   stdin and stdout are both a terminal
+ *       a terminal of its own: a pseudo-terminal of the container's devpts,
+ *       as its controlling terminal and its three streams. The caller's
+ *       terminal is put into raw mode, and lightbox carries the bytes both
+ *       ways and passes on the window's size when it changes.
+ *   some of the three are a terminal
+ *       a pipe in the place of each that is, which lightbox reads or fills;
+ *       the others as they are.
+ *   none is
+ *       all three as they are: files, pipes, /dev/null.
+ *
+ * In every case the command leads a session of its own, so no signal that a
+ * terminal sends to lightbox's process group reaches it by itself. lightbox
+ * passes on the ones that ask a command to end.
+ */
+
+/* One direction of what lightbox carries: from a descriptor to a descriptor,
+ * with what has been read and not yet written in between. */
+struct channel {
+    int32_t from, to;
+    bool    reading;            /* from has not come to its end */
+    bool    close_at_end;       /* to is a pipe of the command's: its end is the command's end of input */
+    size_t  have, sent;
+    char    buf[4096];
+};
+
+struct exec_streams {
+    int32_t command_fd[3];      /* what the command gets as 0, 1 and 2; -1: lightbox's own */
+    int32_t terminal;           /* >= 0: the command's end of the pseudo-terminal */
+    int32_t master;             /* >= 0: lightbox's end of it */
+    int     nchannels;
+    struct channel channels[3];
+};
+
+static bool is_terminal(int32_t fd) {
+    struct lb_termios modes;
+    return lc_kernel_device_control(fd, LB_TCGETS, &modes) >= 0;
+}
+
+/* The modes of a terminal that passes every byte on as it is and leaves
+ * every key to the other side: what cfmakeraw makes of them. */
+static void make_raw(struct lb_termios *modes) {
+    modes->iflag &= ~(uint32_t)(LB_IGNBRK | LB_BRKINT | LB_PARMRK | LB_ISTRIP | LB_INLCR | LB_IGNCR |
+                                LB_ICRNL | LB_IXON);
+    modes->oflag &= ~(uint32_t)LB_OPOST;
+    modes->lflag &= ~(uint32_t)(LB_ECHO | LB_ECHONL | LB_ICANON | LB_ISIG | LB_IEXTEN);
+    modes->cflag &= ~(uint32_t)(LB_CSIZE | LB_PARENB);
+    modes->cflag |= LB_CS8;
+    modes->cc[LB_VMIN] = 1;
+    modes->cc[LB_VTIME] = 0;
+}
+
+static void copy_window_size(int32_t from, int32_t to) {
+    struct lb_winsize size;
+    if (lc_kernel_device_control(from, LB_TIOCGWINSZ, &size) >= 0)
+        lc_kernel_device_control(to, LB_TIOCSWINSZ, &size);
+}
+
+static void set_nonblocking(int32_t fd, bool on) {
+    lc_sysret flags = lb_sys_fcntl(fd, LB_F_GETFL, 0);
+    if (flags >= 0)
+        lb_sys_fcntl(fd, LB_F_SETFL, on ? ((uint64_t)flags | O_NONBLOCK) : ((uint64_t)flags & ~(uint64_t)O_NONBLOCK));
+}
+
+static struct channel *add_channel(struct exec_streams *st, int32_t from, int32_t to, bool close_at_end) {
+    struct channel *c = &st->channels[st->nchannels++];
+    c->from = from;
+    c->to = to;
+    c->reading = true;
+    c->close_at_end = close_at_end;
+    c->have = c->sent = 0;
+    return c;
+}
+
+/*
+ * Decide what the command gets, and make it. ptmx is the container's
+ * /dev/pts/ptmx, by a path that is looked up with the container's root as
+ * the root; the command's end of the pseudo-terminal is opened from the
+ * descriptor of lightbox's end, by no path at all. The terminal is given to
+ * the user the command runs as, the way a login gives a terminal to its user.
+ */
+static void prepare_streams(struct exec_streams *st, const char *ptmx, int uid, int gid) {
+    st->command_fd[0] = st->command_fd[1] = st->command_fd[2] = -1;
+    st->terminal = st->master = -1;
+    st->nchannels = 0;
+
+    bool tty[3] = { is_terminal(STDIN), is_terminal(STDOUT), is_terminal(STDERR) };
+
+    if (tty[0] && tty[1]) {
+        lc_sysret master = lc_kernel_open_file(ptmx, O_RDWR | LB_O_NOCTTY | O_NONBLOCK | O_CLOEXEC, 0);
+        int unlocked = 0;
+        if (master < 0 || lc_kernel_device_control((int32_t)master, LB_TIOCSPTLCK, &unlocked) < 0)
+            die2("Error: the container has no pseudo-terminals to give the command one from: ", ptmx);
+        lc_sysret terminal = lc_kernel_device_control((int32_t)master, LB_TIOCGPTPEER,
+                                                      (void *)(uintptr_t)(O_RDWR | LB_O_NOCTTY | O_CLOEXEC));
+        if (terminal < 0)
+            die("Error: failed to open the command's terminal");
+        (void)lc_kernel_fchownat((int32_t)terminal, "", (uint32_t)uid, (uint32_t)gid, LB_AT_EMPTY_PATH);
+        copy_window_size(STDIN, (int32_t)master);
+
+        st->master = (int32_t)master;
+        st->terminal = (int32_t)terminal;
+        st->command_fd[0] = st->command_fd[1] = st->command_fd[2] = (int32_t)terminal;
+        add_channel(st, STDIN, (int32_t)master, false);
+        add_channel(st, (int32_t)master, STDOUT, false);
+        return;
+    }
+
+    for (int i = 0; i < 3; i++) {
+        if (!tty[i])
+            continue;
+        int32_t ends[2];
+        if (lc_kernel_create_pipe(ends, O_CLOEXEC) < 0)
+            die("Error: failed to make a pipe for the command");
+        if (i == STDIN) {
+            /* typed on the terminal, read by the command */
+            st->command_fd[i] = ends[0];
+            set_nonblocking(ends[1], true);
+            add_channel(st, STDIN, ends[1], true);
+        } else {
+            /* written by the command, shown on the terminal */
+            st->command_fd[i] = ends[1];
+            set_nonblocking(ends[0], true);
+            add_channel(st, ends[0], i, false);
+        }
+    }
+}
+
+/*
+ * In the command's process, before anything else: no signal held back, a
+ * session of its own, the terminal if it gets one as its controlling
+ * terminal, its three streams, and nothing else that was open in whoever ran
+ * lightbox.
+ */
+static void take_streams(const struct exec_streams *st) {
+    uint64_t no_signals = 0;
+    lc_kernel_set_signal_mask(LC_SIG_SETMASK, &no_signals, NULL);
+
+    if (lc_kernel_create_session() < 0)
+        die("Error: failed to give the command a session of its own");
+    if (st->terminal >= 0 && lc_kernel_device_control(st->terminal, LB_TIOCSCTTY, NULL) < 0)
+        die("Error: failed to make the terminal the command's own");
+    for (int i = 0; i < 3; i++) {
+        if (st->command_fd[i] >= 0 && lc_kernel_duplicate_fd(st->command_fd[i], i, 0) < 0)
+            die("Error: failed to set up the command's standard streams");
+    }
+    close_all_but(NULL, 0);
+}
+
+/* In lightbox, once the command has its copies: its ends are the command's
+ * alone, so that each pipe ends when the command is done with it. */
+static void release_command_ends(struct exec_streams *st) {
+    for (int i = 0; i < 3; i++) {
+        int32_t fd = st->command_fd[i];
+        if (fd < 0)
+            continue;
+        lc_kernel_close_file(fd);
+        for (int j = i; j < 3; j++) {
+            if (st->command_fd[j] == fd)
+                st->command_fd[j] = -1;
+        }
+    }
+    st->terminal = -1;
+}
+
+static void channel_end_of_input(struct channel *c) {
+    c->reading = false;
+    if (c->close_at_end && c->to >= 0 && c->have == c->sent) {
+        lc_kernel_close_file(c->to);
+        c->to = -1;
+    }
+}
+
+/* Read what there is. An end of file, and an error that is not "nothing yet",
+ * end the direction: a pseudo-terminal says EIO when its other end is gone. */
+static void channel_read(struct channel *c) {
+    lc_sysret n = lc_kernel_read_bytes(c->from, c->buf, sizeof(c->buf));
+    if (n > 0) {
+        c->have = (size_t)n;
+        c->sent = 0;
+    } else if (n != -LB_EAGAIN && n != -LB_EINTR) {
+        channel_end_of_input(c);
+    }
+}
+
+/* Write what is waiting, or as much of it as is taken. A descriptor that can
+ * no longer be written to ends the direction, and what was waiting is dropped. */
+static void channel_write(struct channel *c) {
+    lc_sysret n = c->to >= 0 ? lc_kernel_write_bytes(c->to, c->buf + c->sent, c->have - c->sent) : -1;
+    if (n > 0) {
+        c->sent += (size_t)n;
+    } else if (n != -LB_EAGAIN && n != -LB_EINTR) {
+        c->sent = c->have;
+        c->reading = false;
+        if (c->close_at_end && c->to >= 0) {
+            lc_kernel_close_file(c->to);
+            c->to = -1;
+        }
+    }
+    if (c->sent == c->have) {
+        c->have = c->sent = 0;
+        if (!c->reading)
+            channel_end_of_input(c);
+    }
+}
+
+/* The signals the process that carries a command's streams reads itself. */
+static uint64_t relay_signal_mask(void) {
+    return sigmask_from_signal(SIGCHLD) | sigmask_from_signal(LB_SIGWINCH) |
+           sigmask_from_signal(SIGINT) | sigmask_from_signal(SIGTERM) |
+           sigmask_from_signal(SIGHUP) | sigmask_from_signal(SIGQUIT);
+}
+
+/*
+ * Carry the command's streams until the command has ended: its wait status.
+ *
+ * A direction is read only when nothing of it is waiting to be written, and
+ * written only when its descriptor takes something, so neither side can hold
+ * up the other. A signal that asks to end is passed on to the command, and a
+ * change of the window's size to its terminal. When the command has ended,
+ * what it wrote last is still delivered; what something it left behind may
+ * write later is not waited for.
+ */
+static int32_t relay_until_exit(struct exec_streams *st, int32_t command, int32_t signal_fd) {
+    int32_t status = 0;
+    bool ended = false;
+
+    while (!ended) {
+        struct lb_pollfd fds[4];
+        struct channel *of[4];
+        bool writing[4];
+        uint64_t count = 0;
+
+        fds[count] = (struct lb_pollfd){ .fd = signal_fd, .events = LB_POLLIN, .revents = 0 };
+        of[count++] = NULL;
+        for (int i = 0; i < st->nchannels; i++) {
+            struct channel *c = &st->channels[i];
+            if (c->have > c->sent && c->to >= 0) {
+                fds[count] = (struct lb_pollfd){ .fd = c->to, .events = LB_POLLOUT, .revents = 0 };
+                writing[count] = true;
+                of[count++] = c;
+            } else if (c->reading) {
+                fds[count] = (struct lb_pollfd){ .fd = c->from, .events = LB_POLLIN, .revents = 0 };
+                writing[count] = false;
+                of[count++] = c;
+            }
+        }
+
+        lc_sysret ready = lb_sys_ppoll(fds, count, NULL);
+        if (ready < 0 && ready != -LB_EINTR)
+            die("Error: failed to wait on the command's streams");
+        if (ready <= 0)
+            continue;
+
+        if (fds[0].revents & LB_POLLIN) {
+            lc_signal_info si;
+            if (lc_kernel_read_retry(signal_fd, &si, sizeof(si)) == (lc_sysret)sizeof(si)) {
+                if (si.signal == SIGCHLD) {
+                    if (lc_kernel_wait_for_child(command, &status, WNOHANG) == command)
+                        ended = true;
+                } else if (si.signal == LB_SIGWINCH) {
+                    if (st->master >= 0)
+                        copy_window_size(STDIN, st->master);
+                } else {
+                    lc_kernel_send_signal(command, (int32_t)si.signal);
+                }
+            }
+        }
+        for (uint64_t i = 1; i < count; i++) {
+            if (!fds[i].revents)
+                continue;
+            if (writing[i])
+                channel_write(of[i]);
+            else
+                channel_read(of[i]);
+        }
+    }
+
+    /* what the command wrote before it ended */
+    for (int i = 0; i < st->nchannels; i++) {
+        struct channel *c = &st->channels[i];
+        if (c->to != STDOUT && c->to != STDERR)
+            continue;
+        for (int rounds = 0; rounds < 256; rounds++) {
+            if (c->have > c->sent)
+                (void)lc_kernel_write_all(c->to, c->buf + c->sent, c->have - c->sent);
+            c->have = c->sent = 0;
+            lc_sysret n = lc_kernel_read_bytes(c->from, c->buf, sizeof(c->buf));
+            if (n <= 0)
+                break;
+            c->have = (size_t)n;
+        }
+    }
+    return status;
+}
+
+/*
+ * In lightbox, with the command started: carry its streams until it ends.
+ * With a terminal for the command, the caller's terminal is raw for that
+ * time, and gets its modes back at the end; the process that ran exec keeps
+ * them too and puts them back once more, in case this one is killed.
+ */
+static int32_t serve_command(struct exec_streams *st, int32_t command, int32_t signal_fd) {
+    release_command_ends(st);
+
+    struct lb_termios saved, raw;
+    bool restore = st->master >= 0 && lc_kernel_device_control(STDIN, LB_TCGETS, &saved) >= 0;
+    if (restore) {
+        raw = saved;
+        make_raw(&raw);
+        lc_kernel_device_control(STDIN, LB_TCSETS, &raw);
+    }
+
+    int32_t status = relay_until_exit(st, command, signal_fd);
+
+    if (restore)
+        lc_kernel_device_control(STDIN, LB_TCSETS, &saved);
+    return status;
+}
+
+/* Hold back the signals that a command's streams are carried around, and
+ * the two that would otherwise end or stop the carrier at a bad moment: a
+ * descriptor to read the first from, or -1. */
+static int32_t hold_relay_signals(void) {
+    uint64_t read_here = relay_signal_mask();
+    uint64_t blocked = read_here | sigmask_from_signal(LB_SIGPIPE) | sigmask_from_signal(LB_SIGTTOU);
+    if (lc_kernel_set_signal_mask(LC_SIG_BLOCK, &blocked, NULL) < 0)
+        return -1;
+    lc_sysret fd = lc_kernel_create_signal_fd(-1, &read_here, SFD_CLOEXEC);
+    return fd < 0 ? -1 : (int32_t)fd;
+}
+
+/*
+ * In the process that ran exec: wait for the worker, and pass on what asks
+ * it to end. A signal that the terminal sent has reached the worker by
+ * itself, since both are in the terminal's foreground, so only the ones a
+ * process sent are passed on. The worker's wait status.
+ */
+static int32_t attend_worker(int32_t worker, int32_t signal_fd) {
+    int32_t status = 0;
+    for (;;) {
+        struct lb_pollfd one = { .fd = signal_fd, .events = LB_POLLIN, .revents = 0 };
+        lc_sysret ready = lb_sys_ppoll(&one, 1, NULL);
+        if (ready < 0 && ready != -LB_EINTR)
+            die("Error: failed to wait for the exec worker");
+        if (ready <= 0)
+            continue;
+        lc_signal_info si;
+        if (lc_kernel_read_retry(signal_fd, &si, sizeof(si)) != (lc_sysret)sizeof(si))
+            continue;
+        if (si.signal == SIGCHLD) {
+            if (lc_kernel_wait_for_child(worker, &status, WNOHANG) == worker)
+                return status;
+        } else if (si.signal != LB_SIGWINCH && si.code <= 0) {
+            lc_kernel_send_signal(worker, (int32_t)si.signal);
+        }
+    }
+}
+
+/*
+ * The rest of what the process that ran exec does: attend to the worker, put
+ * the terminal's modes back as they were before the worker touched them, and
+ * give the exit status to end with. modes is NULL when stdin is no terminal.
+ */
+static int finish_exec(int32_t worker, int32_t signal_fd, const struct lb_termios *modes) {
+    int32_t status = attend_worker(worker, signal_fd);
+    if (modes) {
+        struct lb_termios back = *modes;
+        lc_kernel_device_control(STDIN, LB_TCSETS, &back);
+    }
+    return exit_code_from_status(status);
+}
+
+/* ─── exec: entering the container ──────────────────────────────────────── */
+
 static int exec_inside_container(const char *name, int target_pid, int userns,
-                                 int privileged, int uid, int gid,
-                                 const char *home, const char *user_name,
-                                 int ngroups, const uint32_t *groups,
-                                 const char *const cmd_argv[]) {
+                                 int privileged, const struct exec_request *req) {
+    /* From here to the command's execve this process, and the child it
+     * forks, are lightbox inside a container. Not dumpable, their memory and
+     * their descriptors are closed to the container's processes, whatever
+     * uid those have. */
+    if (lc_kernel_prctl(LB_PR_SET_DUMPABLE, 0, 0, 0, 0) < 0)
+        die("Error: failed to close the exec worker to other processes");
+
     int rootfd = open_target_path(target_pid, "/root");
     if (rootfd < 0)
         die("Error: failed to open target root");
@@ -1404,66 +2646,37 @@ static int exec_inside_container(const char *name, int target_pid, int userns,
     if (lc_kernel_chdir("/") < 0)
         die("Error: failed to chdir to container root");
 
+    /* The container's root is this process's root now: its account files
+     * are read here, where no path in them leads out of the container. */
+    struct identity id;
+    resolve_identity(req, "/etc/passwd", "/etc/group", &id);
+
+    /* What the command gets in the place of a terminal of the caller's: made
+     * here, where /dev/pts is the container's. */
+    static struct exec_streams streams;
+    prepare_streams(&streams, "/dev/pts/ptmx", id.uid, id.gid);
+
     require_setns_fd(pidfd, CLONE_NEWPID, "pid");
+
+    /* held back before the fork, so that the command's end is never missed */
+    int32_t signal_fd = hold_relay_signals();
+    if (signal_fd < 0)
+        die("Error: failed to take over the signals of an exec");
 
     lc_sysret child = lc_kernel_fork();
     if (child < 0)
         die("Error: exec helper fork failed");
 
     if (child == 0) {
-        uint64_t empty_mask = 0;
-        lc_kernel_set_signal_mask(LC_SIG_SETMASK, &empty_mask, NULL);
+        take_streams(&streams);
 
         if (!privileged)
             apply_sandbox();
-
-        if (ngroups >= 0) {
-            if (lc_kernel_setgroups((size_t)ngroups, groups) < 0)
-                die("Error: failed to set supplementary groups for exec");
-        }
-        if (gid >= 0) {
-            if (lc_kernel_setgid(gid) < 0)
-                die("Error: failed to setgid for exec");
-        }
-        if (uid >= 0) {
-            if (lc_kernel_setuid(uid) < 0)
-                die("Error: failed to setuid for exec");
-        }
-
-        char home_env[MAX_PATH + 6] = "HOME=";
-        if (home && home[0])
-            str_append(home_env, 5, home, sizeof(home_env));
-        else if (uid > 0)
-            str_append(home_env, 5, "/", sizeof(home_env));
-        else
-            str_append(home_env, 5, "/root", sizeof(home_env));
-
-        char user_env[NAME_MAX_LEN + 6] = "USER=";
-        char logname_env[NAME_MAX_LEN + 9] = "LOGNAME=";
-        if (user_name && user_name[0]) {
-            str_append(user_env, 5, user_name, sizeof(user_env));
-            str_append(logname_env, 8, user_name, sizeof(logname_env));
-        } else if (uid == 0) {
-            str_append(user_env, 5, "root", sizeof(user_env));
-            str_append(logname_env, 8, "root", sizeof(logname_env));
-        }
-
-        const char *envp[6];
-        int ei = 0;
-        envp[ei++] = "PATH=/usr/bin:/bin:/usr/sbin:/sbin";
-        envp[ei++] = home_env;
-        envp[ei++] = "TERM=xterm";
-        if (user_env[5]) envp[ei++] = user_env;
-        if (logname_env[8]) envp[ei++] = logname_env;
-        envp[ei] = NULL;
-        exec_program(cmd_argv[0], cmd_argv, envp);
-        die2("Error: failed to exec command: ", cmd_argv[0]);
+        become(&id);
+        run_command(req, &id);
     }
 
-    int32_t status;
-    if (wait_child((int32_t)child, &status) < 0)
-        die("Error: failed to wait for the command");
-    return status;
+    return serve_command(&streams, (int32_t)child, signal_fd);
 }
 
 /* ─── Starting: the command's side ──────────────────────────────────────── */
@@ -1717,6 +2930,116 @@ static void enter_user_namespace_root(void) {
         die("Error: capset failed in userns");
 }
 
+/* A volume on its way into a container. */
+struct volume_mount {
+    int32_t tree;               /* a clone of the source's mount, attached nowhere yet */
+    bool    is_dir;
+    bool    ro;
+    char    dst[MAX_PATH];
+};
+
+/*
+ * Clone the mount of a volume's source: a copy of it that hangs nowhere, and
+ * that stays good when the host's filesystems are taken out of the
+ * container's sight. Ends the process when the volume cannot be had.
+ */
+static void open_volume(const char *spec, struct volume_mount *out) {
+    volume_spec vol = {0};
+    const char *wrong = parse_volume_spec(spec, &vol);
+    if (wrong) {
+        print_str(STDERR, "Error: the container's configuration has a volume that cannot be used (");
+        print_str(STDERR, wrong);
+        print_str(STDERR, "): ");
+        print_str(STDERR, spec);
+        lc_print_char(STDERR, '\n');
+        lc_kernel_exit(1);
+    }
+
+    lc_sysret tree = lb_sys_open_tree(AT_FDCWD, vol.src, LB_OPEN_TREE_CLONE | LB_OPEN_TREE_CLOEXEC);
+    if (tree == -LB_ENOENT)
+        die2("Error: volume source does not exist: ", vol.src);
+    struct lb_statx stx;
+    if (tree < 0 || lb_sys_statx((int32_t)tree, "", LB_AT_EMPTY_PATH, LB_STATX_TYPE, &stx) < 0) {
+        say_with_number("Error: cannot take the volume's source (errno ", (int)(tree < 0 ? -tree : 0), "): ");
+        print_str(STDERR, vol.src);
+        lc_print_char(STDERR, '\n');
+        lc_kernel_exit(1);
+    }
+
+    out->tree = (int32_t)tree;
+    out->is_dir = (stx.stx_mode & LB_S_IFMT) == LB_S_IFDIR;
+    out->ro = vol.ro != 0;
+    str_copy(out->dst, vol.dst, sizeof(out->dst));
+}
+
+/* The volumes a container is configured with, cloned: how many. */
+static int open_volumes(const char *name, struct volume_mount *out) {
+    static char conf_buf[CONF_MAX];
+    int count = 0;
+    if (container_conf_read(name, conf_buf) <= 0)
+        return 0;
+
+    for (char *p = conf_buf; *p; ) {
+        char *end = p;
+        while (*end && *end != '\n') end++;
+        bool last = *end == '\0';
+        *end = '\0';
+        if (p[0] == 'v' && p[1] == 'o' && p[2] == 'l' && p[3] == '=') {
+            if (count == MAX_VOLS)
+                die("Error: the container's configuration has more than " STRINGIFY(MAX_VOLS) " volumes");
+            open_volume(p + 4, &out[count++]);
+        }
+        p = last ? end : end + 1;
+    }
+    return count;
+}
+
+/*
+ * Attach the cloned volumes, in the container.
+ *
+ * This runs after the pivot and after the host's root has been taken away, so
+ * every destination is looked up with the container's root as the root: a
+ * link in the image leads where the container sees it lead, and nothing made
+ * here, directory or file, can be anywhere but in the container. It also
+ * runs after /tmp and /run have been mounted, so a volume below them is on
+ * top of them and not hidden beneath.
+ */
+static void attach_volumes(const struct volume_mount *vols, int count) {
+    for (int i = 0; i < count; i++) {
+        const char *dst = vols[i].dst;
+
+        /* something to mount on, of the kind the source is */
+        if (vols[i].is_dir) {
+            if (make_dirs(dst) != 0)
+                lc_kernel_exit(1);
+        } else {
+            char parent[MAX_PATH];
+            parent_dir(parent, sizeof(parent), dst);
+            if (make_dirs(parent) != 0)
+                lc_kernel_exit(1);
+            lc_sysret fd = lc_kernel_open_file(dst, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+            if (fd < 0)
+                die2("Error: failed to create volume target file: ", dst);
+            lc_kernel_close_file((int32_t)fd);
+        }
+
+        lc_sysret rc = lb_sys_move_mount(vols[i].tree, "", AT_FDCWD, dst,
+                                         LB_MOVE_MOUNT_F_EMPTY_PATH | LB_MOVE_MOUNT_T_SYMLINKS);
+        if (rc < 0) {
+            say_with_number("Error: cannot mount the volume (errno ", (int)-rc, ") at ");
+            print_str(STDERR, dst);
+            lc_print_char(STDERR, '\n');
+            lc_kernel_exit(1);
+        }
+        lc_kernel_close_file(vols[i].tree);
+
+        uint64_t flags = MS_REMOUNT | MS_BIND | MS_NOSUID | MS_NODEV;
+        if (vols[i].ro)
+            flags |= MS_RDONLY;
+        require_mount(NULL, dst, NULL, flags, NULL);
+    }
+}
+
 /*
  * Build the container around init: its volumes, its /dev, its own root, and
  * the filesystems that go into it. Every step that fails ends the process
@@ -1733,62 +3056,11 @@ static void build_container(const struct child_args *ca) {
     /* set hostname */
     lc_kernel_sethostname(ca->name, lc_string_length(ca->name));
 
-    /* read volume config and set up bind mounts */
-    char conf_buf[CONF_MAX];
-    if (container_conf_read(ca->name, conf_buf) > 0) {
-        char *p = conf_buf;
-        while (*p) {
-            if (p[0] == 'v' && p[1] == 'o' && p[2] == 'l' && p[3] == '=') {
-                char vol_line[MAX_PATH * 2 + 4];
-                char *end = p + 4;
-                while (*end && *end != '\n') end++;
-                size_t vlen = (size_t)(end - (p + 4));
-                if (vlen < sizeof(vol_line)) {
-                    lc_bytes_copy(vol_line, p + 4, vlen);
-                    vol_line[vlen] = '\0';
-
-                    /* parse src:dst[:ro] */
-                    char *colon1 = NULL, *colon2 = NULL;
-                    for (char *q = vol_line; *q; q++) {
-                        if (*q == ':') { if (!colon1) colon1 = q; else if (!colon2) colon2 = q; }
-                    }
-                        if (colon1) {
-                            *colon1 = '\0';
-                            char *dst = colon1 + 1;
-                            int ro = 0;
-                            if (colon2) { *colon2 = '\0'; ro = (colon2[1] == 'r'); }
-
-                        /* create the correct mount target type for file or directory binds */
-                        char mount_point[MAX_PATH];
-                        path_join(mount_point, MAX_PATH, ca->root, dst);
-                        if (!path_exists(vol_line))
-                            die2("Error: volume source does not exist: ", vol_line);
-
-                        if (path_is_directory(vol_line)) {
-                            mkdir_p_or_die(mount_point);
-                        } else {
-                            char parent[MAX_PATH];
-                            parent_dir(parent, sizeof(parent), mount_point);
-                            mkdir_p_or_die(parent);
-                            lc_sysret fd = lc_kernel_open_file(mount_point, O_WRONLY | O_CREAT, 0644);
-                            if (fd < 0)
-                                die2("Error: failed to create volume target file: ", mount_point);
-                            lc_kernel_close_file((int32_t)fd);
-                        }
-
-                        require_mount(vol_line, mount_point, NULL, MS_BIND, NULL);
-                        {
-                            uint64_t remount_flags = MS_REMOUNT | MS_BIND | MS_NOSUID | MS_NODEV;
-                            if (ro) remount_flags |= MS_RDONLY;
-                            require_mount(NULL, mount_point, NULL, remount_flags, NULL);
-                        }
-                    }
-                }
-            }
-            while (*p && *p != '\n') p++;
-            if (*p == '\n') p++;
-        }
-    }
+    /* The volumes: taken now, while the host's paths mean what they mean on
+     * the host, and attached later, when the container's paths mean what
+     * they mean in the container. */
+    struct volume_mount volumes[MAX_VOLS];
+    int nvolumes = open_volumes(ca->name, volumes);
 
     /* set up /dev via bind mounts (works in both userns and non-userns) */
     {
@@ -1876,6 +3148,17 @@ static void build_container(const struct child_args *ca) {
     lc_kernel_symlinkat("/proc/self/fd/2", AT_FDCWD, "/dev/stderr");
     lc_kernel_symlinkat("pts/ptmx", AT_FDCWD, "/dev/ptmx");
 
+    /* tmpfs for /tmp and /run, so that the hook and its services find them
+     * as they stay. /tmp is for everyone; /run is for root's services to
+     * share with them. */
+    require_mount("tmpfs", "/tmp", "tmpfs", MS_NOSUID | MS_NODEV, NULL);
+    require_mount("tmpfs", "/run", "tmpfs", MS_NOSUID | MS_NODEV, "mode=755");
+    if (ca->read_only)
+        require_mount("tmpfs", "/var/tmp", "tmpfs", MS_NOSUID | MS_NODEV, NULL);
+
+    /* the volumes, on top of all of the above and before the root may close */
+    attach_volumes(volumes, nvolumes);
+
     /* mask sensitive /proc paths (unless privileged) */
     if (!ca->privileged) {
         mask_proc_paths();
@@ -1890,14 +3173,6 @@ static void build_container(const struct child_args *ca) {
      * run: its tools are not needed, and not trusted with what init may do. */
     if (loopback_up() != 0)
         lc_kernel_exit(1);
-
-    /* mount tmpfs for /tmp and /run before /init.sh so services started from
-     * the init hook see the final runtime filesystem layout. */
-    require_mount("tmpfs", "/tmp", "tmpfs", MS_NOSUID | MS_NODEV, NULL);
-    /* /tmp is for everyone; /run is for root's services to share with them */
-    require_mount("tmpfs", "/run", "tmpfs", MS_NOSUID | MS_NODEV, "mode=755");
-    if (ca->read_only)
-        require_mount("tmpfs", "/var/tmp", "tmpfs", MS_NOSUID | MS_NODEV, NULL);
 }
 
 /* What the clone that becomes a container's init runs. */
@@ -2459,248 +3734,28 @@ static void cmd_rm(int argc, char **argv) {
 
 /* ─── cmd_exec ──────────────────────────────────────────────────────────── */
 
-/* Resolve a username from the container's /etc/passwd.
- * Returns 0 on success, -1 if user not found. */
-static int resolve_passwd_user(const char *name, const char *username,
-                               int *out_uid, int *out_gid,
-                               char *out_home, size_t home_sz) {
-    char root[MAX_PATH];
-    container_root(root, name);
-
-    char passwd_path[MAX_PATH];
-    path_join(passwd_path, sizeof(passwd_path), root, "etc/passwd");
-
-    char buf[4096];
-    if (read_file(passwd_path, buf, sizeof(buf)) < 0)
-        return -1;
-
-    size_t ulen = lc_string_length(username);
-
-    /* scan line by line: user:x:uid:gid:gecos:home:shell */
-    char *p = buf;
-    while (*p) {
-        char *line = p;
-        /* find end of line */
-        while (*p && *p != '\n') p++;
-        if (*p == '\n') *p++ = '\0';
-
-        /* match username before first colon */
-        char *c1 = NULL;
-        for (char *q = line; *q; q++) {
-            if (*q == ':') { c1 = q; break; }
-        }
-        if (!c1) continue;
-        if ((size_t)(c1 - line) != ulen) continue;
-
-        bool match = true;
-        for (size_t i = 0; i < ulen; i++) {
-            if (line[i] != username[i]) { match = false; break; }
-        }
-        if (!match) continue;
-
-        /* skip password field (field 2) */
-        char *f = c1 + 1;
-        char *c2 = NULL;
-        for (char *q = f; *q; q++) {
-            if (*q == ':') { c2 = q; break; }
-        }
-        if (!c2) continue;
-
-        /* uid field (field 3) */
-        f = c2 + 1;
-        char *c3 = NULL;
-        for (char *q = f; *q; q++) {
-            if (*q == ':') { c3 = q; break; }
-        }
-        if (!c3) continue;
-        *c3 = '\0';
-        *out_uid = parse_int(f);
-
-        /* gid field (field 4) */
-        f = c3 + 1;
-        char *c4 = NULL;
-        for (char *q = f; *q; q++) {
-            if (*q == ':') { c4 = q; break; }
-        }
-        if (!c4) continue;
-        *c4 = '\0';
-        *out_gid = parse_int(f);
-
-        /* skip gecos (field 5) */
-        f = c4 + 1;
-        char *c5 = NULL;
-        for (char *q = f; *q; q++) {
-            if (*q == ':') { c5 = q; break; }
-        }
-        if (!c5) continue;
-
-        /* home field (field 6) */
-        f = c5 + 1;
-        char *c6 = NULL;
-        for (char *q = f; *q; q++) {
-            if (*q == ':') { c6 = q; break; }
-        }
-        if (c6) *c6 = '\0';
-        str_copy(out_home, f, home_sz);
-
-        return 0;
-    }
-    return -1;
-}
-
-/* Resolve an account by numeric UID from the container's /etc/passwd.
- * Returns 0 on success, -1 if user not found. */
-static int resolve_passwd_uid(const char *name, int uid,
-                              char *out_user, size_t user_sz,
-                              int *out_gid,
-                              char *out_home, size_t home_sz) {
-    char root[MAX_PATH];
-    container_root(root, name);
-
-    char passwd_path[MAX_PATH];
-    path_join(passwd_path, sizeof(passwd_path), root, "etc/passwd");
-
-    char buf[4096];
-    if (read_file(passwd_path, buf, sizeof(buf)) < 0)
-        return -1;
-
-    char *p = buf;
-    while (*p) {
-        char *line = p;
-        while (*p && *p != '\n') p++;
-        if (*p == '\n') *p++ = '\0';
-
-        char *c1 = NULL;
-        for (char *q = line; *q; q++) {
-            if (*q == ':') { c1 = q; break; }
-        }
-        if (!c1) continue;
-        *c1 = '\0';
-
-        char *f = c1 + 1;
-        char *c2 = NULL;
-        for (char *q = f; *q; q++) {
-            if (*q == ':') { c2 = q; break; }
-        }
-        if (!c2) continue;
-
-        f = c2 + 1;
-        char *c3 = NULL;
-        for (char *q = f; *q; q++) {
-            if (*q == ':') { c3 = q; break; }
-        }
-        if (!c3) continue;
-        *c3 = '\0';
-        if (parse_int(f) != uid)
-            continue;
-
-        f = c3 + 1;
-        char *c4 = NULL;
-        for (char *q = f; *q; q++) {
-            if (*q == ':') { c4 = q; break; }
-        }
-        if (!c4) continue;
-        *c4 = '\0';
-        *out_gid = parse_int(f);
-
-        f = c4 + 1;
-        char *c5 = NULL;
-        for (char *q = f; *q; q++) {
-            if (*q == ':') { c5 = q; break; }
-        }
-        if (!c5) continue;
-
-        f = c5 + 1;
-        char *c6 = NULL;
-        for (char *q = f; *q; q++) {
-            if (*q == ':') { c6 = q; break; }
-        }
-        if (c6) *c6 = '\0';
-
-        str_copy(out_user, line, user_sz);
-        str_copy(out_home, f, home_sz);
-        return 0;
-    }
-
-    return -1;
-}
-
-static int resolve_group_memberships(const char *name, const char *username,
-                                     int primary_gid, uint32_t *out_groups,
-                                     int max_groups) {
-    char root[MAX_PATH];
-    container_root(root, name);
-
-    char group_path[MAX_PATH];
-    path_join(group_path, sizeof(group_path), root, "etc/group");
-
-    char buf[4096];
-    if (read_file(group_path, buf, sizeof(buf)) < 0)
-        return 0;
-
-    size_t ulen = lc_string_length(username);
-    int count = 0;
-    char *p = buf;
-    while (*p) {
-        char *line = p;
-        while (*p && *p != '\n') p++;
-        if (*p == '\n') *p++ = '\0';
-        if (!line[0]) continue;
-
-        char *c1 = NULL, *c2 = NULL, *c3 = NULL;
-        for (char *q = line; *q; q++) {
-            if (*q == ':') {
-                if (!c1) c1 = q;
-                else if (!c2) c2 = q;
-                else { c3 = q; break; }
-            }
-        }
-        if (!c1 || !c2 || !c3) continue;
-
-        char *gid_field = c2 + 1;
-        *c3 = '\0';
-        int gid = parse_int(gid_field);
-        if (gid == primary_gid)
-            continue;
-
-        char *members = c3 + 1;
-        bool member = false;
-        while (*members) {
-            char *entry = members;
-            while (*members && *members != ',') members++;
-            char saved = *members;
-            *members = '\0';
-
-            size_t len = lc_string_length(entry);
-            if (len == ulen) {
-                member = true;
-                for (size_t i = 0; i < ulen; i++) {
-                    if (entry[i] != username[i]) {
-                        member = false;
-                        break;
-                    }
-                }
-                if (member) break;
-            }
-
-            *members = saved;
-            if (saved == ',') members++;
-        }
-
-        if (member) {
-            if (count >= max_groups)
-                die("Error: too many supplementary groups for exec user");
-            out_groups[count++] = (uint32_t)gid;
-        }
-    }
-
-    return count;
+/* The caller's TERM goes with the command, when it is a plain name. */
+static void request_term(struct exec_request *req) {
+    const char *term = env_get(caller_env, "TERM");
+    if (term && term_is_plain(term))
+        req->term = term;
 }
 
 static void cmd_exec(int argc, char **argv) {
-    if (argc < 1) die("Usage: lightbox exec <name> [--user <uid[:gid]>] [cmd...]");
+    if (argc < 1)
+        die("Usage: lightbox exec <name> [--user <name|uid[:gid]>] [--env KEY=VALUE]... [--workdir <dir>] [--] [cmd [args...]]");
     const char *name = argv[0];
     validate_name(name);
+
+    run_sealed();
+
+    static const char *const shell[] = { "/bin/sh", NULL };
+    struct exec_request req = { .as = AS_ROOT, .gid = -1 };
+    int command = parse_exec_options(argc, argv, 1, &req);
+    /* the kernel ends argv with a NULL, so the command's words are passed on
+     * as they are, however many */
+    req.argv = command < argc ? (const char *const *)(uintptr_t)(argv + command) : shell;
+    request_term(&req);
 
     if (!is_running(name)) die2("Error: container is not running: ", name);
 
@@ -2711,94 +3766,29 @@ static void cmd_exec(int argc, char **argv) {
     if (userns)
         die("Error: exec into userns containers is not supported yet");
 
-    /* parse exec options */
-    int uid = -1;
-    int gid = -1;
-    char home[MAX_PATH] = {0};
-    char user_name[NAME_MAX_LEN + 1] = {0};
-    uint32_t groups[32];
-    int ngroups = -1;
-    int cmd_start = 1;
+    /* The terminal's modes as they are now. The worker makes the terminal
+     * raw while a command has a terminal of its own, and puts the modes back;
+     * this process puts them back as well, because the worker is in the
+     * container's cgroup and ends without a word when the container is
+     * stopped. */
+    struct lb_termios modes;
+    bool restore = lc_kernel_device_control(STDIN, LB_TCGETS, &modes) >= 0;
 
-    for (int i = 1; i < argc; i++) {
-        if (streq(argv[i], "--user") && i + 1 < argc) {
-            const char *spec = argv[++i];
-
-            /* check if spec starts with a digit — numeric uid[:gid] */
-            bool numeric = (spec[0] >= '0' && spec[0] <= '9');
-
-            if (numeric) {
-                const char *colon = NULL;
-                bool explicit_gid = false;
-                for (const char *p = spec; *p; p++) {
-                    if (*p == ':') { colon = p; break; }
-                }
-                if (colon) {
-                    explicit_gid = true;
-                    char uid_buf[16];
-                    size_t uid_len = (size_t)(colon - spec);
-                    if (uid_len == 0 || uid_len >= sizeof(uid_buf))
-                        die("Error: invalid uid in --user");
-                    for (size_t j = 0; j < uid_len; j++)
-                        uid_buf[j] = spec[j];
-                    uid_buf[uid_len] = '\0';
-                    uid = parse_int(uid_buf);
-                    gid = parse_int(colon + 1);
-                } else {
-                    uid = parse_int(spec);
-                    gid = uid;
-                }
-                if (uid < 0) die("Error: invalid uid in --user");
-                if (gid < 0) die("Error: invalid gid in --user");
-
-                int passwd_gid = gid;
-                if (resolve_passwd_uid(name, uid, user_name, sizeof(user_name), &passwd_gid,
-                                       home, sizeof(home)) == 0) {
-                    int primary_gid = explicit_gid ? gid : passwd_gid;
-                    if (!explicit_gid)
-                        gid = passwd_gid;
-                    ngroups = resolve_group_memberships(name, user_name, primary_gid, groups,
-                                                        (int)(sizeof(groups) / sizeof(groups[0])));
-                }
-            } else {
-                /* resolve username from container's /etc/passwd */
-                if (resolve_passwd_user(name, spec, &uid, &gid, home, sizeof(home)) < 0)
-                    die2("Error: user not found in container: ", spec);
-                str_copy(user_name, spec, sizeof(user_name));
-                ngroups = resolve_group_memberships(name, spec, gid, groups, (int)(sizeof(groups) / sizeof(groups[0])));
-            }
-            cmd_start = i + 1;
-        } else {
-            cmd_start = i;
-            break;
-        }
-    }
-
-    const char *cmd_argv[32];
-    int ai = 0;
-    if (cmd_start < argc) {
-        for (int i = cmd_start; i < argc && ai < 31; i++)
-            cmd_argv[ai++] = argv[i];
-    } else {
-        cmd_argv[ai++] = "/bin/sh";
-    }
-    cmd_argv[ai] = NULL;
+    int32_t signal_fd = hold_relay_signals();
+    if (signal_fd < 0)
+        die("Error: failed to take over the signals of an exec");
 
     lc_sysret worker = lc_kernel_fork();
     if (worker < 0)
         die("Error: failed to fork exec worker");
 
     if (worker == 0) {
-        int status = exec_inside_container(name, pid, userns, privileged,
-                                           uid, gid, home, user_name,
-                                           ngroups, groups, cmd_argv);
+        lc_kernel_close_file(signal_fd);
+        int status = exec_inside_container(name, pid, userns, privileged, &req);
         lc_kernel_exit(exit_code_from_status(status));
     }
 
-    int32_t status;
-    if (wait_child((int32_t)worker, &status) < 0)
-        die("Error: failed to wait for the exec worker");
-    lc_kernel_exit(exit_code_from_status(status));
+    lc_kernel_exit(finish_exec((int32_t)worker, signal_fd, restore ? &modes : NULL));
 }
 
 /* ─── cmd_ls ────────────────────────────────────────────────────────────── */
@@ -2822,14 +3812,17 @@ static void cmd_exec(int argc, char **argv) {
         "         --privileged           Disable security sandbox\n"
         "         --oom-score <n>        OOM score adjustment (default: 500)\n"
         "         --link <name>          Allow network to another container\n"
+        "         --dns <address>        A name server for the container (up to 3; default: the host's)\n"
         "  start  <name> [-t <seconds>]  Start a stopped container\n"
         "         -t <seconds>            How long to wait for /init.sh (default: 30, 0: do not wait)\n"
         "  stop   <name> [-t <seconds>]  Stop a running container\n"
         "         -t <seconds>            How long its processes get to end (default: 10)\n"
         "  add-vol <name> <src:dst[:ro]> Add a volume to an existing container\n"
         "  rm     <name>                 Remove a container (must be stopped)\n"
-        "  exec   <name> [options] [cmd...]  Execute a command in a running container\n"
-        "         --user <name|uid[:gid]> Run as specified user/group (default: root)\n"
+        "  exec   <name> [options] [--] [cmd [args...]]  Run a command in a running container\n"
+        "         --user <name|uid[:gid]> Who to run it as (default: root)\n"
+        "         --env <KEY=VALUE>       Set a variable in its environment (repeatable)\n"
+        "         --workdir <dir>         The directory to run it in (default: /)\n"
         "  logs   <name> [-f]            Show what the container has printed; -f follows it\n"
         "  inspect <name>                Show container metadata and runtime state\n"
         "  doctor                        Show host/runtime dependency status\n"
@@ -2861,6 +3854,8 @@ static void reserve_standard_streams(void) {
 
 int main(int argc, char **argv, char **envp) {
     reserve_standard_streams();
+    caller_argv = argv;
+    caller_env = envp;
     if (argc < 2) usage();
 
     /* load configuration: built-in defaults → lightbox.conf → env vars */

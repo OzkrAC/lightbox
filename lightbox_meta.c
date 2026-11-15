@@ -249,6 +249,22 @@ void cmd_inspect(int argc, char **argv) {
     print_kv_int("readonly", conf_get_int(name, "readonly", 0));
 }
 
+/* doctor: can exec run from a copy of the binary that cannot be written to? */
+static bool report_exec_sealing(void) {
+    switch (exec_seal_method()) {
+        case SEAL_MEMFD:
+            print_kv("exec_sealing", "yes (a sealed copy in memory)");
+            return true;
+        case SEAL_READONLY:
+            print_kv("exec_sealing", "yes (a read-only mount of the binary; executable memfds are refused here)");
+            return true;
+        case SEAL_NONE:
+        default:
+            print_kv("exec_sealing", "no (exec will not run: it needs memfd_create, or root and Linux 5.12)");
+            return false;
+    }
+}
+
 void cmd_doctor(void) {
     static const struct {
         const char *key;
@@ -298,6 +314,9 @@ void cmd_doctor(void) {
         print_check(bins[i].key, ok, path);
         if (!ok) missing++;
     }
+
+    if (!report_exec_sealing())
+        missing++;
 
     print_kv("overall", missing == 0 ? "ok" : "degraded");
     if (missing != 0)

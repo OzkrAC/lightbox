@@ -144,12 +144,18 @@ This creates:
 # Use a different rootfs image
 ./lightbox create deb 10.0.0.5 --rootfs /opt/rootfs/debian
 
+# Choose the name servers the container asks
+./lightbox create web 10.0.0.7 --dns 9.9.9.9 --dns 149.112.112.112
+
 # Disable the security sandbox
 ./lightbox create dev 10.0.0.6 --privileged
 
 # Allow two containers to talk to each other
 ./lightbox create api 10.0.0.10 --link db
 ./lightbox create db  10.0.0.11
+
+# Run a command as one of the container's users, with a variable set, in a directory
+./lightbox exec app --user www-data --env MODE=debug --workdir /var/www -- ls -la
 
 # Add a volume to an existing container configuration
 ./lightbox add-vol app /srv/config/app.conf:/etc/app.conf:ro
@@ -210,6 +216,10 @@ start_timeout = 30
 
 # Seconds that a container's processes get to end when it is stopped
 stop_timeout = 10
+
+# Name servers for new containers, up to three. Without this they are the ones
+# this host asks, or 1.1.1.1 and 8.8.8.8 if those are of no use to a container
+dns = 9.9.9.9, 149.112.112.112
 ```
 
 If `lightbox_dir` is set, `rootfs` and `container_dir` are automatically derived from it (e.g., `rootfs = <lightbox_dir>/rootfs`) unless explicitly overridden.
@@ -232,7 +242,7 @@ lightbox <command> [args]
   stop   <name> [-t <seconds>]  Stop a running container
   add-vol <name> <src>:<dst>[:ro]  Add a volume to an existing container
   rm     <name>                 Remove a container
-  exec   <name> [cmd...]        Run a command in a container
+  exec   <name> [options] [--] [cmd [args...]]   Run a command in a container
   logs   <name> [-f]            Show what a container has printed; -f follows it
   ls                            List all containers
 ```
@@ -252,6 +262,27 @@ lightbox <command> [args]
 | `--privileged` | off | Disable security sandbox |
 | `--oom-score <n>` | `500` | OOM score adjustment |
 | `--link <name>` | — | Allow network to another container (repeatable) |
+| `--dns <address>` | the host's | A name server for the container (IPv4, up to 3) |
+
+### Exec options
+
+Options come before the command. A command that begins with a dash goes after `--`; without a command, `exec` runs `/bin/sh`.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--user <name\|uid[:gid]>`, `-u` | root | Who the command runs as. A name is looked up in the container's `/etc/passwd`. A value that begins with a digit must be a uid, or a uid and a gid, and nothing else |
+| `--env <KEY=VALUE>`, `-e` | — | Set a variable in the command's environment (repeatable; the later of two for one variable wins) |
+| `--workdir <dir>`, `-w` | `/` | The directory the command runs in, as an absolute path in the container |
+
+What the command gets as its standard streams depends on what `exec` itself was given, and is never a terminal of yours:
+
+- **Typed at a terminal** (stdin and stdout are both a terminal): the command gets a terminal of its own, a pseudo-terminal of the container, as its controlling terminal. Your terminal is raw for as long as the command runs, so every key goes to the command: Ctrl-C interrupts what runs in the container, not `exec`. The window's size is passed on, also when it changes.
+- **With a terminal on one side only**, as in `lightbox exec x cat file | less` or `lightbox exec x cat > notes`: the command gets a pipe in the place of the terminal, which `exec` reads or fills. Bytes arrive as they were sent.
+- **Without a terminal**, as in a script or a pipeline: the three streams as they are.
+
+In every case the command leads a session of its own and is given nothing else that was open where `exec` was run. SIGINT, SIGTERM, SIGHUP and SIGQUIT sent to `exec` are passed on to the command.
+
+The command is found as a shell finds it: a name without a slash is looked for in the directories of `PATH`. Its environment is `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, `HOME`, `USER` and `LOGNAME` for its user, and the `TERM` of the terminal `exec` was typed on; nothing else of your environment goes into the container. Its groups are the ones the container's `/etc/group` lists for its user, and none for a uid the container has no account for. `exec` exits with the command's status, with 127 when the command is not there and 126 when it cannot be run.
 
 ## Security
 
@@ -268,6 +299,8 @@ The sandbox covers everything in a container: init, the `/init.sh` hook and all 
 | /proc read-only | Remounts /proc/sys, /proc/bus, /proc/fs, /proc/irq read-only |
 | Root filesystem | Mounted `nodev`, and `nosuid` unless privileged. Devices come from the `/dev` that lightbox builds |
 | Container isolation | A container without `--link` has an isolated port on the bridge: it reaches the host and the outside, and no other container. IPv6 is off inside containers. A container with `--link` shares the bridge, is kept to its links by iptables, and does not start unless `br_netfilter` lets iptables see bridged traffic |
+| The terminal of whoever runs `exec` | A command never holds it. Typed at a terminal, `exec` gives the command a pseudo-terminal of the container and carries the bytes; where only one of its streams is a terminal, a pipe stands in for it |
+| The binary `exec` enters with | `exec` executes itself again from a sealed copy in memory before it enters a container, so the processes it puts there are never the installed binary. Where the kernel refuses executable memfds (`vm.memfd_noexec=2`) it takes the binary through a read-only mount of its own instead. Its worker is not dumpable. `lightbox doctor` says which of the two is in use |
 | User namespaces | Planned future improvement |
 | OOM priority | Containers scored higher for OOM killer |
 
@@ -276,7 +309,7 @@ The sandbox covers everything in a container: init, the `/init.sh` hook and all 
 - **Namespaces**: `clone()` with PID, mount, UTS, IPC, net (and optionally user) namespace flags
 - **Filesystem**: each container lives under `<container_dir>/<name>/` with `rootfs/` for the filesystem, `.conf`, `.ip`, `.pid` for metadata and `console.log` for its output. `pivot_root` into the rootfs copy
 - **Devices**: bind-mounted from host (`/dev/null`, `/dev/zero`, `/dev/random`, etc.)
-- **Networking**: veth pair per container connected to a host bridge with NAT
+- **Networking**: veth pair per container connected to a host bridge with NAT. `create` writes the container's `/etc/resolv.conf`, `/etc/hostname` and a line for its own name in `/etc/hosts`, inside the copy of the image, where a link in the image cannot send them anywhere else
 - **Resource limits**: cgroups v2 (memory, PIDs, CPU, I/O)
 - **Init**: lightbox remains PID 1 inside the container. It reaps children and handles shutdown from the moment the container is built, and runs `/init.sh`, if the rootfs has one, as one of its children: after `/tmp` and `/run` are mounted, with the sandbox on, and only once the container is on record, so `stop` and `ls` always find a container whose hook runs
 - **Stopping**: `stop` sends init a SIGTERM that carries the number of seconds the container may take. Init passes SIGTERM on to every process in the container, the ones `exec` put there included, reaps them, and exits when none is left or the time is over; the kernel kills whatever remains with it. `stop` waits for init through a pidfd, so it returns as soon as the container has ended. It then kills anything still in the cgroup, waits until the kernel reports the cgroup empty, and removes it. A SIGTERM sent to init by other means has the same effect, with the `stop_timeout` that was set when the container started
@@ -287,6 +320,9 @@ The sandbox covers everything in a container: init, the `/init.sh` hook and all 
 
 ## Volume Notes
 
+- A volume is written `src:dst[:ro]`. Both paths are absolute and may not contain `..`; they are stored in one spelling, without doubled slashes. The destination may not be `/` or under `/proc`, `/sys` or `/dev`.
+- The source is a path on the host, taken when the container starts. The destination is a path in the container, looked up inside it: where the image has a link on the way, the volume lands where the link leads in the container. A destination that the image lacks is made; one that leads nowhere in the container fails the start.
+- Volumes are mounted on top of everything else, so one below `/tmp` or `/run` is visible there.
 - `--vol` now supports both directory and single-file bind mounts.
 - `lightbox add-vol <name> <src>:<dst>[:ro]` appends a volume to an existing container's config.
 - If the container is already running, added volumes take effect after a restart.

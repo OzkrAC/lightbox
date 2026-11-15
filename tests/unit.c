@@ -24,6 +24,27 @@
  *   unit stop    <pid> <seconds>              ask_init_to_stop, then wait as stop does:
  *                                             "asked" or "gone", then "ended" or "still there"
  *   unit pids    <file>                       each_listed_pid: a line for each, then the count
+ *   unit volspec <spec>                       parse_volume_spec: "<src> -> <dst> ro|rw",
+ *                                             or "invalid: <what is wrong>"
+ *   unit volumes <root> <spec>... [-- <probe>...]
+ *                                             the volumes as init takes and attaches them, see below
+ *   unit sealed [words...]                    run_sealed, as exec begins: then what this process
+ *                                             runs from, its seals, its name, its words, and
+ *                                             whether its own binary can be opened for writing
+ *   unit sealed-readonly [words...]           the same from readonly_clone, the way exec takes
+ *                                             where an executable memfd is refused
+ *   unit relay <ptmx> -- <command...>         what exec does about a command's standard streams,
+ *                                             without a container: see below
+ *   unit nameservers <resolv.conf>            name_servers_of: a line for each, then the count
+ *   unit dnslist <text>                       name_servers_listed: the same for the dns setting
+ *   unit userspec <text>                      parse_user_spec: "name <n>", "uid <n>",
+ *                                             "uid <n> gid <m>" or "invalid"
+ *   unit identity <passwd> <group> <exec's options...>
+ *                                             resolve_identity for those options, from the two
+ *                                             files: "uid <n> gid <m> name <x> home <h> groups ..."
+ *   unit command <passwd> <group> <exec's options and command...>
+ *                                             the same, and then run_command in the harness's
+ *                                             place, without taking the identity on
  *
  * For mount, "-" stands for an argument that is not given, and the flags are
  * names joined by commas: ro, nosuid, nodev, noexec, remount, bind, rec,
@@ -54,6 +75,20 @@
  * once it is ready, as in a container; with "-" it keeps the harness's.
  * <grace> is how many seconds init gives its processes when a SIGTERM comes
  * without a number of its own; 10 when it is not given.
+ *
+ * relay runs a command the way exec does once it is in a container: a first
+ * process as the one that ran exec, which keeps the terminal's modes and
+ * attends to a second, the worker, which gives the command a pseudo-terminal
+ * from <ptmx>, or pipes, or its own streams, and carries them until the
+ * command ends. The harness ends with the command's exit status.
+ *
+ * volumes does to <root> what init does to a container's root filesystem,
+ * as far as volumes go: open_volume for each spec, pivot_root into <root>,
+ * the old root taken away, attach_volumes. It then prints "attached" and
+ * answers each probe from inside: "cat:<path>" with the file's text,
+ * "ls:<path>" with a line for each entry, "write:<path>" with "written" or
+ * "refused". It needs a mount namespace to itself, since the pivot moves the
+ * root of every process in it, and <root> on a mount of that namespace.
  *
  * It prints what it sees, a line each: "init <pid>", "ready", "hook <exit
  * status>", "hook-timeout", "closed", "signal <n>" and "abandoned" when one of
@@ -299,7 +334,120 @@ static void unit_init(const char *how, bool confined, int seconds, const char *s
     init_abandon(&link);
 }
 
-int main(int argc, char **argv) {
+/* One look at the new root from inside it. */
+static void unit_probe(const char *probe) {
+    size_t len = lc_string_length(probe);
+    put(probe);
+    if (lc_string_starts_with(probe, len, "cat:", 4)) {
+        static char text[512];
+        put(" = ");
+        put(read_file(probe + 4, text, sizeof(text)) >= 0 ? text : "(cannot be read)\n");
+    } else if (lc_string_starts_with(probe, len, "write:", 6)) {
+        lc_sysret fd = lc_kernel_open_file(probe + 6, O_WRONLY | O_CREAT, 0644);
+        put(fd >= 0 ? " = written\n" : " = refused\n");
+        if (fd >= 0)
+            lc_kernel_close_file((int32_t)fd);
+    } else if (lc_string_starts_with(probe, len, "ls:", 3)) {
+        put(" =\n");
+        lc_sysret fd = lc_kernel_open_file(probe + 3, O_RDONLY | O_DIRECTORY, 0);
+        static char entries[4096];
+        for (;;) {
+            lc_sysret n = fd < 0 ? 0 : lc_kernel_read_directory((int32_t)fd, entries, sizeof(entries));
+            if (n <= 0)
+                break;
+            for (lc_sysret pos = 0; pos < n; ) {
+                uint16_t reclen;
+                lc_bytes_copy(&reclen, entries + pos + 16, sizeof(reclen));
+                const char *name = entries + pos + 19;
+                if (!streq(name, ".") && !streq(name, "..")) {
+                    put("  ");
+                    put(name);
+                    put("\n");
+                }
+                if (reclen == 0)
+                    break;
+                pos += reclen;
+            }
+        }
+        if (fd >= 0)
+            lc_kernel_close_file((int32_t)fd);
+    } else {
+        put(" is not a probe\n");
+    }
+}
+
+static void put_int(int number) {
+    char buf[16];
+    fmt_int(buf, number);
+    put(buf);
+}
+
+/* What the process that run_sealed returns in is running from. */
+static void unit_report_sealed(int argc, char **argv) {
+    static char link[256];
+    lc_sysret n = lc_kernel_readlinkat(AT_FDCWD, "/proc/self/exe", link, sizeof(link) - 1);
+    link[n > 0 ? n : 0] = '\0';
+    put("exe ");
+    put(link);
+    put("\n");
+
+    lc_sysret fd = lc_kernel_open_file("/proc/self/exe", O_RDONLY | O_CLOEXEC, 0);
+    lc_sysret seals = fd >= 0 ? lb_sys_fcntl((int32_t)fd, LB_F_GET_SEALS, 0) : -1;
+    if (fd >= 0)
+        lc_kernel_close_file((int32_t)fd);
+    /* the seals as the kernel numbers them, for the case to compare with what it expects:
+     * 1 no more seals, 2 no shrinking, 4 no growing, 8 no writing */
+    put("seals ");
+    if (seals >= 0)
+        put_int((int)seals);
+    else
+        put("none");
+    put("\n");
+
+    struct lb_statfs fs;
+    put(lb_sys_statfs("/proc/self/exe", &fs) >= 0 && (fs.f_flags & LB_ST_RDONLY) ? "mount read-only\n" : "mount writable\n");
+    put(runs_sealed() ? "sealed yes\n" : "sealed no\n");
+
+    static char name[64];
+    if (read_file("/proc/self/comm", name, sizeof(name)) > 0) {
+        put("name ");
+        put(name);
+    }
+    put("words");
+    for (int i = 2; i < argc; i++) {
+        put(" [");
+        put(argv[i]);
+        put("]");
+    }
+    put("\n");
+    const char *kept = env_get(caller_env, "KEPT");
+    put("kept ");
+    put(kept ? kept : "(not in the environment)");
+    put("\n");
+
+    /* the binary this process runs, as another process would reach it */
+    fd = lc_kernel_open_file("/proc/self/exe", O_WRONLY, 0);
+    if (fd < 0) {
+        put("write refused at open\n");
+    } else {
+        put(lc_kernel_write_bytes((int32_t)fd, "x", 1) == 1 ? "write DONE\n" : "write refused\n");
+        lc_kernel_close_file((int32_t)fd);
+    }
+}
+
+/* exec's own parsing and resolving, with the account files where the case
+ * put them instead of in a container. */
+static void unit_request(int argc, char **argv, struct exec_request *req, struct identity *id) {
+    static const char *const shell[] = { "/bin/sh", NULL };
+    int command = parse_exec_options(argc, argv, 4, req);
+    req->argv = command < argc ? (const char *const *)(uintptr_t)(argv + command) : shell;
+    request_term(req);
+    resolve_identity(req, argv[2], argv[3], id);
+}
+
+int main(int argc, char **argv, char **envp) {
+    caller_argv = argv;
+    caller_env = envp;
     if (argc >= 3 && streq(argv[1], "run")) {
         put_result(run_cmd(argv[2], (const char *const *)(argv + 2)));
         return 0;
@@ -392,6 +540,145 @@ int main(int argc, char **argv) {
         put(readable_within((int32_t)pidfd, (int64_t)seconds * 1000 + STOP_MARGIN_MS) ? "ended\n" : "still there\n");
         return 0;
     }
+    if (argc == 3 && streq(argv[1], "volspec")) {
+        volume_spec vol = {0};
+        const char *wrong = parse_volume_spec(argv[2], &vol);
+        if (wrong) {
+            put("invalid: ");
+            put(wrong);
+        } else {
+            put(vol.src);
+            put(" -> ");
+            put(vol.dst);
+            put(vol.ro ? " ro" : " rw");
+        }
+        put("\n");
+        return 0;
+    }
+    if (argc >= 3 && streq(argv[1], "volumes")) {
+        static struct volume_mount volumes[MAX_VOLS];
+        const char *root = argv[2];
+        int count = 0, i = 3;
+
+        require_mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+        for (; i < argc && !streq(argv[i], "--"); i++) {
+            if (count == MAX_VOLS)
+                die("unit: too many volumes");
+            open_volume(argv[i], &volumes[count++]);
+        }
+
+        /* into the root as build_container goes into a container's */
+        require_mount(root, root, NULL, MS_BIND | MS_REC, NULL);
+        if (lc_kernel_chdir(root) < 0)
+            die2("unit: cannot change to ", root);
+        lc_kernel_mkdirat(AT_FDCWD, ".old_root", 0755);
+        if (lc_kernel_pivot_root(".", ".old_root") < 0)
+            die("unit: pivot_root failed");
+        cleanup_old_root_or_die();
+        lc_kernel_chdir("/");
+
+        attach_volumes(volumes, count);
+        put("attached\n");
+        for (i++; i < argc; i++)
+            unit_probe(argv[i]);
+        return 0;
+    }
+    if (argc >= 5 && streq(argv[1], "relay") && streq(argv[3], "--")) {
+        struct lb_termios modes;
+        bool restore = lc_kernel_device_control(STDIN, LB_TCGETS, &modes) >= 0;
+        int32_t signal_fd = hold_relay_signals();
+        if (signal_fd < 0)
+            die("unit: cannot hold signals back");
+
+        lc_sysret worker = lc_kernel_fork();
+        if (worker < 0)
+            die("unit: fork failed");
+        if (worker == 0) {
+            lc_kernel_close_file(signal_fd);
+            static struct exec_streams streams;
+            prepare_streams(&streams, argv[2], (int)lc_kernel_getuid(), -1);
+            int32_t worker_signals = hold_relay_signals();
+            lc_sysret command = lc_kernel_fork();
+            if (command < 0 || worker_signals < 0)
+                die("unit: cannot start the command");
+            if (command == 0) {
+                take_streams(&streams);
+                exec_program(argv[4], (const char *const *)(uintptr_t)(argv + 4), (const char *const *)(uintptr_t)envp);
+                die2("unit: cannot execute ", argv[4]);
+            }
+            lc_kernel_exit(exit_code_from_status(serve_command(&streams, (int32_t)command, worker_signals)));
+        }
+
+        return finish_exec((int32_t)worker, signal_fd, restore ? &modes : NULL);
+    }
+    if (argc >= 2 && streq(argv[1], "sealed")) {
+        run_sealed();
+        unit_report_sealed(argc, argv);
+        return 0;
+    }
+    if (argc >= 2 && streq(argv[1], "sealed-readonly")) {
+        if (!runs_sealed()) {
+            lc_sysret clone = readonly_clone();
+            if (clone < 0)
+                die("unit: no read-only clone of the binary");
+            lb_sys_execveat((int32_t)clone, "", argv, envp, LB_AT_EMPTY_PATH);
+            die("unit: the read-only clone could not be executed");
+        }
+        unit_report_sealed(argc, argv);
+        return 0;
+    }
+    if (argc == 3 && (streq(argv[1], "nameservers") || streq(argv[1], "dnslist"))) {
+        char found[MAX_DNS][16];
+        int count = streq(argv[1], "dnslist") ? name_servers_listed(argv[2], found)
+                                              : name_servers_of(argv[2], found);
+        for (int i = 0; i < count; i++) {
+            put(found[i]);
+            put("\n");
+        }
+        put_result(count);
+        return 0;
+    }
+    if (argc == 3 && streq(argv[1], "userspec")) {
+        struct exec_request req = { .as = AS_ROOT, .gid = -1 };
+        if (!parse_user_spec(argv[2], &req)) {
+            put("invalid\n");
+        } else if (req.as == AS_NAME) {
+            put("name ");
+            put(req.user);
+            put("\n");
+        } else {
+            put("uid ");
+            put_int(req.uid);
+            if (req.gid >= 0) {
+                put(" gid ");
+                put_int(req.gid);
+            }
+            put("\n");
+        }
+        return 0;
+    }
+    if (argc >= 4 && (streq(argv[1], "identity") || streq(argv[1], "command"))) {
+        struct exec_request req = { .as = AS_ROOT, .gid = -1 };
+        static struct identity id;
+        unit_request(argc, argv, &req, &id);
+        if (streq(argv[1], "command"))
+            run_command(&req, &id);
+        put("uid ");
+        put_int(id.uid);
+        put(" gid ");
+        put_int(id.gid);
+        put(" name ");
+        put(id.name[0] ? id.name : "-");
+        put(" home ");
+        put(id.home[0] ? id.home : "-");
+        put(" groups");
+        for (int i = 0; i < id.ngroups; i++) {
+            put(" ");
+            put_int((int)id.groups[i]);
+        }
+        put("\n");
+        return 0;
+    }
     if (argc == 3 && streq(argv[1], "pids")) {
         put_result(each_listed_pid(argv[2], put_pid));
         return 0;
@@ -400,5 +687,10 @@ int main(int argc, char **argv) {
         "       unit mount <source> <target> <fstype> <flags> <data> | unit mkdirs <path> | unit loopback\n"
         "       unit caps | unit sandbox <program> [args...] | unit maskproc | unit noipv6 <pid>\n"
         "       unit seconds <text> | unit streams <file> | unit init <how> confined|open <seconds> <hook script | -> <log file | -> [<grace>]\n"
-        "       unit stop <pid> <seconds> | unit pids <file>");
+        "       unit stop <pid> <seconds> | unit pids <file> | unit userspec <text>\n"
+        "       unit volspec <spec> | unit volumes <root> <spec>... [-- <probe>...]\n"
+        "       unit nameservers <resolv.conf> | unit dnslist <text>\n"
+        "       unit sealed [words...] | unit sealed-readonly [words...]\n"
+        "       unit relay <ptmx> -- <command...>\n"
+        "       unit identity|command <passwd> <group> <exec's options...>");
 }

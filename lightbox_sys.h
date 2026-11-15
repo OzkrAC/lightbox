@@ -25,6 +25,7 @@
 /* ─── Syscall numbers ───────────────────────────────────────────────────── */
 
 #if defined(__x86_64__)
+#define LB_SYS_fcntl      72
 #define LB_SYS_fsync      74
 #define LB_SYS_fchdir     81
 #define LB_SYS_capget     125
@@ -33,11 +34,18 @@
 #define LB_SYS_chroot     161
 #define LB_SYS_renameat   264
 #define LB_SYS_ppoll      271
+#define LB_SYS_memfd_create 319
+#define LB_SYS_execveat   322
 #define LB_SYS_statx      332
 #define LB_SYS_pidfd_send_signal 424
+#define LB_SYS_open_tree  428
+#define LB_SYS_move_mount 429
 #define LB_SYS_pidfd_open 434
 #define LB_SYS_close_range 436
+#define LB_SYS_openat2    437
+#define LB_SYS_mount_setattr 442
 #elif defined(__aarch64__)
+#define LB_SYS_fcntl      25
 #define LB_SYS_renameat   38
 #define LB_SYS_statfs     43
 #define LB_SYS_fchdir     50
@@ -46,10 +54,16 @@
 #define LB_SYS_fsync      82
 #define LB_SYS_capget     90
 #define LB_SYS_capset     91
+#define LB_SYS_memfd_create 279
+#define LB_SYS_execveat   281
 #define LB_SYS_statx      291
 #define LB_SYS_pidfd_send_signal 424
+#define LB_SYS_open_tree  428
+#define LB_SYS_move_mount 429
 #define LB_SYS_pidfd_open 434
 #define LB_SYS_close_range 436
+#define LB_SYS_openat2    437
+#define LB_SYS_mount_setattr 442
 #else
 #error "lightbox supports x86_64 and aarch64 only"
 #endif
@@ -59,12 +73,18 @@
 #define LB_ENOENT                 2
 #define LB_ESRCH                  3
 #define LB_EINTR                  4
+#define LB_EAGAIN                 11
+#define LB_EACCES                 13
 #define LB_EBUSY                  16
 #define LB_EEXIST                 17
+#define LB_EINVAL                 22
+#define LB_ENOTDIR                20
 
 /* The signals lightbox names that lightc does not (asm/signal.h) */
 #define LB_SIGPIPE                13
 #define LB_SIGCONT                18
+#define LB_SIGTTOU                22
+#define LB_SIGWINCH               28
 
 /* si_code of a signal that was queued with a value (asm-generic/siginfo.h) */
 #define LB_SI_QUEUE               (-1)
@@ -72,11 +92,16 @@
 /* What ppoll(2) is asked to wait for, and what it reports (asm-generic/poll.h).
  * A pipe whose other end was closed reports POLLHUP, with or without POLLIN. */
 #define LB_POLLIN                 0x0001
+#define LB_POLLOUT                0x0004
 #define LB_POLLERR                0x0008
 #define LB_POLLHUP                0x0010
 
 #define LB_S_IFMT                 0170000
 #define LB_S_IFDIR                0040000
+#define LB_S_IFREG                0100000
+
+/* statx of the file a descriptor is open on, given an empty path (linux/fcntl.h) */
+#define LB_AT_EMPTY_PATH          0x1000
 
 #define LB_STATX_TYPE             0x00000001U
 #define LB_STATX_MODE             0x00000002U
@@ -92,8 +117,81 @@
 #define LB_ST_NODEV               4
 #define LB_ST_NOEXEC              8
 
+/* Terminals (asm-generic/ioctls.h, termbits.h, fcntl.h).
+ *
+ * TIOCGPTPEER opens the other end of a pseudo-terminal from the descriptor of
+ * the one end, without a path for anything to stand in. */
+#define LB_TCGETS                     0x5401
+#define LB_TCSETS                     0x5402
+#define LB_TIOCSCTTY                  0x540E
+#define LB_TIOCGWINSZ                 0x5413
+#define LB_TIOCSWINSZ                 0x5414
+#define LB_TIOCSPTLCK                 0x40045431
+#define LB_TIOCGPTPEER                0x5441
+
+#define LB_O_NOCTTY                   0400
+#define LB_F_GETFL                    3
+#define LB_F_SETFL                    4
+
+/* what "raw" takes away from a terminal's modes, and the two characters it sets */
+#define LB_IGNBRK                     0x001
+#define LB_BRKINT                     0x002
+#define LB_PARMRK                     0x008
+#define LB_ISTRIP                     0x020
+#define LB_INLCR                      0x040
+#define LB_IGNCR                      0x080
+#define LB_ICRNL                      0x100
+#define LB_IXON                       0x400
+#define LB_OPOST                      0x01
+#define LB_ISIG                       0x00001
+#define LB_ICANON                     0x00002
+#define LB_ECHO                       0x00008
+#define LB_ECHONL                     0x00040
+#define LB_IEXTEN                     0x08000
+#define LB_CSIZE                      0x00000030
+#define LB_CS8                        0x00000030
+#define LB_PARENB                     0x00000100
+#define LB_VTIME                      5
+#define LB_VMIN                       6
+
+/* memfd_create(2) (linux/memfd.h). MFD_EXEC, Linux 6.3, says that the file
+ * is meant to be executed; an older kernel does not know the flag. */
+#define LB_MFD_CLOEXEC                0x0001U
+#define LB_MFD_ALLOW_SEALING          0x0002U
+#define LB_MFD_EXEC                   0x0010U
+
+/* fcntl(2) on a memfd: its seals (linux/fcntl.h). Once F_SEAL_SEAL is set
+ * the others cannot be taken off again, by anyone. */
+#define LB_F_ADD_SEALS                1033
+#define LB_F_GET_SEALS                1034
+#define LB_F_SEAL_SEAL                0x0001
+#define LB_F_SEAL_SHRINK              0x0002
+#define LB_F_SEAL_GROW                0x0004
+#define LB_F_SEAL_WRITE               0x0008
+
+/* mount_setattr(2), Linux 5.12 (linux/mount.h) */
+#define LB_MOUNT_ATTR_RDONLY          0x00000001
+
+/* open(2): fail if the file is there already (asm-generic/fcntl.h); the one
+ * open flag lightbox uses that lightc does not name */
+#define LB_O_EXCL                     0200
+
+/* openat2(2), Linux 5.6 (linux/openat2.h): look a path up as if the directory
+ * it starts from were the root. A link to "/x" then leads to x in that
+ * directory, and ".." does not lead out of it. */
+#define LB_RESOLVE_IN_ROOT            0x10
+
+/* open_tree(2) and move_mount(2), Linux 5.2 (linux/mount.h). A cloned tree
+ * is a copy of a mount that is attached nowhere yet; move_mount attaches it. */
+#define LB_OPEN_TREE_CLONE            1
+#define LB_OPEN_TREE_CLOEXEC          02000000      /* O_CLOEXEC */
+#define LB_MOVE_MOUNT_F_EMPTY_PATH    0x00000004    /* the tree is the descriptor itself */
+#define LB_MOVE_MOUNT_T_SYMLINKS      0x00000010    /* follow a link at the end of the target */
+
 /* prctl(2) requests (linux/prctl.h) */
+#define LB_PR_SET_DUMPABLE            4
 #define LB_PR_SET_KEEPCAPS            8
+#define LB_PR_SET_NAME                15
 #define LB_PR_SET_SECCOMP             22
 #define LB_PR_CAPBSET_READ            23
 #define LB_PR_CAPBSET_DROP            24
@@ -152,6 +250,39 @@ struct lb_siginfo_queue {
     uint32_t uid;
     int32_t  value;
     uint8_t  pad1[100];
+};
+
+/* struct termios, as TCGETS and TCSETS take it, and struct winsize
+ * (asm-generic/termbits.h, termios.h) */
+struct lb_termios {
+    uint32_t iflag;
+    uint32_t oflag;
+    uint32_t cflag;
+    uint32_t lflag;
+    uint8_t  line;
+    uint8_t  cc[19];
+};
+
+struct lb_winsize {
+    uint16_t row;
+    uint16_t col;
+    uint16_t xpixel;
+    uint16_t ypixel;
+};
+
+/* struct mount_attr (linux/mount.h) */
+struct lb_mount_attr {
+    uint64_t attr_set;
+    uint64_t attr_clr;
+    uint64_t propagation;
+    uint64_t userns_fd;
+};
+
+/* struct open_how (linux/openat2.h) */
+struct lb_open_how {
+    uint64_t flags;
+    uint64_t mode;
+    uint64_t resolve;
 };
 
 /* struct pollfd (asm-generic/poll.h) */
@@ -264,6 +395,41 @@ static inline lc_sysret lb_sys_pidfd_open(int32_t pid, uint32_t flags) {
 static inline lc_sysret lb_sys_pidfd_send_signal(int32_t pidfd, int32_t sig,
                                                  const struct lb_siginfo_queue *info, uint32_t flags) {
     return lc_syscall4(LB_SYS_pidfd_send_signal, pidfd, sig, (int64_t)info, flags);
+}
+
+static inline lc_sysret lb_sys_fcntl(int32_t fd, int32_t request, uint64_t argument) {
+    return lc_syscall3(LB_SYS_fcntl, fd, request, (int64_t)argument);
+}
+
+static inline lc_sysret lb_sys_memfd_create(const char *name, uint32_t flags) {
+    return lc_syscall2(LB_SYS_memfd_create, (int64_t)name, flags);
+}
+
+/* execveat(2): execute the file a descriptor is open on, with an empty path
+ * and LB_AT_EMPTY_PATH */
+static inline lc_sysret lb_sys_execveat(int32_t dirfd, const char *path, char *const argv[],
+                                        char *const envp[], int32_t flags) {
+    return lc_syscall5(LB_SYS_execveat, dirfd, (int64_t)path, (int64_t)argv, (int64_t)envp, flags);
+}
+
+static inline lc_sysret lb_sys_mount_setattr(int32_t dirfd, const char *path, uint32_t flags,
+                                             const struct lb_mount_attr *attr) {
+    return lc_syscall5(LB_SYS_mount_setattr, dirfd, (int64_t)path, flags, (int64_t)attr,
+                       (int64_t)sizeof(*attr));
+}
+
+static inline lc_sysret lb_sys_openat2(int32_t dirfd, const char *path, const struct lb_open_how *how) {
+    return lc_syscall4(LB_SYS_openat2, dirfd, (int64_t)path, (int64_t)how, (int64_t)sizeof(*how));
+}
+
+static inline lc_sysret lb_sys_open_tree(int32_t dirfd, const char *path, uint32_t flags) {
+    return lc_syscall3(LB_SYS_open_tree, dirfd, (int64_t)path, flags);
+}
+
+static inline lc_sysret lb_sys_move_mount(int32_t from_dirfd, const char *from_path,
+                                          int32_t to_dirfd, const char *to_path, uint32_t flags) {
+    return lc_syscall5(LB_SYS_move_mount, from_dirfd, (int64_t)from_path,
+                       to_dirfd, (int64_t)to_path, flags);
 }
 
 /* close_range(2), Linux 5.9: close every descriptor from first to last */

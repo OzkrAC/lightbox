@@ -276,6 +276,88 @@ int write_file_atomic(const char *path, const char *data, int32_t mode) {
     return 0;
 }
 
+/* <root>/<dir>, opened as a process whose root is <root> would find it. */
+static lc_sysret open_dir_in_root(const char *root, const char *dir, bool make) {
+    lc_sysret rootfd = lc_kernel_open_file(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+    if (rootfd < 0)
+        return rootfd;
+    if (make)
+        lc_kernel_mkdirat((int32_t)rootfd, dir, 0755);      /* a link of that name stays what it is */
+
+    struct lb_open_how how = {
+        .flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC,
+        .mode = 0,
+        .resolve = LB_RESOLVE_IN_ROOT,
+    };
+    lc_sysret dirfd = lb_sys_openat2((int32_t)rootfd, dir, &how);
+    lc_kernel_close_file((int32_t)rootfd);
+    return dirfd;
+}
+
+int write_file_in_root(const char *root, const char *dir, const char *name,
+                       const char *data, int32_t mode) {
+    lc_sysret dirfd = open_dir_in_root(root, dir, true);
+    if (dirfd < 0)
+        return -1;
+
+    /* From here on every name is one component, looked up in that directory
+     * and never through a link: the temporary file is made new, and the
+     * rename puts it in the place of whatever had the name. */
+    char tmp[MAX_PATH], pidbuf[16];
+    fmt_int(pidbuf, lc_kernel_get_process_id());
+    size_t pos = str_copy(tmp, name, sizeof(tmp));
+    pos = str_append(tmp, pos, ".tmp.", sizeof(tmp));
+    str_append(tmp, pos, pidbuf, sizeof(tmp));
+
+    lc_kernel_unlinkat((int32_t)dirfd, tmp, 0);
+    lc_sysret fd = lc_kernel_open_file_at((int32_t)dirfd, tmp,
+                                          O_WRONLY | O_CREAT | LB_O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode);
+    int result = -1;
+    if (fd >= 0) {
+        size_t len = lc_string_length(data);
+        bool written = lc_kernel_write_all((int32_t)fd, data, len) == (lc_sysret)len &&
+                       lb_sys_fsync((int32_t)fd) >= 0;
+        lc_kernel_close_file((int32_t)fd);
+        if (written && lb_sys_renameat((int32_t)dirfd, tmp, (int32_t)dirfd, name) >= 0 &&
+            lb_sys_fsync((int32_t)dirfd) >= 0)
+            result = 0;
+        else
+            lc_kernel_unlinkat((int32_t)dirfd, tmp, 0);
+    }
+    lc_kernel_close_file((int32_t)dirfd);
+    return result;
+}
+
+int read_file_in_root(const char *root, const char *dir, const char *name, char *buf, size_t bufsz) {
+    buf[0] = '\0';
+    lc_sysret dirfd = open_dir_in_root(root, dir, false);
+    if (dirfd == -LB_ENOENT)
+        return 0;
+    if (dirfd < 0)
+        return -1;
+
+    lc_sysret fd = lc_kernel_open_file_at((int32_t)dirfd, name,
+                                          O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0);
+    lc_kernel_close_file((int32_t)dirfd);
+    if (fd == -LB_ENOENT)
+        return 0;
+    if (fd < 0)
+        return -1;
+
+    struct lb_statx stx;
+    lc_sysret n = -1;
+    if (lb_sys_statx((int32_t)fd, "", LB_AT_EMPTY_PATH, LB_STATX_TYPE, &stx) >= 0 &&
+        (stx.stx_mode & LB_S_IFMT) == LB_S_IFREG)
+        n = lc_kernel_read_all((int32_t)fd, buf, bufsz);
+    lc_kernel_close_file((int32_t)fd);
+    if (n < 0 || (size_t)n >= bufsz) {
+        buf[0] = '\0';
+        return -1;              /* not a file to read, or more than fits */
+    }
+    buf[n] = '\0';
+    return (int)n;
+}
+
 void require_write_file_atomic(const char *path, const char *data) {
     if (write_file_atomic(path, data, MODE_PRIVATE_FILE) < 0)
         die2("Error: atomic write failed: ", path);

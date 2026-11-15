@@ -395,40 +395,186 @@ lbuser" ] || return 1
     done
 }
 
-# A uid with no passwd entry: its groups are its own, whatever groups the
-# person running lightbox is in.
+# The groups of a command are what the container's files give its user, and
+# none for a uid the container has no account for. The groups of whoever runs
+# lightbox are not among them, with --user or without.
 t_exec_unknown_uid_drops_groups() {
     command -v setpriv >/dev/null 2>&1 || { echo "no setpriv to put the caller in a group with"; return 77; }
     up nogroups || return 1
     said=$(setpriv --groups 4242 timeout -k 5 60 "$LB" exec nogroups --user 1234 /bin/sh -c 'id -G' </dev/null) || return 1
     echo "groups of uid 1234 in the container: $said (the caller was in group 4242)"
-    [ "$said" = 1234 ]
+    [ "$said" = 1234 ] || return 1
+    said=$(setpriv --groups 4242 timeout -k 5 60 "$LB" exec nogroups /bin/sh -c 'id -u; id -G' </dev/null | tr '\n' ' ') || return 1
+    echo "uid and groups without --user: $said"
+    [ "$said" = "0 0 " ]
 }
 
 t_exec_user_is_strict() {
     up strict || return 1
     bad=0
-    for spec in 0x10 1000: 12abc; do
+    for spec in 0x10 1000: 12abc 99999999999 :5; do
         if said=$(lb exec strict --user "$spec" /bin/sh -c 'echo "$(id -u):$(id -g)"' </dev/null 2>&1); then
             echo "--user $spec was accepted and ran as $said"
             bad=1
         fi
     done
+    said=$(lb exec strict --user 2>&1 </dev/null) && { echo "--user without a value was accepted"; bad=1; }
+    printf '%s\n' "$said"
+    case $said in *'option --user requires a value'*) ;; *) echo "a missing value is not named"; bad=1 ;; esac
     [ $bad -eq 0 ]
+}
+
+# An account is found wherever it is in the container's passwd, and is the
+# container's: the file is read inside it, to its end.
+t_exec_finds_a_late_account() {
+    up late || return 1
+    {
+        for i in $(seq 1 200); do echo "filler$i:x:$((20000 + i)):$((20000 + i)):an account to fill the file:/home/filler$i:/bin/sh"; done
+        echo 'a-late-user-with-a-long-name:x:4800:4800::/home/late:/bin/sh'
+    } >> "$C/late/rootfs/etc/passwd"
+    echo 'lategroup:x:4801:a-late-user-with-a-long-name' >> "$C/late/rootfs/etc/group"
+    echo "the container's passwd is $(wc -c < "$C/late/rootfs/etc/passwd") bytes"
+    said=$(lb exec late --user a-late-user-with-a-long-name /bin/sh -c 'id -u; id -G; echo "$USER $HOME"' </dev/null | tr '\n' ' ')
+    echo "by name: $said"
+    [ "$said" = "4800 4800 4801 a-late-user-with-a-long-name /home/late " ] || return 1
+    said=$(lb exec late --user 4800 /bin/sh -c 'echo "$USER"' </dev/null)
+    [ "$said" = a-late-user-with-a-long-name ]
 }
 
 t_exec_searches_path() {
     up path || return 1
     said=$(lb exec path echo found </dev/null)
-    [ "$said" = found ]
+    [ "$said" = found ] || return 1
+    # with an argument, as the README shows it
+    echo from a file > "$C/path/rootfs/etc/a-file"
+    [ "$(lb exec path cat /etc/a-file </dev/null)" = "from a file" ] || return 1
+    lb exec path no-such-command </dev/null 2>"$OUT/path.err"
+    rc=$?
+    echo "a command that is not there: status $rc, $(cat "$OUT/path.err")"
+    [ $rc -eq 127 ] && grep -q 'command not found: no-such-command' "$OUT/path.err"
 }
 
 t_exec_passes_every_argument() {
     up argv || return 1
-    words=$(seq 1 40 | tr '\n' ' ')
+    words=$(seq 1 100 | tr '\n' ' ')
+    # shellcheck disable=SC2086
     said=$(lb exec argv /bin/echo $words </dev/null)
-    echo "40 arguments in, $(printf '%s' "$said" | wc -w) out"
+    echo "100 arguments in, $(printf '%s' "$said" | wc -w) out"
     [ "$said" = "${words% }" ]
+}
+
+# Run a command line on a terminal: its output, without the carriage returns
+# a terminal adds. script(1) makes the terminal. It passes the end of its own
+# input on as an end of input on the terminal, so its input is held open until
+# it is done: by the feeder a case names, or by nothing being typed at all.
+on_a_terminal() { # command line [feeder function]
+    command -v script >/dev/null 2>&1 || { echo "no script(1) to make a terminal with"; return 77; }
+    rm -f "$OUT/script.done"
+    {
+        [ -z "${2:-}" ] || "$2"
+        while [ ! -e "$OUT/script.done" ]; do sleep 0.1; done
+    } | {
+        timeout -k 2 40 script -qec "$1" /dev/null
+        : > "$OUT/script.done"
+    } | tr -d '\r'
+}
+
+# Typed at a terminal, exec gives the command a terminal of the container's:
+# not the caller's, whose number and device are another's.
+t_exec_on_a_terminal() {
+    up term || return 1
+    out=$(on_a_terminal "tty; stty rows 31 cols 97; stty -g > '$OUT/term.before'
+        '$LB' exec term /bin/sh -c 'tty; stty size; echo \"devices: \$(stat -c %d /dev/pts) \$(stat -L -c %d /proc/self/fd/0) \$(stat -L -c %d /proc/self/fd/2)\"; ls /proc/self/fd | tr \"\\n\" \" \"; echo; exit 6'
+        echo status \$?; stty -g > '$OUT/term.after'") || return $?
+    printf '%s\n' "$out"
+    outer=$(printf '%s\n' "$out" | sed -n 1p)
+    inner=$(printf '%s\n' "$out" | sed -n 2p)
+    case $outer in /dev/*) ;; *) echo "script gave no terminal"; return 1 ;; esac
+    case $inner in /dev/pts/[0-9]*) ;; *) echo "the command has no terminal of the container's: $inner"; return 1 ;; esac
+    devices=$(printf '%s\n' "$out" | sed -n 's/^devices: //p')
+    # shellcheck disable=SC2086
+    set -- $devices
+    [ $# -eq 3 ] && [ "$1" = "$2" ] && [ "$1" = "$3" ] || { echo "the command's streams are not on the container's devpts: $devices"; return 1; }
+    printf '%s\n' "$out" | grep -qx '31 97' || { echo "the command's terminal does not have the caller's size"; return 1; }
+    printf '%s\n' "$out" | grep -qx '0 1 2 3 ' || { echo "the command has more than its three streams"; return 1; }
+    printf '%s\n' "$out" | grep -qx 'status 6' || return 1
+    cmp -s "$OUT/term.before" "$OUT/term.after" || { echo "the caller's terminal did not get its modes back"; return 1; }
+}
+
+# What is typed reaches the command, the key that interrupts is the command's
+# to get, and a pipe stands in where only one side is a terminal.
+t_exec_terminal_input_and_keys() {
+    up keys || return 1
+    feeder() {
+        wait_until 10 test -e "$C/keys/rootfs/reading" && printf 'hello\n'
+        wait_until 10 test -e "$C/keys/rootfs/waiting" && printf '\003'
+    }
+    out=$(on_a_terminal "'$LB' exec keys /bin/sh -c 'trap \"echo got-SIGINT; exit 3\" INT; : > /reading; read -r line; echo \"read: \$line\"; : > /waiting; sleep 20 & wait'
+        echo status \$?" feeder) || return $?
+    printf '%s\n' "$out"
+    printf '%s\n' "$out" | grep -qx 'read: hello' && printf '%s\n' "$out" | grep -q 'got-SIGINT' &&
+    printf '%s\n' "$out" | grep -qx 'status 3' || return 1
+
+    out=$(on_a_terminal "echo piped | '$LB' exec keys /bin/sh -c 'cat; test -t 1 && echo stdout-is-a-terminal; test -t 2 && echo stderr-is-a-terminal; echo to-stderr >&2'") || return $?
+    printf '%s\n' "$out"
+    [ "$out" = "piped
+to-stderr" ]
+}
+
+# Without a terminal the command gets lightbox's streams as they are, leads a
+# session of its own, and hears of a signal that asks exec to end.
+t_exec_session_and_signals() {
+    up session2 || return 1
+    # the command is given none of what else the caller has open: here a file on descriptor 9
+    said=$(echo typed | lb exec session2 /bin/sh -c 'cat; read -r pid _ _ _ _ sid _ < /proc/self/stat; [ "$pid" = "$sid" ] && echo "leads its session"; ls /proc/self/fd | tr "\n" " "' 9< "$C/session2/.conf")
+    printf '%s\n' "$said"
+    [ "$said" = "typed
+leads its session
+0 1 2 3 " ] || return 1
+
+    "$LB" exec session2 /bin/sh -c 'trap "echo asked > /asked; exit 9" TERM; : > /started; sleep 20 & wait' >"$OUT/session2.exec" 2>&1 </dev/null &
+    front=$!
+    wait_until 5 test -e "$C/session2/rootfs/started" || { echo "the command did not start:"; cat "$OUT/session2.exec"; return 1; }
+    kill -TERM "$front"
+    wait "$front"
+    rc=$?
+    echo "exec returned $rc; the command: $(cat "$C/session2/rootfs/asked" 2>&1)"
+    [ $rc -eq 9 ] && [ "$(cat "$C/session2/rootfs/asked")" = asked ]
+}
+
+# While a command runs, the lightbox processes that put it there are not the
+# installed binary: they run from a sealed copy in memory.
+t_exec_runs_from_a_sealed_copy() {
+    up sealed || return 1
+    "$LB" exec sealed /bin/sh -c ': > /e.started; exec sleep 30' >"$OUT/sealed.exec" 2>&1 </dev/null &
+    front=$!
+    wait_until 5 test -e "$C/sealed/rootfs/e.started" || { echo "the command did not start:"; cat "$OUT/sealed.exec"; return 1; }
+    bad=0
+    for p in "$front" $(children_of "$front" lightbox); do
+        exe=$(readlink "/proc/$p/exe")
+        echo "lightbox process $p runs from: $exe"
+        case $exe in '/memfd:lightbox'*) ;; *) echo "  that is not the sealed copy"; bad=1 ;; esac
+    done
+    [ -n "$(children_of "$front" lightbox)" ] || { echo "exec has no worker to look at"; bad=1; }
+    lb doctor | grep -x 'exec_sealing: yes (a sealed copy in memory)' || { echo "doctor does not say how exec is sealed"; bad=1; }
+    lb stop sealed >/dev/null
+    wait "$front" 2>/dev/null
+    return $bad
+}
+
+# --env, --workdir, the caller's TERM, and -- before a command of any shape.
+t_exec_environment() {
+    up envs || return 1
+    said=$(TERM=vt220 timeout -k 5 60 "$LB" exec envs --env GREETING=hello --env GREETING=hi --workdir /tmp -- \
+               /bin/sh -c 'echo "$GREETING $TERM $(pwd) $PATH"' </dev/null)
+    echo "$said"
+    [ "$said" = "hi vt220 /tmp /usr/bin:/bin:/usr/sbin:/sbin" ] || return 1
+    # nothing else of the caller's environment goes in
+    said=$(NOT_FOR_THE_CONTAINER=1 timeout -k 5 60 "$LB" exec envs /bin/sh -c 'env | sort' </dev/null | tr '\n' ' ')
+    echo "the environment of a command: $said"
+    case $said in *NOT_FOR_THE_CONTAINER*) return 1 ;; esac
+    case $said in *'HOME=/root '*'LOGNAME=root '*'USER=root '*) ;; *) return 1 ;; esac
+    refused lb exec envs --bogus /bin/true </dev/null
 }
 
 # ─── Cases: volumes and the root filesystem ─────────────────────────────────
@@ -474,6 +620,91 @@ t_volume_under_run() {
     said=$(sh_in vrun 'cat /run/secrets/token' 2>&1)
     echo "/run/secrets/token in the container: $said"
     [ "$said" = token ]
+}
+
+# A destination is looked up in the container. A link in the image leads
+# where the container sees it lead, also when it names a path that the host
+# has as well; nothing is made on the host.
+#
+# The directory that stands for the host's is on a tmpfs over /mnt, in this
+# suite's own mount namespace. It cannot be in the work directory: that is
+# below /tmp, and a container mounts a tmpfs of its own over /tmp, which would
+# hide the container's directory of the same name.
+t_volume_destination_is_inside() {
+    [ -d /mnt ] || { echo "no /mnt to put a directory of the host's on"; return 77; }
+    mount -t tmpfs tmpfs /mnt || return 1
+    echo /mnt >> "$T/shims"
+    host=/mnt/named-on-the-host
+    mkdir -p "$T/vol/linked" "$host"
+    echo through-a-link > "$T/vol/linked/in"
+    box vlink --vol "$T/vol/linked:/link/data" --vol "$T/vol/linked:/away/data:ro" || return 1
+    # a link as an image has it, and one that names a directory the host has too
+    mkdir -p "$C/vlink/rootfs/srv" "$C/vlink/rootfs$host"
+    ln -s /srv "$C/vlink/rootfs/link"
+    ln -s "$host" "$C/vlink/rootfs/away"
+    start vlink || return 1
+    [ "$(sh_in vlink 'cat /srv/data/in')" = through-a-link ] || { echo "the volume is not where the link leads in the container"; return 1; }
+    [ "$(sh_in vlink 'cat /away/data/in')" = through-a-link ] || { echo "the second volume is not reachable through its link"; return 1; }
+    [ -z "$(ls -A "$host")" ] || { echo "something was made on the host: $(ls -A "$host")"; return 1; }
+    [ -d "$C/vlink/rootfs$host/data" ] || { echo "the destination was not made in the container's root filesystem"; return 1; }
+    lb stop vlink >/dev/null || return 1
+
+    # the same link when the container has no such directory: it leads nowhere, and the start says so
+    box vnowhere --vol "$T/vol/linked:/away/data" || return 1
+    ln -s "$host" "$C/vnowhere/rootfs/away"
+    if said=$(start vnowhere); then
+        printf '%s\n' "$said"
+        echo "a volume was mounted through a link that leads nowhere in the container"
+        return 1
+    fi
+    printf '%s\n' "$said"
+    [ -z "$(ls -A "$host")" ] || { echo "something was made on the host: $(ls -A "$host")"; return 1; }
+    nothing_left vnowhere
+}
+
+# Volumes go on top of what init mounts itself, and keep their restrictions.
+t_volume_under_tmp() {
+    mkdir -p "$T/vol/cache"
+    echo cached > "$T/vol/cache/in"
+    echo 'one = 1' > "$T/vol/one.conf"
+    up vtmp --read-only --vol "$T/vol/cache:/tmp/cache" --vol "$T/vol/one.conf:/run/app/one.conf:ro" --vol "$T/vol/cache:/not/in/the/image" || return 1
+    [ "$(sh_in vtmp 'cat /tmp/cache/in')" = cached ] || { echo "a volume under /tmp is not visible"; return 1; }
+    [ "$(sh_in vtmp 'cat /run/app/one.conf')" = 'one = 1' ] || { echo "a file volume under /run is not visible"; return 1; }
+    [ "$(sh_in vtmp 'cat /not/in/the/image/in')" = cached ] || { echo "a volume at a path the image lacks is not there, with a read-only root"; return 1; }
+    refused sh_in vtmp 'echo x > /run/app/one.conf' || { echo "a read-only file volume was written"; return 1; }
+    sh_in vtmp 'echo written > /tmp/cache/out' && [ "$(cat "$T/vol/cache/out")" = written ]
+}
+
+# vm.memfd_noexec says whether a memfd may be executed. With 1, exec's copy is
+# still allowed, because exec asks for it by name; with 2 it is not, and exec
+# takes the binary through a read-only mount instead. The setting belongs to
+# this suite's PID namespace and cannot always be taken back, which is why
+# this case is the last one.
+t_exec_where_memfds_may_not_be_executed() {
+    knob=/proc/sys/vm/memfd_noexec
+    [ -w "$knob" ] || { echo "this kernel has no vm.memfd_noexec"; return 77; }
+    was=$(cat "$knob")
+    up noexec || return 1
+    bad=0
+    echo 1 > "$knob" || { echo "vm.memfd_noexec cannot be set here"; return 77; }
+    said=$(sh_in noexec 'echo ran') || true
+    echo "with vm.memfd_noexec = 1: $said; $(lb doctor | grep '^exec_sealing')"
+    [ "$said" = ran ] && lb doctor | grep -qx 'exec_sealing: yes (a sealed copy in memory)' || bad=1
+
+    echo 2 > "$knob" || { echo "vm.memfd_noexec cannot be set to 2 here"; return 77; }
+    said=$(sh_in noexec 'echo ran') || true
+    echo "with vm.memfd_noexec = 2: $said; $(lb doctor | grep '^exec_sealing')"
+    [ "$said" = ran ] && lb doctor | grep -q '^exec_sealing: yes (a read-only mount of the binary' || bad=1
+    "$LB" exec noexec /bin/sh -c ': > /e.started; exec sleep 30' >"$OUT/noexec.exec" 2>&1 </dev/null &
+    front=$!
+    wait_until 5 test -e "$C/noexec/rootfs/e.started" || { echo "the command did not start:"; cat "$OUT/noexec.exec"; bad=1; }
+    exe=$(readlink "/proc/$front/exe")
+    echo "lightbox process $front runs from: $exe"
+    case $exe in /memfd:*) echo "  a memfd was executed though the setting forbids it"; bad=1 ;; esac
+    lb stop noexec >/dev/null
+    wait "$front" 2>/dev/null
+    echo "$was" > "$knob" 2>/dev/null || echo "(vm.memfd_noexec stays at $(cat "$knob") in this suite's PID namespace)"
+    return $bad
 }
 
 t_read_only_root() {
@@ -1435,16 +1666,24 @@ if [ "$MODE" = inside ]; then
     check 'a start that fails leaves no interface, cgroup or runtime file' t_failed_start_leaves_nothing
 
     check 'exec --user takes a name or a number and sets groups and HOME' t_exec_user
-    xfail SB-exec-groups       'exec as a uid without an account keeps none of the caller'"'"'s groups' t_exec_unknown_uid_drops_groups
-    xfail SB-exec-user-parse   'exec --user refuses a malformed value'                 t_exec_user_is_strict
-    xfail CLI-exec-path        'exec finds a command on PATH'                          t_exec_searches_path
-    xfail CLI-exec-argv        'exec passes every argument'                            t_exec_passes_every_argument
+    check 'exec keeps none of the caller'"'"'s groups, with --user or without' t_exec_unknown_uid_drops_groups
+    check 'exec --user refuses a malformed value, and names a missing one' t_exec_user_is_strict
+    check 'exec finds an account late in the container'"'"'s passwd'           t_exec_finds_a_late_account
+    check 'exec finds a command on PATH'                                  t_exec_searches_path
+    check 'exec passes every argument'                                    t_exec_passes_every_argument
+    check 'exec sets --env and --workdir, and passes TERM and nothing else' t_exec_environment
+    check 'exec runs from a sealed copy of the binary'                    t_exec_runs_from_a_sealed_copy
+    check 'on a terminal, exec gives the command a terminal of the container'"'"'s' t_exec_on_a_terminal
+    check 'typed input and the interrupt key reach the command; a pipe for half a terminal' t_exec_terminal_input_and_keys
+    check 'a command leads its own session, and a signal for exec reaches it' t_exec_session_and_signals
 
     check 'a directory volume is shared in both directions'               t_volume_directory
     check 'a file volume is mounted'                                      t_volume_file
     check 'a read-only volume cannot be written'                          t_volume_read_only
     check 'add-vol takes effect at the next start'                        t_addvol_applies_at_next_start
-    xfail FS-vol-shadow        'a volume under /run is visible'                        t_volume_under_run
+    check 'a volume under /run is visible'                                t_volume_under_run
+    check 'volumes under /tmp and /run, and with a read-only root'        t_volume_under_tmp
+    check 'a volume'"'"'s destination is looked up inside the container'      t_volume_destination_is_inside
     check '--read-only closes the root and leaves /tmp, /run and /var/tmp writable' t_read_only_root
     check '/run is mode 0755'                                             t_run_mode
     check 'init mounts everything with the restrictions it should have'   t_mount_table
@@ -1501,6 +1740,9 @@ if [ "$MODE" = inside ]; then
     xfail NET-veth-clobber     'start leaves alone an interface it did not create'     t_start_spares_foreign_interface
     xfail NET-ifname           'the interface in the container is eth0'                t_interface_is_eth0
     check 'a container has no IPv6 address'                               t_no_ipv6_in_container
+
+    # last: it may leave a kernel setting changed for the rest of this suite's life
+    check 'exec works where a memfd may not be executed'                  t_exec_where_memfds_may_not_be_executed
 
     summary lifecycle
     exit $?
