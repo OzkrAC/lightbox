@@ -43,6 +43,7 @@ typedef struct {
     char default_pids[8];
     char default_cpu[4];
     int  default_oom;
+    int  start_timeout;     /* seconds start waits for the init hook; 0: not at all */
 } global_config;
 
 extern global_config cfg_global;
@@ -56,6 +57,12 @@ size_t str_append(char *dst, size_t pos, const char *src, size_t max);
 size_t str_append_whole(char *dst, size_t pos, const char *src, size_t max, bool *overflow);
 void path_join(char *buf, size_t bufsz, const char *a, const char *b);
 int parse_int(const char *s);
+
+/* A time limit in whole seconds, as an option or a setting gives it: digits
+ * only, 0 to SECONDS_MAX. */
+#define SECONDS_MAX            86400
+#define START_TIMEOUT_DEFAULT  30
+bool parse_seconds(const char *s, int *out);
 int fmt_int(char *buf, int val);
 int write_file(const char *path, const char *data);
 void require_write_file(const char *path, const char *data);
@@ -143,6 +150,9 @@ void container_ip_path(char *buf, const char *name);
 void container_conf_path(char *buf, const char *name);
 void container_state_path(char *buf, const char *name);
 
+/* 0, or -1 when the state could not be written */
+[[nodiscard]] int record_container_state(const char *name, const char *state);
+/* the same, ending the process on failure */
 void set_container_state(const char *name, const char *state);
 void get_container_state(const char *name, char *buf, size_t bufsz);
 int container_conf_read(const char *name, char *buf);
@@ -150,6 +160,10 @@ int conf_get(const char *name, const char *key, char *val, size_t valsz, const c
 int conf_get_int(const char *name, const char *key, int def);
 int get_container_pid(const char *name);
 int get_container_pid_starttime(const char *name, char *buf, size_t bufsz);
+/* write .pid_start and .pid for a running init: 0, or -1 */
+[[nodiscard]] int container_record_pid(const char *name, int pid);
+/* remove both */
+void container_forget_pid(const char *name);
 
 /* What the runtime files say about a container's init process. */
 typedef enum {

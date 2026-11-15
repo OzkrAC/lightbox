@@ -22,6 +22,8 @@
 #include <stdint.h>
 
 #include <asm/errno.h>
+#include <asm/poll.h>
+#include <asm/signal.h>
 #include <asm/statfs.h>
 #include <asm/unistd.h>
 #include <linux/audit.h>
@@ -49,6 +51,7 @@ SAME_NR(capset);
 SAME_NR(statfs);
 SAME_NR(chroot);
 SAME_NR(renameat);
+SAME_NR(ppoll);
 SAME_NR(statx);
 
 #define SAME_VALUE(ours, kernels) \
@@ -58,6 +61,10 @@ SAME_VALUE(LB_ENOENT, ENOENT);
 SAME_VALUE(LB_ESRCH, ESRCH);
 SAME_VALUE(LB_EINTR, EINTR);
 SAME_VALUE(LB_EEXIST, EEXIST);
+SAME_VALUE(LB_SIGPIPE, SIGPIPE);
+SAME_VALUE(LB_POLLIN, POLLIN);
+SAME_VALUE(LB_POLLERR, POLLERR);
+SAME_VALUE(LB_POLLHUP, POLLHUP);
 SAME_VALUE(LB_SIOCGIFFLAGS, SIOCGIFFLAGS);
 SAME_VALUE(LB_SIOCSIFFLAGS, SIOCSIFFLAGS);
 SAME_VALUE(LB_S_IFMT, S_IFMT);
@@ -119,6 +126,11 @@ SAME_FIELD(lb_statx, statx, stx_attributes_mask);
 SAME_FIELD(lb_statx, statx, stx_dev_major);
 SAME_FIELD(lb_statx, statx, stx_dev_minor);
 SAME_FIELD(lb_statx, statx, stx_mnt_id);
+
+SAME_SIZE(lb_pollfd, pollfd);
+SAME_FIELD(lb_pollfd, pollfd, fd);
+SAME_FIELD(lb_pollfd, pollfd, events);
+SAME_FIELD(lb_pollfd, pollfd, revents);
 
 SAME_SIZE(lb_cap_header, __user_cap_header_struct);
 SAME_FIELD(lb_cap_header, __user_cap_header_struct, version);

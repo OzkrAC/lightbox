@@ -40,10 +40,15 @@ void container_state_path(char *buf, const char *name) {
     path_join(buf, MAX_PATH, base, ".state");
 }
 
-void set_container_state(const char *name, const char *state) {
+int record_container_state(const char *name, const char *state) {
     char path[MAX_PATH];
     container_state_path(path, name);
-    require_write_file_atomic(path, state);
+    return write_file_atomic(path, state, MODE_PRIVATE_FILE);
+}
+
+void set_container_state(const char *name, const char *state) {
+    if (record_container_state(name, state) < 0)
+        die2("Error: cannot record the state of container ", name);
 }
 
 void get_container_state(const char *name, char *buf, size_t bufsz) {
@@ -161,6 +166,31 @@ static int read_proc_starttime(int pid, char *buf, size_t bufsz) {
     lc_bytes_copy(buf, p, len);
     buf[len] = '\0';
     return 0;
+}
+
+/*
+ * Record a container's init: its PID and, as what tells it from a later
+ * process with the same PID, its start time. The start time goes first, so a
+ * PID is never on record without it. 0, or -1 when either could not be had.
+ */
+int container_record_pid(const char *name, int pid) {
+    char path[MAX_PATH], pidbuf[16], started[32];
+
+    if (read_proc_starttime(pid, started, sizeof(started)) < 0)
+        return -1;
+    container_pid_start_path(path, name);
+    if (write_file_atomic(path, started, MODE_PRIVATE_FILE) < 0)
+        return -1;
+    fmt_int(pidbuf, pid);
+    container_pid_path(path, name);
+    if (write_file_atomic(path, pidbuf, MODE_PRIVATE_FILE) < 0)
+        return -1;
+    return 0;
+}
+
+/* Forget whatever is recorded about a container's init. */
+void container_forget_pid(const char *name) {
+    clear_runtime_identity(name, false);
 }
 
 int get_container_pid_starttime(const char *name, char *buf, size_t bufsz) {

@@ -74,6 +74,21 @@ int parse_int(const char *s) {
     return neg ? -val : val;
 }
 
+bool parse_seconds(const char *s, int *out) {
+    int val = 0;
+    if (!s || !s[0])
+        return false;
+    for (; *s; s++) {
+        if (*s < '0' || *s > '9')
+            return false;
+        val = val * 10 + (*s - '0');
+        if (val > SECONDS_MAX)
+            return false;
+    }
+    *out = val;
+    return true;
+}
+
 int fmt_int(char *buf, int val) {
     if (val == 0) { buf[0] = '0'; buf[1] = '\0'; return 1; }
     int neg = 0, len = 0;

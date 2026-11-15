@@ -490,6 +490,36 @@ t_start_without_root_is_a_clean_error() {
     printf '%s\n' "$msg" | grep -qi 'root' && [ "$(cat "$C/web/.state")" = "$before" ]
 }
 
+# start reads its options before it touches anything, so a mistyped one
+# changes nothing, with or without root.
+t_start_options_are_checked() {
+    lb create web 10.0.0.2 || return 1
+    before=$(tree_sum "$C/web")
+    said() { msg=$(lb start web "$@" 2>&1) && { echo "start web $* succeeded"; return 1; }; echo "start web $*: $msg"; }
+    said -t soon   && case $msg in *soon*) ;; *) return 1 ;; esac || return 1
+    said -t 86401  && case $msg in *86401*) ;; *) return 1 ;; esac || return 1
+    said -t -1     && case $msg in *'number of seconds'*) ;; *) return 1 ;; esac || return 1
+    said -t        && case $msg in *'number of seconds'*) ;; *) return 1 ;; esac || return 1
+    said --bogus   && case $msg in *'unknown option'*--bogus*) ;; *) return 1 ;; esac || return 1
+    said another   && case $msg in *'unexpected argument'*another*) ;; *) return 1 ;; esac || return 1
+    [ "$before" = "$(tree_sum "$C/web")" ] || { echo "the container's records changed"; return 1; }
+}
+
+# A start_timeout that cannot be read is said so, and stops no command.
+t_start_timeout_setting() {
+    lb create web 10.0.0.2 || return 1
+    printf 'start_timeout = soon\n' >> "$CONF"
+    out=$(lb ls 2>"$W/err")
+    rc=$?
+    cat "$W/err"
+    [ $rc -eq 0 ] && grep -q 'start_timeout' "$W/err" && grep -q 'soon' "$W/err" || return 1
+    printf '%s\n' "$out" | grep -q '^web ' || return 1
+    # one that can be read is not mentioned
+    sed -i 's/^start_timeout = soon$/start_timeout = 5/' "$CONF"
+    err=$(lb ls 2>&1 >/dev/null)
+    [ -z "$err" ] || { echo "with start_timeout = 5: $err"; return 1; }
+}
+
 t_storage_is_private() {
     lb create web 10.0.0.2 || return 1
     echo "modes: dir $(mode_of "$C/web"), .conf $(mode_of "$C/web/.conf"), .ip $(mode_of "$C/web/.ip"), .state $(mode_of "$C/web/.state")"
@@ -534,6 +564,8 @@ check 'inspect writes nothing'                              t_inspect_writes_not
 check 'a process owned by another user is not gone'         t_other_users_process_is_not_gone
 check 'a dead container is shown as exited'                 t_dead_container_shown_as_exited
 check 'stop cleans up the record of a dead container'       t_stop_cleans_a_dead_record
+check 'start checks its options before it does anything'    t_start_options_are_checked
+check 'a start_timeout that cannot be read is a warning'    t_start_timeout_setting
 check 'container storage is private to root'                t_storage_is_private
 check 'setup restricts existing storage directories'        t_setup_restricts_existing_storage
 check 'create keeps every volume or refuses'                t_create_keeps_every_volume

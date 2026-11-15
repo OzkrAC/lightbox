@@ -27,6 +27,7 @@ void cfg_global_init(void) {
     str_copy(cfg_global.default_pids, "128", sizeof(cfg_global.default_pids));
     str_copy(cfg_global.default_cpu, "1", sizeof(cfg_global.default_cpu));
     cfg_global.default_oom = 500;
+    cfg_global.start_timeout = START_TIMEOUT_DEFAULT;
 }
 
 static void cfg_set(const char *key, const char *val, bool derived[3]) {
@@ -61,6 +62,16 @@ static void cfg_set(const char *key, const char *val, bool derived[3]) {
         str_copy(cfg_global.default_cpu, val, sizeof(cfg_global.default_cpu));
     } else if (streq(key, "default_oom")) {
         cfg_global.default_oom = parse_int(val);
+    } else if (streq(key, "start_timeout")) {
+        /* A setting that cannot be read must not stop every command, stop
+         * among them: say so and keep the default. */
+        if (!parse_seconds(val, &cfg_global.start_timeout)) {
+            print_str(STDERR, "Warning: start_timeout in lightbox.conf is not a number of seconds from 0 to "
+                              STRINGIFY(SECONDS_MAX) ": ");
+            print_str(STDERR, val);
+            print_str(STDERR, "; using " STRINGIFY(START_TIMEOUT_DEFAULT) "\n");
+            cfg_global.start_timeout = START_TIMEOUT_DEFAULT;
+        }
     }
 }
 

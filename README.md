@@ -153,6 +153,19 @@ This creates:
 # Restart if the container is already running
 ```
 
+### 5. Start services with an init hook
+
+If the image has an `/init.sh`, the container's init runs it with `/bin/sh` once the container is built, and `start` returns when the script has ended:
+
+```sh
+# /init.sh in the image: start the service in the background and return
+/usr/sbin/nginx &
+```
+
+- A hook that exits with a status other than 0 fails the start: `start` says which status it was, and the container is stopped and cleaned up. A hook that fails after `start` has returned stops the container as well.
+- `start` waits 30 seconds for the hook. If the hook is still running then, for instance because it runs its service in the foreground, `start` says so and returns; the container stays up. `start <name> -t <seconds>` or `start_timeout` in `lightbox.conf` sets the wait, and 0 does not wait at all.
+- Ctrl-C, or a `kill`, while `start` is working undoes the start: nothing of the container is left running, and the exit status is 128 plus the signal's number.
+
 ## Configuration
 
 lightbox reads `~/.config/lightbox/lightbox.conf` at startup. All values have built-in defaults — the config file is optional.
@@ -186,6 +199,9 @@ default_mem = 256M
 default_pids = 128
 default_cpu = 1
 default_oom = 500
+
+# Seconds that start waits for a container's /init.sh; 0 does not wait
+start_timeout = 30
 ```
 
 If `lightbox_dir` is set, `rootfs` and `container_dir` are automatically derived from it (e.g., `rootfs = <lightbox_dir>/rootfs`) unless explicitly overridden.
@@ -204,7 +220,7 @@ lightbox <command> [args]
 
   setup                         Initialize host networking
   create <name> <ip> [options]  Create a new container
-  start  <name>                 Start a stopped container
+  start  <name> [-t <seconds>]  Start a stopped container
   stop   <name>                 Stop a running container
   add-vol <name> <src>:<dst>[:ro]  Add a volume to an existing container
   rm     <name>                 Remove a container
@@ -253,7 +269,8 @@ The sandbox covers everything in a container: init, the `/init.sh` hook and all 
 - **Devices**: bind-mounted from host (`/dev/null`, `/dev/zero`, `/dev/random`, etc.)
 - **Networking**: veth pair per container connected to a host bridge with NAT
 - **Resource limits**: cgroups v2 (memory, PIDs, CPU, I/O)
-- **Init**: lightbox remains PID 1 inside the container; if `/init.sh` exists in the rootfs it is run after `/tmp` and `/run` are mounted and the sandbox is on, then lightbox stays alive to reap children and handle shutdown
+- **Init**: lightbox remains PID 1 inside the container. It reaps children and handles shutdown from the moment the container is built, and runs `/init.sh`, if the rootfs has one, as one of its children: after `/tmp` and `/run` are mounted, with the sandbox on, and only once the container is on record, so `stop` and `ls` always find a container whose hook runs
+- **Starting**: `start` and init talk over two pipes. Init builds the container when `start` has set up its cgroup and network, and reports back when it is built and again when the hook has ended. If either side goes away the other notices: an init whose `start` was killed exits before it runs anything
 - **External tools**: on the host, `ip` and `nsenter` set up a container's network, `iptables` the firewall, and `cp` and `rm` create and remove a container. Everything else is direct syscalls, and nothing from the image is run before `/init.sh`
 - **Configuration**: optional `~/.config/lightbox/lightbox.conf` for all paths and defaults
 

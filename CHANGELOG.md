@@ -2,6 +2,25 @@
 
 What changed for someone who uses lightbox, newest first. `ROADMAP.md` has the reasons and the finding each change closes.
 
+## 0.3.0
+
+Not tagged yet, and not complete: the part of Phase 3 that is written so far, which is how a container starts.
+
+### Changes you may have to act on
+
+- **`start` waits for `/init.sh` to end.** It returned after a fixed half second before, whatever the hook was doing. It now returns when the hook has ended, or after 30 seconds with a note that the hook is still running; the container stays up either way. A hook that runs its service in the foreground makes every start take those 30 seconds: start the service in the background, or set the wait with `start <name> -t <seconds>` or `start_timeout` in `lightbox.conf`. 0 does not wait at all.
+- **A hook that fails, fails the start.** `start` exits with an error that names the hook's exit status, and the container is stopped and cleaned up. Before, this happened only when the hook failed within the first half second.
+- **`start` refuses arguments it does not know.** `start web extra` was accepted, and `extra` ignored.
+- **A signal undoes a start.** SIGINT, SIGTERM and SIGHUP no longer end `start` where it stands. It stops the container it was starting, removes what it had set up, and exits with 128 plus the signal's number.
+
+### Fixed
+
+- A `start` that was killed could leave a container running that no record named, and that `stop` and `ls` did not see. Init now exits unless the command that starts it is there, and a container is on record before anything of its image runs.
+- Init did not react to a signal while its hook ran, so a container with a long-running hook could not be stopped except by force, and nothing reaped its processes meanwhile.
+- A start took half a second longer than the work needed.
+- A `.pid_start` file left over from an earlier run made every later start fail with "unexpected stale pid starttime metadata".
+- `start` and `create` could exit in the middle of their work without undoing it: a failed allocation or clone left an interface behind, and a state that could not be written left a half-made container directory.
+
 ## 0.2.0
 
 Not tagged yet. Everything after commit `2320a8d`: Phases 1 and 2 of the roadmap.
