@@ -8,6 +8,7 @@ A minimal, secure Linux container runtime. Single static binary, ~33KB, no libc 
 - GCC and ninja (build time)
 - `iproute2`, `iptables`, `util-linux` (`nsenter`) at runtime
 - BusyBox `ip` is not sufficient; `lightbox start` requires the full `iproute2` `ip` binary for veth creation and bridge attachment
+- For containers created with `--link`: the `br_netfilter` kernel module, with `net.bridge.bridge-nf-call-iptables=1`
 - Root privileges
 
 ## Building
@@ -58,7 +59,7 @@ sudo make test-lifecycle
 
 It covers `setup`, `create`, `start`, `exec`, `stop` and `rm`, volumes, limits, the init hook, the sandbox and the network between containers. It needs a kernel with bridge, veth and cgroup v2, and a statically linked busybox to build the containers' root filesystem from (`busybox-static` on Debian, Ubuntu and Void). `LIGHTBOX_TEST_ROOTFS=/path` uses a copy of a root filesystem of yours instead.
 
-The suite works in private network, mount and PID namespaces with a configuration of its own, so your bridge, firewall rules and containers are not touched. Its cgroups live under `/sys/fs/cgroup/lightbox-test-<pid>` and are removed at the end, and the run fails if the host's interfaces, firewall rules or cgroups differ afterwards. Kernel modules that get loaded on the way stay loaded.
+The suite works in private network, mount and PID namespaces with a configuration of its own, so your bridge, firewall rules and containers are not touched. Its cgroups live under `/sys/fs/cgroup/lightbox-test-<pid>` and are removed at the end, and the run fails if the host's virtual interfaces, firewall rules or cgroups differ afterwards. A network card that the machine itself gains or loses during the run, as a cloud VM can, is reported and does not count. Kernel modules that get loaded on the way stay loaded.
 
 sudo drops the environment, so options go on make's command line: `sudo make test-lifecycle V=1 KEEP=1`. Build first, as yourself; the target builds nothing.
 
@@ -96,7 +97,7 @@ This creates:
 - A `br0` bridge on `10.0.0.1/24`
 - iptables NAT masquerade for outbound traffic
 - FORWARD rules for container-to-WAN communication
-- A DROP rule for inter-container traffic (isolation by default)
+- A DROP rule for inter-container traffic (isolation by default, together with isolated bridge ports)
 - cgroup v2 mount at `/sys/fs/cgroup`
 
 ### 3. Create, start, and use containers
@@ -231,14 +232,17 @@ lightbox <command> [args]
 
 All security features are on by default. Pass `--privileged` to disable.
 
+The sandbox covers everything in a container: init, the `/init.sh` hook and all it starts, and every `exec`. A hook that mounts filesystems or configures the network therefore needs `--privileged`.
+
 | Feature | Implementation |
 |---------|---------------|
-| Capability dropping | `prctl(PR_CAPBSET_DROP)` — keeps Docker's 14 default caps |
+| Capability dropping | The bounding, effective and permitted sets are reduced to 12 capabilities: Docker's default 14 without `NET_RAW` and `MKNOD`. The inheritable and ambient sets are emptied |
 | Seccomp | BPF filter denying 56 syscalls on x86_64 (47 on aarch64), the x32 range, and `clone` with namespace flags |
 | no_new_privs | Prevents SUID escalation |
-| /proc masking | Bind-mounts `/dev/null` over kcore, sysrq-trigger, etc. |
+| /proc and /sys masking | The paths Docker masks by default are covered, files with `/dev/null` and directories with an empty read-only tmpfs. A mask that cannot be made fails the start |
 | /proc read-only | Remounts /proc/sys, /proc/bus, /proc/fs, /proc/irq read-only |
-| Container isolation | iptables drops br0-to-br0 traffic by default |
+| Root filesystem | Mounted `nodev`, and `nosuid` unless privileged. Devices come from the `/dev` that lightbox builds |
+| Container isolation | A container without `--link` has an isolated port on the bridge: it reaches the host and the outside, and no other container. IPv6 is off inside containers. A container with `--link` shares the bridge, is kept to its links by iptables, and does not start unless `br_netfilter` lets iptables see bridged traffic |
 | User namespaces | Planned future improvement |
 | OOM priority | Containers scored higher for OOM killer |
 
@@ -249,7 +253,7 @@ All security features are on by default. Pass `--privileged` to disable.
 - **Devices**: bind-mounted from host (`/dev/null`, `/dev/zero`, `/dev/random`, etc.)
 - **Networking**: veth pair per container connected to a host bridge with NAT
 - **Resource limits**: cgroups v2 (memory, PIDs, CPU, I/O)
-- **Init**: lightbox remains PID 1 inside the container; if `/init.sh` exists in the rootfs it is run after `/tmp` and `/run` are mounted, then lightbox stays alive to reap children and handle shutdown
+- **Init**: lightbox remains PID 1 inside the container; if `/init.sh` exists in the rootfs it is run after `/tmp` and `/run` are mounted and the sandbox is on, then lightbox stays alive to reap children and handle shutdown
 - **External tools**: on the host, `ip` and `nsenter` set up a container's network, `iptables` the firewall, and `cp` and `rm` create and remove a container. Everything else is direct syscalls, and nothing from the image is run before `/init.sh`
 - **Configuration**: optional `~/.config/lightbox/lightbox.conf` for all paths and defaults
 

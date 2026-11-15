@@ -164,6 +164,8 @@ void container_reap_if_dead(const char *name);
 void container_shown_state(const char *name, container_liveness live, char *buf, size_t bufsz);
 int read_container_ip(const char *name, char *ip, size_t ipsz);
 int update_link_rules(const char *name, const char *ip, bool add_rules);
+/* does iptables see what the bridge switches between containers? */
+bool bridge_traffic_is_filtered(void);
 
 void cmd_setup(void);
 void cmd_doctor(void);

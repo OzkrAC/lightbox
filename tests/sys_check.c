@@ -25,9 +25,11 @@
 #include <asm/statfs.h>
 #include <asm/unistd.h>
 #include <linux/audit.h>
+#include <linux/capability.h>
 #include <linux/filter.h>
 #include <linux/magic.h>
 #include <linux/mount.h>
+#include <linux/prctl.h>
 #include <linux/sched.h>
 #include <linux/seccomp.h>
 #include <linux/sockios.h>
@@ -66,6 +68,29 @@ SAME_VALUE(LB_STATX_ATTR_MOUNT_ROOT, STATX_ATTR_MOUNT_ROOT);
 SAME_VALUE(LB_CGROUP_SUPER_MAGIC, CGROUP_SUPER_MAGIC);
 SAME_VALUE(LB_CGROUP2_SUPER_MAGIC, CGROUP2_SUPER_MAGIC);
 
+SAME_VALUE(LB_PR_SET_KEEPCAPS, PR_SET_KEEPCAPS);
+SAME_VALUE(LB_PR_SET_SECCOMP, PR_SET_SECCOMP);
+SAME_VALUE(LB_PR_CAPBSET_READ, PR_CAPBSET_READ);
+SAME_VALUE(LB_PR_CAPBSET_DROP, PR_CAPBSET_DROP);
+SAME_VALUE(LB_PR_SET_NO_NEW_PRIVS, PR_SET_NO_NEW_PRIVS);
+SAME_VALUE(LB_PR_CAP_AMBIENT, PR_CAP_AMBIENT);
+SAME_VALUE(LB_PR_CAP_AMBIENT_CLEAR_ALL, PR_CAP_AMBIENT_CLEAR_ALL);
+
+SAME_VALUE(LB_CAP_CHOWN, CAP_CHOWN);
+SAME_VALUE(LB_CAP_DAC_OVERRIDE, CAP_DAC_OVERRIDE);
+SAME_VALUE(LB_CAP_FOWNER, CAP_FOWNER);
+SAME_VALUE(LB_CAP_FSETID, CAP_FSETID);
+SAME_VALUE(LB_CAP_KILL, CAP_KILL);
+SAME_VALUE(LB_CAP_SETGID, CAP_SETGID);
+SAME_VALUE(LB_CAP_SETUID, CAP_SETUID);
+SAME_VALUE(LB_CAP_SETPCAP, CAP_SETPCAP);
+SAME_VALUE(LB_CAP_NET_BIND_SERVICE, CAP_NET_BIND_SERVICE);
+SAME_VALUE(LB_CAP_SYS_CHROOT, CAP_SYS_CHROOT);
+SAME_VALUE(LB_CAP_AUDIT_WRITE, CAP_AUDIT_WRITE);
+SAME_VALUE(LB_CAP_SETFCAP, CAP_SETFCAP);
+SAME_VALUE(LB_CAPABILITY_VERSION_3, _LINUX_CAPABILITY_VERSION_3);
+SAME_VALUE(LB_CAPABILITY_WORDS, _LINUX_CAPABILITY_U32S_3);
+
 /* The flags statfs reports for a mount are passed back to mount(2) as they
  * are, so each must be the bit mount(2) takes for the same thing. */
 SAME_VALUE(LB_ST_RDONLY, MS_RDONLY);
@@ -94,6 +119,14 @@ SAME_FIELD(lb_statx, statx, stx_attributes_mask);
 SAME_FIELD(lb_statx, statx, stx_dev_major);
 SAME_FIELD(lb_statx, statx, stx_dev_minor);
 SAME_FIELD(lb_statx, statx, stx_mnt_id);
+
+SAME_SIZE(lb_cap_header, __user_cap_header_struct);
+SAME_FIELD(lb_cap_header, __user_cap_header_struct, version);
+SAME_FIELD(lb_cap_header, __user_cap_header_struct, pid);
+SAME_SIZE(lb_cap_data, __user_cap_data_struct);
+SAME_FIELD(lb_cap_data, __user_cap_data_struct, effective);
+SAME_FIELD(lb_cap_data, __user_cap_data_struct, permitted);
+SAME_FIELD(lb_cap_data, __user_cap_data_struct, inheritable);
 
 /* ─── lightbox_seccomp.h ────────────────────────────────────────────────── */
 

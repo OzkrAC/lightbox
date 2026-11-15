@@ -12,6 +12,10 @@
  *   unit mount   <source> <target> <fstype> <flags> <data>     do_mount
  *   unit mkdirs  <path>                       make_dirs
  *   unit loopback                             loopback_up
+ *   unit caps                                 drop_capabilities, then this process's own sets
+ *   unit sandbox <program> [args...]          apply_sandbox, then the program in its place
+ *   unit maskproc                             mask_proc_paths
+ *   unit noipv6  <pid>                        netns_disable_ipv6
  *
  * For mount, "-" stands for an argument that is not given, and the flags are
  * names joined by commas: ro, nosuid, nodev, noexec, remount, bind, rec,
@@ -66,6 +70,27 @@ static uint64_t mount_flags_named(const char *names) {
 
 static const char *given(const char *arg) { return streq(arg, "-") ? NULL : arg; }
 
+/* The lines of /proc/self/status that say what this process may do. */
+static void put_own_privileges(void) {
+    static char status[8192];
+    if (read_file("/proc/self/status", status, sizeof(status)) <= 0)
+        die("unit: cannot read /proc/self/status");
+    for (char *line = status; *line; ) {
+        char *end = line;
+        while (*end && *end != '\n') end++;
+        char after = *end;
+        *end = '\0';
+        size_t len = lc_string_length(line);
+        if (lc_string_starts_with(line, len, "Cap", 3) ||
+            lc_string_starts_with(line, len, "NoNewPrivs:", 11) ||
+            lc_string_starts_with(line, len, "Seccomp:", 8)) {
+            put(line);
+            put("\n");
+        }
+        line = after ? end + 1 : end;
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc >= 3 && streq(argv[1], "run")) {
         put_result(run_cmd(argv[2], (const char *const *)(argv + 2)));
@@ -102,6 +127,26 @@ int main(int argc, char **argv) {
         put_result(loopback_up());
         return 0;
     }
+    if (argc == 2 && streq(argv[1], "caps")) {
+        drop_capabilities();
+        put_own_privileges();
+        return 0;
+    }
+    if (argc >= 3 && streq(argv[1], "sandbox")) {
+        apply_sandbox();
+        exec_program(argv[2], (const char *const *)(argv + 2), TOOL_ENV);
+        die2("unit: cannot execute ", argv[2]);
+    }
+    if (argc == 2 && streq(argv[1], "maskproc")) {
+        mask_proc_paths();
+        put_result(0);
+        return 0;
+    }
+    if (argc == 3 && streq(argv[1], "noipv6")) {
+        put_result(netns_disable_ipv6(parse_int(argv[2])));
+        return 0;
+    }
     die("usage: unit run|quiet <program> [args...] | unit capture <size> <program> [args...] | unit status <n>\n"
-        "       unit mount <source> <target> <fstype> <flags> <data> | unit mkdirs <path> | unit loopback");
+        "       unit mount <source> <target> <fstype> <flags> <data> | unit mkdirs <path> | unit loopback\n"
+        "       unit caps | unit sandbox <program> [args...] | unit maskproc | unit noipv6 <pid>");
 }

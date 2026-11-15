@@ -15,8 +15,9 @@
 # process it starts dies with the PID namespace. cgroups cannot be private in
 # that way, so its containers live in one directory of the real hierarchy,
 # /sys/fs/cgroup/lightbox-test-<pid>, which is removed at the end. The host's
-# interfaces, firewall rules and cgroups are compared before and after, and a
-# difference fails the run.
+# virtual interfaces, firewall rules and cgroups are compared before and after,
+# and a difference fails the run. A network card that the machine gains or
+# loses meanwhile is reported and does not count.
 #
 #   LIGHTBOX_TEST_ROOTFS=/path  use a copy of this root filesystem (Alpine, Debian ...)
 #   BUSYBOX=/path               the static busybox to build the root filesystem from
@@ -142,7 +143,7 @@ settled() { # name
     if grep -qx 'readonly=1' "$C/$1/.conf"; then
         wait_until 5 mounted_in "$pid" /var/tmp || { echo "init $pid did not mount /var/tmp"; return 1; }
     fi
-    if [ ! -e "$C/$1/rootfs/init.sh" ] && ! grep -qx 'privileged=1' "$C/$1/.conf"; then
+    if ! grep -qx 'privileged=1' "$C/$1/.conf"; then
         wait_until 5 sandboxed "$pid" || { echo "init $pid did not apply its sandbox"; return 1; }
     fi
 }
@@ -480,12 +481,6 @@ t_run_mode() {
 }
 
 t_rootfs_mount_flags() {
-    host_opts=$(findmnt -n -o OPTIONS --target "$C" 2>/dev/null)
-    case ",$host_opts," in
-        *,nodev,*) case ",$host_opts," in *,nosuid,*)
-            echo "the work directory is on a filesystem that is nodev and nosuid already; nothing to observe"
-            return 77 ;; esac ;;
-    esac
     up flags || return 1
     script_in flags <<'EOF'
 opts=$(awk '$5 == "/" { print $6 }' /proc/self/mountinfo | tail -n 1)
@@ -515,6 +510,7 @@ want() { # mount point, filesystem type or "-" for any, the flags it must have
         case ",$opts," in *",$flag,"*) ;; *) echo "$point lacks $flag: it has $opts"; bad=1 ;; esac
     done
 }
+want /            -      nodev nosuid
 want /proc        proc   nosuid nodev noexec
 want /proc/sys    proc   ro nosuid nodev noexec
 for d in bus fs irq; do
@@ -638,6 +634,21 @@ EOF
     echo "the hook ran with Seccomp $(field Seccomp), NoNewPrivs $(field NoNewPrivs), CapEff $(field CapEff), CapBnd $(field CapBnd)"
     [ "$(field Seccomp)" = 2 ] && [ "$(field NoNewPrivs)" = 1 ] && [ "$(field CapBnd)" = "$ALLOWED_CAPS" ] &&
     [ "$(field CapEff)" = "$ALLOWED_CAPS" ] && [ "$(field CapPrm)" = "$ALLOWED_CAPS" ]
+}
+
+t_privileged_hook_is_not_sandboxed() {
+    box hookpriv --privileged || return 1
+    hook hookpriv <<'EOF'
+grep -E '^(NoNewPrivs|Seccomp|CapEff|CapBnd):' /proc/self/status > /hook.status
+EOF
+    start hookpriv || return 1
+    seen="$C/hookpriv/rootfs/hook.status"
+    wait_until 5 test -s "$seen" || { echo "the hook left no mark"; return 1; }
+    field() { awk -v k="$1:" '$1 == k { print $2 }' "$seen"; }
+    echo "the hook ran with Seccomp $(field Seccomp), NoNewPrivs $(field NoNewPrivs), CapEff $(field CapEff), CapBnd $(field CapBnd)"
+    # as unconfined as this shell is
+    [ "$(field Seccomp)" = "$(status_field $$ Seccomp)" ] && [ "$(field NoNewPrivs)" = "$(status_field $$ NoNewPrivs)" ] &&
+    [ "$(field CapEff)" = "$(status_field $$ CapEff)" ] && [ "$(field CapBnd)" = "$(status_field $$ CapBnd)" ]
 }
 
 # A hook that fails only after start's fixed half-second wait.
@@ -767,18 +778,20 @@ t_sandbox_on_init() {
 
 t_sandbox_on_exec() {
     up sandboxed || return 1
-    said=$(sh_in sandboxed 'grep -E "^(NoNewPrivs|Seccomp|CapEff|CapPrm|CapBnd):" /proc/self/status')
+    said=$(sh_in sandboxed 'grep -E "^(NoNewPrivs|Seccomp|Cap(Inh|Prm|Eff|Bnd|Amb)):" /proc/self/status')
     printf '%s\n' "$said"
     value() { printf '%s\n' "$said" | awk -v k="$1:" '$1 == k { print $2 }'; }
     [ "$(value Seccomp)" = 2 ] && [ "$(value NoNewPrivs)" = 1 ] && [ "$(value CapBnd)" = "$ALLOWED_CAPS" ] &&
-    [ "$(value CapEff)" = "$ALLOWED_CAPS" ] && [ "$(value CapPrm)" = "$ALLOWED_CAPS" ]
+    [ "$(value CapEff)" = "$ALLOWED_CAPS" ] && [ "$(value CapPrm)" = "$ALLOWED_CAPS" ] &&
+    [ "$(value CapInh)" = 0000000000000000 ] && [ "$(value CapAmb)" = 0000000000000000 ]
 }
 
 t_init_holds_only_allowed_capabilities() {
     up initcaps || return 1
     pid=$(pid_of initcaps)
-    echo "init holds CapEff $(status_field "$pid" CapEff), CapPrm $(status_field "$pid" CapPrm); allowed is $ALLOWED_CAPS"
-    [ "$(status_field "$pid" CapEff)" = "$ALLOWED_CAPS" ] && [ "$(status_field "$pid" CapPrm)" = "$ALLOWED_CAPS" ]
+    echo "init holds CapEff $(status_field "$pid" CapEff), CapPrm $(status_field "$pid" CapPrm), CapInh $(status_field "$pid" CapInh), CapAmb $(status_field "$pid" CapAmb); allowed is $ALLOWED_CAPS"
+    [ "$(status_field "$pid" CapEff)" = "$ALLOWED_CAPS" ] && [ "$(status_field "$pid" CapPrm)" = "$ALLOWED_CAPS" ] &&
+    [ "$(status_field "$pid" CapInh)" = 0000000000000000 ] && [ "$(status_field "$pid" CapAmb)" = 0000000000000000 ]
 }
 
 t_privileged_is_not_sandboxed() {
@@ -789,7 +802,17 @@ t_privileged_is_not_sandboxed() {
     # as unconfined as this shell is
     [ "$(status_field "$pid" Seccomp)" = "$(status_field $$ Seccomp)" ] &&
     [ "$(status_field "$pid" NoNewPrivs)" = "$(status_field $$ NoNewPrivs)" ] &&
-    [ "$(status_field "$pid" CapBnd)" = "$(status_field $$ CapBnd)" ]
+    [ "$(status_field "$pid" CapBnd)" = "$(status_field $$ CapBnd)" ] || return 1
+    # and it sees /proc and /sys as they are
+    script_in priv <<'EOF'
+for p in /proc/kcore /proc/interrupts /proc/sys /sys/firmware; do
+    [ -e "$p" ] || continue
+    if awk -v m="$p" '$5 == m { found = 1 } END { exit !found }' /proc/self/mountinfo; then
+        echo "$p is covered in a privileged container"
+        exit 1
+    fi
+done
+EOF
 }
 
 t_proc_is_masked() {
@@ -812,13 +835,20 @@ EOF
 t_docker_masks() {
     up dmasked || return 1
     script_in dmasked <<'EOF'
-bad=0
+bad=0 seen=""
 for p in /proc/acpi /proc/asound /proc/interrupts /proc/latency_stats /proc/timer_stats /proc/scsi \
          /sys/firmware /sys/devices/virtual/powercap; do
     [ -e "$p" ] || continue
+    seen="$seen $p"
     awk -v m="$p" '$5 == m { found = 1 } END { exit !found }' /proc/self/mountinfo ||
-        { echo "$p is not masked"; bad=1; }
+        { echo "$p is not masked"; bad=1; continue; }
+    if [ -d "$p" ]; then
+        [ -z "$(ls -A "$p")" ] || { echo "$p is not empty"; bad=1; }
+    else
+        [ -z "$(head -c 1 "$p" 2>/dev/null)" ] || { echo "$p can be read"; bad=1; }
+    fi
 done
+echo "masked here:$seen"
 exit $bad
 EOF
 }
@@ -868,22 +898,38 @@ t_isolated_when_filtered() {
 }
 
 # A host without br_netfilter: bridged traffic does not pass through iptables.
+# Containers without links are kept apart at the bridge itself.
 t_isolated_when_not_filtered() {
     need_nc || return 77
     if [ -e "$BRNF" ]; then brnf 0 || return 1; fi
     up iso3 && up iso4 || return 1
     reaches iso3 "$(addr_of iso4)" && { echo "iso3 reached iso4"; return 1; }
-    return 0
+    reaches iso4 "$(addr_of iso3)" && { echo "iso4 reached iso3"; return 1; }
+    reaches iso3 "$GW"      # and the bridge address is still within reach
+}
+
+# A container with links shares the bridge with the others, and only the
+# firewall keeps it to its links. Where the firewall does not see bridged
+# traffic, such a container is not started, and is told why.
+t_link_needs_filtering() {
+    if [ -e "$BRNF" ]; then brnf 0 || return 1; fi
+    box linkpeer && box wantslink --link linkpeer || return 1
+    if said=$(start wantslink); then
+        printf '%s\n' "$said"
+        echo "a container with a link started where nothing filters bridged traffic"
+        return 1
+    fi
+    printf '%s\n' "$said"
+    case $said in *br_netfilter*) ;; *) echo "the refusal does not name br_netfilter"; return 1 ;; esac
+    nothing_left wantslink && [ "$(state_of wantslink)" = stopped ]
 }
 
 t_linked_containers() {
     need_nc || return 77
-    filtered=no
-    if brnf 1; then filtered=yes; fi
+    brnf 1 || { echo "br_netfilter is not loaded, and a container with a link does not start without it"; return 77; }
     box peer && box linked --link peer || return 1
     start peer && start linked || return 1
     reaches linked "$(addr_of peer)" && reaches peer "$(addr_of linked)" || return 1
-    [ $filtered = yes ] || { echo "(br_netfilter is not loaded: nothing is filtered, so only the link itself was checked)"; return 0; }
     up third || return 1
     reaches third "$(addr_of peer)" && { echo "a container without the link reached peer"; return 1; }
     return 0
@@ -899,6 +945,7 @@ t_link_to_later_container() {
 }
 
 t_rm_leaves_no_rule() {
+    brnf 1 || { echo "br_netfilter is not loaded, and a container with a link does not start without it"; return 77; }
     box lpeer && box lmain --link lpeer || return 1
     start lpeer && start lmain || return 1
     ip=$(addr_of lmain)
@@ -1135,7 +1182,7 @@ if [ "$MODE" = inside ]; then
     check '/run is mode 0755'                                             t_run_mode
     check 'init mounts everything with the restrictions it should have'   t_mount_table
     check 'a container starts and stops without any mount tool'           t_start_needs_no_mount_tool
-    xfail SB-no-devfilter      'the root filesystem is mounted nodev and nosuid'       t_rootfs_mount_flags
+    check 'the root filesystem is mounted nodev and nosuid'               t_rootfs_mount_flags
     check 'an image without /dev, /proc, /sys, /tmp and /run starts'      t_image_without_mount_points
     check 'an image of one static binary starts'                          t_image_with_one_binary
     check 'start runs nothing from the image'                             t_start_runs_nothing_from_the_image
@@ -1145,7 +1192,8 @@ if [ "$MODE" = inside ]; then
 
     check 'the init hook runs with /tmp and /run mounted'                 t_hook_runs
     check 'a service the hook starts outlives the start command'          t_service_outlives_start
-    xfail SB-hook-order        'the init hook runs inside the sandbox'                 t_hook_is_sandboxed
+    check 'the init hook runs inside the sandbox'                         t_hook_is_sandboxed
+    check 'in a privileged container the hook is not sandboxed'           t_privileged_hook_is_not_sandboxed
     xfail RT-ready-sleep       'a hook that fails later still fails the start'         t_failing_hook_fails_start
     xfail RT-hook-blocks       'init answers SIGTERM while its hook runs'              t_stop_during_hook
     xfail RT-not-detached      'said=$(lightbox start x) returns'                      t_start_returns_to_a_capture
@@ -1157,23 +1205,24 @@ if [ "$MODE" = inside ]; then
 
     check 'init has the seccomp filter, no_new_privs and the bounding set' t_sandbox_on_init
     check 'a command run by exec has them too, and only the allowed capabilities' t_sandbox_on_exec
-    xfail SB-caps-bounding     'init holds only the allowed capabilities'              t_init_holds_only_allowed_capabilities
-    check 'a privileged container is not sandboxed'                       t_privileged_is_not_sandboxed
+    check 'init holds only the allowed capabilities and passes none on'   t_init_holds_only_allowed_capabilities
+    check 'a privileged container is not sandboxed and sees /proc as it is' t_privileged_is_not_sandboxed
     check '/proc is masked and its system trees are read-only'            t_proc_is_masked
-    xfail SB-mask-failopen     'the paths Docker masks are masked'                     t_docker_masks
+    check 'the paths Docker masks are masked and show nothing'            t_docker_masks
     check 'another user cannot reach container files'                     t_storage_closed_to_others
 
     check 'a container has loopback, its address and a default route'     t_network_inside
     check 'a container reaches the bridge address'                        t_reaches_gateway
     check 'a container reaches an outside address through address translation' t_reaches_outside
     check 'containers cannot reach each other when bridged traffic is filtered' t_isolated_when_filtered
-    xfail NET-isolation-brnf   'containers cannot reach each other without br_netfilter' t_isolated_when_not_filtered
+    check 'containers cannot reach each other without br_netfilter'      t_isolated_when_not_filtered
+    check 'a container with a link is refused where nothing filters bridged traffic' t_link_needs_filtering
     check 'linked containers reach each other, and a third reaches neither' t_linked_containers
     xfail NET-link-leak        'a link to a container created later applies'           t_link_to_later_container
     xfail NET-link-leak        'rm of a dead container leaves no firewall rule'        t_rm_leaves_no_rule
     xfail NET-veth-clobber     'start leaves alone an interface it did not create'     t_start_spares_foreign_interface
     xfail NET-ifname           'the interface in the container is eth0'                t_interface_is_eth0
-    xfail NET-ipv6             'a container has no IPv6 address'                       t_no_ipv6_in_container
+    check 'a container has no IPv6 address'                               t_no_ipv6_in_container
 
     summary lifecycle
     exit $?
@@ -1242,9 +1291,34 @@ preflight() {
     fi
 }
 
+# The host's interfaces of one kind: virtual or hardware. What lightbox and the
+# suite can make is virtual, a bridge and veth pairs, and that must not be left
+# behind. A network card is the machine's: a cloud VM is given one, or loses
+# one, whenever its own host decides, and one arrived during a run on GitHub.
+interfaces() { # kind
+    local path name kind
+    for path in /sys/class/net/*; do
+        [ -d "$path" ] || continue
+        name=${path##*/}
+        kind=hardware
+        [ -e "/sys/devices/virtual/net/$name" ] && kind=virtual
+        [ "$kind" = "$1" ] && printf '%s ' "$name"
+    done
+    echo
+}
+
+# Network cards that came or went are reported and do not count.
+cards_note() { # before, after
+    [ "$1" = "$2" ] && return 0
+    echo "lifecycle: the machine's network cards changed during the run, which is not the suite's doing: '${1% }' before, '${2% }' after"
+    if [ "${GITHUB_ACTIONS:-}" = true ]; then
+        echo "::notice title=lifecycle%3A the machine's network cards changed::Before the run '${1% }', after it '${2% }'. Not counted as a change the suite made."
+    fi
+}
+
 # What the suite must leave as it found it.
 host_state() {
-    echo "interfaces: $(ip -o link show | awk -F': ' '{ sub(/@.*/, "", $2); print $2 }' | sort | tr '\n' ' ')"
+    echo "virtual interfaces: $(interfaces virtual)"
     echo "forwarding: $(cat /proc/sys/net/ipv4/ip_forward)"
     echo "bridged traffic through iptables: $(cat "$BRNF" 2>/dev/null || echo 'br_netfilter not loaded')"
     echo "lightbox cgroups: $(find /sys/fs/cgroup -maxdepth 1 -name 'lightbox*' | sort | tr '\n' ' ')"
@@ -1305,6 +1379,7 @@ export LIFECYCLE_LB LIFECYCLE_T LIFECYCLE_BB
 trap interrupted EXIT
 
 host_state > "$LIFECYCLE_T/host.before"
+CARDS_BEFORE=$(interfaces hardware)
 
 unshare --net --mount --pid --fork --kill-child --mount-proc -- bash "$SELF" --inside
 rc=$?
@@ -1314,9 +1389,10 @@ trap remove_work_dir EXIT
 remove_cgroups
 restore_controllers
 host_state > "$LIFECYCLE_T/host.after"
+cards_note "$CARDS_BEFORE" "$(interfaces hardware)"
 
 if cmp -s "$LIFECYCLE_T/host.before" "$LIFECYCLE_T/host.after"; then
-    echo "lifecycle: the host's interfaces, firewall rules, cgroups and mounts are as they were"
+    echo "lifecycle: the host's virtual interfaces, firewall rules, cgroups and mounts are as they were"
 else
     echo "lifecycle: THE HOST CHANGED (-: before, +: after)"
     diff -u "$LIFECYCLE_T/host.before" "$LIFECYCLE_T/host.after" | sed '1,2d'

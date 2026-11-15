@@ -11,7 +11,8 @@
 # prints "result <n>": the program's exit status, or 256 when no child could be
 # made, 257 when the program could not be executed, 258 when a signal ended it
 # and 259 when it could not be waited for. For the ones that mount, make
-# directories and bring up loopback, "result 0" or "result -1".
+# directories and bring up loopback, "result 0" or "result -1". The sandbox's
+# helpers end the process when they fail, as they do in a container.
 #
 # The case runner (check, xfail, summary) is tests/lib.sh.
 
@@ -286,6 +287,121 @@ t_loopback_up() {
         [ "$("$1" loopback 2>&1)" = "result 0" ]' _ "$UNIT"
 }
 
+# ─── The sandbox: capabilities, no_new_privs, seccomp, masked paths ─────────
+
+ALLOWED_CAPS=00000000a00405fb       # ALLOWED_CAPS of lightbox.c, as /proc/<pid>/status prints a set
+
+field() { printf '%s\n' "$out" | awk -v k="$1:" '$1 == k { print $2 }'; }
+
+# As root of a user namespace, which holds every capability there. Some hosts
+# let an ordinary user make the namespace and give no capability in it; making
+# a mount namespace inside tells the two apart.
+t_capabilities_reduced() {
+    unshare -r --mount true 2>/dev/null || { echo "user namespaces with capabilities are not available to this user"; return 77; }
+    # with something in the two sets that are passed on, where this host's setpriv can put it there
+    with=""
+    if unshare -r setpriv --inh-caps +chown --ambient-caps +chown true 2>/dev/null; then
+        with="setpriv --inh-caps +chown --ambient-caps +chown"
+    fi
+    before=$(unshare -r $with grep -E '^Cap(Inh|Prm|Eff|Bnd|Amb):' /proc/self/status | tr -s '\t\n' ' ')
+    out=$(unshare -r $with "$UNIT" caps 2>&1)
+    echo "before: $before"
+    echo "after:  $(printf '%s\n' "$out" | tr -s '\t\n' ' ')"
+    [ "$(field CapEff)" = "$ALLOWED_CAPS" ] && [ "$(field CapPrm)" = "$ALLOWED_CAPS" ] &&
+    [ "$(field CapBnd)" = "$ALLOWED_CAPS" ] &&
+    [ "$(field CapInh)" = 0000000000000000 ] && [ "$(field CapAmb)" = 0000000000000000 ]
+}
+
+# The whole sandbox, and a program run inside it: what it holds after the
+# execve is the bounding set and no more, and it cannot gain privileges.
+t_sandbox_covers_a_program() {
+    unshare -r --mount true 2>/dev/null || { echo "user namespaces with capabilities are not available to this user"; return 77; }
+    out=$(unshare -r "$UNIT" sandbox "$SH" -c 'grep -E "^(Cap(Inh|Prm|Eff|Bnd|Amb)|NoNewPrivs|Seccomp):" /proc/self/status' 2>&1)
+    printf '%s\n' "$out" | tr -s '\t\n' ' '; echo
+    [ "$(field Seccomp)" = 2 ] && [ "$(field NoNewPrivs)" = 1 ] &&
+    [ "$(field CapEff)" = "$ALLOWED_CAPS" ] && [ "$(field CapPrm)" = "$ALLOWED_CAPS" ] &&
+    [ "$(field CapBnd)" = "$ALLOWED_CAPS" ] &&
+    [ "$(field CapInh)" = 0000000000000000 ] && [ "$(field CapAmb)" = 0000000000000000 ]
+}
+
+# An ordinary user may not shrink the bounding set. The sandbox must then end
+# the process: a container never runs with a step of it left out.
+t_sandbox_fails_closed() {
+    [ "$(id -u)" != 0 ] || { echo "root can apply the sandbox"; return 77; }
+    out=$("$UNIT" sandbox "$SH" -c 'echo the program ran' 2>&1)
+    rc=$?
+    echo "exit $rc: $out"
+    [ $rc -ne 0 ] && case $out in *'the program ran'*) false ;; *'Error: failed to drop a capability'*) true ;; *) false ;; esac
+}
+
+t_paths_are_masked() {
+    unshare -r --mount --pid --fork --mount-proc true 2>/dev/null ||
+        { echo "user namespaces are not available to this user"; return 77; }
+    unshare -r --mount --pid --fork --mount-proc -- bash -c '
+        is_mount() { awk -v m="$1" '"'"'$5 == m { found = 1 } END { exit !found }'"'"' /proc/self/mountinfo; }
+        opts()     { awk -v m="$1" '"'"'$5 == m { o = $6 } END { print o }'"'"' /proc/self/mountinfo; }
+        said=$("$1" maskproc 2>&1) || { echo "mask_proc_paths ended the process: $said"; exit 1; }
+        bad=0 seen=""
+        for p in /proc/acpi /proc/asound /proc/interrupts /proc/kcore /proc/keys /proc/latency_stats \
+                 /proc/sched_debug /proc/scsi /proc/sysrq-trigger /proc/timer_list /proc/timer_stats \
+                 /sys/devices/virtual/powercap /sys/firmware; do
+            [ -e "$p" ] || continue
+            seen="$seen ${p##*/}"
+            is_mount "$p" || { echo "$p is not covered"; bad=1; continue; }
+            if [ -d "$p" ]; then
+                [ -z "$(ls -A "$p")" ] || { echo "$p is not empty"; bad=1; }
+            else
+                [ -z "$(head -c 1 "$p" 2>/dev/null)" ] || { echo "$p can be read"; bad=1; }
+            fi
+        done
+        for p in /proc/bus /proc/fs /proc/irq /proc/sys; do
+            [ -d "$p" ] || continue
+            seen="$seen ${p##*/}"
+            case ",$(opts "$p")," in *,ro,*) ;; *) echo "$p is not read-only: $(opts "$p")"; bad=1 ;; esac
+        done
+        echo "covered here:$seen"
+        exit $bad' _ "$UNIT"
+}
+
+# ─── netns_disable_ipv6 ─────────────────────────────────────────────────────
+
+# Another network namespace, held by a process. Afterwards it has no IPv6
+# address and gives none to an interface it gets, and this one is as it was.
+t_ipv6_switched_off() {
+    [ -e /proc/sys/net/ipv6/conf ] || { echo "this kernel runs without IPv6"; return 77; }
+    command -v ip >/dev/null 2>&1 && command -v nsenter >/dev/null 2>&1 || { echo "no ip and nsenter to look with"; return 77; }
+    unshare -r --net true 2>/dev/null || { echo "user namespaces are not available to this user"; return 77; }
+    unshare -r --net -- bash -c '
+        unshare --net -- sleep 60 >/dev/null 2>&1 </dev/null &
+        holder=$!
+        i=0
+        until [ -n "$(readlink /proc/$holder/ns/net 2>/dev/null)" ] &&
+              [ "$(readlink /proc/$holder/ns/net)" != "$(readlink /proc/self/ns/net)" ]; do
+            i=$((i + 1)); [ $i -lt 50 ] || exit 1; sleep 0.1
+        done
+        there() { nsenter -t "$holder" -n "$@"; }
+        there ip link set lo up
+        before=$(there cat /proc/net/if_inet6)
+        mine=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)
+        result=$("$1" noipv6 "$holder" 2>&1)
+        after=$(there cat /proc/net/if_inet6)
+        all=$(there cat /proc/sys/net/ipv6/conf/all/disable_ipv6)
+        default=$(there cat /proc/sys/net/ipv6/conf/default/disable_ipv6)
+        still=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)
+        kill "$holder"
+        echo "addresses there before: $(printf "%s\n" "$before" | grep -c .); $result; after: $(printf "%s\n" "$after" | grep -c .)"
+        echo "there: all=$all default=$default; here: $mine before, $still after"
+        [ -n "$before" ] && [ "$result" = "result 0" ] && [ -z "$after" ] &&
+        [ "$all" = 1 ] && [ "$default" = 1 ] && [ "$still" = "$mine" ]' _ "$UNIT"
+}
+
+# No process has this number, so there is no namespace to join. start must
+# hear of it: a container is not to run with IPv6 left as it was.
+t_ipv6_failure_is_an_error() {
+    both noipv6 2147483600
+    [ "$out" = "result -1" ]
+}
+
 check 'a program that succeeds gives 0'                          t_success
 check 'a non-zero exit status is returned as it is'              t_exit_status
 check 'a program killed by a signal is a failure, and reported'  t_killed_by_signal
@@ -314,5 +430,13 @@ check 'a mount that fails is reported with its errno'            t_mount_failure
 check 'directories are made with the ones above them'            t_make_dirs
 check 'a file in the way of a directory is an error'             t_make_dirs_stops_at_a_file
 check 'the loopback interface is brought up'                     t_loopback_up
+
+check 'every capability set is reduced to the allowed ones'      t_capabilities_reduced
+check 'a program run in the sandbox is confined by it'           t_sandbox_covers_a_program
+check 'a sandbox that cannot be applied ends the process'        t_sandbox_fails_closed
+check 'paths of /proc and /sys are masked or made read-only'     t_paths_are_masked
+
+check 'IPv6 is switched off in another network namespace'        t_ipv6_switched_off
+check 'a namespace that cannot be joined is an error'            t_ipv6_failure_is_an_error
 
 summary unit

@@ -205,6 +205,9 @@ void cmd_doctor(void) {
     print_kv("bridge", cfg_global.bridge);
     print_kv("subnet", cfg_global.subnet);
     print_kv("gw", cfg_global.gw);
+    /* told, not counted as missing: only a container with links depends on it */
+    print_kv("bridge_filtering", bridge_traffic_is_filtered()
+             ? "yes" : "no (a container with --link will not start; it needs br_netfilter)");
 
     ok = path_exists(cfg_global.lightbox_dir);
     print_check("path.lightbox_dir", ok, cfg_global.lightbox_dir);

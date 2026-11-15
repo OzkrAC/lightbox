@@ -40,41 +40,10 @@ global_config cfg_global;
 
 /* cfg_global_init() and cfg_global_load() defined after utility functions */
 
-/* prctl constants */
-#define PR_SET_NO_NEW_PRIVS  38
-#define PR_SET_KEEPCAPS      8
-#define PR_CAPBSET_DROP      24
-#define PR_SET_SECCOMP       22
-
-/* capability numbers */
-#define CAP_CHOWN            0
-#define CAP_DAC_OVERRIDE     1
-#define CAP_FOWNER           3
-#define CAP_FSETID           4
-#define CAP_KILL             5
-#define CAP_SETGID           6
-#define CAP_SETUID           7
-#define CAP_SETPCAP          8
-#define CAP_NET_BIND_SERVICE 10
-#define CAP_SYS_CHROOT       18
-#define CAP_AUDIT_WRITE      29
-#define CAP_SETFCAP          31
-
 /* device numbers: makedev(major, minor) */
 #define MAKEDEV(ma, mi) (((uint64_t)(ma) << 8) | (mi))
 
 /* ─── Structs ───────────────────────────────────────────────────────────── */
-
-struct user_cap_header {
-    uint32_t version;
-    int32_t pid;
-};
-
-struct user_cap_data {
-    uint32_t effective;
-    uint32_t permitted;
-    uint32_t inheritable;
-};
 
 typedef struct {
     char name[NAME_MAX_LEN + 1];
@@ -508,30 +477,56 @@ static void cgroup_join_self(const char *name) {
  * - no CAP_MKNOD: device node creation is unnecessary with our fixed /dev setup
  */
 static const int ALLOWED_CAPS[] = {
-    CAP_CHOWN, CAP_DAC_OVERRIDE, CAP_FOWNER, CAP_FSETID,
-    CAP_KILL, CAP_SETGID, CAP_SETUID, CAP_SETPCAP,
-    CAP_NET_BIND_SERVICE, CAP_SYS_CHROOT,
-    CAP_AUDIT_WRITE, CAP_SETFCAP,
+    LB_CAP_CHOWN, LB_CAP_DAC_OVERRIDE, LB_CAP_FOWNER, LB_CAP_FSETID,
+    LB_CAP_KILL, LB_CAP_SETGID, LB_CAP_SETUID, LB_CAP_SETPCAP,
+    LB_CAP_NET_BIND_SERVICE, LB_CAP_SYS_CHROOT,
+    LB_CAP_AUDIT_WRITE, LB_CAP_SETFCAP,
 };
 #define N_ALLOWED_CAPS (sizeof(ALLOWED_CAPS) / sizeof(ALLOWED_CAPS[0]))
 
-static bool cap_is_allowed(int cap) {
-    for (size_t i = 0; i < N_ALLOWED_CAPS; i++)
-        if (ALLOWED_CAPS[i] == cap) return true;
-    return false;
-}
-
+/*
+ * Reduce every capability set of this process to the allowed capabilities.
+ *
+ *   bounding                 what a later execve can give back
+ *   effective and permitted  what the process holds itself: init never
+ *                            executes anything, so for it the bounding set
+ *                            alone would change nothing
+ *   inheritable and ambient  what it passes on; emptied
+ *
+ * Any step that fails ends the process: a container must not run with more
+ * than this.
+ */
 static void drop_capabilities(void) {
-    /* read cap_last_cap from kernel */
-    char buf[8];
-    int last_cap = 40; /* fallback */
-    if (read_file("/proc/sys/kernel/cap_last_cap", buf, sizeof(buf)) > 0)
-        last_cap = parse_int(buf);
+    uint64_t allowed = 0;
+    for (size_t i = 0; i < N_ALLOWED_CAPS; i++)
+        allowed |= 1ULL << ALLOWED_CAPS[i];
 
-    for (int cap = 0; cap <= last_cap; cap++) {
-        if (!cap_is_allowed(cap))
-            lc_kernel_prctl(PR_CAPBSET_DROP, (uint64_t)cap, 0, 0, 0);
+    /* PR_CAPBSET_READ fails past the last capability this kernel knows */
+    for (int cap = 0; cap < 64; cap++) {
+        lc_sysret held = lc_kernel_prctl(LB_PR_CAPBSET_READ, (uint64_t)cap, 0, 0, 0);
+        if (held < 0)
+            break;
+        if (held == 1 && !(allowed & (1ULL << cap)) &&
+            lc_kernel_prctl(LB_PR_CAPBSET_DROP, (uint64_t)cap, 0, 0, 0) < 0)
+            die("Error: failed to drop a capability from the bounding set");
     }
+
+    /* never more than the process has: capset cannot add to permitted */
+    struct lb_cap_header hdr = { LB_CAPABILITY_VERSION_3, 0 };
+    struct lb_cap_data sets[LB_CAPABILITY_WORDS];
+    if (lb_sys_capget(&hdr, sets) < 0)
+        die("Error: failed to read the capability sets");
+    for (int word = 0; word < LB_CAPABILITY_WORDS; word++) {
+        uint32_t keep = sets[word].permitted & (uint32_t)(allowed >> (32 * word));
+        sets[word].effective = keep;
+        sets[word].permitted = keep;
+        sets[word].inheritable = 0;
+    }
+    if (lb_sys_capset(&hdr, sets) < 0)
+        die("Error: failed to reduce the capability sets");
+
+    if (lc_kernel_prctl(LB_PR_CAP_AMBIENT, LB_PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) < 0)
+        die("Error: failed to clear the ambient capability set");
 }
 
 /* ─── Security: seccomp ─────────────────────────────────────────────────── */
@@ -550,35 +545,65 @@ static void apply_seccomp(void) {
 
     if (prog.len != LB_SECCOMP_PROG_LEN)
         die("Error: seccomp program has an unexpected length");
-    if (lc_kernel_prctl(PR_SET_SECCOMP, LB_SECCOMP_MODE_FILTER, (uint64_t)&prog, 0, 0) < 0)
+    if (lc_kernel_prctl(LB_PR_SET_SECCOMP, LB_SECCOMP_MODE_FILTER, (uint64_t)&prog, 0, 0) < 0)
         die("Error: failed to install seccomp filter");
+}
+
+/*
+ * What everything in a non-privileged container runs under: the reduced
+ * capability sets, no_new_privs and the seccomp profile. Init applies it
+ * before its hook, so the hook and all it starts inherit it; exec applies it
+ * to the command it runs. Any step that fails ends the process.
+ */
+static void apply_sandbox(void) {
+    drop_capabilities();
+    if (lc_kernel_prctl(LB_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
+        die("Error: failed to enable no_new_privs");
+    apply_seccomp();
 }
 
 /* ─── Security: /proc masking ───────────────────────────────────────────── */
 
+/* Cover a path: a directory with an empty read-only tmpfs, anything else
+ * with /dev/null. What this kernel does not have is left out. */
+static void mask_path(const char *path) {
+    struct lb_statx stx;
+    lc_sysret rc = lb_sys_statx(AT_FDCWD, path, 0, LB_STATX_TYPE, &stx);
+    if (rc == -LB_ENOENT)
+        return;
+    if (rc < 0)
+        die2("Error: cannot examine a path that must be masked: ", path);
+
+    if ((stx.stx_mode & LB_S_IFMT) == LB_S_IFDIR)
+        require_mount("tmpfs", path, "tmpfs", MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC, "mode=555");
+    else
+        require_mount("/dev/null", path, NULL, MS_BIND, NULL);
+}
+
+/*
+ * Keep a non-privileged container away from the parts of /proc and /sys that
+ * show or change the host: the paths Docker masks or makes read-only by
+ * default, with sysrq-trigger masked where Docker makes it read-only. A mount
+ * that fails ends the start; a container must not run with a path left open.
+ */
 static void mask_proc_paths(void) {
-    /* A mount that fails here is reported and the start goes on: masking
-     * fails open until it is made to fail closed (SB-mask-failopen). */
-
-    /* bind /dev/null over sensitive files */
-    static const char *mask_files[] = {
-        "/proc/kcore", "/proc/sysrq-trigger", "/proc/timer_list",
-        "/proc/keys", "/proc/sched_debug",
+    static const char *const masked[] = {
+        "/proc/acpi", "/proc/asound", "/proc/interrupts", "/proc/kcore",
+        "/proc/keys", "/proc/latency_stats", "/proc/sched_debug", "/proc/scsi",
+        "/proc/sysrq-trigger", "/proc/timer_list", "/proc/timer_stats",
+        "/sys/devices/virtual/powercap", "/sys/firmware",
     };
-    for (size_t i = 0; i < sizeof(mask_files) / sizeof(mask_files[0]); i++) {
-        if (path_exists(mask_files[i]))
-            (void)do_mount("/dev/null", mask_files[i], NULL, MS_BIND, NULL);
-    }
+    for (size_t i = 0; i < sizeof(masked) / sizeof(masked[0]); i++)
+        mask_path(masked[i]);
 
-    /* make sensitive subtrees read-only */
-    static const char *ro_dirs[] = {
+    static const char *const read_only[] = {
         "/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys",
     };
-    for (size_t i = 0; i < sizeof(ro_dirs) / sizeof(ro_dirs[0]); i++) {
-        if (path_exists(ro_dirs[i])) {
-            (void)do_mount(ro_dirs[i], ro_dirs[i], NULL, MS_BIND, NULL);
-            (void)do_mount(NULL, ro_dirs[i], NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL);
-        }
+    for (size_t i = 0; i < sizeof(read_only) / sizeof(read_only[0]); i++) {
+        if (!path_exists(read_only[i]))
+            continue;
+        require_mount(read_only[i], read_only[i], NULL, MS_BIND, NULL);
+        require_mount(NULL, read_only[i], NULL, MS_REMOUNT | MS_BIND | MS_RDONLY, NULL);
     }
 }
 
@@ -912,6 +937,38 @@ static int open_target_path(int target_pid, const char *suffix) {
     return (int)lc_kernel_open_file(path, O_RDONLY | O_CLOEXEC, 0);
 }
 
+/*
+ * Switch IPv6 off in the network namespace of a process, for the interfaces
+ * it has and the ones it gets. A container gets an IPv4 address and IPv4
+ * firewall rules; left on, IPv6 would give its interface a link-local address
+ * by itself, and a way to its neighbours that none of those rules cover.
+ *
+ * The setting is read and written through /proc/sys of whoever asks, so a
+ * child joins the namespace and writes it there. 0, or -1.
+ */
+static int netns_disable_ipv6(int target_pid) {
+    lc_sysret child = lc_kernel_fork();
+    if (child < 0)
+        return -1;
+
+    if (child == 0) {
+        int fd = open_target_path(target_pid, "/ns/net");
+        if (fd < 0 || lc_kernel_setns(fd, CLONE_NEWNET) < 0)
+            lc_kernel_exit(1);
+        if (!path_exists("/proc/sys/net/ipv6/conf"))
+            lc_kernel_exit(0);      /* a kernel without IPv6 has nothing to switch off */
+        if (write_file("/proc/sys/net/ipv6/conf/all/disable_ipv6", "1") < 0 ||
+            write_file("/proc/sys/net/ipv6/conf/default/disable_ipv6", "1") < 0)
+            lc_kernel_exit(1);
+        lc_kernel_exit(0);
+    }
+
+    int32_t status;
+    if (wait_child((int32_t)child, &status) < 0)
+        return -1;
+    return exit_code_from_status(status) == 0 ? 0 : -1;
+}
+
 static void require_setns_fd(int fd, int nstype, const char *name) {
     if (lc_kernel_setns(fd, nstype) < 0)
         die2("Error: failed to join namespace: ", name);
@@ -969,12 +1026,8 @@ static int exec_inside_container(const char *name, int target_pid, int userns,
         uint64_t empty_mask = 0;
         lc_kernel_set_signal_mask(LC_SIG_SETMASK, &empty_mask, NULL);
 
-        if (!privileged) {
-            drop_capabilities();
-            if (lc_kernel_prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
-                die("Error: failed to enable no_new_privs");
-            apply_seccomp();
-        }
+        if (!privileged)
+            apply_sandbox();
 
         if (ngroups >= 0) {
             if (lc_kernel_setgroups((size_t)ngroups, groups) < 0)
@@ -1066,10 +1119,10 @@ static int delete_veth_if_present(const char *ifname) {
 }
 
 static void enter_user_namespace_root(void) {
-    struct user_cap_header hdr = { 0x20080522, 0 };
-    struct user_cap_data data[2];
+    struct lb_cap_header hdr = { LB_CAPABILITY_VERSION_3, 0 };
+    struct lb_cap_data data[LB_CAPABILITY_WORDS];
 
-    if (lc_kernel_prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0) < 0)
+    if (lc_kernel_prctl(LB_PR_SET_KEEPCAPS, 1, 0, 0, 0) < 0)
         die("Error: failed to enable keepcaps for userns");
     if (lc_kernel_setgid(0) < 0)
         die("Error: failed to setgid(0) in userns");
@@ -1210,6 +1263,12 @@ static int container_child(void *arg) {
 
     /* pivot_root */
     require_mount(ca->root, ca->root, NULL, MS_BIND | MS_REC, NULL);
+    /* A device node inside the image is not a device here: the devices a
+     * container may use are the ones bound into its /dev, which is a mount of
+     * its own. Without privileges, setuid bits in the image mean nothing
+     * either, as no_new_privs already has it. */
+    require_mount(NULL, ca->root, NULL,
+                  MS_REMOUNT | MS_BIND | MS_NODEV | (ca->privileged ? 0 : MS_NOSUID), NULL);
     if (lc_kernel_chdir(ca->root) < 0)
         die2("Error: chdir to rootfs failed: ", ca->root);
     lc_kernel_mkdirat(AT_FDCWD, ".old_root", 0755);
@@ -1271,16 +1330,15 @@ static int container_child(void *arg) {
     if (ca->read_only)
         require_mount("tmpfs", "/var/tmp", "tmpfs", MS_NOSUID | MS_NODEV, NULL);
 
+    /* The sandbox goes on before the hook, so that the hook and everything
+     * it starts run inside it. Init itself needs little after this: it runs
+     * the hook, reads its signals, reaps and exits. A hook that mounts or
+     * configures the network needs a privileged container. */
+    if (!ca->privileged)
+        apply_sandbox();
+
     /* run /init.sh if present */
     run_init_hook_if_present();
-
-    /* apply security sandbox (unless privileged) */
-    if (!ca->privileged) {
-        drop_capabilities();
-        if (lc_kernel_prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
-            die("Error: failed to enable no_new_privs");
-        apply_seccomp();
-    }
 
     /* remain as PID 1 and reap adopted children until shutdown */
     return supervisor_loop();
@@ -1316,6 +1374,26 @@ static void cmd_start(int argc, char **argv) {
     if (userns)
         die("Error: containers configured with user namespaces are not supported yet");
 
+    /* A container without links gets an isolated port on the bridge: it
+     * reaches the host and, through it, the outside, and no other container.
+     * One with links has to share the bridge with the containers it is linked
+     * to, and then the firewall is all that keeps it to those. The firewall
+     * sees what the bridge switches only with br_netfilter, so without that
+     * such a container is not started. Decided before anything is set up. */
+    char first_link[NAME_MAX_LEN + 1];
+    bool linked = conf_get(name, "link", first_link, sizeof(first_link), "") == 1;
+    if (linked && !bridge_traffic_is_filtered()) {
+        print_str(STDERR, "Error: container '");
+        print_str(STDERR, name);
+        print_str(STDERR,
+            "' has links, and on this host bridged traffic does not pass\n"
+            "through iptables. A linked container shares the bridge with the others, and\n"
+            "only the firewall keeps it to its links. Let the firewall see that traffic,\n"
+            "then start the container again:\n"
+            "  modprobe br_netfilter && sysctl -w net.bridge.bridge-nf-call-iptables=1\n");
+        lc_kernel_exit(1);
+    }
+
     print_str(STDOUT,"Starting container '");
     print_str(STDOUT,name);
     print_str(STDOUT,"'...\n");
@@ -1347,6 +1425,11 @@ static void cmd_start(int argc, char **argv) {
       if (run_cmd(tool_path_ip(), a) != 0) { start_err = "failed to create veth pair"; goto fail_start; } }
     { const char *a[] = { "ip", "link", "set", veth_host, "master", cfg_global.bridge, NULL };
       if (run_cmd(tool_path_ip(), a) != 0) { start_err = "failed to attach veth to bridge"; goto fail_start; } }
+    if (!linked) {
+        /* isolated ports do not reach each other, whatever the firewall does */
+        const char *a[] = { "ip", "link", "set", "dev", veth_host, "type", "bridge_slave", "isolated", "on", NULL };
+        if (run_cmd(tool_path_ip(), a) != 0) { start_err = "failed to isolate the container's port on the bridge"; goto fail_start; }
+    }
     { const char *a[] = { "ip", "link", "set", veth_host, "up", NULL };
       if (run_cmd(tool_path_ip(), a) != 0) { start_err = "failed to bring host veth up"; goto fail_start; } }
 
@@ -1427,6 +1510,12 @@ static void cmd_start(int argc, char **argv) {
     /* set up cgroup */
     if (cgroup_create(name, (int)child_pid) != 0) {
         start_err = "failed to create cgroup";
+        goto fail_start;
+    }
+
+    /* before the namespace has an interface that could come up with it */
+    if (netns_disable_ipv6((int)child_pid) != 0) {
+        start_err = "failed to switch IPv6 off in the container";
         goto fail_start;
     }
 
