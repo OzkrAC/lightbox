@@ -201,6 +201,16 @@ int update_link_rules(const char *name, const char *ip, bool add_rules);
 /* does iptables see what the bridge switches between containers? */
 bool bridge_traffic_is_filtered(void);
 
+/* How exec can run from a copy of this binary that cannot be written to. */
+typedef enum {
+    SEAL_NONE,          /* not at all: exec refuses to run */
+    SEAL_MEMFD,         /* a sealed copy in memory */
+    SEAL_READONLY,      /* the binary itself, on a read-only mount of its own */
+} seal_method;
+
+/* which of them works here, found by doing all of it but the execution */
+seal_method exec_seal_method(void);
+
 void cmd_setup(void);
 void cmd_doctor(void);
 void cmd_ls(int argc, char **argv);

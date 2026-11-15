@@ -24,6 +24,7 @@ Not tagged yet, and not complete: the part of Phase 4 that is written so far, wh
 - `USER` and `LOGNAME` were cut to 12 characters.
 - `exec` read the container's `/etc/passwd` and `/etc/group` through their path on the host, where a link in the container's files leads wherever it says. They are read inside the container now, and only if they are regular files.
 - `exec x --user`, with the value missing, ran `--user` as a command.
+- `exec` entered a container as the installed binary, which a process in the container can reach through `/proc` for as long as the worker runs. `exec` now executes itself again from a sealed copy in memory first, as runc does since CVE-2019-5736, and its worker is closed to other processes until the command starts. If neither a sealed copy nor a read-only mount of the binary can be had, `exec` does not run; `lightbox doctor` says which it is.
 - A volume's destination was made and mounted through its path on the host, before the container had its own root. A link in the image on that path was followed on the host, so `start` could make a directory or an empty file outside the container. Volumes are now attached after the container has its own root and the host's is out of its sight.
 - A volume below `/run` or `/tmp` was hidden by the tmpfs that is mounted there afterwards.
 - A destination such as `//proc/x` got past the check that keeps volumes off `/proc`, `/sys` and `/dev`.

@@ -463,6 +463,26 @@ t_exec_passes_every_argument() {
     [ "$said" = "${words% }" ]
 }
 
+# While a command runs, the lightbox processes that put it there are not the
+# installed binary: they run from a sealed copy in memory.
+t_exec_runs_from_a_sealed_copy() {
+    up sealed || return 1
+    "$LB" exec sealed /bin/sh -c ': > /e.started; exec sleep 30' >"$OUT/sealed.exec" 2>&1 </dev/null &
+    front=$!
+    wait_until 5 test -e "$C/sealed/rootfs/e.started" || { echo "the command did not start:"; cat "$OUT/sealed.exec"; return 1; }
+    bad=0
+    for p in "$front" $(children_of "$front" lightbox); do
+        exe=$(readlink "/proc/$p/exe")
+        echo "lightbox process $p runs from: $exe"
+        case $exe in '/memfd:lightbox'*) ;; *) echo "  that is not the sealed copy"; bad=1 ;; esac
+    done
+    [ -n "$(children_of "$front" lightbox)" ] || { echo "exec has no worker to look at"; bad=1; }
+    lb doctor | grep -x 'exec_sealing: yes (a sealed copy in memory)' || { echo "doctor does not say how exec is sealed"; bad=1; }
+    lb stop sealed >/dev/null
+    wait "$front" 2>/dev/null
+    return $bad
+}
+
 # --env, --workdir, the caller's TERM, and -- before a command of any shape.
 t_exec_environment() {
     up envs || return 1
@@ -574,6 +594,38 @@ t_volume_under_tmp() {
     [ "$(sh_in vtmp 'cat /not/in/the/image/in')" = cached ] || { echo "a volume at a path the image lacks is not there, with a read-only root"; return 1; }
     refused sh_in vtmp 'echo x > /run/app/one.conf' || { echo "a read-only file volume was written"; return 1; }
     sh_in vtmp 'echo written > /tmp/cache/out' && [ "$(cat "$T/vol/cache/out")" = written ]
+}
+
+# vm.memfd_noexec says whether a memfd may be executed. With 1, exec's copy is
+# still allowed, because exec asks for it by name; with 2 it is not, and exec
+# takes the binary through a read-only mount instead. The setting belongs to
+# this suite's PID namespace and cannot always be taken back, which is why
+# this case is the last one.
+t_exec_where_memfds_may_not_be_executed() {
+    knob=/proc/sys/vm/memfd_noexec
+    [ -w "$knob" ] || { echo "this kernel has no vm.memfd_noexec"; return 77; }
+    was=$(cat "$knob")
+    up noexec || return 1
+    bad=0
+    echo 1 > "$knob" || { echo "vm.memfd_noexec cannot be set here"; return 77; }
+    said=$(sh_in noexec 'echo ran') || true
+    echo "with vm.memfd_noexec = 1: $said; $(lb doctor | grep '^exec_sealing')"
+    [ "$said" = ran ] && lb doctor | grep -qx 'exec_sealing: yes (a sealed copy in memory)' || bad=1
+
+    echo 2 > "$knob" || { echo "vm.memfd_noexec cannot be set to 2 here"; return 77; }
+    said=$(sh_in noexec 'echo ran') || true
+    echo "with vm.memfd_noexec = 2: $said; $(lb doctor | grep '^exec_sealing')"
+    [ "$said" = ran ] && lb doctor | grep -q '^exec_sealing: yes (a read-only mount of the binary' || bad=1
+    "$LB" exec noexec /bin/sh -c ': > /e.started; exec sleep 30' >"$OUT/noexec.exec" 2>&1 </dev/null &
+    front=$!
+    wait_until 5 test -e "$C/noexec/rootfs/e.started" || { echo "the command did not start:"; cat "$OUT/noexec.exec"; bad=1; }
+    exe=$(readlink "/proc/$front/exe")
+    echo "lightbox process $front runs from: $exe"
+    case $exe in /memfd:*) echo "  a memfd was executed though the setting forbids it"; bad=1 ;; esac
+    lb stop noexec >/dev/null
+    wait "$front" 2>/dev/null
+    echo "$was" > "$knob" 2>/dev/null || echo "(vm.memfd_noexec stays at $(cat "$knob") in this suite's PID namespace)"
+    return $bad
 }
 
 t_read_only_root() {
@@ -1541,6 +1593,7 @@ if [ "$MODE" = inside ]; then
     check 'exec finds a command on PATH'                                  t_exec_searches_path
     check 'exec passes every argument'                                    t_exec_passes_every_argument
     check 'exec sets --env and --workdir, and passes TERM and nothing else' t_exec_environment
+    check 'exec runs from a sealed copy of the binary'                    t_exec_runs_from_a_sealed_copy
 
     check 'a directory volume is shared in both directions'               t_volume_directory
     check 'a file volume is mounted'                                      t_volume_file
@@ -1605,6 +1658,9 @@ if [ "$MODE" = inside ]; then
     xfail NET-veth-clobber     'start leaves alone an interface it did not create'     t_start_spares_foreign_interface
     xfail NET-ifname           'the interface in the container is eth0'                t_interface_is_eth0
     check 'a container has no IPv6 address'                               t_no_ipv6_in_container
+
+    # last: it may leave a kernel setting changed for the rest of this suite's life
+    check 'exec works where a memfd may not be executed'                  t_exec_where_memfds_may_not_be_executed
 
     summary lifecycle
     exit $?

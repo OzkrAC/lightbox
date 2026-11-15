@@ -28,6 +28,11 @@
  *                                             or "invalid: <what is wrong>"
  *   unit volumes <root> <spec>... [-- <probe>...]
  *                                             the volumes as init takes and attaches them, see below
+ *   unit sealed [words...]                    run_sealed, as exec begins: then what this process
+ *                                             runs from, its seals, its name, its words, and
+ *                                             whether its own binary can be opened for writing
+ *   unit sealed-readonly [words...]           the same from readonly_clone, the way exec takes
+ *                                             where an executable memfd is refused
  *   unit nameservers <resolv.conf>            name_servers_of: a line for each, then the count
  *   unit dnslist <text>                       name_servers_listed: the same for the dns setting
  *   unit userspec <text>                      parse_user_spec: "name <n>", "uid <n>",
@@ -369,6 +374,59 @@ static void put_int(int number) {
     put(buf);
 }
 
+/* What the process that run_sealed returns in is running from. */
+static void unit_report_sealed(int argc, char **argv) {
+    static char link[256];
+    lc_sysret n = lc_kernel_readlinkat(AT_FDCWD, "/proc/self/exe", link, sizeof(link) - 1);
+    link[n > 0 ? n : 0] = '\0';
+    put("exe ");
+    put(link);
+    put("\n");
+
+    lc_sysret fd = lc_kernel_open_file("/proc/self/exe", O_RDONLY | O_CLOEXEC, 0);
+    lc_sysret seals = fd >= 0 ? lb_sys_fcntl((int32_t)fd, LB_F_GET_SEALS, 0) : -1;
+    if (fd >= 0)
+        lc_kernel_close_file((int32_t)fd);
+    /* the seals as the kernel numbers them, for the case to compare with what it expects:
+     * 1 no more seals, 2 no shrinking, 4 no growing, 8 no writing */
+    put("seals ");
+    if (seals >= 0)
+        put_int((int)seals);
+    else
+        put("none");
+    put("\n");
+
+    struct lb_statfs fs;
+    put(lb_sys_statfs("/proc/self/exe", &fs) >= 0 && (fs.f_flags & LB_ST_RDONLY) ? "mount read-only\n" : "mount writable\n");
+    put(runs_sealed() ? "sealed yes\n" : "sealed no\n");
+
+    static char name[64];
+    if (read_file("/proc/self/comm", name, sizeof(name)) > 0) {
+        put("name ");
+        put(name);
+    }
+    put("words");
+    for (int i = 2; i < argc; i++) {
+        put(" [");
+        put(argv[i]);
+        put("]");
+    }
+    put("\n");
+    const char *kept = env_get(caller_env, "KEPT");
+    put("kept ");
+    put(kept ? kept : "(not in the environment)");
+    put("\n");
+
+    /* the binary this process runs, as another process would reach it */
+    fd = lc_kernel_open_file("/proc/self/exe", O_WRONLY, 0);
+    if (fd < 0) {
+        put("write refused at open\n");
+    } else {
+        put(lc_kernel_write_bytes((int32_t)fd, "x", 1) == 1 ? "write DONE\n" : "write refused\n");
+        lc_kernel_close_file((int32_t)fd);
+    }
+}
+
 /* exec's own parsing and resolving, with the account files where the case
  * put them instead of in a container. */
 static void unit_request(int argc, char **argv, struct exec_request *req, struct identity *id) {
@@ -380,6 +438,7 @@ static void unit_request(int argc, char **argv, struct exec_request *req, struct
 }
 
 int main(int argc, char **argv, char **envp) {
+    caller_argv = argv;
     caller_env = envp;
     if (argc >= 3 && streq(argv[1], "run")) {
         put_result(run_cmd(argv[2], (const char *const *)(argv + 2)));
@@ -516,6 +575,22 @@ int main(int argc, char **argv, char **envp) {
             unit_probe(argv[i]);
         return 0;
     }
+    if (argc >= 2 && streq(argv[1], "sealed")) {
+        run_sealed();
+        unit_report_sealed(argc, argv);
+        return 0;
+    }
+    if (argc >= 2 && streq(argv[1], "sealed-readonly")) {
+        if (!runs_sealed()) {
+            lc_sysret clone = readonly_clone();
+            if (clone < 0)
+                die("unit: no read-only clone of the binary");
+            lb_sys_execveat((int32_t)clone, "", argv, envp, LB_AT_EMPTY_PATH);
+            die("unit: the read-only clone could not be executed");
+        }
+        unit_report_sealed(argc, argv);
+        return 0;
+    }
     if (argc == 3 && (streq(argv[1], "nameservers") || streq(argv[1], "dnslist"))) {
         char found[MAX_DNS][16];
         int count = streq(argv[1], "dnslist") ? name_servers_listed(argv[2], found)
@@ -579,5 +654,6 @@ int main(int argc, char **argv, char **envp) {
         "       unit stop <pid> <seconds> | unit pids <file> | unit userspec <text>\n"
         "       unit volspec <spec> | unit volumes <root> <spec>... [-- <probe>...]\n"
         "       unit nameservers <resolv.conf> | unit dnslist <text>\n"
+        "       unit sealed [words...] | unit sealed-readonly [words...]\n"
         "       unit identity|command <passwd> <group> <exec's options...>");
 }

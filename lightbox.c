@@ -2057,10 +2057,176 @@ static bool term_is_plain(const char *term) {
     return true;
 }
 
+/* ─── exec: a binary the container cannot write to ──────────────────────── */
+
+/*
+ * A process that enters a container is, to the container, one of its own:
+ * until it executes the command, it is this binary, and a file that is being
+ * executed can be reached by other processes through /proc/<pid>/exe. So exec
+ * does not enter a container as the installed binary. It first executes
+ * itself again from a copy that nothing can write to:
+ *
+ *   a sealed memfd    a copy in memory, whose seals forbid writing, growing
+ *                     and shrinking, and forbid taking the seals off;
+ *   a read-only mount where the kernel is set to refuse executable memfds
+ *                     (vm.memfd_noexec = 2): the binary itself, seen through
+ *                     a mount of its own that is read-only.
+ *
+ * runc has done the same since CVE-2019-5736. If neither can be had, exec
+ * does not run.
+ */
+#define SELF_SEALS (LB_F_SEAL_SEAL | LB_F_SEAL_SHRINK | LB_F_SEAL_GROW | LB_F_SEAL_WRITE)
+
+/* what main was given: exec passes it on when it executes itself again */
+static char **caller_argv;
+static char **caller_env;
+
+/* Does this process run from a file that cannot be written to? */
+static bool runs_sealed(void) {
+    lc_sysret fd = lc_kernel_open_file("/proc/self/exe", O_RDONLY | O_CLOEXEC, 0);
+    if (fd < 0)
+        return false;
+    lc_sysret seals = lb_sys_fcntl((int32_t)fd, LB_F_GET_SEALS, 0);
+    lc_kernel_close_file((int32_t)fd);
+    if (seals >= 0 && (seals & SELF_SEALS) == SELF_SEALS)
+        return true;
+
+    /* or through a read-only mount: what the path of the running binary
+     * says about its mount is what holds for anyone who reaches it there */
+    struct lb_statfs fs;
+    return lb_sys_statfs("/proc/self/exe", &fs) >= 0 && (fs.f_flags & LB_ST_RDONLY);
+}
+
+/* A sealed copy of this binary in memory: a descriptor to execute, or a
+ * negative errno. */
+static lc_sysret sealed_copy(void) {
+    lc_sysret self = lc_kernel_open_file("/proc/self/exe", O_RDONLY | O_CLOEXEC, 0);
+    if (self < 0)
+        return self;
+
+    lc_sysret copy = lb_sys_memfd_create("lightbox", LB_MFD_CLOEXEC | LB_MFD_ALLOW_SEALING | LB_MFD_EXEC);
+    if (copy == -LB_EINVAL)     /* a kernel from before the flag */
+        copy = lb_sys_memfd_create("lightbox", LB_MFD_CLOEXEC | LB_MFD_ALLOW_SEALING);
+
+    lc_sysret rc = copy;
+    while (rc >= 0) {
+        static char block[65536];
+        lc_sysret n = lc_kernel_read_retry((int32_t)self, block, sizeof(block));
+        if (n == 0)
+            break;
+        rc = n < 0 ? n : lc_kernel_write_all((int32_t)copy, block, (size_t)n);
+        if (rc >= 0 && rc != n)
+            rc = -LB_EINVAL;
+    }
+    if (rc >= 0)
+        rc = lb_sys_fcntl((int32_t)copy, LB_F_ADD_SEALS, SELF_SEALS);
+    lc_kernel_close_file((int32_t)self);
+    if (rc < 0) {
+        if (copy >= 0)
+            lc_kernel_close_file((int32_t)copy);
+        return rc;
+    }
+    return copy;
+}
+
+/* This binary on a mount of its own, made read-only: a descriptor to
+ * execute, or a negative errno. */
+static lc_sysret readonly_clone(void) {
+    lc_sysret tree = lb_sys_open_tree(AT_FDCWD, "/proc/self/exe", LB_OPEN_TREE_CLONE | LB_OPEN_TREE_CLOEXEC);
+    if (tree < 0)
+        return tree;
+    struct lb_mount_attr attr = { .attr_set = LB_MOUNT_ATTR_RDONLY };
+    lc_sysret rc = lb_sys_mount_setattr((int32_t)tree, "", LB_AT_EMPTY_PATH, &attr);
+    if (rc < 0) {
+        lc_kernel_close_file((int32_t)tree);
+        return rc;
+    }
+    return tree;
+}
+
+/*
+ * Would executing this descriptor be refused for what it is? A memfd that is
+ * not allowed to be executed is refused at execve, not before, so the only
+ * way to know without executing is to ask the setting that decides.
+ */
+static bool memfd_exec_refused(void) {
+    char value[8];
+    return read_file("/proc/sys/vm/memfd_noexec", value, sizeof(value)) > 0 && value[0] == '2';
+}
+
+seal_method exec_seal_method(void) {
+    lc_sysret fd = memfd_exec_refused() ? -LB_EACCES : sealed_copy();
+    if (fd >= 0) {
+        lc_kernel_close_file((int32_t)fd);
+        return SEAL_MEMFD;
+    }
+    fd = readonly_clone();
+    if (fd >= 0) {
+        lc_kernel_close_file((int32_t)fd);
+        return SEAL_READONLY;
+    }
+    return SEAL_NONE;
+}
+
+/* The mark, in the environment, of a process that has executed itself once. */
+#define SEALED_MARK "LIGHTBOX_EXEC_SEALED=1"
+
+/*
+ * Make sure this process runs from a file that cannot be written to, by
+ * executing itself again from one if it does not. Returns in the process
+ * that does; ends the process when no such file can be had.
+ */
+static void run_sealed(void) {
+    if (runs_sealed()) {
+        /* executed through a descriptor, a process is named after the
+         * descriptor's number: give it its name back */
+        lc_kernel_prctl(LB_PR_SET_NAME, (uint64_t)(uintptr_t)"lightbox", 0, 0, 0);
+        return;
+    }
+
+    /* Once is enough: a second arrival here means that the copy was executed
+     * and still does not look sealed, and trying again would not end. */
+    if (env_get(caller_env, "LIGHTBOX_EXEC_SEALED"))
+        die("Error: exec runs from a copy of lightbox, and cannot tell that the copy is one that cannot be written to");
+
+    static char *env[256];
+    size_t n = 0;
+    for (; caller_env && caller_env[n] && n < 254; n++)
+        env[n] = caller_env[n];
+    static char mark[] = SEALED_MARK;
+    env[n++] = mark;
+    env[n] = NULL;
+
+    lc_sysret failed = -LB_EACCES;
+    if (!memfd_exec_refused()) {
+        lc_sysret copy = sealed_copy();
+        failed = copy;
+        if (copy >= 0) {
+            failed = lb_sys_execveat((int32_t)copy, "", caller_argv, env, LB_AT_EMPTY_PATH);
+            lc_kernel_close_file((int32_t)copy);
+        }
+    }
+    lc_sysret clone = readonly_clone();
+    if (clone >= 0)
+        failed = lb_sys_execveat((int32_t)clone, "", caller_argv, env, LB_AT_EMPTY_PATH);
+
+    say_with_number("Error: exec enters a container only from a copy of lightbox that the container cannot\n"
+                    "write to, and could not make one here (errno ", (int)-failed,
+                    "). lightbox doctor says more.\n");
+    lc_kernel_exit(1);
+}
+
 /* ─── exec: entering the container ──────────────────────────────────────── */
 
 static int exec_inside_container(const char *name, int target_pid, int userns,
                                  int privileged, const struct exec_request *req) {
+    /* From here to the command's execve this process, and the child it
+     * forks, are lightbox inside a container. Not dumpable, their memory and
+     * their descriptors are closed to the container's processes, whatever
+     * uid those have. */
+    if (lc_kernel_prctl(LB_PR_SET_DUMPABLE, 0, 0, 0, 0) < 0)
+        die("Error: failed to close the exec worker to other processes");
+
     int rootfd = open_target_path(target_pid, "/root");
     if (rootfd < 0)
         die("Error: failed to open target root");
@@ -3180,10 +3346,6 @@ static void cmd_rm(int argc, char **argv) {
 
 /* ─── cmd_exec ──────────────────────────────────────────────────────────── */
 
-/* The environment of whoever ran lightbox, for the one thing exec takes from
- * it: the kind of terminal. */
-static char **caller_env;
-
 /* The caller's TERM goes with the command, when it is a plain name. */
 static void request_term(struct exec_request *req) {
     const char *term = env_get(caller_env, "TERM");
@@ -3196,6 +3358,8 @@ static void cmd_exec(int argc, char **argv) {
         die("Usage: lightbox exec <name> [--user <name|uid[:gid]>] [--env KEY=VALUE]... [--workdir <dir>] [--] [cmd [args...]]");
     const char *name = argv[0];
     validate_name(name);
+
+    run_sealed();
 
     static const char *const shell[] = { "/bin/sh", NULL };
     struct exec_request req = { .as = AS_ROOT, .gid = -1 };
@@ -3292,6 +3456,7 @@ static void reserve_standard_streams(void) {
 
 int main(int argc, char **argv, char **envp) {
     reserve_standard_streams();
+    caller_argv = argv;
     caller_env = envp;
     if (argc < 2) usage();
 

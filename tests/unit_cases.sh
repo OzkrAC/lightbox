@@ -931,6 +931,40 @@ t_name_servers_of_the_host() {
     return $rc
 }
 
+# ─── exec: the binary it runs from ──────────────────────────────────────────
+
+# exec begins by executing itself again from a sealed copy in memory. What
+# comes back is the same command with the same words and environment, running
+# from a file that cannot be opened for writing.
+t_exec_runs_from_a_sealed_copy() {
+    [ "$(cat /proc/sys/vm/memfd_noexec 2>/dev/null)" != 2 ] || { echo "executable memfds are refused on this host"; return 77; }
+    out=$(KEPT=yes "$UNIT" sealed one 'two words' 2>&1)
+    printf '%s\n' "$out"
+    said() { printf '%s\n' "$out" | grep -qxF -- "$1" || { echo "missing: $1"; return 1; }; }
+    # 15: no more seals, no shrinking, no growing, no writing
+    said 'exe /memfd:lightbox (deleted)' && said 'seals 15' && said 'sealed yes' && said 'name lightbox' &&
+    said 'words [one] [two words]' && said 'kept yes' || return 1
+    case $out in *'write DONE'*) echo "the running binary was written to"; return 1 ;; esac
+    # a process that has executed itself once and still is not sealed stops, and does not try for ever
+    out=$(LIGHTBOX_EXEC_SEALED=1 timeout 10 "$UNIT" sealed 2>&1)
+    rc=$?
+    echo "with the mark already set: status $rc, $out"
+    [ $rc -eq 1 ]
+}
+
+# Where executable memfds are refused, exec takes the binary through a mount
+# of its own that is read-only. That takes the right to mount.
+t_exec_sealing_by_a_read_only_mount() {
+    unshare -r --mount true 2>/dev/null || { echo "user namespaces with capabilities are not available to this user"; return 77; }
+    out=$(KEPT=yes unshare -r --mount "$UNIT" sealed-readonly one 'two words' 2>&1)
+    printf '%s\n' "$out"
+    said() { printf '%s\n' "$out" | grep -qxF -- "$1" || { echo "missing: $1"; return 1; }; }
+    said 'mount read-only' && said 'sealed yes' && said 'words [one] [two words]' && said 'kept yes' || return 1
+    # the binary itself, not a copy of it: a file like any other has at most the seal that says it takes none
+    case $out in *'exe /memfd:'*|*'seals 15'*) echo "that is a memfd"; return 1 ;; esac
+    case $out in *'write DONE'*) echo "the running binary was written to"; return 1 ;; esac
+}
+
 # ─── exec: who a command runs as ────────────────────────────────────────────
 
 t_user_spec() {
@@ -1304,6 +1338,9 @@ check 'a volume through a link that leads nowhere ends the start' t_volume_throu
 check 'a volume that cannot be had ends the start'               t_volume_that_cannot_be_had
 
 check 'the name servers of a host are the ones a container can ask' t_name_servers_of_the_host
+
+check 'exec executes itself again from a sealed copy in memory'  t_exec_runs_from_a_sealed_copy
+check 'a read-only mount of the binary does where memfds may not' t_exec_sealing_by_a_read_only_mount
 
 check '--user is a name, a uid or uid:gid, and nothing else'     t_user_spec
 check 'accounts are found wherever they are in the file'         t_accounts_are_found
