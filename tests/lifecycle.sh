@@ -526,31 +526,40 @@ t_volume_under_run() {
 # A destination is looked up in the container. A link in the image leads
 # where the container sees it lead, also when it names a path that the host
 # has as well; nothing is made on the host.
+#
+# The directory that stands for the host's is on a tmpfs over /mnt, in this
+# suite's own mount namespace. It cannot be in the work directory: that is
+# below /tmp, and a container mounts a tmpfs of its own over /tmp, which would
+# hide the container's directory of the same name.
 t_volume_destination_is_inside() {
-    mkdir -p "$T/vol/linked" "$T/named-on-the-host"
+    [ -d /mnt ] || { echo "no /mnt to put a directory of the host's on"; return 77; }
+    mount -t tmpfs tmpfs /mnt || return 1
+    echo /mnt >> "$T/shims"
+    host=/mnt/named-on-the-host
+    mkdir -p "$T/vol/linked" "$host"
     echo through-a-link > "$T/vol/linked/in"
     box vlink --vol "$T/vol/linked:/link/data" --vol "$T/vol/linked:/away/data:ro" || return 1
     # a link as an image has it, and one that names a directory the host has too
-    mkdir -p "$C/vlink/rootfs/srv" "$C/vlink/rootfs$T/named-on-the-host"
+    mkdir -p "$C/vlink/rootfs/srv" "$C/vlink/rootfs$host"
     ln -s /srv "$C/vlink/rootfs/link"
-    ln -s "$T/named-on-the-host" "$C/vlink/rootfs/away"
+    ln -s "$host" "$C/vlink/rootfs/away"
     start vlink || return 1
     [ "$(sh_in vlink 'cat /srv/data/in')" = through-a-link ] || { echo "the volume is not where the link leads in the container"; return 1; }
     [ "$(sh_in vlink 'cat /away/data/in')" = through-a-link ] || { echo "the second volume is not reachable through its link"; return 1; }
-    [ -z "$(ls -A "$T/named-on-the-host")" ] || { echo "something was made on the host: $(ls -A "$T/named-on-the-host")"; return 1; }
-    [ -d "$C/vlink/rootfs$T/named-on-the-host/data" ] || { echo "the destination was not made in the container's root filesystem"; return 1; }
+    [ -z "$(ls -A "$host")" ] || { echo "something was made on the host: $(ls -A "$host")"; return 1; }
+    [ -d "$C/vlink/rootfs$host/data" ] || { echo "the destination was not made in the container's root filesystem"; return 1; }
     lb stop vlink >/dev/null || return 1
 
     # the same link when the container has no such directory: it leads nowhere, and the start says so
     box vnowhere --vol "$T/vol/linked:/away/data" || return 1
-    ln -s "$T/named-on-the-host" "$C/vnowhere/rootfs/away"
+    ln -s "$host" "$C/vnowhere/rootfs/away"
     if said=$(start vnowhere); then
         printf '%s\n' "$said"
         echo "a volume was mounted through a link that leads nowhere in the container"
         return 1
     fi
     printf '%s\n' "$said"
-    [ -z "$(ls -A "$T/named-on-the-host")" ] || { echo "something was made on the host: $(ls -A "$T/named-on-the-host")"; return 1; }
+    [ -z "$(ls -A "$host")" ] || { echo "something was made on the host: $(ls -A "$host")"; return 1; }
     nothing_left vnowhere
 }
 
