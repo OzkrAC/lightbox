@@ -792,6 +792,145 @@ t_handshake_hook_inherits()     { in_handshake_dir h_hook_inherits_nothing; }
 t_handshake_log()               { in_handshake_dir h_output_goes_to_the_log; }
 t_handshake_detached()          { in_handshake_dir h_command_returns_and_init_stays; }
 
+# ─── Volumes ────────────────────────────────────────────────────────────────
+
+t_volume_spec() {
+    bad=0
+    expect() { # spec, what parse_volume_spec makes of it
+        got=$("$UNIT" volspec "$1")
+        case $2 in
+            invalid) case $got in invalid:*) ;; *) echo "'$1' -> $got, expected it to be refused"; bad=1 ;; esac ;;
+            *) [ "$got" = "$2" ] || { echo "'$1' -> $got, expected $2"; bad=1; } ;;
+        esac
+    }
+    expect /a:/b '/a -> /b rw'
+    expect /a:/b:ro '/a -> /b ro'
+    # one spelling for a path, however it was typed
+    expect /a/./b//c/:/data//x/:ro '/a/b/c -> /data/x ro'
+    expect //srv:/procfs '/srv -> /procfs rw'
+    # a path with .. means what the directories before it make it mean
+    for spec in /a:/b/../c /a/../b:/c /a:/.. /a:/b/..; do expect "$spec" invalid; done
+    # the reserved places, however they are spelled
+    for spec in /a:/proc /a:/proc/x /a://proc/x /a:/./sys /a:/dev/ /a:/sys/fs/cgroup /a:/ /a:// /a:/. \
+                /proc/1/root:/data //proc//self:/data /sys:/data /dev/sda:/data /a:/.old_root /a:/.old_root/x; do
+        expect "$spec" invalid
+    done
+    # and what is not a volume at all
+    for spec in /a a:/b /a:b /a: :/b /a:/b:rw /a:/b:ro:x /a:/b:; do expect "$spec" invalid; done
+    return $bad
+}
+
+# The volumes of a container, as init takes and attaches them, in a root
+# filesystem made here. The harness gets a mount namespace of its own inside
+# the script's, because the pivot moves the root of everything in a namespace.
+t_volumes_are_attached_inside() {
+    in_mount_namespace '
+        m tmpfs "$D" tmpfs - -
+        mkdir -p "$D/src/sub" "$D/fixed" "$D/root/etc" "$D/root/inside" "$D/root/tmp" "$D/named-on-the-host"
+        mkdir -p "$D/root$D/named-on-the-host"          # the new root has a directory of that name too
+        echo from the source > "$D/src/file"
+        echo fixed > "$D/fixed/file"
+        echo one file > "$D/single"
+        ln -s /inside "$D/root/link"                    # as an image has it: absolute, and meant inside
+        mkdir "$D/root/inside/last-target"
+        ln -s /inside/last-target "$D/root/last"        # the destination itself is a link
+        ln -s "$D/named-on-the-host" "$D/root/away"     # names a directory that the host has too
+        out=$(unshare --mount "$UNIT" volumes "$D/root" \
+                  "$D/src:/data" "$D/fixed:/link/fixed:ro" "$D/single:/etc/app/single" "$D/src:/away/vol" "$D/src:/tmp/below" "$D/fixed:/last:ro" -- \
+                  cat:/data/file cat:/inside/fixed/file write:/inside/fixed/new write:/data/new \
+                  cat:/etc/app/single cat:/inside/last-target/file ls:/tmp/below ls:/ 2>&1)
+        rc=$?
+        printf "%s\n" "$out"
+        [ $rc -eq 0 ] || exit 1
+        said() { printf "%s\n" "$out" | grep -qxF -- "$1" || { echo "missing: $1"; exit 1; }; }
+        said "attached"
+        said "cat:/data/file = from the source"
+        # through the link, to where the link leads in the new root
+        said "cat:/inside/fixed/file = fixed"
+        said "write:/inside/fixed/new = refused"
+        said "write:/data/new = written"
+        said "cat:/etc/app/single = one file"
+        said "cat:/inside/last-target/file = fixed"
+        said "  file"
+        # the host is out of sight: nothing of it is in the new root
+        printf "%s\n" "$out" | sed -n "/^ls:\/ =/,\$p" | grep -q "old_root" && { echo "the old root is still there"; exit 1; }
+        # what was written through the volume is in its source
+        [ -e "$D/src/new" ] || { echo "the volume is not its source"; exit 1; }
+        [ ! -e "$D/fixed/new" ] || exit 1
+        # a link that names a directory the host has too led to the one in the new root, and the
+        # host one was not touched
+        [ -z "$(ls -A "$D/named-on-the-host")" ] || { echo "something was made in the directory on the host: $(ls -A "$D/named-on-the-host")"; exit 1; }
+        [ -d "$D/root$D/named-on-the-host/vol" ] || { echo "the destination was not made inside the new root"; exit 1; }'
+}
+
+# A link that leads nowhere in the new root leads nowhere: the start ends
+# there, and the place of that name on the host is as it was.
+t_volume_through_a_dangling_link() {
+    in_mount_namespace '
+        m tmpfs "$D" tmpfs - -
+        mkdir -p "$D/src" "$D/root" "$D/named-on-the-host"
+        ln -s "$D/named-on-the-host" "$D/root/away"
+        out=$(unshare --mount "$UNIT" volumes "$D/root" "$D/src:/away/vol" 2>&1) && { echo "the volume was attached: $out"; exit 1; }
+        echo "$out"
+        [ -z "$(ls -A "$D/named-on-the-host")" ] || { echo "something was made on the host: $(ls -A "$D/named-on-the-host")"; exit 1; }
+        [ "$(ls -A "$D/root")" = away ] || { echo "something was made in the new root: $(ls -A "$D/root")"; exit 1; }'
+}
+
+t_volume_that_cannot_be_had() {
+    in_mount_namespace '
+        m tmpfs "$D" tmpfs - -
+        mkdir -p "$D/src" "$D/root"
+        out=$(unshare --mount "$UNIT" volumes "$D/root" "$D/missing:/data" 2>&1) && { echo "a missing source was accepted"; exit 1; }
+        echo "$out"
+        [ "$out" = "Error: volume source does not exist: $D/missing" ] || exit 1
+        out=$(unshare --mount "$UNIT" volumes "$D/root" "$D/src:/a/../b" 2>&1) && { echo "a destination with .. was accepted"; exit 1; }
+        echo "$out"
+        case $out in *"cannot be used"*"$D/src:/a/../b") ;; *) exit 1 ;; esac
+        # a directory cannot go where the image has a file
+        : > "$D/root/file"
+        out=$(unshare --mount "$UNIT" volumes "$D/root" "$D/src:/file" 2>&1) && { echo "a directory was mounted on a file"; exit 1; }
+        echo "$out"
+        [ -z "$(ls -A "$D/src")" ]'
+}
+
+# ─── Name servers ───────────────────────────────────────────────────────────
+
+# What a container can ask of the name servers a host asks: the IPv4 ones that
+# are not the host's own loopback, the first three.
+t_name_servers_of_the_host() {
+    dir=$(mktemp -d "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    (
+        {
+            echo '# made for a test'
+            echo 'nameserver 127.0.0.53'
+            echo 'nameserver ::1'
+            echo 'nameserver 2001:db8::53'
+            echo 'search example.org'
+            printf '  nameserver \t 192.0.2.1  \n'
+            echo 'nameserverx 192.0.2.9'
+            echo 'nameserver 192.0.2.2 # the second'
+            echo 'nameserver 0.0.0.0'
+            echo 'nameserver 192.0.2.300'
+            printf 'nameserver 192.0.2.3\r\n'
+            echo 'nameserver 192.0.2.4'
+        } > "$dir/resolv.conf"
+        got=$("$UNIT" nameservers "$dir/resolv.conf" | paste -sd' ' -)
+        echo "$got"
+        [ "$got" = "192.0.2.1 192.0.2.2 192.0.2.3 result 3" ] || exit 1
+        printf 'nameserver 127.0.0.1\n' > "$dir/stub"
+        [ "$("$UNIT" nameservers "$dir/stub")" = "result 0" ] && [ "$("$UNIT" nameservers "$dir/missing")" = "result 0" ] || exit 1
+        # the dns setting: a list, and nothing but a list
+        [ "$("$UNIT" dnslist '9.9.9.9, 149.112.112.112' | paste -sd' ' -)" = "9.9.9.9 149.112.112.112 result 2" ] || exit 1
+        [ "$("$UNIT" dnslist '9.9.9.9 1.1.1.1,8.8.8.8' | paste -sd' ' -)" = "9.9.9.9 1.1.1.1 8.8.8.8 result 3" ] || exit 1
+        for list in 'nine' '9.9.9.9, ::1' '127.0.0.1' '1.1.1.1 2.2.2.2 3.3.3.3 4.4.4.4' '9.9.9.9;8.8.8.8'; do
+            [ "$("$UNIT" dnslist "$list" | tail -n 1)" = "result -1" ] || { echo "'$list' was taken for a list of name servers"; exit 1; }
+        done
+    )
+    rc=$?
+    rm -rf -- "$dir"
+    return $rc
+}
+
 # ─── exec: who a command runs as ────────────────────────────────────────────
 
 t_user_spec() {
@@ -1158,6 +1297,13 @@ check 'a SIGTERM without a number uses init'"'"'s own limit'          t_stop_pla
 check 'a stopped process is continued so that it can end'        t_stop_stopped_process
 check 'a process that is not init'"'"'s child is ended and waited for' t_stop_guest
 check 'a list of PIDs is read whole, across reads'               t_pid_list_is_read_whole
+
+check 'a volume is src:dst[:ro], with paths that mean what they say' t_volume_spec
+check 'volumes are attached after the pivot, inside the new root' t_volumes_are_attached_inside
+check 'a volume through a link that leads nowhere ends the start' t_volume_through_a_dangling_link
+check 'a volume that cannot be had ends the start'               t_volume_that_cannot_be_had
+
+check 'the name servers of a host are the ones a container can ask' t_name_servers_of_the_host
 
 check '--user is a name, a uid or uid:gid, and nothing else'     t_user_spec
 check 'accounts are found wherever they are in the file'         t_accounts_are_found

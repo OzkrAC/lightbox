@@ -31,6 +31,7 @@
 #define NAME_MAX_LEN     12
 #define USERNS_RANGE_SIZE 65536
 #define USERNS_MIN_START 100000
+#define MAX_DNS          3       /* as many as a resolver reads from resolv.conf */
 #define CHILD_STACK_SIZE (1024 * 1024) /* 1 MiB */
 
 /* ─── Configurable defaults ─────────────────────────────────────────────── */
@@ -63,6 +64,8 @@ typedef struct {
     int  vol_ro[MAX_VOLS];
     int  nlinks;
     char links[MAX_LINKS][NAME_MAX_LEN + 1];
+    int  ndns;
+    char dns[MAX_DNS][16];
 } container_config;
 
 typedef struct {
@@ -161,53 +164,135 @@ static void validate_positive_integer_option(const char *label, const char *valu
         die2(label, value);
 }
 
+/* Is this an address a container can ask for names: IPv4, and not this
+ * host's own loopback, which in a container is the container's? */
+static bool usable_name_server(const char *text) {
+    uint8_t ip[4];
+    return parse_ipv4(text, ip) && ip[0] != 127 && ipv4_to_u32(ip) != 0;
+}
+
+/*
+ * The name servers a resolv.conf lists that a container can use, in its
+ * order: how many, at most MAX_DNS. A resolver on the host's loopback is
+ * left out, and so is IPv6, which containers do not have.
+ */
+static int name_servers_of(const char *resolv_path, char out[][16]) {
+    static char text[8192];
+    if (read_file(resolv_path, text, sizeof(text)) <= 0)
+        return 0;
+
+    int count = 0;
+    for (char *line = text; *line && count < MAX_DNS; ) {
+        char *end = line;
+        while (*end && *end != '\n') end++;
+        bool last = *end == '\0';
+        *end = '\0';
+
+        while (*line == ' ' || *line == '\t') line++;
+        if (lc_string_starts_with(line, lc_string_length(line), "nameserver", 10) &&
+            (line[10] == ' ' || line[10] == '\t')) {
+            char *address = line + 10;
+            while (*address == ' ' || *address == '\t') address++;
+            size_t len = 0;
+            while (address[len] && address[len] != ' ' && address[len] != '\t' && address[len] != '\r')
+                len++;
+            address[len] = '\0';
+            if (len < 16 && usable_name_server(address))
+                str_copy(out[count++], address, 16);
+        }
+        line = last ? end : end + 1;
+    }
+    return count;
+}
+
+/* A list of addresses as the dns setting has it, separated by commas or
+ * spaces: how many, or -1 when something in it is not a usable address or
+ * there are more than MAX_DNS. */
+static int name_servers_listed(const char *list, char out[][16]) {
+    int count = 0;
+    for (const char *p = list; *p; ) {
+        while (*p == ' ' || *p == '\t' || *p == ',') p++;
+        size_t len = 0;
+        while (p[len] && p[len] != ' ' && p[len] != '\t' && p[len] != ',') len++;
+        if (len == 0)
+            break;
+        char address[16];
+        if (len >= sizeof(address) || count == MAX_DNS)
+            return -1;
+        lc_bytes_copy(address, p, len);
+        address[len] = '\0';
+        if (!usable_name_server(address))
+            return -1;
+        str_copy(out[count++], address, 16);
+        p += len;
+    }
+    return count;
+}
+
 static void validate_oom_score(int oom_score) {
     if (oom_score < -1000 || oom_score > 1000)
         die("Error: oom-score must be between -1000 and 1000");
 }
 
-static void validate_volume_paths(const char *src, const char *dst) {
-    if (!src[0]) die("Error: volume source must not be empty");
-    if (src[0] != '/') die2("Error: volume source must be an absolute path: ", src);
-    if (lc_string_starts_with(src, lc_string_length(src), "/proc", 5) &&
-        (src[5] == '\0' || src[5] == '/'))
-        die2("Error: volume source under /proc is not allowed: ", src);
-    if (lc_string_starts_with(src, lc_string_length(src), "/sys", 4) &&
-        (src[4] == '\0' || src[4] == '/'))
-        die2("Error: volume source under /sys is not allowed: ", src);
-    if (lc_string_starts_with(src, lc_string_length(src), "/dev", 4) &&
-        (src[4] == '\0' || src[4] == '/'))
-        die2("Error: volume source under /dev is not allowed: ", src);
-    if (lc_string_starts_with(src, lc_string_length(src), "/.old_root", 10))
-        die2("Error: reserved volume source: ", src);
-    if (!dst[0]) die("Error: volume destination must not be empty");
-    if (dst[0] != '/') die2("Error: volume destination must be an absolute container path: ", dst);
-    if (streq(dst, "/")) die("Error: mounting over / is not allowed");
-    if (lc_string_starts_with(dst, lc_string_length(dst), "/proc", 5) &&
-        (dst[5] == '\0' || dst[5] == '/'))
-        die2("Error: volume destination under /proc is not allowed: ", dst);
-    if (lc_string_starts_with(dst, lc_string_length(dst), "/sys", 4) &&
-        (dst[4] == '\0' || dst[4] == '/'))
-        die2("Error: volume destination under /sys is not allowed: ", dst);
-    if (lc_string_starts_with(dst, lc_string_length(dst), "/dev", 4) &&
-        (dst[4] == '\0' || dst[4] == '/'))
-        die2("Error: volume destination under /dev is not allowed: ", dst);
-    if (lc_string_starts_with(dst, lc_string_length(dst), "/.old_root", 10))
-        die2("Error: reserved volume destination: ", dst);
+/*
+ * Bring an absolute path to one spelling: single slashes, no "." component,
+ * no slash at the end. False for a path that is not absolute or that has a
+ * ".." component: where that leads depends on what is in the directories
+ * before it, and a volume's paths are to mean what they say.
+ */
+static bool normalise_path(char *path) {
+    if (path[0] != '/')
+        return false;
+
+    size_t out = 0;
+    for (size_t in = 0; path[in]; ) {
+        while (path[in] == '/')
+            in++;
+        size_t len = 0;
+        while (path[in + len] && path[in + len] != '/')
+            len++;
+        if (len == 0)
+            break;
+        if (len == 2 && path[in] == '.' && path[in + 1] == '.')
+            return false;
+        if (!(len == 1 && path[in] == '.')) {
+            path[out++] = '/';
+            for (size_t i = 0; i < len; i++)
+                path[out++] = path[in + i];
+        }
+        in += len;
+    }
+    if (out == 0)
+        path[out++] = '/';
+    path[out] = '\0';
+    return true;
 }
 
-static void parse_volume_spec_or_die(const char *spec, volume_spec *vol) {
+/* Is a normalised path this directory, or something inside it? */
+static bool path_is_under(const char *path, const char *dir) {
+    size_t len = lc_string_length(dir);
+    return lc_string_starts_with(path, lc_string_length(path), dir, len) &&
+           (path[len] == '\0' || path[len] == '/');
+}
+
+/*
+ * A volume as it is written: src:dst[:ro]. NULL when it is one, with both
+ * paths normalised in vol; otherwise what is wrong with it. create, add-vol
+ * and start all read a volume through this, so they agree on what one is.
+ */
+static const char *parse_volume_spec(const char *spec, volume_spec *vol) {
     const char *colon1 = NULL, *colon2 = NULL;
     for (size_t i = 0; spec[i]; i++) {
         if (spec[i] != ':') continue;
         if (!colon1) colon1 = spec + i;
         else if (!colon2) colon2 = spec + i;
     }
-    if (!colon1) die("Error: volume format is src:dst[:ro]");
+    if (!colon1)
+        return "a volume is written src:dst[:ro]";
 
     size_t slen = (size_t)(colon1 - spec);
     if (slen == 0 || slen >= sizeof(vol->src))
-        die2("Error: invalid volume source in spec: ", spec);
+        return "the volume's source is empty or too long";
     lc_bytes_copy(vol->src, spec, slen);
     vol->src[slen] = '\0';
 
@@ -215,7 +300,7 @@ static void parse_volume_spec_or_die(const char *spec, volume_spec *vol) {
     const char *dst_end = colon2 ? colon2 : spec + lc_string_length(spec);
     size_t dlen = (size_t)(dst_end - dst_start);
     if (dlen == 0 || dlen >= sizeof(vol->dst))
-        die2("Error: invalid volume destination in spec: ", spec);
+        return "the volume's destination is empty or too long";
     lc_bytes_copy(vol->dst, dst_start, dlen);
     vol->dst[dlen] = '\0';
 
@@ -224,15 +309,36 @@ static void parse_volume_spec_or_die(const char *spec, volume_spec *vol) {
         if (colon2[1] == 'r' && colon2[2] == 'o' && colon2[3] == '\0')
             vol->ro = 1;
         else
-            die2("Error: invalid volume mode in spec: ", spec);
+            return "after the volume's destination only :ro may follow";
     }
 
-    validate_volume_paths(vol->src, vol->dst);
+    if (!normalise_path(vol->src))
+        return "the volume's source must be an absolute path without ..";
+    if (!normalise_path(vol->dst))
+        return "the volume's destination must be an absolute path without ..";
+    if (path_is_under(vol->src, "/proc") || path_is_under(vol->src, "/sys") ||
+        path_is_under(vol->src, "/dev"))
+        return "a volume's source may not be under /proc, /sys or /dev";
+    if (streq(vol->dst, "/"))
+        return "a volume may not be mounted over /";
+    if (path_is_under(vol->dst, "/.old_root"))
+        return "/.old_root is a name lightbox uses itself while it builds a container";
+    if (path_is_under(vol->dst, "/proc") || path_is_under(vol->dst, "/sys") ||
+        path_is_under(vol->dst, "/dev"))
+        return "a volume's destination may not be under /proc, /sys or /dev";
+    return NULL;
 }
 
-static void mkdir_p_or_die(const char *path) {
-    if (make_dirs(path) != 0)
-        lc_kernel_exit(1);      /* make_dirs has said what failed */
+static void parse_volume_spec_or_die(const char *spec, volume_spec *vol) {
+    const char *wrong = parse_volume_spec(spec, vol);
+    if (wrong) {
+        print_str(STDERR, "Error: ");
+        print_str(STDERR, wrong);
+        print_str(STDERR, ": ");
+        print_str(STDERR, spec);
+        lc_print_char(STDERR, '\n');
+        lc_kernel_exit(1);
+    }
 }
 
 static void parent_dir(char *buf, size_t bufsz, const char *path) {
@@ -269,8 +375,8 @@ static bool container_has_volume(const char *name, const volume_spec *needle) {
                 lc_bytes_copy(line, p + 4, len);
                 line[len] = '\0';
                 volume_spec existing = {0};
-                parse_volume_spec_or_die(line, &existing);
-                if (streq(existing.src, needle->src) &&
+                if (parse_volume_spec(line, &existing) == NULL &&
+                    streq(existing.src, needle->src) &&
                     streq(existing.dst, needle->dst) &&
                     existing.ro == needle->ro)
                     return true;
@@ -777,6 +883,11 @@ static void cmd_create(int argc, char **argv) {
             str_copy(cfg.vol_dst[cfg.nvols], vol.dst, sizeof(cfg.vol_dst[cfg.nvols]));
             cfg.vol_ro[cfg.nvols] = vol.ro;
             cfg.nvols++;
+        } else if (streq(argv[i], "--dns") && i + 1 < argc) {
+            if (cfg.ndns >= MAX_DNS) die("Error: more than " STRINGIFY(MAX_DNS) " --dns options: a resolver reads no more");
+            if (!usable_name_server(argv[i + 1]))
+                die2("Error: --dns takes an IPv4 address that a container can reach: ", argv[i + 1]);
+            str_copy(cfg.dns[cfg.ndns++], argv[++i], 16);
         } else if (streq(argv[i], "--link") && i + 1 < argc) {
             if (cfg.nlinks >= MAX_LINKS) die("Error: too many links");
             validate_name(argv[i + 1]);
@@ -912,16 +1023,75 @@ static void cmd_create(int argc, char **argv) {
         goto fail_create;
     }
 
-    /* write resolv.conf */
-    char resolv[MAX_PATH];
-    char etc_dir[MAX_PATH];
-    path_join(etc_dir, MAX_PATH, root, "etc");
-    lc_kernel_mkdirat(AT_FDCWD, etc_dir, 0755);
-    path_join(resolv, MAX_PATH, root, "etc/resolv.conf");
-    /* inside the container's own filesystem, so readable by its users */
-    if (write_file_atomic(resolv, "nameserver 1.1.1.1\nnameserver 8.8.8.8\n", MODE_PUBLIC_FILE) < 0) {
-        create_err = "failed to write resolv.conf";
-        goto fail_create;
+    /*
+     * What the container asks for names, what it is called, and that its name
+     * is its own address. These go into the copy of the image, which is the
+     * image's to shape: its etc may be a link, and so may any of the three
+     * files. They are written as the container will see them, with the new
+     * root as the root, so a link in the image cannot put them anywhere else.
+     *
+     * The name servers are the ones --dns gave; or the dns setting; or the
+     * ones this host asks, without its own loopback; or two public ones.
+     */
+    {
+        if (cfg.ndns == 0 && cfg_global.dns[0]) {
+            cfg.ndns = name_servers_listed(cfg_global.dns, cfg.dns);
+            if (cfg.ndns <= 0) {
+                create_err = "the dns setting in lightbox.conf is not a list of up to " STRINGIFY(MAX_DNS) " IPv4 addresses";
+                goto fail_create;
+            }
+        }
+        if (cfg.ndns == 0)
+            cfg.ndns = name_servers_of("/etc/resolv.conf", cfg.dns);
+        if (cfg.ndns == 0)      /* behind systemd-resolved's stub, the servers it asks */
+            cfg.ndns = name_servers_of("/run/systemd/resolve/resolv.conf", cfg.dns);
+        if (cfg.ndns == 0) {
+            str_copy(cfg.dns[0], "1.1.1.1", 16);
+            str_copy(cfg.dns[1], "8.8.8.8", 16);
+            cfg.ndns = 2;
+        }
+
+        char text[4096];
+        bool cut = false;
+        size_t pos = 0;
+        text[0] = '\0';
+        for (int i = 0; i < cfg.ndns; i++) {
+            pos = str_append_whole(text, pos, "nameserver ", sizeof(text), &cut);
+            pos = str_append_whole(text, pos, cfg.dns[i], sizeof(text), &cut);
+            pos = str_append_whole(text, pos, "\n", sizeof(text), &cut);
+        }
+        /* inside the container's own filesystem, so readable by its users */
+        if (cut || write_file_in_root(root, "etc", "resolv.conf", text, MODE_PUBLIC_FILE) < 0) {
+            create_err = "failed to write resolv.conf";
+            goto fail_create;
+        }
+
+        pos = str_copy(text, name, sizeof(text));
+        str_append(text, pos, "\n", sizeof(text));
+        if (write_file_in_root(root, "etc", "hostname", text, MODE_PUBLIC_FILE) < 0) {
+            create_err = "failed to write the container's hostname file";
+            goto fail_create;
+        }
+
+        /* the image's hosts file, with the container's name added to it */
+        int had = read_file_in_root(root, "etc", "hosts", text, sizeof(text) - 64);
+        if (had < 0) {
+            print_str(STDERR, "Warning: the image's /etc/hosts is not a file that can be added to; it is left as it is\n");
+        } else {
+            pos = (size_t)had;
+            if (had == 0)
+                pos = str_append_whole(text, pos, "127.0.0.1\tlocalhost\n", sizeof(text), &cut);
+            else if (text[pos - 1] != '\n')
+                pos = str_append_whole(text, pos, "\n", sizeof(text), &cut);
+            pos = str_append_whole(text, pos, ip, sizeof(text), &cut);
+            pos = str_append_whole(text, pos, "\t", sizeof(text), &cut);
+            pos = str_append_whole(text, pos, name, sizeof(text), &cut);
+            str_append_whole(text, pos, "\n", sizeof(text), &cut);
+            if (cut || write_file_in_root(root, "etc", "hosts", text, MODE_PUBLIC_FILE) < 0) {
+                create_err = "failed to write the container's hosts file";
+                goto fail_create;
+            }
+        }
     }
 
     /* shift rootfs ownership for user namespace */
@@ -2206,6 +2376,116 @@ static void enter_user_namespace_root(void) {
         die("Error: capset failed in userns");
 }
 
+/* A volume on its way into a container. */
+struct volume_mount {
+    int32_t tree;               /* a clone of the source's mount, attached nowhere yet */
+    bool    is_dir;
+    bool    ro;
+    char    dst[MAX_PATH];
+};
+
+/*
+ * Clone the mount of a volume's source: a copy of it that hangs nowhere, and
+ * that stays good when the host's filesystems are taken out of the
+ * container's sight. Ends the process when the volume cannot be had.
+ */
+static void open_volume(const char *spec, struct volume_mount *out) {
+    volume_spec vol = {0};
+    const char *wrong = parse_volume_spec(spec, &vol);
+    if (wrong) {
+        print_str(STDERR, "Error: the container's configuration has a volume that cannot be used (");
+        print_str(STDERR, wrong);
+        print_str(STDERR, "): ");
+        print_str(STDERR, spec);
+        lc_print_char(STDERR, '\n');
+        lc_kernel_exit(1);
+    }
+
+    lc_sysret tree = lb_sys_open_tree(AT_FDCWD, vol.src, LB_OPEN_TREE_CLONE | LB_OPEN_TREE_CLOEXEC);
+    if (tree == -LB_ENOENT)
+        die2("Error: volume source does not exist: ", vol.src);
+    struct lb_statx stx;
+    if (tree < 0 || lb_sys_statx((int32_t)tree, "", LB_AT_EMPTY_PATH, LB_STATX_TYPE, &stx) < 0) {
+        say_with_number("Error: cannot take the volume's source (errno ", (int)(tree < 0 ? -tree : 0), "): ");
+        print_str(STDERR, vol.src);
+        lc_print_char(STDERR, '\n');
+        lc_kernel_exit(1);
+    }
+
+    out->tree = (int32_t)tree;
+    out->is_dir = (stx.stx_mode & LB_S_IFMT) == LB_S_IFDIR;
+    out->ro = vol.ro != 0;
+    str_copy(out->dst, vol.dst, sizeof(out->dst));
+}
+
+/* The volumes a container is configured with, cloned: how many. */
+static int open_volumes(const char *name, struct volume_mount *out) {
+    static char conf_buf[CONF_MAX];
+    int count = 0;
+    if (container_conf_read(name, conf_buf) <= 0)
+        return 0;
+
+    for (char *p = conf_buf; *p; ) {
+        char *end = p;
+        while (*end && *end != '\n') end++;
+        bool last = *end == '\0';
+        *end = '\0';
+        if (p[0] == 'v' && p[1] == 'o' && p[2] == 'l' && p[3] == '=') {
+            if (count == MAX_VOLS)
+                die("Error: the container's configuration has more than " STRINGIFY(MAX_VOLS) " volumes");
+            open_volume(p + 4, &out[count++]);
+        }
+        p = last ? end : end + 1;
+    }
+    return count;
+}
+
+/*
+ * Attach the cloned volumes, in the container.
+ *
+ * This runs after the pivot and after the host's root has been taken away, so
+ * every destination is looked up with the container's root as the root: a
+ * link in the image leads where the container sees it lead, and nothing made
+ * here, directory or file, can be anywhere but in the container. It also
+ * runs after /tmp and /run have been mounted, so a volume below them is on
+ * top of them and not hidden beneath.
+ */
+static void attach_volumes(const struct volume_mount *vols, int count) {
+    for (int i = 0; i < count; i++) {
+        const char *dst = vols[i].dst;
+
+        /* something to mount on, of the kind the source is */
+        if (vols[i].is_dir) {
+            if (make_dirs(dst) != 0)
+                lc_kernel_exit(1);
+        } else {
+            char parent[MAX_PATH];
+            parent_dir(parent, sizeof(parent), dst);
+            if (make_dirs(parent) != 0)
+                lc_kernel_exit(1);
+            lc_sysret fd = lc_kernel_open_file(dst, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+            if (fd < 0)
+                die2("Error: failed to create volume target file: ", dst);
+            lc_kernel_close_file((int32_t)fd);
+        }
+
+        lc_sysret rc = lb_sys_move_mount(vols[i].tree, "", AT_FDCWD, dst,
+                                         LB_MOVE_MOUNT_F_EMPTY_PATH | LB_MOVE_MOUNT_T_SYMLINKS);
+        if (rc < 0) {
+            say_with_number("Error: cannot mount the volume (errno ", (int)-rc, ") at ");
+            print_str(STDERR, dst);
+            lc_print_char(STDERR, '\n');
+            lc_kernel_exit(1);
+        }
+        lc_kernel_close_file(vols[i].tree);
+
+        uint64_t flags = MS_REMOUNT | MS_BIND | MS_NOSUID | MS_NODEV;
+        if (vols[i].ro)
+            flags |= MS_RDONLY;
+        require_mount(NULL, dst, NULL, flags, NULL);
+    }
+}
+
 /*
  * Build the container around init: its volumes, its /dev, its own root, and
  * the filesystems that go into it. Every step that fails ends the process
@@ -2222,62 +2502,11 @@ static void build_container(const struct child_args *ca) {
     /* set hostname */
     lc_kernel_sethostname(ca->name, lc_string_length(ca->name));
 
-    /* read volume config and set up bind mounts */
-    char conf_buf[CONF_MAX];
-    if (container_conf_read(ca->name, conf_buf) > 0) {
-        char *p = conf_buf;
-        while (*p) {
-            if (p[0] == 'v' && p[1] == 'o' && p[2] == 'l' && p[3] == '=') {
-                char vol_line[MAX_PATH * 2 + 4];
-                char *end = p + 4;
-                while (*end && *end != '\n') end++;
-                size_t vlen = (size_t)(end - (p + 4));
-                if (vlen < sizeof(vol_line)) {
-                    lc_bytes_copy(vol_line, p + 4, vlen);
-                    vol_line[vlen] = '\0';
-
-                    /* parse src:dst[:ro] */
-                    char *colon1 = NULL, *colon2 = NULL;
-                    for (char *q = vol_line; *q; q++) {
-                        if (*q == ':') { if (!colon1) colon1 = q; else if (!colon2) colon2 = q; }
-                    }
-                        if (colon1) {
-                            *colon1 = '\0';
-                            char *dst = colon1 + 1;
-                            int ro = 0;
-                            if (colon2) { *colon2 = '\0'; ro = (colon2[1] == 'r'); }
-
-                        /* create the correct mount target type for file or directory binds */
-                        char mount_point[MAX_PATH];
-                        path_join(mount_point, MAX_PATH, ca->root, dst);
-                        if (!path_exists(vol_line))
-                            die2("Error: volume source does not exist: ", vol_line);
-
-                        if (path_is_directory(vol_line)) {
-                            mkdir_p_or_die(mount_point);
-                        } else {
-                            char parent[MAX_PATH];
-                            parent_dir(parent, sizeof(parent), mount_point);
-                            mkdir_p_or_die(parent);
-                            lc_sysret fd = lc_kernel_open_file(mount_point, O_WRONLY | O_CREAT, 0644);
-                            if (fd < 0)
-                                die2("Error: failed to create volume target file: ", mount_point);
-                            lc_kernel_close_file((int32_t)fd);
-                        }
-
-                        require_mount(vol_line, mount_point, NULL, MS_BIND, NULL);
-                        {
-                            uint64_t remount_flags = MS_REMOUNT | MS_BIND | MS_NOSUID | MS_NODEV;
-                            if (ro) remount_flags |= MS_RDONLY;
-                            require_mount(NULL, mount_point, NULL, remount_flags, NULL);
-                        }
-                    }
-                }
-            }
-            while (*p && *p != '\n') p++;
-            if (*p == '\n') p++;
-        }
-    }
+    /* The volumes: taken now, while the host's paths mean what they mean on
+     * the host, and attached later, when the container's paths mean what
+     * they mean in the container. */
+    struct volume_mount volumes[MAX_VOLS];
+    int nvolumes = open_volumes(ca->name, volumes);
 
     /* set up /dev via bind mounts (works in both userns and non-userns) */
     {
@@ -2365,6 +2594,17 @@ static void build_container(const struct child_args *ca) {
     lc_kernel_symlinkat("/proc/self/fd/2", AT_FDCWD, "/dev/stderr");
     lc_kernel_symlinkat("pts/ptmx", AT_FDCWD, "/dev/ptmx");
 
+    /* tmpfs for /tmp and /run, so that the hook and its services find them
+     * as they stay. /tmp is for everyone; /run is for root's services to
+     * share with them. */
+    require_mount("tmpfs", "/tmp", "tmpfs", MS_NOSUID | MS_NODEV, NULL);
+    require_mount("tmpfs", "/run", "tmpfs", MS_NOSUID | MS_NODEV, "mode=755");
+    if (ca->read_only)
+        require_mount("tmpfs", "/var/tmp", "tmpfs", MS_NOSUID | MS_NODEV, NULL);
+
+    /* the volumes, on top of all of the above and before the root may close */
+    attach_volumes(volumes, nvolumes);
+
     /* mask sensitive /proc paths (unless privileged) */
     if (!ca->privileged) {
         mask_proc_paths();
@@ -2379,14 +2619,6 @@ static void build_container(const struct child_args *ca) {
      * run: its tools are not needed, and not trusted with what init may do. */
     if (loopback_up() != 0)
         lc_kernel_exit(1);
-
-    /* mount tmpfs for /tmp and /run before /init.sh so services started from
-     * the init hook see the final runtime filesystem layout. */
-    require_mount("tmpfs", "/tmp", "tmpfs", MS_NOSUID | MS_NODEV, NULL);
-    /* /tmp is for everyone; /run is for root's services to share with them */
-    require_mount("tmpfs", "/run", "tmpfs", MS_NOSUID | MS_NODEV, "mode=755");
-    if (ca->read_only)
-        require_mount("tmpfs", "/var/tmp", "tmpfs", MS_NOSUID | MS_NODEV, NULL);
 }
 
 /* What the clone that becomes a container's init runs. */
@@ -3018,6 +3250,7 @@ static void cmd_exec(int argc, char **argv) {
         "         --privileged           Disable security sandbox\n"
         "         --oom-score <n>        OOM score adjustment (default: 500)\n"
         "         --link <name>          Allow network to another container\n"
+        "         --dns <address>        A name server for the container (up to 3; default: the host's)\n"
         "  start  <name> [-t <seconds>]  Start a stopped container\n"
         "         -t <seconds>            How long to wait for /init.sh (default: 30, 0: do not wait)\n"
         "  stop   <name> [-t <seconds>]  Stop a running container\n"

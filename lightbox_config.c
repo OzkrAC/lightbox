@@ -29,6 +29,7 @@ void cfg_global_init(void) {
     cfg_global.default_oom = 500;
     cfg_global.start_timeout = START_TIMEOUT_DEFAULT;
     cfg_global.stop_timeout = STOP_TIMEOUT_DEFAULT;
+    cfg_global.dns[0] = '\0';
 }
 
 /* A setting in seconds. One that cannot be read must not stop every command,
@@ -86,6 +87,9 @@ static void cfg_set(const char *key, const char *val, bool derived[3]) {
         cfg_set_seconds(key, val, &cfg_global.start_timeout);
     } else if (streq(key, "stop_timeout")) {
         cfg_set_seconds(key, val, &cfg_global.stop_timeout);
+    } else if (streq(key, "dns")) {
+        /* create reads it, and says so if it is not a list of addresses */
+        str_copy(cfg_global.dns, val, sizeof(cfg_global.dns));
     }
 }
 

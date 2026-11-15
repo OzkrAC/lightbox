@@ -24,6 +24,12 @@
  *   unit stop    <pid> <seconds>              ask_init_to_stop, then wait as stop does:
  *                                             "asked" or "gone", then "ended" or "still there"
  *   unit pids    <file>                       each_listed_pid: a line for each, then the count
+ *   unit volspec <spec>                       parse_volume_spec: "<src> -> <dst> ro|rw",
+ *                                             or "invalid: <what is wrong>"
+ *   unit volumes <root> <spec>... [-- <probe>...]
+ *                                             the volumes as init takes and attaches them, see below
+ *   unit nameservers <resolv.conf>            name_servers_of: a line for each, then the count
+ *   unit dnslist <text>                       name_servers_listed: the same for the dns setting
  *   unit userspec <text>                      parse_user_spec: "name <n>", "uid <n>",
  *                                             "uid <n> gid <m>" or "invalid"
  *   unit identity <passwd> <group> <exec's options...>
@@ -62,6 +68,14 @@
  * once it is ready, as in a container; with "-" it keeps the harness's.
  * <grace> is how many seconds init gives its processes when a SIGTERM comes
  * without a number of its own; 10 when it is not given.
+ *
+ * volumes does to <root> what init does to a container's root filesystem,
+ * as far as volumes go: open_volume for each spec, pivot_root into <root>,
+ * the old root taken away, attach_volumes. It then prints "attached" and
+ * answers each probe from inside: "cat:<path>" with the file's text,
+ * "ls:<path>" with a line for each entry, "write:<path>" with "written" or
+ * "refused". It needs a mount namespace to itself, since the pivot moves the
+ * root of every process in it, and <root> on a mount of that namespace.
  *
  * It prints what it sees, a line each: "init <pid>", "ready", "hook <exit
  * status>", "hook-timeout", "closed", "signal <n>" and "abandoned" when one of
@@ -307,6 +321,48 @@ static void unit_init(const char *how, bool confined, int seconds, const char *s
     init_abandon(&link);
 }
 
+/* One look at the new root from inside it. */
+static void unit_probe(const char *probe) {
+    size_t len = lc_string_length(probe);
+    put(probe);
+    if (lc_string_starts_with(probe, len, "cat:", 4)) {
+        static char text[512];
+        put(" = ");
+        put(read_file(probe + 4, text, sizeof(text)) >= 0 ? text : "(cannot be read)\n");
+    } else if (lc_string_starts_with(probe, len, "write:", 6)) {
+        lc_sysret fd = lc_kernel_open_file(probe + 6, O_WRONLY | O_CREAT, 0644);
+        put(fd >= 0 ? " = written\n" : " = refused\n");
+        if (fd >= 0)
+            lc_kernel_close_file((int32_t)fd);
+    } else if (lc_string_starts_with(probe, len, "ls:", 3)) {
+        put(" =\n");
+        lc_sysret fd = lc_kernel_open_file(probe + 3, O_RDONLY | O_DIRECTORY, 0);
+        static char entries[4096];
+        for (;;) {
+            lc_sysret n = fd < 0 ? 0 : lc_kernel_read_directory((int32_t)fd, entries, sizeof(entries));
+            if (n <= 0)
+                break;
+            for (lc_sysret pos = 0; pos < n; ) {
+                uint16_t reclen;
+                lc_bytes_copy(&reclen, entries + pos + 16, sizeof(reclen));
+                const char *name = entries + pos + 19;
+                if (!streq(name, ".") && !streq(name, "..")) {
+                    put("  ");
+                    put(name);
+                    put("\n");
+                }
+                if (reclen == 0)
+                    break;
+                pos += reclen;
+            }
+        }
+        if (fd >= 0)
+            lc_kernel_close_file((int32_t)fd);
+    } else {
+        put(" is not a probe\n");
+    }
+}
+
 static void put_int(int number) {
     char buf[16];
     fmt_int(buf, number);
@@ -417,6 +473,60 @@ int main(int argc, char **argv, char **envp) {
         put(readable_within((int32_t)pidfd, (int64_t)seconds * 1000 + STOP_MARGIN_MS) ? "ended\n" : "still there\n");
         return 0;
     }
+    if (argc == 3 && streq(argv[1], "volspec")) {
+        volume_spec vol = {0};
+        const char *wrong = parse_volume_spec(argv[2], &vol);
+        if (wrong) {
+            put("invalid: ");
+            put(wrong);
+        } else {
+            put(vol.src);
+            put(" -> ");
+            put(vol.dst);
+            put(vol.ro ? " ro" : " rw");
+        }
+        put("\n");
+        return 0;
+    }
+    if (argc >= 3 && streq(argv[1], "volumes")) {
+        static struct volume_mount volumes[MAX_VOLS];
+        const char *root = argv[2];
+        int count = 0, i = 3;
+
+        require_mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+        for (; i < argc && !streq(argv[i], "--"); i++) {
+            if (count == MAX_VOLS)
+                die("unit: too many volumes");
+            open_volume(argv[i], &volumes[count++]);
+        }
+
+        /* into the root as build_container goes into a container's */
+        require_mount(root, root, NULL, MS_BIND | MS_REC, NULL);
+        if (lc_kernel_chdir(root) < 0)
+            die2("unit: cannot change to ", root);
+        lc_kernel_mkdirat(AT_FDCWD, ".old_root", 0755);
+        if (lc_kernel_pivot_root(".", ".old_root") < 0)
+            die("unit: pivot_root failed");
+        cleanup_old_root_or_die();
+        lc_kernel_chdir("/");
+
+        attach_volumes(volumes, count);
+        put("attached\n");
+        for (i++; i < argc; i++)
+            unit_probe(argv[i]);
+        return 0;
+    }
+    if (argc == 3 && (streq(argv[1], "nameservers") || streq(argv[1], "dnslist"))) {
+        char found[MAX_DNS][16];
+        int count = streq(argv[1], "dnslist") ? name_servers_listed(argv[2], found)
+                                              : name_servers_of(argv[2], found);
+        for (int i = 0; i < count; i++) {
+            put(found[i]);
+            put("\n");
+        }
+        put_result(count);
+        return 0;
+    }
     if (argc == 3 && streq(argv[1], "userspec")) {
         struct exec_request req = { .as = AS_ROOT, .gid = -1 };
         if (!parse_user_spec(argv[2], &req)) {
@@ -467,5 +577,7 @@ int main(int argc, char **argv, char **envp) {
         "       unit caps | unit sandbox <program> [args...] | unit maskproc | unit noipv6 <pid>\n"
         "       unit seconds <text> | unit streams <file> | unit init <how> confined|open <seconds> <hook script | -> <log file | -> [<grace>]\n"
         "       unit stop <pid> <seconds> | unit pids <file> | unit userspec <text>\n"
+        "       unit volspec <spec> | unit volumes <root> <spec>... [-- <probe>...]\n"
+        "       unit nameservers <resolv.conf> | unit dnslist <text>\n"
         "       unit identity|command <passwd> <group> <exec's options...>");
 }

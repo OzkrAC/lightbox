@@ -4,7 +4,7 @@ What changed for someone who uses lightbox, newest first. `ROADMAP.md` has the r
 
 ## 0.4.0
 
-Not tagged yet, and not complete: the part of Phase 4 that is written so far, which is who `exec` runs a command as and how it finds it.
+Not tagged yet, and not complete: the part of Phase 4 that is written so far, which is who `exec` runs a command as and how it finds it, where volumes are mounted, and what `create` writes into a new container.
 
 ### Changes you may have to act on
 
@@ -12,6 +12,9 @@ Not tagged yet, and not complete: the part of Phase 4 that is written so far, wh
 - **A `--user` value that begins with a digit must be numbers.** `--user 0x10` ran as uid 0, `--user 1000:` as gid 0, and `--user 12abc` as uid 12; a uid too large to be one wrapped around. All of these are refused.
 - **A command no longer has the groups of whoever ran `exec`.** Its supplementary groups are the ones the container's `/etc/group` lists for its user, and none for a uid without an account. Before, a uid without an account, and root when `--user` was not given, kept the caller's groups.
 - **`exec` exits with 127 for a command that is not there, and 126 for one that cannot be run.** Both were 1.
+- **A new container asks the name servers this host asks.** It used to get 1.1.1.1 and 8.8.8.8 whatever the host used. It still gets those two when the host's only resolver is on its own loopback, as with systemd-resolved, and the servers behind that stub cannot be found. `create --dns <address>` and the `dns` setting choose others. Existing containers keep the file they have.
+- **A volume path with `..` is refused**, by `create`, by `add-vol`, and by `start` for a container that already has one. A path is stored in one spelling, so `/data//x/` becomes `/data/x`.
+- **A volume whose destination leads nowhere in the container fails the start.** A destination is now looked up inside the container. Where the image has a link on the way that points to a path the container lacks, the old code followed it on the host instead.
 
 ### Fixed
 
@@ -21,11 +24,17 @@ Not tagged yet, and not complete: the part of Phase 4 that is written so far, wh
 - `USER` and `LOGNAME` were cut to 12 characters.
 - `exec` read the container's `/etc/passwd` and `/etc/group` through their path on the host, where a link in the container's files leads wherever it says. They are read inside the container now, and only if they are regular files.
 - `exec x --user`, with the value missing, ran `--user` as a command.
+- A volume's destination was made and mounted through its path on the host, before the container had its own root. A link in the image on that path was followed on the host, so `start` could make a directory or an empty file outside the container. Volumes are now attached after the container has its own root and the host's is out of its sight.
+- A volume below `/run` or `/tmp` was hidden by the tmpfs that is mounted there afterwards.
+- A destination such as `//proc/x` got past the check that keeps volumes off `/proc`, `/sys` and `/dev`.
+- `create` wrote `resolv.conf` through the image's own `etc`. An image whose `etc`, or whose `resolv.conf`, is a link had the file written wherever that link leads on the host. It is written inside the copy of the image now, as the container will see it.
 
 ### Added
 
 - `exec --env KEY=VALUE`, `exec --workdir <dir>`, `--` to end the options, and `-u`, `-e` and `-w` for short.
 - The command gets the `TERM` of the terminal `exec` was typed on.
+- `create --dns <address>` and the `dns` setting.
+- `create` writes `/etc/hostname`, and adds the container's name and address to `/etc/hosts`.
 
 ## 0.3.0
 

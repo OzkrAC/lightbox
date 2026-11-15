@@ -144,6 +144,9 @@ This creates:
 # Use a different rootfs image
 ./lightbox create deb 10.0.0.5 --rootfs /opt/rootfs/debian
 
+# Choose the name servers the container asks
+./lightbox create web 10.0.0.7 --dns 9.9.9.9 --dns 149.112.112.112
+
 # Disable the security sandbox
 ./lightbox create dev 10.0.0.6 --privileged
 
@@ -213,6 +216,10 @@ start_timeout = 30
 
 # Seconds that a container's processes get to end when it is stopped
 stop_timeout = 10
+
+# Name servers for new containers, up to three. Without this they are the ones
+# this host asks, or 1.1.1.1 and 8.8.8.8 if those are of no use to a container
+dns = 9.9.9.9, 149.112.112.112
 ```
 
 If `lightbox_dir` is set, `rootfs` and `container_dir` are automatically derived from it (e.g., `rootfs = <lightbox_dir>/rootfs`) unless explicitly overridden.
@@ -255,6 +262,7 @@ lightbox <command> [args]
 | `--privileged` | off | Disable security sandbox |
 | `--oom-score <n>` | `500` | OOM score adjustment |
 | `--link <name>` | — | Allow network to another container (repeatable) |
+| `--dns <address>` | the host's | A name server for the container (IPv4, up to 3) |
 
 ### Exec options
 
@@ -291,7 +299,7 @@ The sandbox covers everything in a container: init, the `/init.sh` hook and all 
 - **Namespaces**: `clone()` with PID, mount, UTS, IPC, net (and optionally user) namespace flags
 - **Filesystem**: each container lives under `<container_dir>/<name>/` with `rootfs/` for the filesystem, `.conf`, `.ip`, `.pid` for metadata and `console.log` for its output. `pivot_root` into the rootfs copy
 - **Devices**: bind-mounted from host (`/dev/null`, `/dev/zero`, `/dev/random`, etc.)
-- **Networking**: veth pair per container connected to a host bridge with NAT
+- **Networking**: veth pair per container connected to a host bridge with NAT. `create` writes the container's `/etc/resolv.conf`, `/etc/hostname` and a line for its own name in `/etc/hosts`, inside the copy of the image, where a link in the image cannot send them anywhere else
 - **Resource limits**: cgroups v2 (memory, PIDs, CPU, I/O)
 - **Init**: lightbox remains PID 1 inside the container. It reaps children and handles shutdown from the moment the container is built, and runs `/init.sh`, if the rootfs has one, as one of its children: after `/tmp` and `/run` are mounted, with the sandbox on, and only once the container is on record, so `stop` and `ls` always find a container whose hook runs
 - **Stopping**: `stop` sends init a SIGTERM that carries the number of seconds the container may take. Init passes SIGTERM on to every process in the container, the ones `exec` put there included, reaps them, and exits when none is left or the time is over; the kernel kills whatever remains with it. `stop` waits for init through a pidfd, so it returns as soon as the container has ended. It then kills anything still in the cgroup, waits until the kernel reports the cgroup empty, and removes it. A SIGTERM sent to init by other means has the same effect, with the `stop_timeout` that was set when the container started
@@ -302,6 +310,9 @@ The sandbox covers everything in a container: init, the `/init.sh` hook and all 
 
 ## Volume Notes
 
+- A volume is written `src:dst[:ro]`. Both paths are absolute and may not contain `..`; they are stored in one spelling, without doubled slashes. The destination may not be `/` or under `/proc`, `/sys` or `/dev`.
+- The source is a path on the host, taken when the container starts. The destination is a path in the container, looked up inside it: where the image has a link on the way, the volume lands where the link leads in the container. A destination that the image lacks is made; one that leads nowhere in the container fails the start.
+- Volumes are mounted on top of everything else, so one below `/tmp` or `/run` is visible there.
 - `--vol` now supports both directory and single-file bind mounts.
 - `lightbox add-vol <name> <src>:<dst>[:ro]` appends a volume to an existing container's config.
 - If the container is already running, added volumes take effect after a restart.

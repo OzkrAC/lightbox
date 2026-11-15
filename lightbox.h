@@ -45,6 +45,7 @@ typedef struct {
     int  default_oom;
     int  start_timeout;     /* seconds start waits for the init hook; 0: not at all */
     int  stop_timeout;      /* seconds a container gets to end when it is asked to */
+    char dns[64];           /* name servers for new containers, as written; empty: the host's */
 } global_config;
 
 extern global_config cfg_global;
@@ -77,6 +78,19 @@ void require_write_file(const char *path, const char *data);
 #define MODE_PUBLIC_FILE   0644
 
 int write_file_atomic(const char *path, const char *data, int32_t mode);
+
+/* Files in a root filesystem that is not this process's root: <root>/<dir>/<name>,
+ * with every link on the way followed as that root's own processes would
+ * follow it, so that nothing is read or written outside the root. dir is one
+ * directory name, and is made if it is missing.
+ *
+ * Writing is atomic, and replaces a link of that name with the file. 0 or -1.
+ * Reading gives the text and its length, 0 for a file that is not there, and
+ * -1 for one that cannot be read, is not a regular file or does not fit. */
+[[nodiscard]] int write_file_in_root(const char *root, const char *dir, const char *name,
+                                     const char *data, int32_t mode);
+[[nodiscard]] int read_file_in_root(const char *root, const char *dir, const char *name,
+                                    char *buf, size_t bufsz);
 /* For lightbox's own records: always MODE_PRIVATE_FILE. */
 void require_write_file_atomic(const char *path, const char *data);
 void cfg_global_init(void);

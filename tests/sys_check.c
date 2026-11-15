@@ -33,6 +33,7 @@
 #include <linux/filter.h>
 #include <linux/magic.h>
 #include <linux/mount.h>
+#include <linux/openat2.h>
 #include <linux/prctl.h>
 #include <linux/sched.h>
 #include <linux/seccomp.h>
@@ -56,6 +57,9 @@ SAME_NR(renameat);
 SAME_NR(ppoll);
 SAME_NR(close_range);
 SAME_NR(pidfd_open);
+SAME_NR(open_tree);
+SAME_NR(openat2);
+SAME_NR(move_mount);
 SAME_NR(pidfd_send_signal);
 SAME_NR(statx);
 
@@ -70,6 +74,12 @@ SAME_VALUE(LB_EACCES, EACCES);
 SAME_VALUE(LB_ENOTDIR, ENOTDIR);
 SAME_VALUE(LB_S_IFREG, S_IFREG);
 SAME_VALUE(LB_AT_EMPTY_PATH, AT_EMPTY_PATH);
+SAME_VALUE(LB_O_EXCL, O_EXCL);
+SAME_VALUE(LB_RESOLVE_IN_ROOT, RESOLVE_IN_ROOT);
+SAME_VALUE(LB_OPEN_TREE_CLONE, OPEN_TREE_CLONE);
+SAME_VALUE(LB_OPEN_TREE_CLOEXEC, OPEN_TREE_CLOEXEC);
+SAME_VALUE(LB_MOVE_MOUNT_F_EMPTY_PATH, MOVE_MOUNT_F_EMPTY_PATH);
+SAME_VALUE(LB_MOVE_MOUNT_T_SYMLINKS, MOVE_MOUNT_T_SYMLINKS);
 SAME_VALUE(LB_EBUSY, EBUSY);
 SAME_VALUE(LB_SIGPIPE, SIGPIPE);
 SAME_VALUE(LB_SIGCONT, SIGCONT);
@@ -153,6 +163,11 @@ SAME_SIGINFO(code, si_code);
 SAME_SIGINFO(pid, si_pid);
 SAME_SIGINFO(uid, si_uid);
 SAME_SIGINFO(value, si_int);
+
+SAME_SIZE(lb_open_how, open_how);
+SAME_FIELD(lb_open_how, open_how, flags);
+SAME_FIELD(lb_open_how, open_how, mode);
+SAME_FIELD(lb_open_how, open_how, resolve);
 
 SAME_SIZE(lb_pollfd, pollfd);
 SAME_FIELD(lb_pollfd, pollfd, fd);

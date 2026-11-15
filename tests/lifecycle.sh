@@ -523,6 +523,50 @@ t_volume_under_run() {
     [ "$said" = token ]
 }
 
+# A destination is looked up in the container. A link in the image leads
+# where the container sees it lead, also when it names a path that the host
+# has as well; nothing is made on the host.
+t_volume_destination_is_inside() {
+    mkdir -p "$T/vol/linked" "$T/named-on-the-host"
+    echo through-a-link > "$T/vol/linked/in"
+    box vlink --vol "$T/vol/linked:/link/data" --vol "$T/vol/linked:/away/data:ro" || return 1
+    # a link as an image has it, and one that names a directory the host has too
+    mkdir -p "$C/vlink/rootfs/srv" "$C/vlink/rootfs$T/named-on-the-host"
+    ln -s /srv "$C/vlink/rootfs/link"
+    ln -s "$T/named-on-the-host" "$C/vlink/rootfs/away"
+    start vlink || return 1
+    [ "$(sh_in vlink 'cat /srv/data/in')" = through-a-link ] || { echo "the volume is not where the link leads in the container"; return 1; }
+    [ "$(sh_in vlink 'cat /away/data/in')" = through-a-link ] || { echo "the second volume is not reachable through its link"; return 1; }
+    [ -z "$(ls -A "$T/named-on-the-host")" ] || { echo "something was made on the host: $(ls -A "$T/named-on-the-host")"; return 1; }
+    [ -d "$C/vlink/rootfs$T/named-on-the-host/data" ] || { echo "the destination was not made in the container's root filesystem"; return 1; }
+    lb stop vlink >/dev/null || return 1
+
+    # the same link when the container has no such directory: it leads nowhere, and the start says so
+    box vnowhere --vol "$T/vol/linked:/away/data" || return 1
+    ln -s "$T/named-on-the-host" "$C/vnowhere/rootfs/away"
+    if said=$(start vnowhere); then
+        printf '%s\n' "$said"
+        echo "a volume was mounted through a link that leads nowhere in the container"
+        return 1
+    fi
+    printf '%s\n' "$said"
+    [ -z "$(ls -A "$T/named-on-the-host")" ] || { echo "something was made on the host: $(ls -A "$T/named-on-the-host")"; return 1; }
+    nothing_left vnowhere
+}
+
+# Volumes go on top of what init mounts itself, and keep their restrictions.
+t_volume_under_tmp() {
+    mkdir -p "$T/vol/cache"
+    echo cached > "$T/vol/cache/in"
+    echo 'one = 1' > "$T/vol/one.conf"
+    up vtmp --read-only --vol "$T/vol/cache:/tmp/cache" --vol "$T/vol/one.conf:/run/app/one.conf:ro" --vol "$T/vol/cache:/not/in/the/image" || return 1
+    [ "$(sh_in vtmp 'cat /tmp/cache/in')" = cached ] || { echo "a volume under /tmp is not visible"; return 1; }
+    [ "$(sh_in vtmp 'cat /run/app/one.conf')" = 'one = 1' ] || { echo "a file volume under /run is not visible"; return 1; }
+    [ "$(sh_in vtmp 'cat /not/in/the/image/in')" = cached ] || { echo "a volume at a path the image lacks is not there, with a read-only root"; return 1; }
+    refused sh_in vtmp 'echo x > /run/app/one.conf' || { echo "a read-only file volume was written"; return 1; }
+    sh_in vtmp 'echo written > /tmp/cache/out' && [ "$(cat "$T/vol/cache/out")" = written ]
+}
+
 t_read_only_root() {
     up readonly --read-only || return 1
     refused sh_in readonly 'echo x > /root/new' || { echo "the root filesystem was written"; return 1; }
@@ -1493,7 +1537,9 @@ if [ "$MODE" = inside ]; then
     check 'a file volume is mounted'                                      t_volume_file
     check 'a read-only volume cannot be written'                          t_volume_read_only
     check 'add-vol takes effect at the next start'                        t_addvol_applies_at_next_start
-    xfail FS-vol-shadow        'a volume under /run is visible'                        t_volume_under_run
+    check 'a volume under /run is visible'                                t_volume_under_run
+    check 'volumes under /tmp and /run, and with a read-only root'        t_volume_under_tmp
+    check 'a volume'"'"'s destination is looked up inside the container'      t_volume_destination_is_inside
     check '--read-only closes the root and leaves /tmp, /run and /var/tmp writable' t_read_only_root
     check '/run is mode 0755'                                             t_run_mode
     check 'init mounts everything with the restrictions it should have'   t_mount_table

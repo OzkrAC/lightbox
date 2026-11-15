@@ -135,7 +135,19 @@ t_volume_spec_rules() {
     refused lb create b 10.0.0.3 --vol "$W/vol:/proc/x" &&
     refused lb create c 10.0.0.4 --vol "$W/vol:/sys" &&
     refused lb create d 10.0.0.5 --vol "$W/vol:/data:rw" &&
-    refused lb create e 10.0.0.6 --vol "$W/vol"
+    refused lb create e 10.0.0.6 --vol "$W/vol" &&
+    # a reserved place by another spelling, and a path that goes up
+    refused lb create f 10.0.0.7 --vol "$W/vol://proc/x" &&
+    refused lb create g 10.0.0.8 --vol "$W/vol:/data/../proc" &&
+    refused lb create h 10.0.0.9 --vol "$W/vol/../vol:/data" || return 1
+    # what is stored is one spelling of what was typed, from create and from add-vol
+    lb create web 10.0.0.2 --vol "$W//vol/./:/data//x/:ro" || return 1
+    lb add-vol web "$W/vol/:/more/" || return 1
+    grep '^vol=' "$C/web/.conf"
+    conf_has web "vol=$W/vol:/data/x:ro" && conf_has web "vol=$W/vol:/more" || return 1
+    refused lb add-vol web "$W/vol:/a/../b" || return 1
+    # the same volume in another spelling is the same volume
+    lb add-vol web "$W/vol//:/more" | grep -q 'already present'
 }
 
 t_unknown_option_refused() {
@@ -600,6 +612,78 @@ t_closed_streams_are_harmless() {
     lb ls | grep -q '^web '
 }
 
+# What create puts into a new container's etc: where it asks for names, what
+# it is called, and its own name beside its address.
+t_create_writes_names() {
+    lb create web 10.0.0.2 --dns 9.9.9.9 --dns 149.112.112.112 || return 1
+    etc=$C/web/rootfs/etc
+    echo "resolv.conf: $(paste -sd'|' "$etc/resolv.conf"); hostname: $(cat "$etc/hostname"); hosts: $(paste -sd'|' "$etc/hosts")"
+    [ "$(cat "$etc/resolv.conf")" = "nameserver 9.9.9.9
+nameserver 149.112.112.112" ] && [ "$(cat "$etc/hostname")" = web ] &&
+    [ "$(cat "$etc/hosts")" = "$(printf '127.0.0.1\tlocalhost\n10.0.0.2\tweb')" ] &&
+    [ "$(mode_of "$etc/resolv.conf")" = 644 ] || return 1
+
+    # a hosts file that the image has is kept, and added to
+    printf '10.9.9.9 elsewhere' > "$BASE/etc/hosts"
+    lb create db 10.0.0.3 || return 1
+    [ "$(cat "$C/db/rootfs/etc/hosts")" = "$(printf '10.9.9.9 elsewhere\n10.0.0.3\tdb')" ] || { cat "$C/db/rootfs/etc/hosts"; return 1; }
+    # without --dns and without a setting: something a container can ask, whatever this host asks
+    echo "by default: $(paste -sd'|' "$C/db/rootfs/etc/resolv.conf")"
+    grep -q '^nameserver ' "$C/db/rootfs/etc/resolv.conf" && ! grep -qv '^nameserver [0-9.]*$' "$C/db/rootfs/etc/resolv.conf" &&
+    ! grep -q '^nameserver 127\.' "$C/db/rootfs/etc/resolv.conf" || return 1
+
+    # the dns setting, and --dns before it
+    printf 'dns = 9.9.9.10, 149.112.112.10\n' >> "$CONF"
+    lb create a 10.0.0.4 && lb create b 10.0.0.5 --dns 9.9.9.9 || return 1
+    [ "$(paste -sd' ' "$C/a/rootfs/etc/resolv.conf")" = "nameserver 9.9.9.10 nameserver 149.112.112.10" ] &&
+    [ "$(cat "$C/b/rootfs/etc/resolv.conf")" = "nameserver 9.9.9.9" ] || return 1
+
+    refused lb create c 10.0.0.6 --dns 127.0.0.53 && refused lb create c 10.0.0.6 --dns ::1 &&
+    refused lb create c 10.0.0.6 --dns nine &&
+    refused lb create c 10.0.0.6 --dns 1.1.1.1 --dns 2.2.2.2 --dns 3.3.3.3 --dns 4.4.4.4 || return 1
+    sed -i 's/^dns = .*/dns = nonsense/' "$CONF"
+    refused lb create d 10.0.0.7 || return 1
+    [ ! -e "$C/c" ] && [ ! -e "$C/d" ]
+}
+
+# An image shapes its own etc: a link, in one of the ways images have them.
+# Whatever it is, what create writes is written where the container will see
+# it, in the copy of the image, and a link that leads nowhere there fails.
+t_create_writes_stay_in_the_rootfs() {
+    rm -rf "${BASE:?}/etc"
+    mkdir -p "$BASE/usr/etc"
+    ln -s usr/etc "$BASE/etc"
+    lb create rel 10.0.0.2 --dns 9.9.9.9 || return 1
+    [ -L "$C/rel/rootfs/etc" ] && [ "$(cat "$C/rel/rootfs/usr/etc/resolv.conf")" = "nameserver 9.9.9.9" ] || { echo "etc -> usr/etc was not followed inside the image"; return 1; }
+
+    rm "$BASE/etc"
+    ln -s /usr/etc "$BASE/etc"
+    lb create abs 10.0.0.3 --dns 9.9.9.9 || return 1
+    [ -L "$C/abs/rootfs/etc" ] && [ "$(cat "$C/abs/rootfs/usr/etc/hostname")" = abs ] || { echo "etc -> /usr/etc was not followed inside the image"; return 1; }
+
+    # resolv.conf as a link, the way an image set up for a local resolver has it: the file takes its place
+    rm "$BASE/etc"
+    mkdir "$BASE/etc"
+    ln -s ../run/stub-resolv.conf "$BASE/etc/resolv.conf"
+    lb create stub 10.0.0.4 --dns 9.9.9.9 || return 1
+    [ ! -L "$C/stub/rootfs/etc/resolv.conf" ] && [ "$(cat "$C/stub/rootfs/etc/resolv.conf")" = "nameserver 9.9.9.9" ] &&
+    [ ! -e "$C/stub/rootfs/run/stub-resolv.conf" ] || { echo "resolv.conf was written through the link"; return 1; }
+
+    # an image without an etc gets one
+    rm -rf "${BASE:?}/etc"
+    lb create bare 10.0.0.6 --dns 9.9.9.9 || return 1
+    [ -d "$C/bare/rootfs/etc" ] && [ ! -L "$C/bare/rootfs/etc" ] && [ "$(cat "$C/bare/rootfs/etc/hostname")" = bare ] || { echo "an image without etc did not get one"; return 1; }
+
+    # a link that names a directory the host has and the image does not: nothing is written, anywhere
+    mkdir "$W/named-on-the-host"
+    rm -rf "${BASE:?}/etc"
+    ln -s "$W/named-on-the-host" "$BASE/etc"
+    msg=$(lb create out 10.0.0.5 --dns 9.9.9.9 2>&1) && { echo "create succeeded: $msg"; return 1; }
+    printf '%s\n' "$msg"
+    [ -z "$(ls -A "$W/named-on-the-host")" ] || { echo "something was written on the host: $(ls -A "$W/named-on-the-host")"; return 1; }
+    [ ! -e "$C/out" ]
+}
+
 t_storage_is_private() {
     lb create web 10.0.0.2 || return 1
     echo "modes: dir $(mode_of "$C/web"), .conf $(mode_of "$C/web/.conf"), .ip $(mode_of "$C/web/.ip"), .state $(mode_of "$C/web/.state")"
@@ -650,6 +734,8 @@ check 'stop checks its options before it does anything'     t_stop_options_are_c
 check 'logs prints the log, and nothing where there is none' t_logs_prints_the_log
 check 'logs -f follows a running container and ends with it' t_logs_follows
 check 'a command with its standard streams closed is harmless' t_closed_streams_are_harmless
+check 'create writes name servers, hostname and hosts'      t_create_writes_names
+check 'what create writes stays in the new root filesystem' t_create_writes_stay_in_the_rootfs
 check 'container storage is private to root'                t_storage_is_private
 check 'setup restricts existing storage directories'        t_setup_restricts_existing_storage
 check 'create keeps every volume or refuses'                t_create_keeps_every_volume

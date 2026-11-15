@@ -43,3 +43,10 @@
 # sent them SIGTERM. What is still running then is killed. `stop -t <seconds>`
 # overrides this for one stop; 0 kills at once.
 # stop_timeout = 10
+
+# Name servers written into a new container's /etc/resolv.conf: up to three
+# IPv4 addresses, separated by commas or spaces. `create --dns <address>`
+# comes before this. Without either, a container gets the servers this host
+# asks, leaving out the host's own loopback (127.0.0.53 and the like), and
+# 1.1.1.1 and 8.8.8.8 when nothing usable is left.
+# dns = 9.9.9.9, 149.112.112.112

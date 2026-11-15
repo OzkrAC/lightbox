@@ -35,8 +35,11 @@
 #define LB_SYS_ppoll      271
 #define LB_SYS_statx      332
 #define LB_SYS_pidfd_send_signal 424
+#define LB_SYS_open_tree  428
+#define LB_SYS_move_mount 429
 #define LB_SYS_pidfd_open 434
 #define LB_SYS_close_range 436
+#define LB_SYS_openat2    437
 #elif defined(__aarch64__)
 #define LB_SYS_renameat   38
 #define LB_SYS_statfs     43
@@ -48,8 +51,11 @@
 #define LB_SYS_capset     91
 #define LB_SYS_statx      291
 #define LB_SYS_pidfd_send_signal 424
+#define LB_SYS_open_tree  428
+#define LB_SYS_move_mount 429
 #define LB_SYS_pidfd_open 434
 #define LB_SYS_close_range 436
+#define LB_SYS_openat2    437
 #else
 #error "lightbox supports x86_64 and aarch64 only"
 #endif
@@ -97,6 +103,22 @@
 #define LB_ST_NOSUID              2
 #define LB_ST_NODEV               4
 #define LB_ST_NOEXEC              8
+
+/* open(2): fail if the file is there already (asm-generic/fcntl.h); the one
+ * open flag lightbox uses that lightc does not name */
+#define LB_O_EXCL                     0200
+
+/* openat2(2), Linux 5.6 (linux/openat2.h): look a path up as if the directory
+ * it starts from were the root. A link to "/x" then leads to x in that
+ * directory, and ".." does not lead out of it. */
+#define LB_RESOLVE_IN_ROOT            0x10
+
+/* open_tree(2) and move_mount(2), Linux 5.2 (linux/mount.h). A cloned tree
+ * is a copy of a mount that is attached nowhere yet; move_mount attaches it. */
+#define LB_OPEN_TREE_CLONE            1
+#define LB_OPEN_TREE_CLOEXEC          02000000      /* O_CLOEXEC */
+#define LB_MOVE_MOUNT_F_EMPTY_PATH    0x00000004    /* the tree is the descriptor itself */
+#define LB_MOVE_MOUNT_T_SYMLINKS      0x00000010    /* follow a link at the end of the target */
 
 /* prctl(2) requests (linux/prctl.h) */
 #define LB_PR_SET_KEEPCAPS            8
@@ -158,6 +180,13 @@ struct lb_siginfo_queue {
     uint32_t uid;
     int32_t  value;
     uint8_t  pad1[100];
+};
+
+/* struct open_how (linux/openat2.h) */
+struct lb_open_how {
+    uint64_t flags;
+    uint64_t mode;
+    uint64_t resolve;
 };
 
 /* struct pollfd (asm-generic/poll.h) */
@@ -270,6 +299,20 @@ static inline lc_sysret lb_sys_pidfd_open(int32_t pid, uint32_t flags) {
 static inline lc_sysret lb_sys_pidfd_send_signal(int32_t pidfd, int32_t sig,
                                                  const struct lb_siginfo_queue *info, uint32_t flags) {
     return lc_syscall4(LB_SYS_pidfd_send_signal, pidfd, sig, (int64_t)info, flags);
+}
+
+static inline lc_sysret lb_sys_openat2(int32_t dirfd, const char *path, const struct lb_open_how *how) {
+    return lc_syscall4(LB_SYS_openat2, dirfd, (int64_t)path, (int64_t)how, (int64_t)sizeof(*how));
+}
+
+static inline lc_sysret lb_sys_open_tree(int32_t dirfd, const char *path, uint32_t flags) {
+    return lc_syscall3(LB_SYS_open_tree, dirfd, (int64_t)path, flags);
+}
+
+static inline lc_sysret lb_sys_move_mount(int32_t from_dirfd, const char *from_path,
+                                          int32_t to_dirfd, const char *to_path, uint32_t flags) {
+    return lc_syscall5(LB_SYS_move_mount, from_dirfd, (int64_t)from_path,
+                       to_dirfd, (int64_t)to_path, flags);
 }
 
 /* close_range(2), Linux 5.9: close every descriptor from first to last */
