@@ -363,6 +363,45 @@ t_paths_are_masked() {
         exit $bad' _ "$UNIT"
 }
 
+# ─── netns_disable_ipv6 ─────────────────────────────────────────────────────
+
+# Another network namespace, held by a process. Afterwards it has no IPv6
+# address and gives none to an interface it gets, and this one is as it was.
+t_ipv6_switched_off() {
+    [ -e /proc/sys/net/ipv6/conf ] || { echo "this kernel runs without IPv6"; return 77; }
+    command -v ip >/dev/null 2>&1 && command -v nsenter >/dev/null 2>&1 || { echo "no ip and nsenter to look with"; return 77; }
+    unshare -r --net true 2>/dev/null || { echo "user namespaces are not available to this user"; return 77; }
+    unshare -r --net -- bash -c '
+        unshare --net -- sleep 60 >/dev/null 2>&1 </dev/null &
+        holder=$!
+        i=0
+        until [ -n "$(readlink /proc/$holder/ns/net 2>/dev/null)" ] &&
+              [ "$(readlink /proc/$holder/ns/net)" != "$(readlink /proc/self/ns/net)" ]; do
+            i=$((i + 1)); [ $i -lt 50 ] || exit 1; sleep 0.1
+        done
+        there() { nsenter -t "$holder" -n "$@"; }
+        there ip link set lo up
+        before=$(there cat /proc/net/if_inet6)
+        mine=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)
+        result=$("$1" noipv6 "$holder" 2>&1)
+        after=$(there cat /proc/net/if_inet6)
+        all=$(there cat /proc/sys/net/ipv6/conf/all/disable_ipv6)
+        default=$(there cat /proc/sys/net/ipv6/conf/default/disable_ipv6)
+        still=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)
+        kill "$holder"
+        echo "addresses there before: $(printf "%s\n" "$before" | grep -c .); $result; after: $(printf "%s\n" "$after" | grep -c .)"
+        echo "there: all=$all default=$default; here: $mine before, $still after"
+        [ -n "$before" ] && [ "$result" = "result 0" ] && [ -z "$after" ] &&
+        [ "$all" = 1 ] && [ "$default" = 1 ] && [ "$still" = "$mine" ]' _ "$UNIT"
+}
+
+# No process has this number, so there is no namespace to join. start must
+# hear of it: a container is not to run with IPv6 left as it was.
+t_ipv6_failure_is_an_error() {
+    both noipv6 2147483600
+    [ "$out" = "result -1" ]
+}
+
 check 'a program that succeeds gives 0'                          t_success
 check 'a non-zero exit status is returned as it is'              t_exit_status
 check 'a program killed by a signal is a failure, and reported'  t_killed_by_signal
@@ -396,5 +435,8 @@ check 'every capability set is reduced to the allowed ones'      t_capabilities_
 check 'a program run in the sandbox is confined by it'           t_sandbox_covers_a_program
 check 'a sandbox that cannot be applied ends the process'        t_sandbox_fails_closed
 check 'paths of /proc and /sys are masked or made read-only'     t_paths_are_masked
+
+check 'IPv6 is switched off in another network namespace'        t_ipv6_switched_off
+check 'a namespace that cannot be joined is an error'            t_ipv6_failure_is_an_error
 
 summary unit

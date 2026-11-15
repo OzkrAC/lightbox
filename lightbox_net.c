@@ -91,6 +91,18 @@ int update_link_rules(const char *name, const char *ip, bool add_rules) {
     return 0;
 }
 
+/*
+ * Whether traffic that the bridge switches between two of its ports passes
+ * through iptables. It does only when br_netfilter is loaded and its switch
+ * is on; without it the rules of setup see what the host routes and nothing
+ * that one container sends another directly.
+ */
+bool bridge_traffic_is_filtered(void) {
+    char value[8];
+    return read_file("/proc/sys/net/bridge/bridge-nf-call-iptables", value, sizeof(value)) > 0 &&
+           value[0] == '1';
+}
+
 static void detect_wan_interface(char *wan_if, size_t bufsz) {
     char route_buf[256];
     const char *argv[] = { "ip", "route", "show", "default", NULL };
@@ -274,6 +286,13 @@ void cmd_setup(void) {
                         "-o", cfg_global.bridge, "-j", "DROP", NULL };
         iptables_idempotent(chk, add);
     }
+
+    if (!bridge_traffic_is_filtered())
+        print_str(STDOUT,
+            "Note: br_netfilter is not filtering bridged traffic on this host. Containers\n"
+            "are kept apart at the bridge, so that needs nothing. A container created with\n"
+            "--link will not start until it does:\n"
+            "  modprobe br_netfilter && sysctl -w net.bridge.bridge-nf-call-iptables=1\n");
 
     print_str(STDOUT, "Host networking ready\n");
 }

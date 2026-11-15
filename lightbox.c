@@ -937,6 +937,38 @@ static int open_target_path(int target_pid, const char *suffix) {
     return (int)lc_kernel_open_file(path, O_RDONLY | O_CLOEXEC, 0);
 }
 
+/*
+ * Switch IPv6 off in the network namespace of a process, for the interfaces
+ * it has and the ones it gets. A container gets an IPv4 address and IPv4
+ * firewall rules; left on, IPv6 would give its interface a link-local address
+ * by itself, and a way to its neighbours that none of those rules cover.
+ *
+ * The setting is read and written through /proc/sys of whoever asks, so a
+ * child joins the namespace and writes it there. 0, or -1.
+ */
+static int netns_disable_ipv6(int target_pid) {
+    lc_sysret child = lc_kernel_fork();
+    if (child < 0)
+        return -1;
+
+    if (child == 0) {
+        int fd = open_target_path(target_pid, "/ns/net");
+        if (fd < 0 || lc_kernel_setns(fd, CLONE_NEWNET) < 0)
+            lc_kernel_exit(1);
+        if (!path_exists("/proc/sys/net/ipv6/conf"))
+            lc_kernel_exit(0);      /* a kernel without IPv6 has nothing to switch off */
+        if (write_file("/proc/sys/net/ipv6/conf/all/disable_ipv6", "1") < 0 ||
+            write_file("/proc/sys/net/ipv6/conf/default/disable_ipv6", "1") < 0)
+            lc_kernel_exit(1);
+        lc_kernel_exit(0);
+    }
+
+    int32_t status;
+    if (wait_child((int32_t)child, &status) < 0)
+        return -1;
+    return exit_code_from_status(status) == 0 ? 0 : -1;
+}
+
 static void require_setns_fd(int fd, int nstype, const char *name) {
     if (lc_kernel_setns(fd, nstype) < 0)
         die2("Error: failed to join namespace: ", name);
@@ -1342,6 +1374,26 @@ static void cmd_start(int argc, char **argv) {
     if (userns)
         die("Error: containers configured with user namespaces are not supported yet");
 
+    /* A container without links gets an isolated port on the bridge: it
+     * reaches the host and, through it, the outside, and no other container.
+     * One with links has to share the bridge with the containers it is linked
+     * to, and then the firewall is all that keeps it to those. The firewall
+     * sees what the bridge switches only with br_netfilter, so without that
+     * such a container is not started. Decided before anything is set up. */
+    char first_link[NAME_MAX_LEN + 1];
+    bool linked = conf_get(name, "link", first_link, sizeof(first_link), "") == 1;
+    if (linked && !bridge_traffic_is_filtered()) {
+        print_str(STDERR, "Error: container '");
+        print_str(STDERR, name);
+        print_str(STDERR,
+            "' has links, and on this host bridged traffic does not pass\n"
+            "through iptables. A linked container shares the bridge with the others, and\n"
+            "only the firewall keeps it to its links. Let the firewall see that traffic,\n"
+            "then start the container again:\n"
+            "  modprobe br_netfilter && sysctl -w net.bridge.bridge-nf-call-iptables=1\n");
+        lc_kernel_exit(1);
+    }
+
     print_str(STDOUT,"Starting container '");
     print_str(STDOUT,name);
     print_str(STDOUT,"'...\n");
@@ -1373,6 +1425,11 @@ static void cmd_start(int argc, char **argv) {
       if (run_cmd(tool_path_ip(), a) != 0) { start_err = "failed to create veth pair"; goto fail_start; } }
     { const char *a[] = { "ip", "link", "set", veth_host, "master", cfg_global.bridge, NULL };
       if (run_cmd(tool_path_ip(), a) != 0) { start_err = "failed to attach veth to bridge"; goto fail_start; } }
+    if (!linked) {
+        /* isolated ports do not reach each other, whatever the firewall does */
+        const char *a[] = { "ip", "link", "set", "dev", veth_host, "type", "bridge_slave", "isolated", "on", NULL };
+        if (run_cmd(tool_path_ip(), a) != 0) { start_err = "failed to isolate the container's port on the bridge"; goto fail_start; }
+    }
     { const char *a[] = { "ip", "link", "set", veth_host, "up", NULL };
       if (run_cmd(tool_path_ip(), a) != 0) { start_err = "failed to bring host veth up"; goto fail_start; } }
 
@@ -1453,6 +1510,12 @@ static void cmd_start(int argc, char **argv) {
     /* set up cgroup */
     if (cgroup_create(name, (int)child_pid) != 0) {
         start_err = "failed to create cgroup";
+        goto fail_start;
+    }
+
+    /* before the namespace has an interface that could come up with it */
+    if (netns_disable_ipv6((int)child_pid) != 0) {
+        start_err = "failed to switch IPv6 off in the container";
         goto fail_start;
     }
 

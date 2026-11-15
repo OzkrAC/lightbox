@@ -8,6 +8,7 @@ A minimal, secure Linux container runtime. Single static binary, ~33KB, no libc 
 - GCC and ninja (build time)
 - `iproute2`, `iptables`, `util-linux` (`nsenter`) at runtime
 - BusyBox `ip` is not sufficient; `lightbox start` requires the full `iproute2` `ip` binary for veth creation and bridge attachment
+- For containers created with `--link`: the `br_netfilter` kernel module, with `net.bridge.bridge-nf-call-iptables=1`
 - Root privileges
 
 ## Building
@@ -96,7 +97,7 @@ This creates:
 - A `br0` bridge on `10.0.0.1/24`
 - iptables NAT masquerade for outbound traffic
 - FORWARD rules for container-to-WAN communication
-- A DROP rule for inter-container traffic (isolation by default)
+- A DROP rule for inter-container traffic (isolation by default, together with isolated bridge ports)
 - cgroup v2 mount at `/sys/fs/cgroup`
 
 ### 3. Create, start, and use containers
@@ -241,7 +242,7 @@ The sandbox covers everything in a container: init, the `/init.sh` hook and all 
 | /proc and /sys masking | The paths Docker masks by default are covered, files with `/dev/null` and directories with an empty read-only tmpfs. A mask that cannot be made fails the start |
 | /proc read-only | Remounts /proc/sys, /proc/bus, /proc/fs, /proc/irq read-only |
 | Root filesystem | Mounted `nodev`, and `nosuid` unless privileged. Devices come from the `/dev` that lightbox builds |
-| Container isolation | iptables drops br0-to-br0 traffic by default |
+| Container isolation | A container without `--link` has an isolated port on the bridge: it reaches the host and the outside, and no other container. IPv6 is off inside containers. A container with `--link` shares the bridge, is kept to its links by iptables, and does not start unless `br_netfilter` lets iptables see bridged traffic |
 | User namespaces | Planned future improvement |
 | OOM priority | Containers scored higher for OOM killer |
 

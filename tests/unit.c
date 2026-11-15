@@ -15,6 +15,7 @@
  *   unit caps                                 drop_capabilities, then this process's own sets
  *   unit sandbox <program> [args...]          apply_sandbox, then the program in its place
  *   unit maskproc                             mask_proc_paths
+ *   unit noipv6  <pid>                        netns_disable_ipv6
  *
  * For mount, "-" stands for an argument that is not given, and the flags are
  * names joined by commas: ro, nosuid, nodev, noexec, remount, bind, rec,
@@ -141,7 +142,11 @@ int main(int argc, char **argv) {
         put_result(0);
         return 0;
     }
+    if (argc == 3 && streq(argv[1], "noipv6")) {
+        put_result(netns_disable_ipv6(parse_int(argv[2])));
+        return 0;
+    }
     die("usage: unit run|quiet <program> [args...] | unit capture <size> <program> [args...] | unit status <n>\n"
         "       unit mount <source> <target> <fstype> <flags> <data> | unit mkdirs <path> | unit loopback\n"
-        "       unit caps | unit sandbox <program> [args...] | unit maskproc");
+        "       unit caps | unit sandbox <program> [args...] | unit maskproc | unit noipv6 <pid>");
 }

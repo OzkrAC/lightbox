@@ -897,22 +897,38 @@ t_isolated_when_filtered() {
 }
 
 # A host without br_netfilter: bridged traffic does not pass through iptables.
+# Containers without links are kept apart at the bridge itself.
 t_isolated_when_not_filtered() {
     need_nc || return 77
     if [ -e "$BRNF" ]; then brnf 0 || return 1; fi
     up iso3 && up iso4 || return 1
     reaches iso3 "$(addr_of iso4)" && { echo "iso3 reached iso4"; return 1; }
-    return 0
+    reaches iso4 "$(addr_of iso3)" && { echo "iso4 reached iso3"; return 1; }
+    reaches iso3 "$GW"      # and the bridge address is still within reach
+}
+
+# A container with links shares the bridge with the others, and only the
+# firewall keeps it to its links. Where the firewall does not see bridged
+# traffic, such a container is not started, and is told why.
+t_link_needs_filtering() {
+    if [ -e "$BRNF" ]; then brnf 0 || return 1; fi
+    box linkpeer && box wantslink --link linkpeer || return 1
+    if said=$(start wantslink); then
+        printf '%s\n' "$said"
+        echo "a container with a link started where nothing filters bridged traffic"
+        return 1
+    fi
+    printf '%s\n' "$said"
+    case $said in *br_netfilter*) ;; *) echo "the refusal does not name br_netfilter"; return 1 ;; esac
+    nothing_left wantslink && [ "$(state_of wantslink)" = stopped ]
 }
 
 t_linked_containers() {
     need_nc || return 77
-    filtered=no
-    if brnf 1; then filtered=yes; fi
+    brnf 1 || { echo "br_netfilter is not loaded, and a container with a link does not start without it"; return 77; }
     box peer && box linked --link peer || return 1
     start peer && start linked || return 1
     reaches linked "$(addr_of peer)" && reaches peer "$(addr_of linked)" || return 1
-    [ $filtered = yes ] || { echo "(br_netfilter is not loaded: nothing is filtered, so only the link itself was checked)"; return 0; }
     up third || return 1
     reaches third "$(addr_of peer)" && { echo "a container without the link reached peer"; return 1; }
     return 0
@@ -928,6 +944,7 @@ t_link_to_later_container() {
 }
 
 t_rm_leaves_no_rule() {
+    brnf 1 || { echo "br_netfilter is not loaded, and a container with a link does not start without it"; return 77; }
     box lpeer && box lmain --link lpeer || return 1
     start lpeer && start lmain || return 1
     ip=$(addr_of lmain)
@@ -1197,13 +1214,14 @@ if [ "$MODE" = inside ]; then
     check 'a container reaches the bridge address'                        t_reaches_gateway
     check 'a container reaches an outside address through address translation' t_reaches_outside
     check 'containers cannot reach each other when bridged traffic is filtered' t_isolated_when_filtered
-    xfail NET-isolation-brnf   'containers cannot reach each other without br_netfilter' t_isolated_when_not_filtered
+    check 'containers cannot reach each other without br_netfilter'      t_isolated_when_not_filtered
+    check 'a container with a link is refused where nothing filters bridged traffic' t_link_needs_filtering
     check 'linked containers reach each other, and a third reaches neither' t_linked_containers
     xfail NET-link-leak        'a link to a container created later applies'           t_link_to_later_container
     xfail NET-link-leak        'rm of a dead container leaves no firewall rule'        t_rm_leaves_no_rule
     xfail NET-veth-clobber     'start leaves alone an interface it did not create'     t_start_spares_foreign_interface
     xfail NET-ifname           'the interface in the container is eth0'                t_interface_is_eth0
-    xfail NET-ipv6             'a container has no IPv6 address'                       t_no_ipv6_in_container
+    check 'a container has no IPv6 address'                               t_no_ipv6_in_container
 
     summary lifecycle
     exit $?
