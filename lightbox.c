@@ -11,6 +11,7 @@
  *   stop   <name>                 — stop a container
  *   rm     <name>                 — remove a container
  *   exec   <name> [cmd...]        — run a command in a container
+ *   logs   <name> [-f]            — show what a container has printed
  *   ls                            — list containers
  */
 
@@ -877,6 +878,7 @@ struct child_args {
     int32_t      go_rd, go_wr;              /* init reads the first */
     int32_t      report_rd, report_wr;      /* init writes the second */
     int32_t      starter_signals;           /* the command's signalfd, or -1 */
+    int32_t      null_fd, log_fd;           /* init's standard streams once it is built; -1: the command's */
     const char  *name;
     const char  *root;
     const char  *hook;                      /* the script init runs when it is ready */
@@ -910,6 +912,32 @@ static bool report_to_starter(int32_t fd, int32_t what, int32_t status) {
 }
 
 /*
+ * Close every descriptor from 3 up but the ones listed; -1 lists none. One
+ * close_range call for each stretch between them.
+ */
+static void close_all_but(const int32_t *keep, size_t count) {
+    uint32_t from = 3;
+    for (;;) {
+        /* the lowest listed descriptor that is not below from */
+        int32_t next = -1;
+        for (size_t i = 0; i < count; i++) {
+            if (keep[i] >= (int32_t)from && (next < 0 || keep[i] < next))
+                next = keep[i];
+        }
+        uint32_t last = next < 0 ? ~0U : (uint32_t)next - 1;
+        if (last >= from && lb_sys_close_range(from, last, 0) < 0) {
+            /* no close_range here: one at a time, as far as descriptors
+             * usually go */
+            for (uint32_t fd = from; fd <= last && fd < 4096; fd++)
+                lc_kernel_close_file((int32_t)fd);
+        }
+        if (next < 0)
+            return;
+        from = (uint32_t)next + 1;
+    }
+}
+
+/*
  * The first thing init does.
  *
  * Its signals are blocked from here on and read from a signalfd later. The
@@ -918,6 +946,14 @@ static bool report_to_starter(int32_t fd, int32_t what, int32_t status) {
  * while its hook runs, has to be acted on. SIGPIPE is blocked so that writing
  * to a command that is gone is an error to act on and nothing else.
  *
+ * It leaves the session and the process group of the command that started
+ * it. The terminal that command runs on is then not init's: Ctrl-C there, or
+ * the terminal closing, signals the command's group and not the container.
+ *
+ * And it closes what it inherited: every descriptor but its ends of the two
+ * pipes, what becomes its standard streams, and for now the command's
+ * standard streams, where it reports a container that cannot be built.
+ *
  * Then init waits for the command's first byte.
  */
 static void init_begin(const struct child_args *ca) {
@@ -925,11 +961,17 @@ static void init_begin(const struct child_args *ca) {
     if (lc_kernel_set_signal_mask(LC_SIG_SETMASK, &blocked, NULL) < 0)
         die("Error: failed to block init's signals");
 
-    /* the command's ends of the pipes, and its own signalfd */
+    if (lc_kernel_create_session() < 0)
+        die("Error: failed to give init a session of its own");
+
+    /* The command's ends of the pipes and its signalfd first, by name: init
+     * would never see the go pipe close while it held the other end itself. */
     lc_kernel_close_file(ca->go_wr);
     lc_kernel_close_file(ca->report_rd);
     if (ca->starter_signals >= 0)
         lc_kernel_close_file(ca->starter_signals);
+    const int32_t keep[] = { ca->go_rd, ca->report_wr, ca->null_fd, ca->log_fd };
+    close_all_but(keep, sizeof(keep) / sizeof(keep[0]));
 
     if (!go_received(ca->go_rd))
         lc_kernel_exit(1);
@@ -1062,6 +1104,20 @@ static int init_main(const struct child_args *ca) {
     lc_sysret sfd = lc_kernel_create_signal_fd(-1, &mask, SFD_CLOEXEC);
     if (sfd < 0)
         die("Error: failed to create signalfd");
+
+    /* Everything that could not be done has been said on the command's
+     * stderr. From here on init, and with it the hook and every service, has
+     * nothing to read and writes to the container's log: the command's
+     * terminal or pipe is the command's again, and a shell that captures its
+     * output gets it when the command ends, not when the container does. */
+    if (ca->log_fd >= 0 && ca->null_fd >= 0) {
+        if (lc_kernel_duplicate_fd(ca->null_fd, STDIN, 0) < 0 ||
+            lc_kernel_duplicate_fd(ca->log_fd, STDOUT, 0) < 0 ||
+            lc_kernel_duplicate_fd(ca->log_fd, STDERR, 0) < 0)
+            die("Error: failed to send the container's output to its log");
+        lc_kernel_close_file(ca->null_fd);
+        lc_kernel_close_file(ca->log_fd);
+    }
 
     /* Without a command to hear this, or without its answer, no record names
      * this container: it must not run anything. */
@@ -1272,6 +1328,38 @@ static int32_t hold_signals(void) {
         return -1;
     lc_sysret fd = lc_kernel_create_signal_fd(-1, &read_here, SFD_CLOEXEC);
     return fd < 0 ? -1 : (int32_t)fd;
+}
+
+/*
+ * Open what becomes a container's standard streams: /dev/null to read from,
+ * and its log to append to. Both are close-on-exec here; init puts copies on
+ * 0, 1 and 2 that are not. The log is never followed through a link. True, or
+ * false with neither open.
+ */
+static bool open_container_streams(const char *log_path, int32_t *null_fd, int32_t *log_fd) {
+    lc_sysret null = lc_kernel_open_file("/dev/null", O_RDONLY | O_CLOEXEC, 0);
+    if (null < 0)
+        return false;
+    lc_sysret log = lc_kernel_open_file(log_path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_CLOEXEC,
+                                        MODE_PRIVATE_FILE);
+    if (log < 0) {
+        lc_kernel_close_file((int32_t)null);
+        return false;
+    }
+    *null_fd = (int32_t)null;
+    *log_fd = (int32_t)log;
+    return true;
+}
+
+static void close_container_streams(int32_t *null_fd, int32_t *log_fd) {
+    if (*null_fd >= 0) {
+        lc_kernel_close_file(*null_fd);
+        *null_fd = -1;
+    }
+    if (*log_fd >= 0) {
+        lc_kernel_close_file(*log_fd);
+        *log_fd = -1;
+    }
 }
 
 /*
@@ -1745,6 +1833,8 @@ static void cmd_start(int argc, char **argv) {
     char err_buf[96];
     int exit_code = 1;
     bool undo_is_ours = true;
+    bool hook_failed = false;
+    int32_t null_fd = -1, log_fd = -1;
     struct init_link init = INIT_LINK_NONE;
     struct start_report report = { 0, 0 };
     int stop_signal = 0;
@@ -1778,9 +1868,19 @@ static void cmd_start(int argc, char **argv) {
     { const char *a[] = { "ip", "link", "set", veth_host, "up", NULL };
       if (run_cmd(tool_path_ip(), a) != 0) { start_err = "failed to bring host veth up"; goto fail_start; } }
 
+    /* what the container reads from and writes to, once it is built */
+    char log_path[MAX_PATH];
+    container_log_path(log_path, name);
+    if (!open_container_streams(log_path, &null_fd, &log_fd)) {
+        start_err = "failed to open the container's log";
+        goto fail_start;
+    }
+
     /* clone init; it waits for its first byte */
     struct child_args ca = {
         .starter_signals = signal_fd,
+        .null_fd = null_fd,
+        .log_fd = log_fd,
         .name = name,
         .root = root,
         .hook = "/init.sh",
@@ -1792,6 +1892,7 @@ static void cmd_start(int argc, char **argv) {
     if (userns) clone_flags |= CLONE_NEWUSER;
 
     start_err = init_spawn(&init, &ca, clone_flags, container_child);
+    close_container_streams(&null_fd, &log_fd);     /* init has its own copies */
     if (start_err)
         goto fail_start;
     int child_pid = (int)init.pid;
@@ -1931,6 +2032,7 @@ static void cmd_start(int argc, char **argv) {
                     start_err = text_with_number(err_buf, sizeof(err_buf),
                                                  "the init hook /init.sh failed with exit status ",
                                                  report.status, "");
+                    hook_failed = true;
                     goto fail_start;
                 }
                 break;
@@ -1985,9 +2087,15 @@ interrupted:
 
 fail_start:
     init_abandon(&init);
+    close_container_streams(&null_fd, &log_fd);
     if (start_err) {
         print_str(STDERR, "Error: ");
         print_str(STDERR, start_err);
+        lc_print_char(STDERR, '\n');
+    }
+    if (hook_failed) {
+        print_str(STDERR, "What the hook printed is in the container's log: lightbox logs ");
+        print_str(STDERR, name);
         lc_print_char(STDERR, '\n');
     }
     if (undo_is_ours)
@@ -2507,6 +2615,7 @@ static void cmd_exec(int argc, char **argv) {
         "  rm     <name>                 Remove a container (must be stopped)\n"
         "  exec   <name> [options] [cmd...]  Execute a command in a running container\n"
         "         --user <name|uid[:gid]> Run as specified user/group (default: root)\n"
+        "  logs   <name> [-f]            Show what the container has printed; -f follows it\n"
         "  inspect <name>                Show container metadata and runtime state\n"
         "  doctor                        Show host/runtime dependency status\n"
         "  ls                            List all containers\n"
@@ -2517,7 +2626,26 @@ static void cmd_exec(int argc, char **argv) {
 
 /* ─── main ──────────────────────────────────────────────────────────────── */
 
+/*
+ * A descriptor that lightbox opens must never be 0, 1 or 2: a message would
+ * be written into whatever file that was, and a container would get it as a
+ * standard stream. A caller can leave any of the three closed, so fill what
+ * is missing with /dev/null before anything else is opened.
+ */
+static void reserve_standard_streams(void) {
+    for (;;) {
+        lc_sysret fd = lc_kernel_open_file("/dev/null", O_RDWR, 0);
+        if (fd < 0)
+            return;
+        if (fd > STDERR) {
+            lc_kernel_close_file((int32_t)fd);
+            return;
+        }
+    }
+}
+
 int main(int argc, char **argv, char **envp) {
+    reserve_standard_streams();
     if (argc < 2) usage();
 
     /* load configuration: built-in defaults → lightbox.conf → env vars */
@@ -2535,6 +2663,7 @@ int main(int argc, char **argv, char **envp) {
     else if (streq(cmd, "add-vol")) cmd_add_vol(sub_argc, sub_argv);
     else if (streq(cmd, "rm"))     cmd_rm(sub_argc, sub_argv);
     else if (streq(cmd, "exec"))   cmd_exec(sub_argc, sub_argv);
+    else if (streq(cmd, "logs"))   cmd_logs(sub_argc, sub_argv);
     else if (streq(cmd, "inspect")) cmd_inspect(sub_argc, sub_argv);
     else if (streq(cmd, "doctor")) cmd_doctor();
     else if (streq(cmd, "ls"))     cmd_ls(sub_argc, sub_argv);

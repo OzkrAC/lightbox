@@ -34,6 +34,7 @@
 #define LB_SYS_renameat   264
 #define LB_SYS_ppoll      271
 #define LB_SYS_statx      332
+#define LB_SYS_close_range 436
 #elif defined(__aarch64__)
 #define LB_SYS_renameat   38
 #define LB_SYS_statfs     43
@@ -44,6 +45,7 @@
 #define LB_SYS_capget     90
 #define LB_SYS_capset     91
 #define LB_SYS_statx      291
+#define LB_SYS_close_range 436
 #else
 #error "lightbox supports x86_64 and aarch64 only"
 #endif
@@ -228,6 +230,11 @@ static inline lc_sysret lb_sys_socket(int32_t domain, int32_t type, int32_t prot
  * descriptors that have something, 0 when the time ran out. */
 static inline lc_sysret lb_sys_ppoll(struct lb_pollfd *fds, uint64_t count, lc_timespec *timeout) {
     return lc_syscall5(LB_SYS_ppoll, (int64_t)fds, (int64_t)count, (int64_t)timeout, 0, 0);
+}
+
+/* close_range(2), Linux 5.9: close every descriptor from first to last */
+static inline lc_sysret lb_sys_close_range(uint32_t first, uint32_t last, uint32_t flags) {
+    return lc_syscall3(LB_SYS_close_range, first, last, flags);
 }
 
 static inline lc_sysret lb_sys_statfs(const char *path, struct lb_statfs *buf) {

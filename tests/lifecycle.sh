@@ -149,9 +149,10 @@ settled() { # name
     fi
 }
 
-# Init keeps the standard streams of the command that started it
-# (RT-not-detached), so start's output goes to a file: a pipe would stay open
-# for as long as the container runs.
+# start's output goes to a file and is printed from there. A pipe would do
+# since init stopped holding on to the command's streams, but if that ever
+# came back, every case would wait at its pipe until its time ran out. The
+# cases that are about capturing start's output use a pipe, under a limit.
 start() { # name
     lb start "$1" >"$OUT/$1.start" 2>&1 </dev/null
     local rc=$?
@@ -368,7 +369,14 @@ t_start_after_init_died() {
 
 t_failed_start_leaves_nothing() {
     box broken --vol "$T/vol/does-not-exist:/data" || return 1
-    refused start broken || { echo "the start succeeded"; return 1; }
+    if said=$(start broken); then
+        printf '%s\n' "$said"
+        echo "the start succeeded"
+        return 1
+    fi
+    printf '%s\n' "$said"
+    # init's reason comes out of the command, though init's output goes to a log
+    printf '%s\n' "$said" | grep -q 'volume source does not exist' || { echo "start does not say why"; return 1; }
     nothing_left broken
 }
 
@@ -669,6 +677,7 @@ t_failing_hook_fails_start() {
     box hookfail || return 1
     hook hookfail <<'EOF'
 sleep 2
+echo the reason the hook gives
 exit 3
 EOF
     if said=$(start hookfail); then
@@ -678,6 +687,8 @@ EOF
     fi
     printf '%s\n' "$said"
     printf '%s\n' "$said" | grep -q 'failed with exit status 3' || { echo "start does not say how the hook ended"; return 1; }
+    printf '%s\n' "$said" | grep -q 'lightbox logs hookfail' || { echo "start does not say where the hook's output is"; return 1; }
+    lb logs hookfail | grep -qx 'the reason the hook gives' || { echo "the hook's output is not in the log"; return 1; }
     nothing_left hookfail
 }
 
@@ -746,7 +757,18 @@ t_start_returns_to_a_capture() {
         echo 'said=$(lightbox start capture) was still waiting after 8 seconds: init holds the pipe open'
         return 1
     fi
-    [ $rc -eq 0 ]
+    [ $rc -eq 0 ] && settled capture
+}
+
+t_start_returns_to_a_pipe() {
+    box piped || return 1
+    timeout -k 2 8 bash -c 'set -o pipefail; "$1" start piped 2>&1 | cat' _ "$LB" </dev/null
+    rc=$?
+    if [ $rc -eq 124 ] || [ $rc -eq 137 ]; then
+        echo 'lightbox start piped | cat was still waiting after 8 seconds: init holds the pipe open'
+        return 1
+    fi
+    [ $rc -eq 0 ] && settled piped
 }
 
 # The starter leads a session of its own here, so that its number is one this
@@ -757,23 +779,92 @@ t_init_has_its_own_session() {
         _ "$LB" "$OUT/session.start" "$T/starter.session" || { cat "$OUT/session.start"; return 1; }
     settled session || return 1
     starter=$(cat "$T/starter.session")
-    its=$(awk '{ print $6 }' "/proc/$(pid_of session)/stat")
-    echo "session of the command that started it: $starter; of the container's init: $its"
-    [ "$its" != "$starter" ] && [ "$its" != 0 ]
+    pid=$(pid_of session)
+    read -r _ _ _ _ group its _ < "/proc/$pid/stat"
+    echo "session of the command that started it: $starter; of the container's init $pid: session $its, process group $group"
+    [ "$its" != "$starter" ] && [ "$its" = "$pid" ] && [ "$group" = "$pid" ]
 }
 
 # What Ctrl-C does: SIGINT to the process group of the command that was typed.
+# The starter leads its group here, so the group's number is the starter's.
 t_sigint_spares_the_container() {
     box sigint || return 1
-    setsid --wait bash -c 'exec "$1" start sigint >"$2" 2>&1 </dev/null' _ "$LB" "$OUT/sigint.start" ||
-        { cat "$OUT/sigint.start"; return 1; }
+    setsid --wait bash -c 'echo $$ > "$3"; exec "$1" start sigint >"$2" 2>&1 </dev/null' \
+        _ "$LB" "$OUT/sigint.start" "$T/starter.group" || { cat "$OUT/sigint.start"; return 1; }
     settled sigint || return 1
     pid=$(pid_of sigint)
-    group=$(awk '{ print $5 }' "/proc/$pid/stat")
-    echo "init $pid is in process group $group; the starter's was its own session"
-    kill -INT -- "-$group" 2>/dev/null      # the group is empty once init has left it
+    starter=$(cat "$T/starter.group")
+    its=$(awk '{ print $5 }' "/proc/$pid/stat")
+    echo "process group of the command that started it: $starter; of the container's init $pid: $its"
+    kill -INT -- "-$starter" 2>/dev/null      # nobody is left in it once init is out of it
     sleep 1
     alive "$pid" || { echo "SIGINT to the starter's process group ended the container"; return 1; }
+    [ "$its" != "$starter" ]
+}
+
+# What the container prints goes to its log and not to the command that
+# started it; logs shows it, and logs -f goes on until the container ends.
+t_logs() {
+    box logged || return 1
+    hook logged <<'EOF'
+echo printed by the hook
+echo complained by the hook >&2
+(sleep 2; echo printed by the service) &
+EOF
+    said=$(start logged) || { printf '%s\n' "$said"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *'by the hook'*) echo "the hook's output reached the command that started the container"; return 1 ;; esac
+    first=$(lb logs logged) || return 1
+    echo "the log when start returned:"; printf '%s\n' "$first" | sed 's/^/  /'
+    [ "$first" = "printed by the hook
+complained by the hook" ] || return 1
+    [ "$(stat -c %a "$C/logged/console.log")" = 600 ] || { echo "the log has mode $(stat -c %a "$C/logged/console.log")"; return 1; }
+
+    "$LB" logs logged -f > "$OUT/logged.followed" 2>&1 </dev/null &
+    follower=$!
+    wait_until 5 grep -qx 'printed by the service' "$OUT/logged.followed" || { echo "logs -f did not show what the service printed later"; kill "$follower"; return 1; }
+    alive "$follower" || { echo "logs -f ended while the container was running"; return 1; }
+    lb stop logged >/dev/null || return 1
+    wait_until 5 gone "$follower" || { echo "logs -f did not end with the container"; kill "$follower"; return 1; }
+    [ "$(cat "$OUT/logged.followed")" = "printed by the hook
+complained by the hook
+printed by the service" ] || { echo "logs -f showed:"; cat "$OUT/logged.followed"; return 1; }
+
+    # the log is kept from one start to the next
+    start logged >/dev/null || return 1
+    [ "$(lb logs logged | grep -c 'printed by the hook')" = 2 ]
+}
+
+# Nothing that was open in the command stays open in the container: init has
+# /dev/null, the log twice, and its signalfd. The command here has a file on
+# descriptor 9, and no standard streams of its own the second time.
+t_init_keeps_nothing_of_the_command() {
+    box clean || return 1
+    look() { # name
+        local pid fd n to log bad=0
+        pid=$(pid_of "$1") || return 1
+        log=$C/$1/console.log
+        for fd in "/proc/$pid/fd"/*; do
+            n=${fd##*/}
+            to=$(readlink "$fd")
+            echo "  init $pid, descriptor $n: $to"
+            # the same file, however its path is spelled
+            if [ "$n" = 0 ] && [ "$fd" -ef /dev/null ]; then continue; fi
+            if { [ "$n" = 1 ] || [ "$n" = 2 ]; } && [ "$fd" -ef "$log" ]; then continue; fi
+            if [ "$n" -gt 2 ] && [ "$to" = 'anon_inode:[signalfd]' ]; then continue; fi
+            echo "  init should not have that"
+            bad=1
+        done
+        [ -e "/proc/$pid/fd/0" ] && [ -e "/proc/$pid/fd/1" ] && [ -e "/proc/$pid/fd/2" ] || { echo "  init lacks a standard stream"; bad=1; }
+        return $bad
+    }
+    : > "$T/open-in-the-command"
+    lb start clean >"$OUT/clean.start" 2>&1 </dev/null 9< "$T/open-in-the-command" || { cat "$OUT/clean.start"; return 1; }
+    settled clean && look clean || return 1
+    lb stop clean >/dev/null || return 1
+
+    "$LB" start clean <&- >&- 2>&- || { echo "a start with its standard streams closed failed with status $?"; return 1; }
+    settled clean && look clean
 }
 
 t_stop_is_graceful() {
@@ -1306,9 +1397,12 @@ if [ "$MODE" = inside ]; then
     check 'a start that is killed leaves no init behind'                  t_killed_start_leaves_no_container
     check 'a start killed while the hook runs leaves a container stop finds' t_killed_start_leaves_a_container
     check 'a leftover .pid_start does not fail the next start'            t_stale_pid_start
-    xfail RT-not-detached      'said=$(lightbox start x) returns'                      t_start_returns_to_a_capture
-    xfail RT-not-detached      'init is in a session of its own'                       t_init_has_its_own_session
-    xfail RT-not-detached      'SIGINT to the starter'"'"'s process group spares the container' t_sigint_spares_the_container
+    check 'said=$(lightbox start x) returns'                              t_start_returns_to_a_capture
+    check 'lightbox start x | cat returns'                                t_start_returns_to_a_pipe
+    check 'init leads a session and a process group of its own'           t_init_has_its_own_session
+    check 'SIGINT to the starter'"'"'s process group spares the container'    t_sigint_spares_the_container
+    check 'the container'"'"'s output is in its log, which logs shows and follows' t_logs
+    check 'init keeps nothing that was open in the command'               t_init_keeps_nothing_of_the_command
     xfail RT-stop-kill         'stop lets a service handle SIGTERM'                    t_stop_is_graceful
 
     check 'init has the seccomp filter, no_new_privs and the bounding set' t_sandbox_on_init

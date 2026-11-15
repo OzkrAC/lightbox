@@ -52,6 +52,7 @@ SAME_NR(statfs);
 SAME_NR(chroot);
 SAME_NR(renameat);
 SAME_NR(ppoll);
+SAME_NR(close_range);
 SAME_NR(statx);
 
 #define SAME_VALUE(ours, kernels) \

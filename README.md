@@ -115,6 +115,9 @@ This creates:
 # Run a single command
 ./lightbox exec mybox cat /etc/os-release
 
+# See what the container's services have printed; -f keeps following
+./lightbox logs mybox
+
 # List all containers
 ./lightbox ls
 
@@ -162,6 +165,7 @@ If the image has an `/init.sh`, the container's init runs it with `/bin/sh` once
 /usr/sbin/nginx &
 ```
 
+- The hook and everything it starts read from `/dev/null` and write to the container's log, not to the terminal `start` was typed on. `lightbox logs <name>` shows the log, and `logs -f` follows it until the container stops.
 - A hook that exits with a status other than 0 fails the start: `start` says which status it was, and the container is stopped and cleaned up. A hook that fails after `start` has returned stops the container as well.
 - `start` waits 30 seconds for the hook. If the hook is still running then, for instance because it runs its service in the foreground, `start` says so and returns; the container stays up. `start <name> -t <seconds>` or `start_timeout` in `lightbox.conf` sets the wait, and 0 does not wait at all.
 - Ctrl-C, or a `kill`, while `start` is working undoes the start: nothing of the container is left running, and the exit status is 128 plus the signal's number.
@@ -225,6 +229,7 @@ lightbox <command> [args]
   add-vol <name> <src>:<dst>[:ro]  Add a volume to an existing container
   rm     <name>                 Remove a container
   exec   <name> [cmd...]        Run a command in a container
+  logs   <name> [-f]            Show what a container has printed; -f follows it
   ls                            List all containers
 ```
 
@@ -265,11 +270,12 @@ The sandbox covers everything in a container: init, the `/init.sh` hook and all 
 ## How it works
 
 - **Namespaces**: `clone()` with PID, mount, UTS, IPC, net (and optionally user) namespace flags
-- **Filesystem**: each container lives under `<container_dir>/<name>/` with `rootfs/` for the filesystem and `.conf`, `.ip`, `.pid` for metadata. `pivot_root` into the rootfs copy
+- **Filesystem**: each container lives under `<container_dir>/<name>/` with `rootfs/` for the filesystem, `.conf`, `.ip`, `.pid` for metadata and `console.log` for its output. `pivot_root` into the rootfs copy
 - **Devices**: bind-mounted from host (`/dev/null`, `/dev/zero`, `/dev/random`, etc.)
 - **Networking**: veth pair per container connected to a host bridge with NAT
 - **Resource limits**: cgroups v2 (memory, PIDs, CPU, I/O)
 - **Init**: lightbox remains PID 1 inside the container. It reaps children and handles shutdown from the moment the container is built, and runs `/init.sh`, if the rootfs has one, as one of its children: after `/tmp` and `/run` are mounted, with the sandbox on, and only once the container is on record, so `stop` and `ls` always find a container whose hook runs
+- **Output**: init leads a session of its own and keeps nothing that was open in the command that started it. Its standard output and error, and those of the hook and every service, are appended to `<container_dir>/<name>/console.log`, which only root can read. The log is kept from one start to the next and is not rotated or limited yet, so a container that prints without end fills the disk it is on
 - **Starting**: `start` and init talk over two pipes. Init builds the container when `start` has set up its cgroup and network, and reports back when it is built and again when the hook has ended. If either side goes away the other notices: an init whose `start` was killed exits before it runs anything
 - **External tools**: on the host, `ip` and `nsenter` set up a container's network, `iptables` the firewall, and `cp` and `rm` create and remove a container. Everything else is direct syscalls, and nothing from the image is run before `/init.sh`
 - **Configuration**: optional `~/.config/lightbox/lightbox.conf` for all paths and defaults

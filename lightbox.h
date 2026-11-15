@@ -149,6 +149,8 @@ void container_pid_start_path(char *buf, const char *name);
 void container_ip_path(char *buf, const char *name);
 void container_conf_path(char *buf, const char *name);
 void container_state_path(char *buf, const char *name);
+/* what the container's init, its hook and its services write to stdout and stderr */
+void container_log_path(char *buf, const char *name);
 
 /* 0, or -1 when the state could not be written */
 [[nodiscard]] int record_container_state(const char *name, const char *state);
@@ -185,5 +187,6 @@ void cmd_setup(void);
 void cmd_doctor(void);
 void cmd_ls(int argc, char **argv);
 void cmd_inspect(int argc, char **argv);
+void cmd_logs(int argc, char **argv);
 
 #endif

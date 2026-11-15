@@ -34,6 +34,12 @@ void container_conf_path(char *buf, const char *name) {
     path_join(buf, MAX_PATH, base, ".conf");
 }
 
+void container_log_path(char *buf, const char *name) {
+    char base[MAX_PATH];
+    container_dir_path(base, name);
+    path_join(buf, MAX_PATH, base, "console.log");
+}
+
 void container_state_path(char *buf, const char *name) {
     char base[MAX_PATH];
     container_dir_path(base, name);

@@ -17,7 +17,9 @@
  *   unit maskproc                             mask_proc_paths
  *   unit noipv6  <pid>                        netns_disable_ipv6
  *   unit seconds <text>                       parse_seconds
- *   unit init    <how> confined|open <seconds> <hook script | ->
+ *   unit streams <file>                       reserve_standard_streams, then the number
+ *                                             the next descriptor gets, written to <file>
+ *   unit init    <how> confined|open <seconds> <hook script | -> <log file | ->
  *                                             the two sides of a start, see below
  *
  * For mount, "-" stands for an argument that is not given, and the flags are
@@ -42,6 +44,11 @@
  *   no-first-byte   closes its pipes without sending the first byte
  *   deaf            closes its end of the report pipe before the first byte
  *   no-second-byte  closes its pipes once init has reported that it is ready
+ *   leave           as whole, and then ends like a start that worked: it
+ *                   prints "left" and leaves init running
+ *
+ * With a log file, init gets /dev/null and that file as its standard streams
+ * once it is ready, as in a container; with "-" it keeps the harness's.
  *
  * It prints what it sees, a line each: "init <pid>", "ready", "hook <exit
  * status>", "hook-timeout", "closed", "signal <n>" and "abandoned" when one of
@@ -149,20 +156,27 @@ static void unit_close(int32_t *fd) {
     *fd = -1;
 }
 
-static void unit_init(const char *how, bool confined, int seconds, const char *script) {
+static void unit_init(const char *how, bool confined, int seconds, const char *script, const char *log) {
     int32_t signal_fd = hold_signals();
     if (signal_fd < 0)
         die("unit: cannot hold signals back");
 
+    int32_t null_fd = -1, log_fd = -1;
+    if (log && !open_container_streams(log, &null_fd, &log_fd))
+        die2("unit: cannot open ", log);
+
     struct init_link link = INIT_LINK_NONE;
     struct child_args ca = {
         .starter_signals = signal_fd,
+        .null_fd = null_fd,
+        .log_fd = log_fd,
         .name = "unit",
         .root = "/",
         .hook = script,
         .privileged = !confined,
     };
     const char *failed = init_spawn(&link, &ca, CLONE_NEWPID, unit_init_child);
+    close_container_streams(&null_fd, &log_fd);
     if (failed) {
         init_abandon(&link);
         die2("unit: ", failed);
@@ -253,6 +267,12 @@ static void unit_init(const char *how, bool confined, int seconds, const char *s
         }
     }
 
+    if (streq(how, "leave") && !ends_by_itself) {
+        init_link_close(&link);
+        put("left\n");
+        return;
+    }
+
     if (!ends_by_itself) {
         lc_kernel_send_signal(link.pid, SIGTERM);
         put("sent SIGTERM\n");
@@ -326,16 +346,28 @@ int main(int argc, char **argv) {
         put_result(ok ? seconds : -1);
         return 0;
     }
-    if (argc == 6 && streq(argv[1], "init")) {
+    if (argc == 3 && streq(argv[1], "streams")) {
+        /* whatever of 0, 1 and 2 the caller left closed: the file must not land there */
+        reserve_standard_streams();
+        lc_sysret fd = lc_kernel_open_file(argv[2], O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (fd < 0)
+            return 1;
+        char digits[16];
+        int len = fmt_int(digits, (int)fd);
+        lc_kernel_write_bytes((int32_t)fd, digits, (size_t)len);
+        lc_kernel_close_file((int32_t)fd);
+        return 0;
+    }
+    if (argc == 7 && streq(argv[1], "init")) {
         int seconds = 0;
         bool confined = streq(argv[3], "confined");
         if ((!confined && !streq(argv[3], "open")) || !parse_seconds(argv[4], &seconds))
-            die("unit: init <how> confined|open <seconds> <hook script | ->");
-        unit_init(argv[2], confined, seconds, given(argv[5]));
+            die("unit: init <how> confined|open <seconds> <hook script | -> <log file | ->");
+        unit_init(argv[2], confined, seconds, given(argv[5]), given(argv[6]));
         return 0;
     }
     die("usage: unit run|quiet <program> [args...] | unit capture <size> <program> [args...] | unit status <n>\n"
         "       unit mount <source> <target> <fstype> <flags> <data> | unit mkdirs <path> | unit loopback\n"
         "       unit caps | unit sandbox <program> [args...] | unit maskproc | unit noipv6 <pid>\n"
-        "       unit seconds <text> | unit init <how> confined|open <seconds> <hook script | ->");
+        "       unit seconds <text> | unit streams <file> | unit init <how> confined|open <seconds> <hook script | -> <log file | ->");
 }
