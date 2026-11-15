@@ -8,7 +8,7 @@
  *   setup                         — initialize host networking
  *   create <name> <ip> [options]  — create a container
  *   start  <name> [-t <seconds>]  — start a container
- *   stop   <name>                 — stop a container
+ *   stop   <name> [-t <seconds>]  — stop a container
  *   rm     <name>                 — remove a container
  *   exec   <name> [cmd...]        — run a command in a container
  *   logs   <name> [-f]            — show what a container has printed
@@ -383,6 +383,35 @@ static int allocate_uid_start(const char *exclude_name) {
     return -1;
 }
 
+/* ─── Time ──────────────────────────────────────────────────────────────── */
+
+static int64_t monotonic_ms(void) {
+    lc_timespec now = { 0, 0 };
+    lc_kernel_get_clock(LC_CLOCK_MONOTONIC, &now);
+    return now.seconds * 1000 + now.nanoseconds / 1000000;
+}
+
+static void sleep_ms(int64_t ms) {
+    lc_timespec nap = { .seconds = ms / 1000, .nanoseconds = (ms % 1000) * 1000000 };
+    lc_kernel_sleep(&nap);
+}
+
+/* Wait until a descriptor has something to read, for at most ms milliseconds. */
+static bool readable_within(int32_t fd, int64_t ms) {
+    int64_t deadline = monotonic_ms() + ms;
+    for (;;) {
+        int64_t left = deadline - monotonic_ms();
+        if (left < 0)
+            left = 0;
+        lc_timespec limit = { .seconds = left / 1000, .nanoseconds = (left % 1000) * 1000000 };
+        struct lb_pollfd one = { .fd = fd, .events = LB_POLLIN, .revents = 0 };
+        lc_sysret n = lb_sys_ppoll(&one, 1, &limit);
+        if (n == -LB_EINTR)
+            continue;
+        return n > 0;
+    }
+}
+
 /* ─── Cgroup management ─────────────────────────────────────────────────── */
 
 static void cgroup_path(char *buf, const char *name) {
@@ -440,26 +469,115 @@ static int cgroup_create(const char *name, int pid) {
     return 0;
 }
 
-static void cgroup_destroy(const char *name) {
-    char cg[MAX_PATH], tmp[MAX_PATH], buf[4096];
+/*
+ * Call fn for every PID a cgroup.procs lists. The list is read to its end,
+ * however long it is, and a number is put together across reads: taken from
+ * a buffer that ends in the middle of one, it would be another process's.
+ * How many there were, or -1 when the list could not be read.
+ */
+static int each_listed_pid(const char *procs_path, void (*fn)(int pid)) {
+    lc_sysret fd = lc_kernel_open_file(procs_path, O_RDONLY | O_CLOEXEC, 0);
+    if (fd < 0)
+        return -1;
+
+    char buf[4096];
+    int count = 0;
+    int64_t pid = 0;
+    bool in_number = false;
+    for (;;) {
+        lc_sysret n = lc_kernel_read_retry((int32_t)fd, buf, sizeof(buf));
+        if (n < 0) {
+            lc_kernel_close_file((int32_t)fd);
+            return -1;
+        }
+        /* at the end of the list a number without a newline ends too */
+        for (lc_sysret i = 0; i < (n == 0 ? 1 : n); i++) {
+            char c = n == 0 ? '\n' : buf[i];
+            if (c >= '0' && c <= '9') {
+                if (pid <= INT32_MAX)
+                    pid = pid * 10 + (c - '0');
+                in_number = true;
+            } else {
+                if (in_number && pid > 0 && pid <= INT32_MAX) {
+                    fn((int)pid);
+                    count++;
+                }
+                pid = 0;
+                in_number = false;
+            }
+        }
+        if (n == 0)
+            break;
+    }
+    lc_kernel_close_file((int32_t)fd);
+    return count;
+}
+
+static void kill_pid(int pid) {
+    lc_kernel_send_signal(pid, SIGKILL);
+}
+
+/* Does the cgroup's own account say that no process is left in it? */
+static bool cgroup_is_empty(const char *cg) {
+    char path[MAX_PATH], events[256];
+    path_join(path, MAX_PATH, cg, "cgroup.events");
+    if (read_file(path, events, sizeof(events)) <= 0)
+        return false;
+    for (const char *line = events; *line; ) {
+        if (lc_string_starts_with(line, lc_string_length(line), "populated 0", 11))
+            return true;
+        while (*line && *line != '\n') line++;
+        if (*line == '\n') line++;
+    }
+    return false;
+}
+
+/* How long a cgroup gets to become empty once everything in it is killed. */
+#define CGROUP_EMPTY_MS 5000
+
+/*
+ * Remove a container's cgroup: kill what is left in it, wait until the
+ * kernel says it is empty, and only then remove the directory. 0, or -1 with
+ * the reason reported when the directory is still there.
+ *
+ * cgroup.kill (Linux 5.14) ends everything in the cgroup at once, including
+ * what is forked while it does. Without it, what the list shows is killed,
+ * again and again until the list is empty.
+ */
+static int cgroup_destroy(const char *name) {
+    char cg[MAX_PATH], tmp[MAX_PATH];
     cgroup_path(cg, name);
 
-    if (!path_exists(cg)) return;
+    if (!path_exists(cg)) return 0;
 
-    /* kill remaining processes */
+    path_join(tmp, MAX_PATH, cg, "cgroup.kill");
+    bool at_once = write_file(tmp, "1") == 0;
     path_join(tmp, MAX_PATH, cg, "cgroup.procs");
-    if (read_file(tmp, buf, sizeof(buf)) > 0) {
-        char *p = buf;
-        while (*p) {
-            int pid = parse_int(p);
-            if (pid > 0) lc_kernel_send_signal(pid, 9);
-            while (*p && *p != '\n') p++;
-            if (*p == '\n') p++;
-        }
+
+    int64_t deadline = monotonic_ms() + CGROUP_EMPTY_MS;
+    while (!cgroup_is_empty(cg) && monotonic_ms() < deadline) {
+        if (!at_once)
+            (void)each_listed_pid(tmp, kill_pid);
+        sleep_ms(10);
     }
 
-    /* rmdir the cgroup */
-    lc_kernel_unlinkat(AT_FDCWD, cg, AT_REMOVEDIR);
+    lc_sysret rc = lc_kernel_unlinkat(AT_FDCWD, cg, AT_REMOVEDIR);
+    while (rc == -LB_EBUSY && monotonic_ms() < deadline) {
+        /* the last process is gone and the kernel has not finished with it */
+        sleep_ms(10);
+        rc = lc_kernel_unlinkat(AT_FDCWD, cg, AT_REMOVEDIR);
+    }
+    if (rc < 0 && rc != -LB_ENOENT) {
+        char digits[16];
+        fmt_int(digits, (int)-rc);
+        print_str(STDERR, "Error: cannot remove the cgroup ");
+        print_str(STDERR, cg);
+        print_str(STDERR, " (errno ");
+        print_str(STDERR, digits);
+        print_str(STDERR, ")\n");
+        return -1;
+    }
+    return 0;
 }
 
 static void cgroup_join_self(const char *name) {
@@ -882,6 +1000,7 @@ struct child_args {
     const char  *name;
     const char  *root;
     const char  *hook;                      /* the script init runs when it is ready */
+    int          stop_grace;                /* seconds the container gets to end, unless a stop says otherwise */
     int          userns;
     int          privileged;
     int          read_only;
@@ -1037,6 +1156,51 @@ static void cleanup_old_root_or_die(void) {
 }
 
 /*
+ * End everything in the container, and return when it has ended or when the
+ * grace period is over.
+ *
+ * kill(-1) reaches every process of the PID namespace but init: the services,
+ * what they started, and commands that exec put there. SIGCONT goes with it,
+ * so that a stopped process gets to see the SIGTERM. Then init reaps, and
+ * asks with the null signal whether anyone is left: its own children end
+ * with a SIGCHLD, but a command put there by exec is someone else's child,
+ * so init also looks every tenth of a second.
+ *
+ * Whatever is left when init returns from here dies with it: the kernel kills
+ * a PID namespace whose init exits.
+ */
+static void shut_down(int32_t sfd, int grace_seconds) {
+    /* Only ever as the init of a PID namespace, where "every process" is the
+     * container. Anywhere else it would be every process of the host that
+     * this one may signal. */
+    if (lc_kernel_get_process_id() != 1)
+        return;
+
+    lc_kernel_send_signal(-1, SIGTERM);
+    lc_kernel_send_signal(-1, LB_SIGCONT);
+
+    int64_t deadline = monotonic_ms() + (int64_t)grace_seconds * 1000;
+    for (;;) {
+        int32_t unused = 0;
+        (void)reap_children(0, &unused);
+        if (lc_kernel_send_signal(-1, 0) == -LB_ESRCH)
+            return;
+
+        int64_t left = deadline - monotonic_ms();
+        if (left <= 0) {
+            say_with_number("lightbox: not everything in the container ended within ", grace_seconds,
+                            " s of SIGTERM; killing what is left\n");
+            return;
+        }
+        if (readable_within(sfd, left < 100 ? left : 100)) {
+            /* a child ended, or someone asks again: either way, look again */
+            lc_signal_info si;
+            (void)lc_kernel_read_retry(sfd, &si, sizeof(si));
+        }
+    }
+}
+
+/*
  * Init's life: read its signals, reap what dies, and leave when asked to.
  *
  * The hook is one child among the others. Init is here before the hook
@@ -1045,9 +1209,12 @@ static void cleanup_old_root_or_die(void) {
  * hook ends init tells the command how. A hook that fails ends the container,
  * whenever it does.
  *
+ * Asked to leave, it first gives the container time to end by itself:
+ * stop_grace seconds, or as many as a stop sends along with its SIGTERM.
+ *
  * hook_pid is 0 when there is no hook; report_fd is then not used.
  */
-static int supervisor_loop(int32_t sfd, int32_t report_fd, int32_t hook_pid) {
+static int supervisor_loop(int32_t sfd, int32_t report_fd, int32_t hook_pid, int stop_grace) {
     for (;;) {
         lc_signal_info si;
         lc_sysret n = lc_kernel_read_retry(sfd, &si, sizeof(si));
@@ -1077,8 +1244,11 @@ static int supervisor_loop(int32_t sfd, int32_t report_fd, int32_t hook_pid) {
             case SIGINT:
             case SIGQUIT:
             case SIGTERM: {
-                int32_t unused = 0;
-                (void)reap_children(0, &unused);
+                int grace = stop_grace;
+                if (si.signal == SIGTERM && si.code == LB_SI_QUEUE &&
+                    si.int_val >= 0 && si.int_val <= SECONDS_MAX)
+                    grace = si.int_val;
+                shut_down(sfd, grace);
                 return 0;
             }
             default:
@@ -1137,7 +1307,7 @@ static int init_main(const struct child_args *ca) {
         lc_kernel_close_file(ca->report_wr);
     }
 
-    return supervisor_loop((int32_t)sfd, ca->report_wr, hook_pid);
+    return supervisor_loop((int32_t)sfd, ca->report_wr, hook_pid, ca->stop_grace);
 }
 
 static void build_proc_pid_path(char *buf, size_t bufsz, int pid, const char *suffix) {
@@ -1444,12 +1614,6 @@ static void init_abandon(struct init_link *link) {
     init_link_close(link);
 }
 
-static int64_t monotonic_ms(void) {
-    lc_timespec now = { 0, 0 };
-    lc_kernel_get_clock(LC_CLOCK_MONOTONIC, &now);
-    return now.seconds * 1000 + now.nanoseconds / 1000000;
-}
-
 enum await_result {
     AWAIT_REPORT,       /* *report is filled in */
     AWAIT_CLOSED,       /* init closed its end: it is gone, or going */
@@ -1501,31 +1665,35 @@ static enum await_result await_report(int32_t report_fd, int32_t signal_fd, int 
     }
 }
 
-/* What a start that failed leaves behind, removed. Init is gone by now. */
-static void cleanup_start_failure(const char *name, const char *ip, const char *veth_host) {
-    if (veth_host && veth_host[0]) {
-        const char *show[] = { "ip", "link", "show", veth_host, NULL };
-        if (run_cmd_quiet(tool_path_ip(), show) == 0) {
-            const char *del[] = { "ip", "link", "delete", veth_host, NULL };
-            (void)run_cmd(tool_path_ip(), del);   /* clean-up: best effort */
-        }
-    }
-
-    cgroup_destroy(name);
-    if (ip && ip[0])
-        (void)update_link_rules(name, ip, false);
-
-    container_forget_pid(name);
-    (void)record_container_state(name, "failed\n");
-}
-
+/*
+ * Remove an interface if it is there. The kernel removes a container's
+ * interfaces by itself a moment after its init has ended, so one that was
+ * there at the first look can be gone at the delete: that is not a failure.
+ * 0 when the interface is gone afterwards, however it went; -1 when it is
+ * still there.
+ */
 static int delete_veth_if_present(const char *ifname) {
     const char *show[] = { "ip", "link", "show", ifname, NULL };
     if (run_cmd_quiet(tool_path_ip(), show) != 0)
         return 0;
 
     const char *del[] = { "ip", "link", "delete", ifname, NULL };
-    return run_cmd(tool_path_ip(), del);
+    if (run_cmd_quiet(tool_path_ip(), del) == 0)
+        return 0;
+    return run_cmd_quiet(tool_path_ip(), show) != 0 ? 0 : -1;
+}
+
+/* What a start that failed leaves behind, removed. Init is gone by now. */
+static void cleanup_start_failure(const char *name, const char *ip, const char *veth_host) {
+    if (veth_host && veth_host[0])
+        (void)delete_veth_if_present(veth_host);    /* clean-up: best effort */
+
+    (void)cgroup_destroy(name);     /* it has said so if it could not */
+    if (ip && ip[0])
+        (void)update_link_rules(name, ip, false);
+
+    container_forget_pid(name);
+    (void)record_container_state(name, "failed\n");
 }
 
 static void enter_user_namespace_root(void) {
@@ -1884,6 +2052,7 @@ static void cmd_start(int argc, char **argv) {
         .name = name,
         .root = root,
         .hook = "/init.sh",
+        .stop_grace = cfg_global.stop_timeout,
         .userns = userns,
         .privileged = privileged,
         .read_only = read_only,
@@ -2105,42 +2274,84 @@ fail_start:
 
 /* ─── cmd_stop ──────────────────────────────────────────────────────────── */
 
+/* What init gets beyond its own limit before stop ends it by force. */
+#define STOP_MARGIN_MS 2000
+
+/*
+ * Ask a container's init to stop: SIGTERM through its pidfd, with the seconds
+ * it may take sent along as the signal's value. False when init is gone.
+ */
+static bool ask_init_to_stop(int32_t pidfd, int seconds) {
+    struct lb_siginfo_queue info = {
+        .signo = SIGTERM,
+        .code = LB_SI_QUEUE,
+        .pid = lc_kernel_get_process_id(),
+        .uid = (uint32_t)lc_kernel_getuid(),
+        .value = seconds,
+    };
+    lc_sysret rc = lb_sys_pidfd_send_signal(pidfd, SIGTERM, &info, 0);
+    if (rc < 0 && rc != -LB_ESRCH)
+        rc = lb_sys_pidfd_send_signal(pidfd, SIGTERM, NULL, 0);   /* without the value, then */
+    return rc >= 0;
+}
+
 static void cmd_stop(int argc, char **argv) {
-    if (argc < 1) die("Usage: lightbox stop <name>");
+    if (argc < 1) die("Usage: lightbox stop <name> [-t <seconds>]");
     const char *name = argv[0];
     validate_name(name);
+
+    /* how long the container gets to end by itself */
+    int seconds = cfg_global.stop_timeout;
+    for (int i = 1; i < argc; i++) {
+        if (!streq(argv[i], "-t") && !streq(argv[i], "--timeout"))
+            die2(argv[i][0] == '-' ? "Error: unknown option: " : "Error: unexpected argument: ", argv[i]);
+        if (i + 1 >= argc)
+            die2("Error: option needs a number of seconds: ", argv[i]);
+        if (!parse_seconds(argv[++i], &seconds))
+            die2("Error: not a number of seconds from 0 to " STRINGIFY(SECONDS_MAX) ": ", argv[i]);
+    }
 
     if (!is_running(name)) {
         container_reap_if_dead(name);
         die2("Error: container is not running: ", name);
     }
 
+    /* A descriptor for init, taken before looking once more whether the
+     * record is init's: from here on it is that process and no other,
+     * whatever becomes of the number. It reads as ready when init has ended. */
     int pid = get_container_pid(name);
+    lc_sysret pidfd = lb_sys_pidfd_open(pid, 0);
+    if (pidfd < 0 || !is_running(name)) {
+        if (pidfd >= 0)
+            lc_kernel_close_file((int32_t)pidfd);
+        container_reap_if_dead(name);
+        die2("Error: container is not running: ", name);
+    }
 
     print_str(STDOUT,"Stopping container '");
     print_str(STDOUT,name);
     print_str(STDOUT,"'...\n");
     set_container_state(name, "stopping\n");
 
-    /* Ask the in-container supervisor to exit cleanly before forcing SIGKILL. */
-    lc_kernel_send_signal(pid, SIGTERM);
-
-    /* wait for process to exit */
-    for (int i = 0; i < 10; i++) {
-        lc_timespec ts = { .seconds = 0, .nanoseconds = 200000000 };
-        lc_kernel_sleep(&ts);
-        if (lc_kernel_send_signal(pid, 0) < 0) break;
+    /* Init passes the SIGTERM on to everything in the container and exits
+     * when it has all ended, or after the seconds it was given. Only if it
+     * is still there after that, and a margin, is it killed. */
+    bool ended = !ask_init_to_stop((int32_t)pidfd, seconds) ||
+                 readable_within((int32_t)pidfd, (int64_t)seconds * 1000 + STOP_MARGIN_MS);
+    if (!ended) {
+        print_str(STDERR, "Warning: the container's init did not stop when asked; killing it\n");
+        lb_sys_pidfd_send_signal((int32_t)pidfd, SIGKILL, NULL, 0);
+        ended = readable_within((int32_t)pidfd, CGROUP_EMPTY_MS);
     }
+    lc_kernel_close_file((int32_t)pidfd);
 
-    if (lc_kernel_send_signal(pid, 0) == 0)
-        lc_kernel_send_signal(pid, SIGKILL);
+    bool clean = ended;
+    if (!ended)
+        print_str(STDERR, "Error: the container's init is still there\n");
 
-    /* wait for child to reap */
-    int32_t status;
-    lc_kernel_wait_for_child(pid, &status, WNOHANG);
-
-    /* clean up cgroup */
-    cgroup_destroy(name);
+    /* whatever is still in the cgroup, and the cgroup itself */
+    if (cgroup_destroy(name) != 0)
+        clean = false;
 
     /* clean up link iptables rules */
     {
@@ -2151,26 +2362,29 @@ static void cmd_stop(int argc, char **argv) {
         }
     }
 
-    /* clean up veth if it exists */
+    /* the host's end of the container's interface, if the kernel has not
+     * removed it with the container's network namespace already */
     {
         char veth_host[16];
         size_t p = str_copy(veth_host, "vb-", sizeof(veth_host));
         str_append(veth_host, p, name, sizeof(veth_host));
-        const char *show[] = { "ip", "link", "show", veth_host, NULL };
-        if (run_cmd_quiet(tool_path_ip(), show) == 0) {
-            const char *del[] = { "ip", "link", "delete", veth_host, NULL };
-            (void)run_cmd(tool_path_ip(), del);   /* clean-up: best effort */
+        if (delete_veth_if_present(veth_host) != 0) {
+            print_str(STDERR, "Error: cannot remove the interface ");
+            print_str(STDERR, veth_host);
+            lc_print_char(STDERR, '\n');
+            clean = false;
         }
     }
 
-    /* remove PID file */
-    char pid_path[MAX_PATH];
-    container_pid_path(pid_path, name);
-    lc_kernel_unlinkat(AT_FDCWD, pid_path, 0);
-    container_pid_start_path(pid_path, name);
-    lc_kernel_unlinkat(AT_FDCWD, pid_path, 0);
+    container_forget_pid(name);
     set_container_state(name, "stopped\n");
 
+    if (!clean) {
+        print_str(STDERR, "Error: container '");
+        print_str(STDERR, name);
+        print_str(STDERR, "' is stopped, but not everything of it could be removed\n");
+        lc_kernel_exit(1);
+    }
     print_str(STDOUT,"Container '");
     print_str(STDOUT,name);
     print_str(STDOUT,"' stopped\n");
@@ -2610,7 +2824,8 @@ static void cmd_exec(int argc, char **argv) {
         "         --link <name>          Allow network to another container\n"
         "  start  <name> [-t <seconds>]  Start a stopped container\n"
         "         -t <seconds>            How long to wait for /init.sh (default: 30, 0: do not wait)\n"
-        "  stop   <name>                 Stop a running container\n"
+        "  stop   <name> [-t <seconds>]  Stop a running container\n"
+        "         -t <seconds>            How long its processes get to end (default: 10)\n"
         "  add-vol <name> <src:dst[:ro]> Add a volume to an existing container\n"
         "  rm     <name>                 Remove a container (must be stopped)\n"
         "  exec   <name> [options] [cmd...]  Execute a command in a running container\n"

@@ -19,8 +19,11 @@
  *   unit seconds <text>                       parse_seconds
  *   unit streams <file>                       reserve_standard_streams, then the number
  *                                             the next descriptor gets, written to <file>
- *   unit init    <how> confined|open <seconds> <hook script | -> <log file | ->
+ *   unit init    <how> confined|open <seconds> <hook script | -> <log file | -> [<grace>]
  *                                             the two sides of a start, see below
+ *   unit stop    <pid> <seconds>              ask_init_to_stop, then wait as stop does:
+ *                                             "asked" or "gone", then "ended" or "still there"
+ *   unit pids    <file>                       each_listed_pid: a line for each, then the count
  *
  * For mount, "-" stands for an argument that is not given, and the flags are
  * names joined by commas: ro, nosuid, nodev, noexec, remount, bind, rec,
@@ -49,6 +52,8 @@
  *
  * With a log file, init gets /dev/null and that file as its standard streams
  * once it is ready, as in a container; with "-" it keeps the harness's.
+ * <grace> is how many seconds init gives its processes when a SIGTERM comes
+ * without a number of its own; 10 when it is not given.
  *
  * It prints what it sees, a line each: "init <pid>", "ready", "hook <exit
  * status>", "hook-timeout", "closed", "signal <n>" and "abandoned" when one of
@@ -156,7 +161,15 @@ static void unit_close(int32_t *fd) {
     *fd = -1;
 }
 
-static void unit_init(const char *how, bool confined, int seconds, const char *script, const char *log) {
+static void put_pid(int pid) {
+    char buf[16];
+    fmt_int(buf, pid);
+    put(buf);
+    put("\n");
+}
+
+static void unit_init(const char *how, bool confined, int seconds, const char *script, const char *log,
+                      int grace) {
     int32_t signal_fd = hold_signals();
     if (signal_fd < 0)
         die("unit: cannot hold signals back");
@@ -173,6 +186,7 @@ static void unit_init(const char *how, bool confined, int seconds, const char *s
         .name = "unit",
         .root = "/",
         .hook = script,
+        .stop_grace = grace,
         .privileged = !confined,
     };
     const char *failed = init_spawn(&link, &ca, CLONE_NEWPID, unit_init_child);
@@ -358,16 +372,33 @@ int main(int argc, char **argv) {
         lc_kernel_close_file((int32_t)fd);
         return 0;
     }
-    if (argc == 7 && streq(argv[1], "init")) {
-        int seconds = 0;
+    if ((argc == 7 || argc == 8) && streq(argv[1], "init")) {
+        int seconds = 0, grace = STOP_TIMEOUT_DEFAULT;
         bool confined = streq(argv[3], "confined");
-        if ((!confined && !streq(argv[3], "open")) || !parse_seconds(argv[4], &seconds))
-            die("unit: init <how> confined|open <seconds> <hook script | -> <log file | ->");
-        unit_init(argv[2], confined, seconds, given(argv[5]), given(argv[6]));
+        if ((!confined && !streq(argv[3], "open")) || !parse_seconds(argv[4], &seconds) ||
+            (argc == 8 && !parse_seconds(argv[7], &grace)))
+            die("unit: init <how> confined|open <seconds> <hook script | -> <log file | -> [<grace>]");
+        unit_init(argv[2], confined, seconds, given(argv[5]), given(argv[6]), grace);
+        return 0;
+    }
+    if (argc == 4 && streq(argv[1], "stop")) {
+        int seconds = 0;
+        if (!parse_seconds(argv[3], &seconds))
+            die("unit: stop <pid> <seconds>");
+        lc_sysret pidfd = lb_sys_pidfd_open(parse_int(argv[2]), 0);
+        if (pidfd < 0)
+            die2("unit: no process ", argv[2]);
+        put(ask_init_to_stop((int32_t)pidfd, seconds) ? "asked\n" : "gone\n");
+        put(readable_within((int32_t)pidfd, (int64_t)seconds * 1000 + STOP_MARGIN_MS) ? "ended\n" : "still there\n");
+        return 0;
+    }
+    if (argc == 3 && streq(argv[1], "pids")) {
+        put_result(each_listed_pid(argv[2], put_pid));
         return 0;
     }
     die("usage: unit run|quiet <program> [args...] | unit capture <size> <program> [args...] | unit status <n>\n"
         "       unit mount <source> <target> <fstype> <flags> <data> | unit mkdirs <path> | unit loopback\n"
         "       unit caps | unit sandbox <program> [args...] | unit maskproc | unit noipv6 <pid>\n"
-        "       unit seconds <text> | unit streams <file> | unit init <how> confined|open <seconds> <hook script | -> <log file | ->");
+        "       unit seconds <text> | unit streams <file> | unit init <how> confined|open <seconds> <hook script | -> <log file | -> [<grace>]\n"
+        "       unit stop <pid> <seconds> | unit pids <file>");
 }

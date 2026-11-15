@@ -505,19 +505,34 @@ t_start_options_are_checked() {
     [ "$before" = "$(tree_sum "$C/web")" ] || { echo "the container's records changed"; return 1; }
 }
 
-# A start_timeout that cannot be read is said so, and stops no command.
+# A start_timeout or stop_timeout that cannot be read is said so, and stops
+# no command.
 t_start_timeout_setting() {
     lb create web 10.0.0.2 || return 1
-    printf 'start_timeout = soon\n' >> "$CONF"
+    printf 'start_timeout = soon\nstop_timeout = 1m\n' >> "$CONF"
     out=$(lb ls 2>"$W/err")
     rc=$?
     cat "$W/err"
-    [ $rc -eq 0 ] && grep -q 'start_timeout' "$W/err" && grep -q 'soon' "$W/err" || return 1
+    [ $rc -eq 0 ] && grep -q 'start_timeout.*soon; using 30' "$W/err" && grep -q 'stop_timeout.*1m; using 10' "$W/err" || return 1
     printf '%s\n' "$out" | grep -q '^web ' || return 1
-    # one that can be read is not mentioned
-    sed -i 's/^start_timeout = soon$/start_timeout = 5/' "$CONF"
+    # ones that can be read are not mentioned
+    sed -i -e 's/^start_timeout = soon$/start_timeout = 5/' -e 's/^stop_timeout = 1m$/stop_timeout = 60/' "$CONF"
     err=$(lb ls 2>&1 >/dev/null)
-    [ -z "$err" ] || { echo "with start_timeout = 5: $err"; return 1; }
+    [ -z "$err" ] || { echo "with settings that can be read: $err"; return 1; }
+}
+
+# stop reads its options before it looks at the container.
+t_stop_options_are_checked() {
+    lb create web 10.0.0.2 || return 1
+    before=$(tree_sum "$C/web")
+    said() { msg=$(lb stop web "$@" 2>&1) && { echo "stop web $* succeeded"; return 1; }; echo "stop web $*: $msg"; }
+    said -t soon   && case $msg in *soon*) ;; *) return 1 ;; esac || return 1
+    said -t        && case $msg in *'number of seconds'*) ;; *) return 1 ;; esac || return 1
+    said --bogus   && case $msg in *'unknown option'*--bogus*) ;; *) return 1 ;; esac || return 1
+    said another   && case $msg in *'unexpected argument'*another*) ;; *) return 1 ;; esac || return 1
+    # with options that are fine it gets as far as the container, which is not running
+    said -t 3      && case $msg in *'not running'*) ;; *) return 1 ;; esac || return 1
+    [ "$before" = "$(tree_sum "$C/web")" ] || { echo "the container's records changed"; return 1; }
 }
 
 # logs prints the container's log, and nothing for a container that has none.
@@ -630,7 +645,8 @@ check 'a process owned by another user is not gone'         t_other_users_proces
 check 'a dead container is shown as exited'                 t_dead_container_shown_as_exited
 check 'stop cleans up the record of a dead container'       t_stop_cleans_a_dead_record
 check 'start checks its options before it does anything'    t_start_options_are_checked
-check 'a start_timeout that cannot be read is a warning'    t_start_timeout_setting
+check 'a timeout setting that cannot be read is a warning'  t_start_timeout_setting
+check 'stop checks its options before it does anything'     t_stop_options_are_checked
 check 'logs prints the log, and nothing where there is none' t_logs_prints_the_log
 check 'logs -f follows a running container and ends with it' t_logs_follows
 check 'a command with its standard streams closed is harmless' t_closed_streams_are_harmless

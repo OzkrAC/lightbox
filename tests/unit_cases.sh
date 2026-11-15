@@ -644,6 +644,141 @@ h_command_returns_and_init_stays() {
     return $bad
 }
 
+# ─── Stopping: init ends what runs in the container, and stop waits ─────────
+
+# An init that goes on running after the command has left, as after a start
+# that worked: sets $init. Its processes get $2 seconds when a SIGTERM comes
+# without a number of its own.
+init_with() { # hook | -, grace
+    out=$(timeout -k 2 10 unshare -r "$UNIT" init leave confined 5 "$1" "$D/log" "$2" 2>&1)
+    printf '%s\n' "$out"
+    init=$(printf '%s\n' "$out" | sed -n 's/^init //p')
+    [ "$(story)" = "ready hook 0 left" ] && [ -n "$init" ] && kill -0 "$init" 2>/dev/null
+}
+
+# What stop does to init, timed: sets $said and $ms.
+stop_init() { # seconds
+    local t0=${EPOCHREALTIME/[.,]/}
+    said=$("$UNIT" stop "$init" "$1" 2>&1 | paste -sd' ' -)
+    ms=$(((${EPOCHREALTIME/[.,]/} - t0) / 1000))
+    echo "stop $1: $said, after $ms ms"
+}
+
+init_is_gone() {
+    wait_for 5 eval '! kill -0 "$init" 2>/dev/null' || { echo "init $init is still there"; kill -KILL "$init"; return 1; }
+}
+
+# A service that does what a service should on SIGTERM, and one that will not.
+service() { # polite | stubborn | stopped
+    case $1 in
+        polite)   printf 'trap "echo asked to stop > %s/stopped; exit 0" TERM\n: > %s/started\nwhile :; do sleep 1 & wait $!; done\n' "$D" "$D" ;;
+        stubborn) printf 'trap "" TERM\n: > %s/started\nwhile :; do sleep %s; done\n' "$D" "$NAP" ;;
+        stopped)  printf ': > %s/started\nkill -STOP $$\nsleep %s\n' "$D" "$NAP" ;;
+    esac > "$D/service"
+    printf '/bin/sh %s/service &\n' "$D" > "$D/hook"
+}
+
+h_stop_idle() {
+    [ -n "${EPOCHREALTIME:-}" ] || { echo "this needs bash 5 or later, for its clock"; return 77; }
+    init_with - 10 || return 1
+    stop_init 5
+    [ "$said" = "asked ended" ] && [ "$ms" -lt 1000 ] && init_is_gone
+}
+
+h_stop_lets_a_service_end() {
+    [ -n "${EPOCHREALTIME:-}" ] || { echo "this needs bash 5 or later, for its clock"; return 77; }
+    service polite
+    init_with "$D/hook" 10 || return 1
+    wait_for 5 test -e "$D/started" || { echo "the service did not start"; kill -KILL "$init"; return 1; }
+    stop_init 5
+    # the service had its say by the time stop returned, and nobody waited out the five seconds
+    [ "$said" = "asked ended" ] && [ "$(cat "$D/stopped" 2>/dev/null)" = "asked to stop" ] && [ "$ms" -lt 3000 ] && init_is_gone
+}
+
+# stop -t 1 against an init whose own limit is 30 seconds: the number travels
+# with the signal. The service is killed when the second is over, not before.
+h_stop_kills_after_the_limit() {
+    [ -n "${EPOCHREALTIME:-}" ] || { echo "this needs bash 5 or later, for its clock"; return 77; }
+    service stubborn
+    init_with "$D/hook" 30 || return 1
+    wait_for 5 test -e "$D/started" || { echo "the service did not start"; kill -KILL "$init"; return 1; }
+    stop_init 1
+    echo "the log: $(cat "$D/log")"
+    [ "$said" = "asked ended" ] && [ "$ms" -ge 1000 ] && [ "$ms" -lt 2900 ] && init_is_gone || return 1
+    grep -q 'within 1 s of SIGTERM' "$D/log" || { echo "init does not say that it had to kill"; return 1; }
+    ! sleeping || { echo "the service is still running"; return 1; }
+}
+
+# A SIGTERM that brings no number, as from kill: init's own limit holds.
+h_plain_sigterm_uses_inits_limit() {
+    [ -n "${EPOCHREALTIME:-}" ] || { echo "this needs bash 5 or later, for its clock"; return 77; }
+    service stubborn
+    init_with "$D/hook" 1 || return 1
+    wait_for 5 test -e "$D/started" || { echo "the service did not start"; kill -KILL "$init"; return 1; }
+    t0=${EPOCHREALTIME/[.,]/}
+    kill -TERM "$init"
+    init_is_gone || return 1
+    ms=$(((${EPOCHREALTIME/[.,]/} - t0) / 1000))
+    echo "init went $ms ms after a plain SIGTERM; the log: $(cat "$D/log")"
+    [ "$ms" -ge 1000 ] && [ "$ms" -lt 4000 ] && ! sleeping
+}
+
+# A process that is stopped cannot act on SIGTERM until it is continued.
+h_stop_wakes_a_stopped_process() {
+    [ -n "${EPOCHREALTIME:-}" ] || { echo "this needs bash 5 or later, for its clock"; return 77; }
+    service stopped
+    init_with "$D/hook" 30 || return 1
+    wait_for 5 test -e "$D/started" || { echo "the service did not start"; kill -KILL "$init"; return 1; }
+    sleep 0.3
+    stop_init 20
+    [ "$said" = "asked ended" ] && [ "$ms" -lt 3000 ] && init_is_gone
+}
+
+# What exec puts into a container is in its PID namespace and is nobody's
+# child there. Init sends it the SIGTERM with the rest and waits for it too:
+# this one takes a moment over ending, and has ended when stop returns.
+h_stop_ends_what_is_not_inits_child() {
+    [ -n "${EPOCHREALTIME:-}" ] || { echo "this needs bash 5 or later, for its clock"; return 77; }
+    command -v nsenter >/dev/null 2>&1 || { echo "no nsenter to put a process into the namespace with"; return 77; }
+    init_with - 30 || return 1
+    printf 'trap "sleep 0.4; echo ended in its own time > %s/guest.stopped; exit 0" TERM\n: > %s/guest.started\nwhile :; do sleep 1 & wait $!; done\n' "$D" "$D" > "$D/guest"
+    nsenter --user --pid --preserve-credentials -t "$init" /bin/sh "$D/guest" >"$D/guest.out" 2>&1 &
+    guest=$!
+    wait_for 3 test -e "$D/guest.started" || { echo "nsenter could not put a process there: $(cat "$D/guest.out")"; kill -KILL "$init"; return 77; }
+    stop_init 5
+    [ "$said" = "asked ended" ] && [ "$ms" -ge 400 ] && [ "$ms" -lt 3000 ] && init_is_gone || return 1
+    wait "$guest" 2>/dev/null
+    [ "$(cat "$D/guest.stopped" 2>/dev/null)" = "ended in its own time" ] || { echo "init did not wait for the process that was put there"; return 1; }
+}
+
+# The list of a cgroup's processes is read whole, and a number is never cut
+# where one read ends and the next begins: 3000 numbers are 18 891 bytes,
+# which is more than four reads.
+t_pid_list_is_read_whole() {
+    dir=$(mktemp -d "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    (
+        seq 100001 103000 > "$dir/procs"
+        out=$("$UNIT" pids "$dir/procs")
+        echo "bytes in the list: $(wc -c < "$dir/procs"); numbers read: $(result_of "$out")"
+        [ "$(result_of "$out")" = 3000 ] && [ "$(printf '%s\n' "$out" | sed '$d')" = "$(cat "$dir/procs")" ] || exit 1
+        # a last line without its newline, an empty list, and a list that is not there
+        printf '41\n42' > "$dir/short"
+        [ "$("$UNIT" pids "$dir/short" | paste -sd' ' -)" = "41 42 result 2" ] || exit 1
+        : > "$dir/empty"
+        [ "$("$UNIT" pids "$dir/empty")" = "result 0" ] && [ "$("$UNIT" pids "$dir/missing")" = "result -1" ]
+    )
+    rc=$?
+    rm -rf -- "$dir"
+    return $rc
+}
+
+t_stop_idle()                   { in_handshake_dir h_stop_idle; }
+t_stop_graceful()               { in_handshake_dir h_stop_lets_a_service_end; }
+t_stop_limit()                  { in_handshake_dir h_stop_kills_after_the_limit; }
+t_stop_plain_sigterm()          { in_handshake_dir h_plain_sigterm_uses_inits_limit; }
+t_stop_stopped_process()        { in_handshake_dir h_stop_wakes_a_stopped_process; }
+t_stop_guest()                  { in_handshake_dir h_stop_ends_what_is_not_inits_child; }
+
 t_handshake_without_hook()      { in_handshake_dir h_without_hook; }
 t_handshake_first_byte()        { in_handshake_dir h_init_waits_for_its_first_byte; }
 t_handshake_hook()              { in_handshake_dir h_hook_runs_and_reports; }
@@ -757,6 +892,14 @@ check 'init exits when the command is gone, and runs no hook'    t_handshake_com
 check 'the hook inherits three streams and no blocked signal'    t_handshake_hook_inherits
 check 'init and the hook write to the log, and read nothing'     t_handshake_log
 check 'the command returns to a capture, and init is detached'   t_handshake_detached
+
+check 'init with nothing to end goes at once'                    t_stop_idle
+check 'a service gets SIGTERM and time to act on it'             t_stop_graceful
+check 'a service that ignores SIGTERM is killed after the limit' t_stop_limit
+check 'a SIGTERM without a number uses init'"'"'s own limit'          t_stop_plain_sigterm
+check 'a stopped process is continued so that it can end'        t_stop_stopped_process
+check 'a process that is not init'"'"'s child is ended and waited for' t_stop_guest
+check 'a list of PIDs is read whole, across reads'               t_pid_list_is_read_whole
 
 check 'a number of seconds is digits within the limit'           t_seconds
 check 'a file never gets the number of a closed standard stream' t_standard_streams_are_reserved

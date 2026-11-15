@@ -44,6 +44,7 @@ typedef struct {
     char default_cpu[4];
     int  default_oom;
     int  start_timeout;     /* seconds start waits for the init hook; 0: not at all */
+    int  stop_timeout;      /* seconds a container gets to end when it is asked to */
 } global_config;
 
 extern global_config cfg_global;
@@ -62,6 +63,7 @@ int parse_int(const char *s);
  * only, 0 to SECONDS_MAX. */
 #define SECONDS_MAX            86400
 #define START_TIMEOUT_DEFAULT  30
+#define STOP_TIMEOUT_DEFAULT   10
 bool parse_seconds(const char *s, int *out);
 int fmt_int(char *buf, int val);
 int write_file(const char *path, const char *data);

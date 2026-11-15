@@ -879,8 +879,81 @@ SERVICE
 EOF
     start graceful || return 1
     wait_until 5 test -e "$C/graceful/rootfs/service.started" || { echo "the service did not start"; return 1; }
+    pid=$(pid_of graceful)
+    began=$SECONDS
     lb stop graceful || return 1
+    echo "stop took about $((SECONDS - began)) s"
     [ -e "$C/graceful/rootfs/service.stopped" ] || { echo "the service was killed without being asked to stop"; return 1; }
+    # a service that ends when asked is not waited for any longer
+    [ $((SECONDS - began)) -lt 5 ] || { echo "stop waited though the service had ended"; return 1; }
+    wait_until 5 gone "$pid" || { echo "init $pid is still there after stop"; return 1; }
+    nothing_left graceful
+}
+
+# A service that will not end is killed, when the time stop gives it is over
+# and not before.
+t_stop_kills_after_the_limit() {
+    [ -n "${EPOCHREALTIME:-}" ] || { echo "this needs bash 5 or later, for its clock"; return 77; }
+    box stubborn || return 1
+    hook stubborn <<'EOF'
+cat > /service.sh <<'SERVICE'
+trap '' TERM
+: > /service.started
+while :; do sleep 1; done
+SERVICE
+/bin/sh /service.sh &
+EOF
+    start stubborn || return 1
+    wait_until 5 test -e "$C/stubborn/rootfs/service.started" || { echo "the service did not start"; return 1; }
+    pid=$(pid_of stubborn)
+    t0=${EPOCHREALTIME/[.,]/}
+    lb stop stubborn -t 2 >"$OUT/stubborn.stop" 2>&1
+    rc=$?
+    ms=$(((${EPOCHREALTIME/[.,]/} - t0) / 1000))
+    cat "$OUT/stubborn.stop"
+    echo "stop -t 2 returned $rc after $ms ms"
+    [ $rc -eq 0 ] || return 1
+    [ "$ms" -ge 2000 ] || { echo "the service did not get its two seconds"; return 1; }
+    [ "$ms" -lt 6000 ] || { echo "stop took far longer than the limit it was given"; return 1; }
+    lb logs stubborn | grep -q 'within 2 s of SIGTERM' || { echo "the log does not say that the service had to be killed"; return 1; }
+    wait_until 5 gone "$pid" || { echo "init $pid is still there after stop"; return 1; }
+    nothing_left stubborn
+}
+
+# stop looked every 200 ms whether init was gone. The quickest of three.
+t_stop_of_an_idle_container_is_quick() {
+    [ -n "${EPOCHREALTIME:-}" ] || { echo "this needs bash 5 or later, for its clock"; return 77; }
+    box idle || return 1
+    best=999999
+    for i in 1 2 3; do
+        start idle >/dev/null || return 1
+        t0=${EPOCHREALTIME/[.,]/}
+        "$LB" stop idle >"$OUT/idle.stop" 2>&1 </dev/null || { cat "$OUT/idle.stop"; return 1; }
+        ms=$(((${EPOCHREALTIME/[.,]/} - t0) / 1000))
+        echo "stop $i took $ms ms"
+        [ "$ms" -lt "$best" ] && best=$ms
+        nothing_left idle >/dev/null || { nothing_left idle; return 1; }
+    done
+    [ "$best" -lt 150 ] || { echo "the quickest of three stops took $best ms"; return 1; }
+}
+
+# A command that exec runs is in the container too: stop ends it, and the
+# exec that started it returns.
+t_stop_ends_an_exec() {
+    up guest || return 1
+    lb exec guest /bin/sh -c ': > /guest.started; exec sleep 300' >"$OUT/guest.exec" 2>&1 </dev/null &
+    execer=$!
+    wait_until 5 test -e "$C/guest/rootfs/guest.started" || { echo "the command did not start:"; cat "$OUT/guest.exec"; return 1; }
+    pid=$(pid_of guest)
+    began=$SECONDS
+    lb stop guest || return 1
+    echo "stop took about $((SECONDS - began)) s"
+    [ $((SECONDS - began)) -lt 5 ] || { echo "stop waited though the command ends on SIGTERM"; return 1; }
+    wait_until 5 gone "$execer" || { echo "the exec is still waiting for its command"; kill "$execer"; return 1; }
+    wait "$execer"
+    echo "exec returned $?"
+    wait_until 5 gone "$pid" || { echo "init $pid is still there after stop"; return 1; }
+    nothing_left guest
 }
 
 # What Ctrl-C or a kill does to a start that waits for the hook: the command
@@ -1403,7 +1476,10 @@ if [ "$MODE" = inside ]; then
     check 'SIGINT to the starter'"'"'s process group spares the container'    t_sigint_spares_the_container
     check 'the container'"'"'s output is in its log, which logs shows and follows' t_logs
     check 'init keeps nothing that was open in the command'               t_init_keeps_nothing_of_the_command
-    xfail RT-stop-kill         'stop lets a service handle SIGTERM'                    t_stop_is_graceful
+    check 'stop lets a service handle SIGTERM, and waits for it'          t_stop_is_graceful
+    check 'stop -t kills a service that will not end, when the time is over' t_stop_kills_after_the_limit
+    check 'stop of an idle container does not wait a fixed time'          t_stop_of_an_idle_container_is_quick
+    check 'stop ends a command that exec runs in the container'           t_stop_ends_an_exec
 
     check 'init has the seccomp filter, no_new_privs and the bounding set' t_sandbox_on_init
     check 'a command run by exec has them too, and only the allowed capabilities' t_sandbox_on_exec

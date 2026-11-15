@@ -168,6 +168,7 @@ If the image has an `/init.sh`, the container's init runs it with `/bin/sh` once
 - The hook and everything it starts read from `/dev/null` and write to the container's log, not to the terminal `start` was typed on. `lightbox logs <name>` shows the log, and `logs -f` follows it until the container stops.
 - A hook that exits with a status other than 0 fails the start: `start` says which status it was, and the container is stopped and cleaned up. A hook that fails after `start` has returned stops the container as well.
 - `start` waits 30 seconds for the hook. If the hook is still running then, for instance because it runs its service in the foreground, `start` says so and returns; the container stays up. `start <name> -t <seconds>` or `start_timeout` in `lightbox.conf` sets the wait, and 0 does not wait at all.
+- `lightbox stop` sends SIGTERM to every process in the container and waits until they have ended, for 10 seconds; what is left then is killed. A service that should shut down cleanly has to handle SIGTERM. `stop <name> -t <seconds>` or `stop_timeout` in `lightbox.conf` sets the time, and `-t 0` kills at once.
 - Ctrl-C, or a `kill`, while `start` is working undoes the start: nothing of the container is left running, and the exit status is 128 plus the signal's number.
 
 ## Configuration
@@ -206,6 +207,9 @@ default_oom = 500
 
 # Seconds that start waits for a container's /init.sh; 0 does not wait
 start_timeout = 30
+
+# Seconds that a container's processes get to end when it is stopped
+stop_timeout = 10
 ```
 
 If `lightbox_dir` is set, `rootfs` and `container_dir` are automatically derived from it (e.g., `rootfs = <lightbox_dir>/rootfs`) unless explicitly overridden.
@@ -225,7 +229,7 @@ lightbox <command> [args]
   setup                         Initialize host networking
   create <name> <ip> [options]  Create a new container
   start  <name> [-t <seconds>]  Start a stopped container
-  stop   <name>                 Stop a running container
+  stop   <name> [-t <seconds>]  Stop a running container
   add-vol <name> <src>:<dst>[:ro]  Add a volume to an existing container
   rm     <name>                 Remove a container
   exec   <name> [cmd...]        Run a command in a container
@@ -275,6 +279,7 @@ The sandbox covers everything in a container: init, the `/init.sh` hook and all 
 - **Networking**: veth pair per container connected to a host bridge with NAT
 - **Resource limits**: cgroups v2 (memory, PIDs, CPU, I/O)
 - **Init**: lightbox remains PID 1 inside the container. It reaps children and handles shutdown from the moment the container is built, and runs `/init.sh`, if the rootfs has one, as one of its children: after `/tmp` and `/run` are mounted, with the sandbox on, and only once the container is on record, so `stop` and `ls` always find a container whose hook runs
+- **Stopping**: `stop` sends init a SIGTERM that carries the number of seconds the container may take. Init passes SIGTERM on to every process in the container, the ones `exec` put there included, reaps them, and exits when none is left or the time is over; the kernel kills whatever remains with it. `stop` waits for init through a pidfd, so it returns as soon as the container has ended. It then kills anything still in the cgroup, waits until the kernel reports the cgroup empty, and removes it. A SIGTERM sent to init by other means has the same effect, with the `stop_timeout` that was set when the container started
 - **Output**: init leads a session of its own and keeps nothing that was open in the command that started it. Its standard output and error, and those of the hook and every service, are appended to `<container_dir>/<name>/console.log`, which only root can read. The log is kept from one start to the next and is not rotated or limited yet, so a container that prints without end fills the disk it is on
 - **Starting**: `start` and init talk over two pipes. Init builds the container when `start` has set up its cgroup and network, and reports back when it is built and again when the hook has ended. If either side goes away the other notices: an init whose `start` was killed exits before it runs anything
 - **External tools**: on the host, `ip` and `nsenter` set up a container's network, `iptables` the firewall, and `cp` and `rm` create and remove a container. Everything else is direct syscalls, and nothing from the image is run before `/init.sh`

@@ -23,6 +23,7 @@
 
 #include <asm/errno.h>
 #include <asm/poll.h>
+#include <asm/siginfo.h>
 #include <asm/signal.h>
 #include <asm/statfs.h>
 #include <asm/unistd.h>
@@ -53,6 +54,8 @@ SAME_NR(chroot);
 SAME_NR(renameat);
 SAME_NR(ppoll);
 SAME_NR(close_range);
+SAME_NR(pidfd_open);
+SAME_NR(pidfd_send_signal);
 SAME_NR(statx);
 
 #define SAME_VALUE(ours, kernels) \
@@ -62,7 +65,10 @@ SAME_VALUE(LB_ENOENT, ENOENT);
 SAME_VALUE(LB_ESRCH, ESRCH);
 SAME_VALUE(LB_EINTR, EINTR);
 SAME_VALUE(LB_EEXIST, EEXIST);
+SAME_VALUE(LB_EBUSY, EBUSY);
 SAME_VALUE(LB_SIGPIPE, SIGPIPE);
+SAME_VALUE(LB_SIGCONT, SIGCONT);
+SAME_VALUE(LB_SI_QUEUE, SI_QUEUE);
 SAME_VALUE(LB_POLLIN, POLLIN);
 SAME_VALUE(LB_POLLERR, POLLERR);
 SAME_VALUE(LB_POLLHUP, POLLHUP);
@@ -127,6 +133,21 @@ SAME_FIELD(lb_statx, statx, stx_attributes_mask);
 SAME_FIELD(lb_statx, statx, stx_dev_major);
 SAME_FIELD(lb_statx, statx, stx_dev_minor);
 SAME_FIELD(lb_statx, statx, stx_mnt_id);
+
+/* siginfo_t is a typedef, and its fields past the first three are macros
+ * into a union: compared one by one. */
+#define SAME_SIGINFO(ours, kernels) \
+    _Static_assert(offsetof(struct lb_siginfo_queue, ours) == offsetof(siginfo_t, kernels) && \
+                   sizeof(((struct lb_siginfo_queue *)0)->ours) == sizeof(((siginfo_t *)0)->kernels), \
+                   "struct lb_siginfo_queue." #ours " does not match the kernel's siginfo_t." #kernels)
+_Static_assert(sizeof(struct lb_siginfo_queue) == sizeof(siginfo_t),
+               "struct lb_siginfo_queue is not the size of the kernel's siginfo_t");
+SAME_SIGINFO(signo, si_signo);
+SAME_SIGINFO(err, si_errno);
+SAME_SIGINFO(code, si_code);
+SAME_SIGINFO(pid, si_pid);
+SAME_SIGINFO(uid, si_uid);
+SAME_SIGINFO(value, si_int);
 
 SAME_SIZE(lb_pollfd, pollfd);
 SAME_FIELD(lb_pollfd, pollfd, fd);
