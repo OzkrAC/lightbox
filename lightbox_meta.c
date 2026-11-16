@@ -46,11 +46,11 @@ void cmd_ls(int argc, char **argv) {
     int count = list_containers(names, MAX_LISTED, &more);
 
     if (!json) {
-        print_padded("NAME", 20);
+        print_padded("NAME", NAME_MAX_LEN + 2);
         print_padded("IP", 16);
         print_padded("STATUS", 10);
         print_str(STDOUT, "PID\n");
-        print_padded("----", 20);
+        print_padded("----", NAME_MAX_LEN + 2);
         print_padded("--", 16);
         print_padded("------", 10);
         print_str(STDOUT, "---\n");
@@ -86,7 +86,7 @@ void cmd_ls(int argc, char **argv) {
             json_key("pid", false);    print_str(STDOUT, running ? pid_str : "null");
             print_str(STDOUT, "}");
         } else {
-            print_padded(name, 20);
+            print_padded(name, NAME_MAX_LEN + 2);
             print_padded(ip_buf, 16);
             print_padded(status, 10);
             print_str(STDOUT, pid_str);
@@ -220,6 +220,11 @@ void cmd_inspect(int argc, char **argv) {
     print_kv("state", state);
     print_kv("running", live == CONTAINER_RUNNING ? "yes" : "no");
     print_kv("ip", ip);
+    {
+        char port[IFNAME_TEXT_MAX];
+        host_port_name(name, port);
+        print_kv("host_interface", port);
+    }
     print_kv("dir", cdir);
     print_kv("rootfs", root);
     print_kv("config_path", conf_path);

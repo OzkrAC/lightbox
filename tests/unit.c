@@ -10,6 +10,9 @@
  *   unit capture <size> <program> [args...]   run_cmd_capture, into <size> bytes
  *   unit input   <text> <program> [args...]   run_cmd_input, with <text> as its input; then
  *                                             "left open <n>": descriptors it left open
+ *   unit names <name>                         host_port_name and link_chain_name, a line each
+ *   unit owner <name> <listing>               port_owner_of_listing: absent, ours or foreign
+ *   unit chain <text>                         link_chain_ok: ok or refused
  *   unit firewall links <name> [<link>...]    firewall_links_text for a container with those links;
  *                                             links-into-64 gives it 64 bytes to write into
  *   unit firewall setup <subnet> <gw> <bridge> <ip_masq>
@@ -625,6 +628,26 @@ int main(int argc, char **argv, char **envp) {
         int before = open_descriptors();
         put_result(run_cmd_input(argv[3], (const char *const *)(argv + 3), argv[2], false));
         put_number("left open", open_descriptors() - before);
+        return 0;
+    }
+    if (argc == 4 && streq(argv[1], "owner")) {
+        static char listing[4096];
+        if (!str_copy(listing, argv[3], sizeof(listing)))
+            die("unit: owner <name> <listing>");
+        port_owner owner = port_owner_of_listing(listing, argv[2]);
+        put(owner == PORT_OURS ? "ours\n" : owner == PORT_FOREIGN ? "foreign\n" : "absent\n");
+        return 0;
+    }
+    if (argc == 3 && streq(argv[1], "chain")) {
+        put(link_chain_ok(argv[2]) ? "ok\n" : "refused\n");
+        return 0;
+    }
+    if (argc == 3 && streq(argv[1], "names")) {
+        char port[IFNAME_TEXT_MAX], chain[IFNAME_TEXT_MAX];
+        host_port_name(argv[2], port);
+        link_chain_name(argv[2], chain);
+        put_line("", port);
+        put_line("", chain);
         return 0;
     }
     if (argc >= 4 && streq(argv[1], "firewall")) {

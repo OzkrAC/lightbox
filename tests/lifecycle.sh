@@ -129,6 +129,14 @@ box() { # name [create options] : create a container on the next free address
     shift
     ip=$(next_ip) || return 1
     lb create "$name" "$ip" "$@" >"$OUT/$name.create" 2>&1 || { cat "$OUT/$name.create"; return 1; }
+    port_of "$name" >/dev/null
+}
+
+# The end of a container's interface on the host, as inspect names it: kept,
+# so that it can be asked for after the container is removed.
+port_of() { # name
+    [ -s "$T/port.$1" ] || lb inspect "$1" 2>/dev/null | sed -n 's/^host_interface: //p' > "$T/port.$1"
+    cat "$T/port.$1"
 }
 
 mounted_in()   { awk -v m="$2" '$5 == m { found = 1 } END { exit !found }' "/proc/$1/mountinfo" 2>/dev/null; }
@@ -180,7 +188,13 @@ nothing_left() { # name
     if [ -e "$RUN/$1/pid" ] || [ -e "$RUN/$1/pid_start" ] || [ -e "$RUN/$1/exit" ]; then
         echo "runtime records are left: $(ls -A "$RUN/$1" | tr '\n' ' ')"; bad=1
     fi
-    no_link "vb-$1" || { echo "the interface vb-$1 is left"; bad=1; }
+    local port
+    port=$(port_of "$1")
+    if [ -z "$port" ]; then
+        echo "what the interface of $1 is called on the host cannot be told"; bad=1
+    elif ! no_link "$port"; then
+        echo "the interface $port is left"; bad=1
+    fi
     [ ! -d "$CG/$1" ] || { echo "the cgroup $CG/$1 is left"; bad=1; }
     if [ -e "$RUN/$1/firewall" ] || iptables -n -L "LB-$1" >/dev/null 2>&1; then
         echo "the firewall chain LB-$1 of its links, or the record of it, is left"; bad=1
@@ -416,7 +430,7 @@ Container 'web' stopped" ] || return 1
 
     [ "$(state_of web)" = stopped ] || { echo "state after stop: $(state_of web)"; return 1; }
     wait_until 5 gone "$pid" || { echo "init $pid is still there after stop"; return 1; }
-    wait_until 5 no_link vb-web || { echo "vb-web is still there after stop"; return 1; }
+    wait_until 5 no_link "$(port_of web)" || { echo "$(port_of web) is still there after stop"; return 1; }
     nothing_left web || return 1
 
     lb rm web || return 1
@@ -489,7 +503,7 @@ t_start_after_init_died() {
     lb ls
     lb ls | grep -Eq '^crash +[0-9.]+ +exited' || { echo "ls does not show it as exited"; return 1; }
     # the kernel removes the dead container's interface a moment later
-    wait_until 5 no_link vb-crash || { echo "vb-crash did not go away"; return 1; }
+    wait_until 5 no_link "$(port_of crash)" || { echo "$(port_of crash) did not go away"; return 1; }
     start crash || return 1
     [ "$(sh_in crash 'echo back')" = back ]
 }
@@ -564,7 +578,7 @@ t_after_a_reboot() {
     # what a reboot does to it, as far as that can be done here
     kill -KILL "$pid"
     wait_until 5 gone "$pid" || return 1
-    wait_until 5 no_link vb-was-up || return 1
+    wait_until 5 no_link "$(port_of was-up)" || return 1
     rm -rf -- "$RUN"
     lb ls
     lb ls | grep -Eq '^was-up +[0-9.]+ +stopped' && lb ls | grep -Eq '^never-up +[0-9.]+ +stopped' ||
@@ -1260,7 +1274,7 @@ t_without_io_controller() {
     said=$(lb start limited 2>&1 </dev/null) && { echo "a container with an I/O limit started without io"; return 1; }
     printf '%s\n' "$said"
     case $said in *"has no io controller, and the container has an I/O limit"*) ;; *) return 1 ;; esac
-    [ ! -d "$sub/base/limited" ] && no_link vb-limited
+    [ ! -d "$sub/base/limited" ] && no_link "$(port_of limited)"
 }
 
 t_cgroup_membership() {
@@ -1949,19 +1963,53 @@ t_rm_leaves_no_rule() {
     [ ! -e "$RUN/lmain" ] || { echo "left in run_dir: $(ls -A "$RUN/lmain")"; return 1; }
 }
 
+# An interface on the host by the name lightbox would give a container's,
+# without lightbox's alias: start refuses, says so, and leaves it alone.
+# One with the alias is what an earlier run left, and start takes it away.
 t_start_spares_foreign_interface() {
     box clobber || return 1
-    ip link add vb-clobber type veth peer name lbt-foreign || return 1
-    start clobber       # it may refuse, or use another name
-    no_link lbt-foreign && { echo "start deleted an interface it had not created"; return 1; }
-    return 0
+    port=$(port_of clobber)
+    ip link add "$port" type dummy 2>/dev/null || ip link add "$port" type veth peer name lbt-foreign || return 1
+    said=$(lb start clobber 2>&1 </dev/null) && { echo "start went ahead"; return 1; }
+    printf '%s\n' "$said"
+    ip link show dev "$port" >/dev/null 2>&1 || { echo "start deleted an interface it had not created"; return 1; }
+    case $said in *"interface $port that lightbox did not make"*) ;; *) return 1 ;; esac
+    [ "$(state_of clobber)" = failed ] || [ "$(state_of clobber)" = stopped ] || { echo "state: $(state_of clobber)"; return 1; }
+    ip link delete "$port" || return 1
+    # what an earlier run of the container left: its own, which goes
+    ip link add "$port" alias lightbox:clobber type dummy 2>/dev/null ||
+        ip link add "$port" alias lightbox:clobber type veth peer name lbt-foreign || return 1
+    start clobber || return 1
+    ip -d link show dev "$port" | grep -q 'veth' || { echo "the interface is not the container's veth"; return 1; }
+}
+
+# The host's end of a container's interface carries lightbox's alias, and the
+# container's end is eth0, in the container only.
+t_interface_is_tagged() {
+    up tagged || return 1
+    port=$(port_of tagged)
+    ip link show dev "$port"
+    ip link show dev "$port" | grep -q '^ *alias lightbox:tagged$' || { echo "no alias lightbox:tagged"; return 1; }
+    ! ip link show dev eth0 2>/dev/null | grep -q 'link-netns' || { echo "an eth0 of a container is on the host"; return 1; }
+}
+
+# A name of 30 characters: start, exec, stop and rm, and nothing left.
+t_long_name() {
+    long='a-container-of-30-characters-x'
+    box "$long" || return 1
+    start "$long" || return 1
+    [ "$(sh_in "$long" 'echo here')" = here ] || return 1
+    [ "$(sh_in "$long" 'hostname')" = "$long" ] || { echo "the hostname is $(sh_in "$long" hostname)"; return 1; }
+    lb stop "$long" >/dev/null && nothing_left "$long" && lb rm "$long" >/dev/null
 }
 
 t_interface_is_eth0() {
     up ifname || return 1
     said=$(sh_in ifname 'cat /proc/net/dev')
     printf '%s\n' "$said" | sed '1,2d' | awk -F: '{ gsub(/ /, "", $1); printf "%s ", $1 } END { print "" }'
-    printf '%s\n' "$said" | grep -q '^ *eth0:'
+    printf '%s\n' "$said" | grep -q '^ *eth0:' || return 1
+    ! printf '%s\n' "$said" | grep -q '^ *ve-' || { echo "the container has a ve- interface"; return 1; }
+    printf '%s\n' "$(sh_in ifname 'ip -4 addr show dev eth0')" | grep -q "inet $(addr_of ifname)/"
 }
 
 t_no_ipv6_in_container() {
@@ -2260,8 +2308,10 @@ if [ "$MODE" = inside ]; then
     check 'a link to a container created later applies'                  t_link_to_later_container
     check 'a start puts in its link rules with one process'               t_link_rules_in_one_process
     check 'rm of a dead container leaves no firewall rule'                t_rm_leaves_no_rule
-    xfail NET-veth-clobber     'start leaves alone an interface it did not create'     t_start_spares_foreign_interface
-    xfail NET-ifname           'the interface in the container is eth0'                t_interface_is_eth0
+    check 'start leaves alone an interface it did not create, and says so' t_start_spares_foreign_interface
+    check 'the interface in the container is eth0'                       t_interface_is_eth0
+    check 'the host'"'"'s end of the interface carries lightbox'"'"'s alias'  t_interface_is_tagged
+    check 'a name of 30 characters works from create to rm'              t_long_name
     check 'a container has no IPv6 address'                               t_no_ipv6_in_container
 
     # last: it may leave a kernel setting changed for the rest of this suite's life

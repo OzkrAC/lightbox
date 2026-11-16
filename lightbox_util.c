@@ -742,6 +742,10 @@ int run_cmd_capture(const char *prog, const char *const argv[], char *out, size_
     return run_program(prog, argv, &(struct run_opts){ .capture = out, .capture_size = outsz });
 }
 
+int run_cmd_capture_quiet(const char *prog, const char *const argv[], char *out, size_t outsz) {
+    return run_program(prog, argv, &(struct run_opts){ .capture = out, .capture_size = outsz, .quiet = true });
+}
+
 int run_cmd_input(const char *prog, const char *const argv[], const char *input, bool quiet) {
     return run_program(prog, argv, &(struct run_opts){ .input = input, .quiet = quiet });
 }

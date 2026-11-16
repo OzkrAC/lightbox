@@ -1643,22 +1643,82 @@ left open 0' ] || return 1
     case $out in *'the input is too long for '*) ;; *) return 1 ;; esac
 }
 
+# What a container is called on the host: vb- and LB- with the same twelve
+# hex digits of its name's FNV-1a hash, whatever the name's length, the same
+# for a name every time and another for another name.
+t_host_names() {
+    bad=0
+    expect() { # name, interface, chain
+        got=$("$UNIT" names "$1" | paste -sd' ' -)
+        [ "$got" = "$2 $3" ] || { echo "'$1': $got, expected $2 $3"; bad=1; }
+    }
+    expect web vb-5ea0e1194872 LB-5ea0e1194872
+    expect db vb-08914e07b53b LB-08914e07b53b
+    expect a vb-af63dc4c8601 LB-af63dc4c8601
+    expect abcdefghijklmnopqrstuvwxyz0123 vb-b99d11b887d2 LB-b99d11b887d2
+    [ "$("$UNIT" names web2 | head -n 1)" != vb-5ea0e1194872 ] || { echo "web2 has web's interface"; bad=1; }
+    return $bad
+}
+
+# Whose an interface is, from what "ip link show" prints: lightbox's for this
+# container only with the alias lightbox:<name>, exactly; without an alias,
+# or with another, not lightbox's to touch.
+t_interface_owner() {
+    bad=0
+    expect() { # name, listing, expected
+        got=$("$UNIT" owner "$1" "$2")
+        [ "$got" = "$3" ] || { echo "$1 with: $2"; echo "  $got, expected $3"; bad=1; }
+    }
+    head='7: vb-5ea0e1194872@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue master br0 state UP mode DEFAULT group default qlen 1000
+    link/ether 2a:51:0c:7e:1b:93 brd ff:ff:ff:ff:ff:ff link-netnsid 1'
+    expect web "$head
+    alias lightbox:web" ours
+    expect web "$head
+    alias lightbox:web2" foreign
+    expect web "$head
+    alias lightbox:we" foreign
+    expect web "$head
+    alias lightbox:web " foreign
+    expect web "$head
+    alias something:web" foreign
+    expect web "$head" foreign
+    expect web "$head
+    altname enp0s31f6" foreign
+    expect web "$head
+    altname lightbox:web
+    alias lightbox:web" ours
+    return $bad
+}
+
+# A record of link rules names a chain of lightbox's, or nothing is done with it.
+t_link_chain_names() {
+    bad=0
+    for chain in LB-5ea0e1194872 LB-web LB-a LB-abcdefghijklmnopqrstuvwxy; do
+        [ "$("$UNIT" chain "$chain")" = ok ] || { echo "$chain was refused"; bad=1; }
+    done
+    for chain in '' LB- LB LIGHTBOX-LINKS FORWARD 'LB-a b' 'LB-a;b' LB-abcdefghijklmnopqrstuvwxyz '-j ACCEPT' 'LB-x
+-A FORWARD'; do
+        [ "$("$UNIT" chain "$chain")" = refused ] || { echo "'$chain' was taken"; bad=1; }
+    done
+    return $bad
+}
+
 # What iptables-restore is given for a container's links: a chain of its own,
 # a rule for each way of each link that names the two ports and no address,
 # and the jump to it.
 t_firewall_links_text() {
     got=$("$UNIT" firewall links web db cache)
     want='*filter
-:LB-web - [0:0]
--A LB-web -m physdev --physdev-in vb-web --physdev-out vb-db -j ACCEPT
--A LB-web -m physdev --physdev-in vb-db --physdev-out vb-web -j ACCEPT
--A LB-web -m physdev --physdev-in vb-web --physdev-out vb-cache -j ACCEPT
--A LB-web -m physdev --physdev-in vb-cache --physdev-out vb-web -j ACCEPT
--A LIGHTBOX-LINKS -j LB-web
+:LB-5ea0e1194872 - [0:0]
+-A LB-5ea0e1194872 -m physdev --physdev-in vb-5ea0e1194872 --physdev-out vb-08914e07b53b -j ACCEPT
+-A LB-5ea0e1194872 -m physdev --physdev-in vb-08914e07b53b --physdev-out vb-5ea0e1194872 -j ACCEPT
+-A LB-5ea0e1194872 -m physdev --physdev-in vb-5ea0e1194872 --physdev-out vb-1c33d13ab5ec -j ACCEPT
+-A LB-5ea0e1194872 -m physdev --physdev-in vb-1c33d13ab5ec --physdev-out vb-5ea0e1194872 -j ACCEPT
+-A LIGHTBOX-LINKS -j LB-5ea0e1194872
 COMMIT'
     [ "$got" = "$want" ] || { printf '%s\n' "$got"; return 1; }
     # eight links of the longest names fit
-    long=abcdefghijkl
+    long=abcdefghijklmnopqrstuvwxyz0123
     got=$("$UNIT" firewall links "$long" "${long%?}1" "${long%?}2" "${long%?}3" "${long%?}4" \
           "${long%?}5" "${long%?}6" "${long%?}7" "${long%?}8" | grep -c -- '--physdev-in')
     [ "$got" = 16 ] || { echo "rules for eight links: $got"; return 1; }
@@ -1905,7 +1965,7 @@ config_strict() {
     refuses 'line 2: privileged is not 0 or 1'          version=1 privileged=yes
     refuses 'line 2: readonly is not 0 or 1'            version=1 readonly=2
     refuses 'line 2: the link is not the name of a container' version=1 'link=a b'
-    refuses 'line 2: the link is not the name of a container' version=1 link=a-name-that-is-too-long
+    refuses 'line 2: the link is not the name of a container' version=1 link=a-name-of-thirty-one-characters
     refuses 'line 2: *absolute path without ..'         version=1 vol=/srv:/a/../b
     refuses 'line 2: a volume is written src:dst*'      version=1 vol=/srv
     refuses 'line 2: *only :ro may follow'              version=1 vol=/srv:/data:rw
@@ -2358,6 +2418,9 @@ check 'a number is digits in its range, and never wraps'         t_numbers_are_s
 check 'memory, process, CPU and OOM limits are what they say'    t_limits
 check 'a cgroup without a controller: refused when a limit needs it, said when not' t_controllers
 check 'a program gets its input whole, read or not, and too much is refused' t_program_input
+check 'a container is vb- and LB- with twelve digits of its name'"'"'s hash on the host' t_host_names
+check 'an interface is lightbox'"'"'s for a container only with its alias' t_interface_owner
+check 'a record of link rules names a chain of lightbox'"'"'s or is refused' t_link_chain_names
 check 'a container'"'"'s link rules are a chain of its own, by port and not address' t_firewall_links_text
 check 'setup'"'"'s rules: links between ports, out by any interface, masquerade if set' t_firewall_setup_text
 check 'an address is four numbers and three dots, and no zero in front' t_addresses_are_strict

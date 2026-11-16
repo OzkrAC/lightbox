@@ -138,8 +138,26 @@ t_create_refuses_existing_name() {
 t_create_refuses_bad_names() {
     refused lb create 'bad name' 10.0.0.2 &&
     refused lb create 'bad/name' 10.0.0.2 &&
-    refused lb create waytoolongname1 10.0.0.2 &&
+    refused lb create a-name-of-thirty-one-characters 10.0.0.2 &&
     [ -z "$(ls -A "$C")" ]
+}
+
+# A name of 30 characters is a container's, and one of 31 is not. On the host
+# a container is called by twelve digits of its name's hash, which inspect
+# shows, the same for a name every time and another for another name.
+t_long_names() {
+    long=a-name-of-thirty-characters-0k
+    [ ${#long} -eq 30 ] || return 1
+    lb create "$long" || return 1
+    lb ls | grep -q "^$long " || { echo "ls does not show it"; return 1; }
+    port=$(lb inspect "$long" | sed -n 's/^host_interface: //p')
+    echo "host interface of $long: $port"
+    case $port in vb-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+        *) echo "not vb- and twelve hex digits"; return 1 ;; esac
+    lb create web || return 1
+    [ "$(lb inspect web | sed -n 's/^host_interface: //p')" = vb-5ea0e1194872 ] || { echo "web is not vb-5ea0e1194872"; return 1; }
+    lb rm "$long" >/dev/null && lb create "$long" >/dev/null || return 1
+    [ "$(lb inspect "$long" | sed -n 's/^host_interface: //p')" = "$port" ] || { echo "the name changed for the same container name"; return 1; }
 }
 
 t_create_refuses_bad_addresses() {
@@ -1107,7 +1125,7 @@ t_ls_is_sorted() {
 # valid container name are listed.
 t_ls_lists_only_containers() {
     lb create web 10.0.0.2 || return 1
-    mkdir "$C/has space" "$C/far-too-long-for-a-name" "$C/.hidden"
+    mkdir "$C/has space" "$C/a-name-of-thirty-one-characters" "$C/.hidden"
     : > "$C/afile"
     ln -s web "$C/alink"
     listing=$(lb ls | sed '1,2d' | awk '{print $1}' | tr '\n' ' ')
@@ -1392,6 +1410,7 @@ check 'create stores the options it was given'              t_create_stores_opti
 check 'create copies the base rootfs'                       t_create_copies_base
 check 'create refuses a name that exists'                   t_create_refuses_existing_name
 check 'create refuses malformed names'                      t_create_refuses_bad_names
+check 'a name has 30 characters, and on the host twelve hex digits' t_long_names
 check 'create refuses malformed and out-of-subnet addresses' t_create_refuses_bad_addresses
 check 'volume specifications are validated'                 t_volume_spec_rules
 check 'an unknown option is refused'                        t_unknown_option_refused

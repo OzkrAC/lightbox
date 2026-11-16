@@ -28,7 +28,6 @@
 /* ─── Compile-time limits ───────────────────────────────────────────────── */
 
 #define MAX_PATH         512
-#define NAME_MAX_LEN     12
 #define USERNS_RANGE_SIZE 65536
 #define USERNS_MIN_START 100000
 #define MAX_DNS          3       /* as many as a resolver reads from resolv.conf */
@@ -131,11 +130,11 @@ static bool name_char_ok(char c) {
            (c >= '0' && c <= '9') || c == '_' || c == '-';
 }
 
-/* Validate container name: [a-zA-Z0-9_-], max 12 chars */
+/* Validate container name: [a-zA-Z0-9_-], 1 to NAME_MAX_LEN characters */
 void validate_name(const char *name) {
     if (!name || !name[0]) die("Error: container name required");
     size_t len = lc_string_length(name);
-    if (len > NAME_MAX_LEN) die("Error: container name must be 12 characters or fewer");
+    if (len > NAME_MAX_LEN) die("Error: container name must be " STRINGIFY(NAME_MAX_LEN) " characters or fewer");
     for (size_t i = 0; i < len; i++) {
         if (!name_char_ok(name[i]))
             die("Error: container name must only contain [a-zA-Z0-9_-]");
@@ -2798,28 +2797,10 @@ static enum await_result await_report(int32_t report_fd, int32_t signal_fd, int 
     }
 }
 
-/*
- * Remove an interface if it is there. The kernel removes a container's
- * interfaces by itself a moment after its init has ended, so one that was
- * there at the first look can be gone at the delete: that is not a failure.
- * 0 when the interface is gone afterwards, however it went; -1 when it is
- * still there.
- */
-static int delete_veth_if_present(const char *ifname) {
-    const char *show[] = { "ip", "link", "show", ifname, NULL };
-    if (run_cmd_quiet(tool_path_ip(), show) != 0)
-        return 0;
-
-    const char *del[] = { "ip", "link", "delete", ifname, NULL };
-    if (run_cmd_quiet(tool_path_ip(), del) == 0)
-        return 0;
-    return run_cmd_quiet(tool_path_ip(), show) != 0 ? 0 : -1;
-}
-
 /* What a start that failed leaves behind, removed. Init is gone by now. */
-static void cleanup_start_failure(const char *name, const char *veth_host) {
-    if (veth_host && veth_host[0])
-        (void)delete_veth_if_present(veth_host);    /* clean-up: best effort */
+static void cleanup_start_failure(const char *name, const char *port) {
+    if (port && port[0])
+        (void)remove_own_port(port, name);          /* clean-up: best effort */
 
     (void)cgroup_destroy(name);     /* it has said so if it could not */
     (void)firewall_remove_links(name);
@@ -2848,11 +2829,11 @@ static bool release_container(const char *name) {
     /* the host's end of the container's interface, if the kernel has not
      * removed it with the container's network namespace already */
     {
-        char veth_host[16], veth_cont[16];
-        veth_names(name, veth_host, veth_cont);
-        if (delete_veth_if_present(veth_host) != 0) {
+        char port[IFNAME_TEXT_MAX];
+        host_port_name(name, port);
+        if (remove_own_port(port, name) < 0) {
             print_str(STDERR, "Error: cannot remove the interface ");
-            print_str(STDERR, veth_host);
+            print_str(STDERR, port);
             lc_print_char(STDERR, '\n');
             clean = false;
         }
@@ -3304,29 +3285,28 @@ static void cmd_start(int argc, char **argv) {
     struct start_report report = { 0, 0 };
     int stop_signal = 0;
 
-    /* set up veth pair */
-    char veth_host[16], veth_cont[16];
-    veth_names(name, veth_host, veth_cont);
-
-    /* clean up stale veth endpoints if either name is left behind */
-    if (delete_veth_if_present(veth_host) != 0 ||
-        delete_veth_if_present(veth_cont) != 0) {
-        start_err = "failed to delete stale veth";
-        goto fail_start;
+    /* The end of the container's interface on the host, by a name made from
+     * its own. One that is there already is cleared away when lightbox made
+     * it for this container; when not, it is left alone and the start ends. */
+    char port[IFNAME_TEXT_MAX], port_err[128];
+    host_port_name(name, port);
+    {
+        port_owner owner = host_port_owner(port, name);
+        if (owner == PORT_FOREIGN) {
+            bool cut = false;
+            size_t pos = str_append(port_err, 0, "this host has an interface ", sizeof(port_err), &cut);
+            pos = str_append(port_err, pos, port, sizeof(port_err), &cut);
+            str_append(port_err, pos, " that lightbox did not make for this container; it is left alone",
+                       sizeof(port_err), &cut);
+            start_err = port_err;
+            port[0] = '\0';         /* and nothing goes on to remove it */
+            goto fail_start;
+        }
+        if (owner == PORT_OURS && remove_own_port(port, name) != 0) {
+            start_err = "failed to remove what an earlier run left of the container's interface";
+            goto fail_start;
+        }
     }
-
-    /* create veth pair */
-    { const char *a[] = { "ip", "link", "add", veth_cont, "type", "veth", "peer", "name", veth_host, NULL };
-      if (run_cmd(tool_path_ip(), a) != 0) { start_err = "failed to create veth pair"; goto fail_start; } }
-    { const char *a[] = { "ip", "link", "set", veth_host, "master", cfg_global.bridge, NULL };
-      if (run_cmd(tool_path_ip(), a) != 0) { start_err = "failed to attach veth to bridge"; goto fail_start; } }
-    if (!linked) {
-        /* isolated ports do not reach each other, whatever the firewall does */
-        const char *a[] = { "ip", "link", "set", "dev", veth_host, "type", "bridge_slave", "isolated", "on", NULL };
-        if (run_cmd(tool_path_ip(), a) != 0) { start_err = "failed to isolate the container's port on the bridge"; goto fail_start; }
-    }
-    { const char *a[] = { "ip", "link", "set", veth_host, "up", NULL };
-      if (run_cmd(tool_path_ip(), a) != 0) { start_err = "failed to bring host veth up"; goto fail_start; } }
 
     /* what the container reads from and writes to, once it is built */
     char log_path[MAX_PATH];
@@ -3411,20 +3391,35 @@ static void cmd_start(int argc, char **argv) {
         goto fail_start;
     }
 
-    /* move veth into container network namespace */
+    /* The pair: the host's end, with lightbox's alias, on the bridge; and
+     * the container's, made in the container's namespace as eth0, so that
+     * no end of it is on the host under a name of the container's. */
     {
-        char nsbuf[16]; fmt_int(nsbuf, child_pid);
-        const char *a[] = { "ip", "link", "set", veth_cont, "netns", nsbuf, NULL };
-        if (run_cmd(tool_path_ip(), a) != 0) { start_err = "failed to move veth into netns"; goto fail_start; }
+        char nsbuf[16], alias[64];
+        fmt_int(nsbuf, child_pid);
+        bool cut = false;
+        str_append(alias, str_append(alias, 0, "lightbox:", sizeof(alias), &cut), name, sizeof(alias), &cut);
+        const char *add[] = { "ip", "link", "add", port, "alias", alias, "type", "veth",
+                              "peer", "name", CONTAINER_IFNAME, "netns", nsbuf, NULL };
+        if (cut || run_cmd(tool_path_ip(), add) != 0) { start_err = "failed to create the container's interface"; goto fail_start; }
     }
+    { const char *a[] = { "ip", "link", "set", port, "master", cfg_global.bridge, NULL };
+      if (run_cmd(tool_path_ip(), a) != 0) { start_err = "failed to attach the container's interface to the bridge"; goto fail_start; } }
+    if (!linked) {
+        /* isolated ports do not reach each other, whatever the firewall does */
+        const char *a[] = { "ip", "link", "set", "dev", port, "type", "bridge_slave", "isolated", "on", NULL };
+        if (run_cmd(tool_path_ip(), a) != 0) { start_err = "failed to isolate the container's port on the bridge"; goto fail_start; }
+    }
+    { const char *a[] = { "ip", "link", "set", port, "up", NULL };
+      if (run_cmd(tool_path_ip(), a) != 0) { start_err = "failed to bring the container's interface up on the host"; goto fail_start; } }
 
     /* configure networking inside the container */
     {
         char nsbuf[16]; fmt_int(nsbuf, child_pid);
 
-        const char *a1[] = { "nsenter", "-t", nsbuf, "-n", "--", "ip", "link", "set", veth_cont, "up", NULL };
+        const char *a1[] = { "nsenter", "-t", nsbuf, "-n", "--", "ip", "link", "set", CONTAINER_IFNAME, "up", NULL };
         if (run_cmd(tool_path_nsenter(), a1) != 0) { start_err = "failed to bring container veth up"; goto fail_start; }
-        const char *a2[] = { "nsenter", "-t", nsbuf, "-n", "--", "ip", "addr", "add", ip_cidr, "dev", veth_cont, NULL };
+        const char *a2[] = { "nsenter", "-t", nsbuf, "-n", "--", "ip", "addr", "add", ip_cidr, "dev", CONTAINER_IFNAME, NULL };
         if (run_cmd(tool_path_nsenter(), a2) != 0) { start_err = "failed to assign container IP"; goto fail_start; }
         const char *a3[] = { "nsenter", "-t", nsbuf, "-n", "--", "ip", "route", "add", "default", "via", cfg_global.gw, NULL };
         if (run_cmd(tool_path_nsenter(), a3) != 0) { start_err = "failed to install default route"; goto fail_start; }
@@ -3556,7 +3551,7 @@ fail_start:
         print_str(STDERR, name);
         lc_print_char(STDERR, '\n');
     }
-    cleanup_start_failure(name, veth_host);
+    cleanup_start_failure(name, port);
     lc_kernel_exit(exit_code);
 }
 

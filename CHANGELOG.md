@@ -30,6 +30,9 @@ Not tagged yet, and not complete: the part of Phase 5 that is written so far.
 - **Rules of the host's that are to decide before lightbox's go in `LIGHTBOX-USER`**, like Docker's `DOCKER-USER`. lightbox makes the chain and never changes it.
 - **Masquerading no longer names the interface of the default route.** What leaves by any interface but the bridge is masqueraded, and forwarded out of the bridge: a host whose default route moves to another interface, or that reaches some networks by another one, does not cut its containers off. `setup` no longer fails on a host without a default route.
 - **`setup` fills `LIGHTBOX-FORWARD` and `LIGHTBOX-POSTROUTING` for the bridge of its `lightbox.conf`**: one host has one lightbox network. Before, a second `lightbox.conf` with another bridge added rules beside the first one's.
+- **The interface in a container is `eth0`.** It was `ve-<name>`; a service that names its interface has to name `eth0`. A container started before keeps its old interface until it is started again.
+- **The host's end of a container's interface is `vb-` and twelve hex digits** of a hash of the container's name, no longer `vb-<name>`, and carries the alias `lightbox:<name>`. `inspect` shows it as `host_interface`. lightbox removes only interfaces that carry its alias: `start` used to delete whatever was called `vb-<name>` or `ve-<name>`, a name systemd-nspawn uses as well, and now refuses with the interface named and leaves it alone.
+- **The chain of a container's links is `LB-` and the same twelve digits.**
 - **A container's `.conf` that lightbox cannot use is an error that names the file and the line**, for `start`, `exec`, `inspect`, `add-vol` and `rm-vol`. `stop` still stops such a container and clears away all it had, the firewall rules of its links among them, which it knows from their record in `run_dir`. `rm` removes it as before.
 
 ### Added
@@ -40,7 +43,8 @@ Not tagged yet, and not complete: the part of Phase 5 that is written so far.
 - `doctor` shows the network that `subnet` and `gw` make, or what is wrong with them.
 - **`--swap <limit>`** lets a container use swap: `0`, a size as for `--mem`, or `max`.
 - **`--io-max "<major>:<minor> <key>=<value>..."`** gives a container an I/O limit for one whole disk, as `io.max` takes it. Before, only an edit of the `.conf` could. `create` refuses a device that the host does not have, and a partition, for which the kernel takes no limit.
-- `inspect` shows `swap` and `io`.
+- `inspect` shows `swap` and `io`, and `host_interface`.
+- **A container's name can have 30 characters**, where it could have 12: the name is no longer part of an interface's name.
 - **Four firewall settings in `lightbox.conf`, those of Docker's `daemon.json`**: `firewall` (Docker's `iptables`), `ip_forward`, `ip_forward_no_drop` and `ip_masq`, each `true` or `false`. `firewall = false` makes no rules at all, and then a container with links is not started. `doctor` shows the four.
 - **`lightbox rm-vol <name> <dst>`** takes the volume at a destination out of a container's configuration. Like `add-vol`, it takes effect at the next start.
 - A container's `.conf` begins with `version=1`. Containers made by earlier versions keep working as they are, and get the line the next time `add-vol` or `rm-vol` writes the file.

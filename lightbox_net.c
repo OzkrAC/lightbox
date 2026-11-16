@@ -185,13 +185,66 @@ int read_container_ip(const char *name, char *ip, size_t ipsz) {
 
 /* ─── The firewall ──────────────────────────────────────────────────────── */
 
-_Static_assert(NAME_MAX_LEN + 3 < 16, "an interface name holds a container's name and three more");
-void veth_names(const char *name, char host[16], char cont[16]) {
-    bool cut = false;       /* never: the name has been checked to be one */
-    size_t pos = str_append(host, 0, "vb-", 16, &cut);
-    str_append(host, pos, name, 16, &cut);
-    pos = str_append(cont, 0, "ve-", 16, &cut);
-    str_append(cont, pos, name, 16, &cut);
+/* <prefix> and the top 48 bits of the name's 64-bit FNV-1a hash, in hex */
+static void hashed_name(const char *prefix, const char *name, char out[IFNAME_TEXT_MAX]) {
+    static const char hex[] = "0123456789abcdef";
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (const char *p = name; *p; p++) {
+        h ^= (uint8_t)*p;
+        h *= 0x100000001b3ull;
+    }
+    size_t pos = lc_string_length(prefix);     /* "vb-" or "LB-" */
+    lc_bytes_copy(out, prefix, pos);
+    for (int i = 0; i < 12; i++)
+        out[pos++] = hex[(h >> (60 - 4 * i)) & 0xf];
+    out[pos] = '\0';
+}
+_Static_assert(3 + 12 < IFNAME_TEXT_MAX, "an interface name holds the prefix and twelve digits");
+
+void host_port_name(const char *name, char out[IFNAME_TEXT_MAX]) { hashed_name("vb-", name, out); }
+void link_chain_name(const char *name, char out[IFNAME_TEXT_MAX]) { hashed_name("LB-", name, out); }
+
+port_owner host_port_owner(const char *ifname, const char *name) {
+    static char shown[4096];
+    const char *show[] = { "ip", "link", "show", "dev", ifname, NULL };
+    if (run_cmd_capture_quiet(tool_path_ip(), show, shown, sizeof(shown)) != 0)
+        return PORT_ABSENT;
+    return port_owner_of_listing(shown, name);
+}
+
+port_owner port_owner_of_listing(char *shown, const char *name) {
+    char want[64];
+    bool cut = false;
+    str_append(want, str_append(want, 0, "lightbox:", sizeof(want), &cut), name, sizeof(want), &cut);
+    /* "    alias lightbox:<name>", a line of its own */
+    for (char *line = shown; *line; ) {
+        char *end = line;
+        while (*end && *end != '\n') end++;
+        bool last = *end == '\0';
+        *end = '\0';
+        while (*line == ' ' || *line == '\t') line++;
+        if (lc_string_starts_with(line, lc_string_length(line), "alias ", 6))
+            return !cut && streq(line + 6, want) ? PORT_OURS : PORT_FOREIGN;
+        line = last ? end : end + 1;
+    }
+    return PORT_FOREIGN;
+}
+
+/*
+ * The kernel removes a container's interface by itself a moment after its
+ * init has ended, so one that was there at the first look can be gone at
+ * the delete: that is not a failure.
+ */
+int remove_own_port(const char *ifname, const char *name) {
+    port_owner owner = host_port_owner(ifname, name);
+    if (owner == PORT_ABSENT)
+        return 0;
+    if (owner == PORT_FOREIGN)
+        return 1;
+    const char *del[] = { "ip", "link", "delete", ifname, NULL };
+    if (run_cmd_quiet(tool_path_ip(), del) == 0)
+        return 0;
+    return host_port_owner(ifname, name) == PORT_ABSENT ? 0 : -1;
 }
 
 struct text_out {
@@ -205,11 +258,18 @@ static void out_put(struct text_out *out, const char *s) {
     out->pos = str_append(out->text, out->pos, s, out->max, &out->cut);
 }
 
-/* LB-<name>: the chain of a container's links */
-static void link_chain(char out[32], const char *name) {
-    bool cut = false;       /* never: the name has been checked to be one */
-    size_t pos = str_append(out, 0, "LB-", 32, &cut);
-    str_append(out, pos, name, 32, &cut);
+/* A chain's name as a record of it may give it: LB- and what a chain name
+ * may hold, within the 28 characters of one. */
+bool link_chain_ok(const char *chain) {
+    size_t len = lc_string_length(chain);
+    if (len < 4 || len > 28 || !lc_string_starts_with(chain, len, "LB-", 3))
+        return false;
+    for (size_t i = 3; i < len; i++) {
+        char c = chain[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-'))
+            return false;
+    }
+    return true;
 }
 
 /*
@@ -221,16 +281,16 @@ static void link_chain(char out[32], const char *name) {
  */
 bool firewall_links_text(const char *name, const container_config *config, char *text, size_t max) {
     struct text_out out = { .text = text, .max = max, .pos = 0, .cut = false };
-    char chain[32], port[16], unused[16];
-    link_chain(chain, name);
-    veth_names(name, port, unused);
+    char chain[IFNAME_TEXT_MAX], port[IFNAME_TEXT_MAX];
+    link_chain_name(name, chain);
+    host_port_name(name, port);
     text[0] = '\0';
     out_put(&out, "*filter\n:");
     out_put(&out, chain);
     out_put(&out, " - [0:0]\n");
     for (int i = 0; i < config->nlinks; i++) {
-        char other[16];
-        veth_names(config->links[i], other, unused);
+        char other[IFNAME_TEXT_MAX];
+        host_port_name(config->links[i], other);
         for (int back = 0; back < 2; back++) {
             out_put(&out, "-A ");
             out_put(&out, chain);
@@ -280,11 +340,21 @@ bool firewall_setup_text(const container_network *net, char *text, size_t max) {
 }
 
 int firewall_remove_links(const char *name) {
-    char record[MAX_PATH], chain[32];
+    char record[MAX_PATH], chain[40];
     container_firewall_path(record, name);
     if (!path_exists(record))
         return 0;
-    link_chain(chain, name);
+    /* the chain the record names: the one a start put in, whatever name the
+     * lightbox that started the container gave it */
+    int n = read_file(record, chain, sizeof(chain));
+    if (n > 0 && chain[n - 1] == '\n')
+        chain[n - 1] = '\0';
+    if (n <= 0 || !link_chain_ok(chain)) {
+        print_str(STDERR, "Error: the record of the container's link rules does not name a chain of lightbox's: ");
+        print_str(STDERR, record);
+        lc_print_char(STDERR, '\n');
+        return -1;
+    }
 
     /* As a start left it: the jump, the chain's rules and the chain, in one
      * transaction. Anything else, one piece at a time, as far as it is there. */
@@ -331,9 +401,9 @@ int firewall_add_links(const char *name, const container_config *config) {
 
     /* On record before they are there: a command that is killed in between
      * leaves the record, and the next command takes away what it names. */
-    char record[MAX_PATH], chain[32], line[34];
+    char record[MAX_PATH], chain[IFNAME_TEXT_MAX], line[IFNAME_TEXT_MAX + 1];
     container_firewall_path(record, name);
-    link_chain(chain, name);
+    link_chain_name(name, chain);
     bool cut = false;
     str_append(line, str_append(line, 0, chain, sizeof(line), &cut), "\n", sizeof(line), &cut);
     if (container_run_dir_make(name) != 0 || write_file_volatile(record, line) != 0) {

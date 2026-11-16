@@ -17,7 +17,7 @@
 #endif
 
 #define MAX_PATH         512
-#define NAME_MAX_LEN     12
+#define NAME_MAX_LEN     30
 #define MAX_VOLS         16
 #define MAX_LINKS        8
 
@@ -264,6 +264,8 @@ extern const char *const TOOL_ENV[];   /* what tools run with: a fixed PATH */
 [[nodiscard]] int run_cmd_env(const char *prog, const char *const argv[], const char *const envp[]);
 /* the same with the program's stdout collected in out as a string, cut to fit */
 [[nodiscard]] int run_cmd_capture(const char *prog, const char *const argv[], char *out, size_t outsz);
+/* the same, with what it says on stderr thrown away */
+[[nodiscard]] int run_cmd_capture_quiet(const char *prog, const char *const argv[], char *out, size_t outsz);
 /* the same with input as the program's standard input, at most RUN_INPUT_MAX bytes of it */
 #define RUN_INPUT_MAX 32768
 [[nodiscard]] int run_cmd_input(const char *prog, const char *const argv[], const char *input, bool quiet);
@@ -427,10 +429,31 @@ int read_container_ip(const char *name, char *ip, size_t ipsz);
  *                                          container with links
  *   nat     POSTROUTING -> LIGHTBOX-POSTROUTING
  */
-/* The two ends of a container's interface, as they are called on the host
- * before one of them is moved: vb-<name> stays on the bridge, ve-<name> goes
- * into the container. 16 bytes each, which a name with three more fits. */
-void veth_names(const char *name, char host[16], char cont[16]);
+/*
+ * What a container is called where its name does not fit: the end of its
+ * interface on the host, vb-<12 hex digits>, and the chain of its links,
+ * LB-<the same digits>. The digits are 48 bits of an FNV-1a hash of the
+ * name, the same for a name every time. In the container the interface is
+ * eth0.
+ */
+#define IFNAME_TEXT_MAX  16
+#define CONTAINER_IFNAME "eth0"
+void host_port_name(const char *name, char out[IFNAME_TEXT_MAX]);
+void link_chain_name(const char *name, char out[IFNAME_TEXT_MAX]);
+/* Whose an interface on the host is, by the alias lightbox gives what it
+ * makes for a container: lightbox:<name>. One without it is not lightbox's. */
+typedef enum { PORT_ABSENT, PORT_OURS, PORT_FOREIGN } port_owner;
+port_owner host_port_owner(const char *ifname, const char *name);
+/* The same from what "ip link show dev <interface>" printed, which this cuts
+ * into lines where it stands. */
+port_owner port_owner_of_listing(char *shown, const char *name);
+/* Is this a chain a record of link rules may name: LB- and what an iptables
+ * chain name may hold, within its 28 characters? */
+bool link_chain_ok(const char *chain);
+/* The interface removed when it is this container's: 0 when none of the
+ * container's is there afterwards, 1 when one of that name that is not
+ * lightbox's was left alone, -1 when it could not be removed. */
+int remove_own_port(const char *ifname, const char *name);
 #define FIREWALL_TEXT_MAX 4096
 /* What iptables-restore is given: for a container's links, or for setup.
  * False when it does not fit. */
