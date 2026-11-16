@@ -464,8 +464,9 @@ wait_for() { # seconds, command...
 # Is "sleep <seconds>" running? The odd number of seconds is what tells a
 # case's own sleep from every other process, so the whole command line has to
 # be that and nothing else: a shell or an editor that merely names the number
-# does not count.
-NAP=31.4159
+# does not count. The number has this suite's process ID in it, so that two
+# suites running on one machine do not take each other's sleep for their own.
+NAP=31.$$
 sleeping() {
     local f
     for f in /proc/[0-9]*/cmdline; do
@@ -883,9 +884,6 @@ t_volume_that_cannot_be_had() {
         out=$(unshare --mount "$UNIT" volumes "$D/root" "$D/missing:/data" 2>&1) && { echo "a missing source was accepted"; exit 1; }
         echo "$out"
         [ "$out" = "Error: volume source does not exist: $D/missing" ] || exit 1
-        out=$(unshare --mount "$UNIT" volumes "$D/root" "$D/src:/a/../b" 2>&1) && { echo "a destination with .. was accepted"; exit 1; }
-        echo "$out"
-        case $out in *"cannot be used"*"$D/src:/a/../b") ;; *) exit 1 ;; esac
         # a directory cannot go where the image has a file
         : > "$D/root/file"
         out=$(unshare --mount "$UNIT" volumes "$D/root" "$D/src:/file" 2>&1) && { echo "a directory was mounted on a file"; exit 1; }
@@ -1462,12 +1460,392 @@ t_start_has_one_way_out() {
     [ -n "$region" ] || { echo "cmd_start, or the start of its guarded part, was not found in $src"; return 1; }
     echo "lines looked at: $(printf '%s\n' "$region" | wc -l)"
     bad=0
-    if printf '%s\n' "$region" | grep -nE '\b(die|die2|require_[a-z_]+|set_container_state|usage)\(' ; then
+    if printf '%s\n' "$region" | grep -nE '\b(die|die2|[a-z_]+_or_die|require_[a-z_]+|set_container_state|usage)\(' ; then
         echo "these end the process where it stands"; bad=1
     fi
     exits=$(printf '%s\n' "$region" | grep -c 'lc_kernel_exit(')
     [ "$exits" = 1 ] || { echo "lc_kernel_exit is called $exits times; the one in fail_start is the only one there may be"; bad=1; }
     printf '%s\n' "$region" | grep -q 'goto fail_start' || { echo "nothing goes to fail_start"; bad=1; }
+    return $bad
+}
+
+# ─── Text and numbers ───────────────────────────────────────────────────────
+
+# The three helpers that put text into a buffer never put part of it there.
+t_text_is_whole_or_refused() {
+    bad=0
+    expect() { # expected output, then the harness's arguments
+        want=$1; shift
+        got=$("$UNIT" text "$@")
+        [ "$got" = "$want" ] || { echo "text $*: '$got', expected '$want'"; bad=1; }
+    }
+    # five characters need six bytes
+    expect 'whole hello'  copy 6 hello
+    expect 'cut '         copy 5 hello
+    expect 'cut '         copy 1 hello
+    expect 'whole '       copy 1 ''
+    # what does not fit is not appended, and what was there stays whole
+    expect 'whole abcdef' append 7 abc def
+    expect 'cut abc'      append 6 abc def
+    expect 'cut abc'      append 4 abc def
+    # one slash between the two, whatever they bring
+    expect 'whole /a/b'   join 5 /a b
+    expect 'whole /a/b'   join 5 /a/ b
+    expect 'whole /a/b'   join 5 /a /b
+    expect 'whole /a/b'   join 5 /a/ /b
+    expect 'cut '         join 4 /a b
+    expect 'cut '         join 3 /a b
+    expect 'whole /b'     join 3 / b
+    return $bad
+}
+
+t_numbers_are_strict() {
+    bad=0
+    expect() { # text, min, max, expected
+        got=$("$UNIT" number "$1" "$2" "$3")
+        [ "$got" = "$4" ] || { echo "'$1' in [$2, $3]: $got, expected $4"; bad=1; }
+    }
+    expect 0 0 10 0
+    expect 10 0 10 10
+    expect 11 0 10 refused
+    expect -1 0 10 refused
+    expect -5 -10 10 -5
+    expect 007 0 10 7
+    # nothing but a sign and digits
+    for text in '' '-' '+5' ' 5' '5 ' 5s s5 1.5 0x10 1e3 '5
+' -0 --5; do
+        expect "$text" -100 100 refused
+    done
+    # the ends of what a number can be, and one past each
+    expect 9223372036854775807 0 9223372036854775807 9223372036854775807
+    expect 9223372036854775808 0 9223372036854775807 refused
+    expect -9223372036854775808 -9223372036854775808 0 -9223372036854775808
+    expect -9223372036854775809 -9223372036854775808 0 refused
+    # a number that would come round to a small one
+    expect 18446744073709551621 0 100 refused
+    expect 99999999999999999999999999 0 9223372036854775807 refused
+    return $bad
+}
+
+# What --mem, --pids, --cpu and --oom-score take; the settings default_* and
+# the lines of a .conf are held to the same.
+t_limits() {
+    bad=0
+    expect() { # kind, text, expected
+        got=$("$UNIT" limit "$1" "$2")
+        [ "$got" = "$3" ] || { echo "$1 '$2': $got, expected $3"; bad=1; }
+    }
+    for text in 1 4096 268435456 64K 64k 256M 256m 1G 2g 1T 2t max 9223372036854775807 8589934591G 8388607T; do
+        expect mem "$text" ok
+    done
+    # the kernel would read a leading 0 as octal: 0100M is 64M to it
+    for text in '' 0 0100M 00 M 1P 1GB 1.5G -1 +1 ' 1G' '1G ' 'not-a-size' MAX 9223372036854775808 8589934592G 8388608T 99999999999999999999 '1G
+privileged=1'; do
+        expect mem "$text" refused
+    done
+    for text in 1 128 4194304 max; do expect pids "$text" ok; done
+    for text in '' 0 010 -1 4194305 123456789 12a 1.5 MAX '5
+'; do
+        expect pids "$text" refused
+    done
+    expect cpu 1 'quota 100000'
+    expect cpu 2 'quota 200000'
+    expect cpu 0.5 'quota 50000'
+    expect cpu 0.25 'quota 25000'
+    expect cpu 1.5 'quota 150000'
+    expect cpu 0.01 'quota 1000'
+    expect cpu 512 'quota 51200000'
+    expect cpu 02 'quota 200000'
+    for text in '' 0 0.0 0.00 0.001 0.125 .5 1. 1.x -1 +1 512.01 513 1024 1e3 abc '1 ' 1,5; do
+        expect cpu "$text" refused
+    done
+    expect oom 0 'score 0'
+    expect oom -1000 'score -1000'
+    expect oom 1000 'score 1000'
+    for text in '' abc 12abc 1001 -1001 1.5 ' 5'; do expect oom "$text" refused; done
+    return $bad
+}
+
+# ─── A container's configuration ────────────────────────────────────────────
+
+# Runs a function with $D as a directory of containers that holds one, "web".
+in_config_dir() { # function
+    D=$(mktemp -d "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    mkdir "$D/web"
+    ( "$1" )
+    rc=$?
+    rm -rf -- "$D"
+    return $rc
+}
+config()  { "$UNIT" config "$D" web "$@"; }
+written() { "$UNIT" config-write "$D" web "$@"; }
+
+config_as_written() {
+    {
+        echo 'version=1'
+        echo 'mem=512M'
+        echo 'pids=64'
+        echo 'cpu=0.5'
+        echo 'oom_score=-300'
+        echo 'privileged=1'
+        echo 'readonly=1'
+        echo 'io=8:0 rbps=1048576'
+        echo 'vol=/srv/data:/data'
+        echo 'vol=/etc/app.conf:/etc/app.conf:ro'
+        echo 'link=db'
+        echo 'link=cache'
+    } > "$D/web/.conf"
+    got=$(config)
+    want='version 1
+mem 512M
+pids 64
+cpu 0.5
+oom_score -300
+privileged 1
+readonly 1
+userns 0
+uid_start 0
+io 8:0 rbps=1048576
+vol /srv/data -> /data rw
+vol /etc/app.conf -> /etc/app.conf ro
+link db
+link cache'
+    printf '%s\n' "$got"
+    [ "$got" = "$want" ]
+}
+t_config_is_read_whole() { in_config_dir config_as_written; }
+
+# What a file does not say is what lightbox.conf says, and a file may say
+# nothing at all.
+config_defaults() {
+    : > "$D/web/.conf"
+    got=$(config)
+    printf '%s\n' "$got"
+    [ "$got" = 'version 0
+mem 256M
+pids 128
+cpu 1
+oom_score 500
+privileged 0
+readonly 0
+userns 0
+uid_start 0
+io -' ] || return 1
+    # a default that cannot be used is no default: the file must have the limit
+    got=$(config nodefaults)
+    printf '%s\n' "$got"
+    case $got in 'refused: '*"$D/web/.conf"*'default_mem') ;; *) return 1 ;; esac
+    printf 'version=1\nmem=1G\npids=max\ncpu=2\noom_score=0\n' > "$D/web/.conf"
+    got=$(config nodefaults)
+    printf '%s\n' "$got"
+    case $got in 'version 1
+mem 1G
+pids max
+cpu 2
+oom_score 0
+'*) ;; *) return 1 ;; esac
+    # each limit by itself: the file lacks it, and its default is the one named
+    for missing in mem pids cpu oom_score; do
+        printf 'version=1\nmem=1G\npids=max\ncpu=2\noom_score=0\n' | grep -v "^$missing=" > "$D/web/.conf"
+        got=$(config nodefaults)
+        setting=default_${missing%_score}
+        case $got in 'refused: '*": $setting") ;; *) echo "without $missing: $got"; return 1 ;; esac
+        got=$(config)
+        case $got in 'version 1'*) ;; *) echo "without $missing, and a default: $got"; return 1 ;; esac
+    done
+    # and no file is not an empty file
+    rm "$D/web/.conf"
+    got=$(config)
+    printf '%s\n' "$got"
+    case $got in 'refused: '*'cannot be read') ;; *) return 1 ;; esac
+}
+t_config_defaults() { in_config_dir config_defaults; }
+
+# A file with the version line is lightbox's own writing: whatever in it is
+# not what lightbox writes means the file is damaged, and is said with the
+# line it is on.
+config_strict() {
+    bad=0
+    refuses() { # what the message must say, then the file's lines
+        want=$1; shift
+        printf '%s\n' "$@" > "$D/web/.conf"
+        got=$(config)
+        # shellcheck disable=SC2254     # $want is a pattern, and is meant as one
+        case $got in "refused: $D/web/.conf: "$want) ;; *) echo "expected '$want', got: $got"; bad=1 ;; esac
+    }
+    refuses 'line 2: a key lightbox does not know'      version=1 colour=blue
+    refuses 'line 3: is not key=value'                  version=1 mem=1G junk
+    refuses 'line 3: a key the file already has'        version=1 mem=1G mem=2G
+    refuses 'line 2: mem is not *'                      version=1 mem=lots
+    refuses 'line 2: mem is not *'                      version=1 mem=0100M
+    refuses 'line 2: pids is not *'                     version=1 pids=123456789
+    refuses 'line 2: cpu is not *'                      version=1 cpu=1024
+    refuses 'line 2: oom_score is not *'                version=1 oom_score=12abc
+    refuses 'line 2: privileged is not 0 or 1'          version=1 privileged=yes
+    refuses 'line 2: readonly is not 0 or 1'            version=1 readonly=2
+    refuses 'line 2: the link is not the name of a container' version=1 'link=a b'
+    refuses 'line 2: the link is not the name of a container' version=1 link=a-name-that-is-too-long
+    refuses 'line 2: *absolute path without ..'         version=1 vol=/srv:/a/../b
+    refuses 'line 2: a volume is written src:dst*'      version=1 vol=/srv
+    refuses 'line 2: *only :ro may follow'              version=1 vol=/srv:/data:rw
+    refuses 'line 2: *may not be under /proc*'          version=1 vol=/srv:/proc/sys
+    refuses 'line 2: the version is not the first line' mem=1G version=1
+    refuses 'line 1: the version is not a number'       version=one
+    refuses 'line 1: the version is not a number'       version=0
+    refuses 'line 1: was written by a newer lightbox*'  version=2 mem=1G
+    # a carriage return is a control character like any other
+    printf 'version=1\r\nmem=1G\r\n' > "$D/web/.conf"
+    got=$(config)
+    case $got in "refused: $D/web/.conf: line 1: has a control character") ;; *) echo "CRLF: $got"; bad=1 ;; esac
+    # what follows a NUL byte would never be read
+    printf 'version=1\nmem=1G\n\0privileged=1\n' > "$D/web/.conf"
+    got=$(config)
+    case $got in "refused: $D/web/.conf: has a NUL byte") ;; *) echo "NUL: $got"; bad=1 ;; esac
+    # more volumes and links than a container has
+    { echo version=1; for i in $(seq 1 17); do echo "vol=/srv:/v$i"; done; } > "$D/web/.conf"
+    got=$(config)
+    case $got in "refused: $D/web/.conf: line 18: more than 16 volumes") ;; *) echo "17 volumes: $got"; bad=1 ;; esac
+    { echo version=1; for i in $(seq 1 9); do echo "link=c$i"; done; } > "$D/web/.conf"
+    got=$(config)
+    case $got in "refused: $D/web/.conf: line 10: more than 8 links") ;; *) echo "9 links: $got"; bad=1 ;; esac
+    # a file too large to be a configuration
+    { echo version=1; head -c 30000 /dev/zero | tr '\0' '\n'; } > "$D/web/.conf"
+    got=$(config)
+    case $got in "refused: $D/web/.conf: is larger than lightbox supports") ;; *) echo "large: $got"; bad=1 ;; esac
+    # the line that is named is the line an editor shows, empty ones counted
+    refuses 'line 5: a key lightbox does not know'      version=1 '' mem=1G '' colour=blue
+    # empty lines are no lines
+    printf '\nversion=1\n\nmem=1G\n\n' > "$D/web/.conf"
+    got=$(config)
+    case $got in 'version 1
+mem 1G
+'*) ;; *) echo "empty lines: $got"; bad=1 ;; esac
+    return $bad
+}
+t_config_is_read_strictly() { in_config_dir config_strict; }
+
+# A file from before the version line is read as it was read then: the first
+# of two values counts, and what lightbox does not know is passed over. What
+# it does know still has to be a value.
+config_from_before() {
+    {
+        echo 'mem=512M'
+        echo 'pids=64'
+        echo 'cpu=2'
+        echo 'a line that is no setting'
+        echo 'colour=blue'
+        echo 'mem=1G'
+        echo 'privileged=1'
+        echo 'oom_score=100'
+        echo 'vol=/srv/data//:/data/'
+        echo 'vol=/srv/other:/data'
+        echo 'link=db'
+    } > "$D/web/.conf"
+    got=$(config)
+    printf '%s\n' "$got"
+    [ "$got" = 'version 0
+mem 512M
+pids 64
+cpu 2
+oom_score 100
+privileged 1
+readonly 0
+userns 0
+uid_start 0
+io -
+vol /srv/data -> /data rw
+vol /srv/other -> /data rw
+link db' ] || return 1
+    printf 'mem=lots\n' > "$D/web/.conf"
+    got=$(config)
+    printf '%s\n' "$got"
+    case $got in "refused: $D/web/.conf: line 1: mem is not "*) ;; *) return 1 ;; esac
+    printf 'cpu=1\nversion=1\n' > "$D/web/.conf"
+    got=$(config)
+    printf '%s\n' "$got"
+    case $got in "refused: $D/web/.conf: line 2: the version is not the first line") ;; *) return 1 ;; esac
+}
+t_config_from_before_the_version_line() { in_config_dir config_from_before; }
+
+# What is written is what is read back, and a value that would be read back
+# as anything else is not written at all. No command lets such a value in;
+# this is the writer's own refusal, for the day one does.
+config_written() {
+    bad=0
+    got=$(written mem=1G pids=max cpu=0.25 'io=8:0 wbps=1024' src=/srv/data dst=/data link=db)
+    [ "$got" = written ] || { echo "a good configuration: $got"; bad=1; }
+    cat "$D/web/.conf"
+    [ "$(cat "$D/web/.conf")" = 'version=1
+mem=1G
+pids=max
+cpu=0.25
+oom_score=500
+io=8:0 wbps=1024
+vol=/srv/data:/data
+link=db' ] || { echo "the file is not what was put in"; bad=1; }
+    [ "$(stat -c %a "$D/web/.conf")" = 600 ] || { echo "the file's mode is $(stat -c %a "$D/web/.conf")"; bad=1; }
+    got=$(config | tr '\n' ' ')
+    case $got in 'version 1 mem 1G pids max cpu 0.25 oom_score 500 '*'io 8:0 wbps=1024 vol /srv/data -> /data rw link db ') ;;
+        *) echo "read back: $got"; bad=1 ;; esac
+
+    before=$(cat "$D/web/.conf")
+    nl='
+'
+    for value in "mem=1G${nl}privileged=1" "pids=5${nl}cpu=9" "cpu=1${nl}mem=1G" \
+                 "io=8:0 rbps=1${nl}privileged=1" "link=db${nl}cpu=9" \
+                 "src=/srv${nl}privileged=1" "src=/srv:/etc"; do
+        case $value in src=*) got=$(written "$value" dst=/data) ;; *) got=$(written "$value") ;; esac
+        case $got in 'refused: '*) ;; *) echo "written with ${value%%=*} of two lines or two paths: $got"; bad=1 ;; esac
+    done
+    got=$(written src=/srv "dst=/data${nl}privileged=1")
+    case $got in 'refused: '*) ;; *) echo "written with a destination of two lines: $got"; bad=1 ;; esac
+    got=$(written src=/srv dst=/data:ro)
+    case $got in 'refused: '*) ;; *) echo "written with a colon in a destination: $got"; bad=1 ;; esac
+    got=$(written "mem=1G$(printf '\r')")
+    case $got in 'refused: '*) ;; *) echo "written with a carriage return: $got"; bad=1 ;; esac
+    # values that are one line and still not what a reader takes, or takes as they are
+    for value in mem=lots mem=0100M mem= pids=0 pids= cpu=1024 cpu= 'link=a b' link= \
+                 src=/srv/ src=/srv/../etc src=srv src=/proc/1; do
+        case $value in src=*) got=$(written "$value" dst=/data) ;; *) got=$(written "$value") ;; esac
+        case $got in 'refused: '*) ;; *) echo "written with $value: $got"; bad=1 ;; esac
+    done
+    for value in dst=/data/ dst=/ dst=/proc/x dst=/a/../b dst=data; do
+        got=$(written src=/srv "$value")
+        case $got in 'refused: '*) ;; *) echo "written with $value: $got"; bad=1 ;; esac
+    done
+    # two volumes at one place are refused where one is added, not here: a
+    # container from before can have them, and its file is written all the same
+    got=$(written src=/srv dst=/data src=/other dst=/data)
+    [ "$got" = written ] || { echo "two volumes at one place: $got"; bad=1; }
+    got=$(written mem=1G pids=max cpu=0.25 'io=8:0 wbps=1024' src=/srv/data dst=/data link=db)
+    [ "$got" = written ] || { echo "the good configuration again: $got"; bad=1; }
+    [ "$(cat "$D/web/.conf")" = "$before" ] || { echo "a refused configuration changed the file"; bad=1; }
+    for left in "$D/web"/.[!.]* "$D/web"/*; do
+        [ -e "$left" ] || continue
+        [ "$left" = "$D/web/.conf" ] || { echo "left beside the file: $left"; bad=1; }
+    done
+    return $bad
+}
+t_config_is_written_as_it_will_be_read() { in_config_dir config_written; }
+
+# One reader and one writer: nothing else opens a .conf, and nothing else
+# knows what is in one.
+t_conf_has_one_reader() {
+    src=$HERE/..
+    bad=0
+    users=$(grep -l 'container_conf_path(' "$src"/lightbox*.c | xargs -n1 basename | sort | tr '\n' ' ')
+    echo "container_conf_path is called in: $users"
+    [ "$users" = 'lightbox_container.c lightbox_meta.c lightbox_state.c ' ] || { echo "expected the reader and writer, inspect (which prints the path) and the definition"; bad=1; }
+    # inspect names the file and does not read it
+    grep -n 'conf_path' "$src/lightbox_meta.c" | grep -v 'container_conf_path(conf_path, name)\|print_kv("config_path", conf_path)\|char cdir' && { echo "lightbox_meta.c does more with the path than print it"; bad=1; }
+    for file in "$src"/lightbox.c "$src"/lightbox_meta.c "$src"/lightbox_state.c "$src"/lightbox_net.c \
+                "$src"/lightbox_config.c "$src"/lightbox_util.c; do
+        if grep -nE '"(vol|link|mem|pids|cpu|oom_score|privileged|readonly|userns|uid_start|version)="|conf_get|container_conf_read' "$file" /dev/null; then
+            echo "$(basename "$file") looks into a .conf's text"; bad=1
+        fi
+    done
+    # and the helpers that cut are gone
+    grep -n 'str_append_whole\|[^a-z_]parse_int(' "$src"/lightbox*.c "$src"/lightbox.h && { echo "a helper that cuts text or reads half a number is still there"; bad=1; }
     return $bad
 }
 
@@ -1560,5 +1938,15 @@ check 'exec'"'"'s options are checked, and a missing value names its option' t_c
 check 'a number of seconds is digits within the limit'           t_seconds
 check 'a file never gets the number of a closed standard stream' t_standard_streams_are_reserved
 check 'cmd_start has one way out once it has changed the host'   t_start_has_one_way_out
+
+check 'text is put into a buffer whole or not at all'            t_text_is_whole_or_refused
+check 'a number is digits in its range, and never wraps'         t_numbers_are_strict
+check 'memory, process, CPU and OOM limits are what they say'    t_limits
+check 'a .conf is read into one structure, whole'                t_config_is_read_whole
+check 'what a .conf leaves out is the default, if that is usable' t_config_defaults
+check 'a .conf with a version is read strictly, by line'         t_config_is_read_strictly
+check 'a .conf from before the version line is still read'       t_config_from_before_the_version_line
+check 'a .conf is written as it will be read, or not written'    t_config_is_written_as_it_will_be_read
+check 'one file reads and writes a .conf, and none looks into it' t_conf_has_one_reader
 
 summary unit

@@ -88,7 +88,7 @@ jobs:
       - name: Install the toolchain and what the suite needs
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build gcc-14 busybox-static iproute2 iptables util-linux
+          sudo apt-get install -y ninja-build gcc-14 busybox-static iproute2 iptables util-linux strace
       - name: Build
         run: make CC=gcc-14
       # The suite makes bridge and veth interfaces, and lightbox's firewall

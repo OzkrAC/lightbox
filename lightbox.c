@@ -47,46 +47,7 @@ global_config cfg_global;
 
 /* ─── Structs ───────────────────────────────────────────────────────────── */
 
-typedef struct {
-    char name[NAME_MAX_LEN + 1];
-    char ip[16];
-    char mem[16];
-    char pids[8];
-    char cpu[4];
-    int  userns;
-    int  uid_start;
-    int  privileged;
-    int  read_only;
-    int  oom_score;
-    int  nvols;
-    char vol_src[MAX_VOLS][MAX_PATH];
-    char vol_dst[MAX_VOLS][MAX_PATH];
-    int  vol_ro[MAX_VOLS];
-    int  nlinks;
-    char links[MAX_LINKS][NAME_MAX_LEN + 1];
-    int  ndns;
-    char dns[MAX_DNS][16];
-} container_config;
-
-typedef struct {
-    char src[MAX_PATH];
-    char dst[MAX_PATH];
-    int ro;
-} volume_spec;
-
 /* ─── Utility functions ─────────────────────────────────────────────────── */
-
-static bool parse_u32_strict(const char *s, uint32_t *out) {
-    uint32_t val = 0;
-    if (!s || !s[0]) return false;
-    for (size_t i = 0; s[i]; i++) {
-        char c = s[i];
-        if (c < '0' || c > '9') return false;
-        val = val * 10u + (uint32_t)(c - '0');
-    }
-    *out = val;
-    return true;
-}
 
 static bool parse_ipv4(const char *s, uint8_t out[4]) {
     uint32_t cur = 0;
@@ -135,8 +96,10 @@ static bool parse_cidr_ipv4(const char *cidr, uint8_t net[4], uint32_t *prefix) 
     ip_part[ip_len] = '\0';
 
     if (!parse_ipv4(ip_part, net)) return false;
-    if (!parse_u32_strict(slash + 1, prefix)) return false;
-    return *prefix <= 32u;
+    int64_t bits;
+    if (!parse_number(slash + 1, 0, 32, &bits)) return false;
+    *prefix = (uint32_t)bits;
+    return true;
 }
 
 static void validate_ipv4_address(const char *ip) {
@@ -156,12 +119,6 @@ static void validate_ip_in_subnet(const char *ip, const char *cidr) {
     uint32_t mask = (prefix == 0) ? 0u : (0xffffffffu << (32u - prefix));
     if ((ipv4_to_u32(ip_octets) & mask) != (ipv4_to_u32(net_octets) & mask))
         die2("Error: IP is outside configured subnet: ", ip);
-}
-
-static void validate_positive_integer_option(const char *label, const char *value) {
-    uint32_t parsed;
-    if (!parse_u32_strict(value, &parsed) || parsed == 0)
-        die2(label, value);
 }
 
 /* Is this an address a container can ask for names: IPv4, and not this
@@ -197,8 +154,8 @@ static int name_servers_of(const char *resolv_path, char out[][16]) {
             while (address[len] && address[len] != ' ' && address[len] != '\t' && address[len] != '\r')
                 len++;
             address[len] = '\0';
-            if (len < 16 && usable_name_server(address))
-                str_copy(out[count++], address, 16);
+            if (usable_name_server(address) && str_copy(out[count], address, 16))
+                count++;
         }
         line = last ? end : end + 1;
     }
@@ -221,112 +178,12 @@ static int name_servers_listed(const char *list, char out[][16]) {
             return -1;
         lc_bytes_copy(address, p, len);
         address[len] = '\0';
-        if (!usable_name_server(address))
+        if (!usable_name_server(address) || !str_copy(out[count], address, 16))
             return -1;
-        str_copy(out[count++], address, 16);
+        count++;
         p += len;
     }
     return count;
-}
-
-static void validate_oom_score(int oom_score) {
-    if (oom_score < -1000 || oom_score > 1000)
-        die("Error: oom-score must be between -1000 and 1000");
-}
-
-/*
- * Bring an absolute path to one spelling: single slashes, no "." component,
- * no slash at the end. False for a path that is not absolute or that has a
- * ".." component: where that leads depends on what is in the directories
- * before it, and a volume's paths are to mean what they say.
- */
-static bool normalise_path(char *path) {
-    if (path[0] != '/')
-        return false;
-
-    size_t out = 0;
-    for (size_t in = 0; path[in]; ) {
-        while (path[in] == '/')
-            in++;
-        size_t len = 0;
-        while (path[in + len] && path[in + len] != '/')
-            len++;
-        if (len == 0)
-            break;
-        if (len == 2 && path[in] == '.' && path[in + 1] == '.')
-            return false;
-        if (!(len == 1 && path[in] == '.')) {
-            path[out++] = '/';
-            for (size_t i = 0; i < len; i++)
-                path[out++] = path[in + i];
-        }
-        in += len;
-    }
-    if (out == 0)
-        path[out++] = '/';
-    path[out] = '\0';
-    return true;
-}
-
-/* Is a normalised path this directory, or something inside it? */
-static bool path_is_under(const char *path, const char *dir) {
-    size_t len = lc_string_length(dir);
-    return lc_string_starts_with(path, lc_string_length(path), dir, len) &&
-           (path[len] == '\0' || path[len] == '/');
-}
-
-/*
- * A volume as it is written: src:dst[:ro]. NULL when it is one, with both
- * paths normalised in vol; otherwise what is wrong with it. create, add-vol
- * and start all read a volume through this, so they agree on what one is.
- */
-static const char *parse_volume_spec(const char *spec, volume_spec *vol) {
-    const char *colon1 = NULL, *colon2 = NULL;
-    for (size_t i = 0; spec[i]; i++) {
-        if (spec[i] != ':') continue;
-        if (!colon1) colon1 = spec + i;
-        else if (!colon2) colon2 = spec + i;
-    }
-    if (!colon1)
-        return "a volume is written src:dst[:ro]";
-
-    size_t slen = (size_t)(colon1 - spec);
-    if (slen == 0 || slen >= sizeof(vol->src))
-        return "the volume's source is empty or too long";
-    lc_bytes_copy(vol->src, spec, slen);
-    vol->src[slen] = '\0';
-
-    const char *dst_start = colon1 + 1;
-    const char *dst_end = colon2 ? colon2 : spec + lc_string_length(spec);
-    size_t dlen = (size_t)(dst_end - dst_start);
-    if (dlen == 0 || dlen >= sizeof(vol->dst))
-        return "the volume's destination is empty or too long";
-    lc_bytes_copy(vol->dst, dst_start, dlen);
-    vol->dst[dlen] = '\0';
-
-    vol->ro = 0;
-    if (colon2) {
-        if (colon2[1] == 'r' && colon2[2] == 'o' && colon2[3] == '\0')
-            vol->ro = 1;
-        else
-            return "after the volume's destination only :ro may follow";
-    }
-
-    if (!normalise_path(vol->src))
-        return "the volume's source must be an absolute path without ..";
-    if (!normalise_path(vol->dst))
-        return "the volume's destination must be an absolute path without ..";
-    if (path_is_under(vol->src, "/proc") || path_is_under(vol->src, "/sys") ||
-        path_is_under(vol->src, "/dev"))
-        return "a volume's source may not be under /proc, /sys or /dev";
-    if (streq(vol->dst, "/"))
-        return "a volume may not be mounted over /";
-    if (path_is_under(vol->dst, "/.old_root"))
-        return "/.old_root is a name lightbox uses itself while it builds a container";
-    if (path_is_under(vol->dst, "/proc") || path_is_under(vol->dst, "/sys") ||
-        path_is_under(vol->dst, "/dev"))
-        return "a volume's destination may not be under /proc, /sys or /dev";
-    return NULL;
 }
 
 static void parse_volume_spec_or_die(const char *spec, volume_spec *vol) {
@@ -339,95 +196,6 @@ static void parse_volume_spec_or_die(const char *spec, volume_spec *vol) {
         lc_print_char(STDERR, '\n');
         lc_kernel_exit(1);
     }
-}
-
-static void parent_dir(char *buf, size_t bufsz, const char *path) {
-    size_t len = lc_string_length(path);
-    if (len == 0 || len >= bufsz)
-        die2("Error: invalid path: ", path);
-
-    str_copy(buf, path, bufsz);
-    while (len > 0 && buf[len - 1] != '/')
-        len--;
-
-    if (len == 0) {
-        str_copy(buf, ".", bufsz);
-    } else if (len == 1) {
-        buf[1] = '\0';
-    } else {
-        buf[len - 1] = '\0';
-    }
-}
-
-static bool container_has_volume(const char *name, const volume_spec *needle) {
-    char conf_buf[CONF_MAX];
-    if (container_conf_read(name, conf_buf) <= 0)
-        return false;
-
-    char *p = conf_buf;
-    while (*p) {
-        if (p[0] == 'v' && p[1] == 'o' && p[2] == 'l' && p[3] == '=') {
-            char line[MAX_PATH * 2 + 4];
-            char *end = p + 4;
-            while (*end && *end != '\n') end++;
-            size_t len = (size_t)(end - (p + 4));
-            if (len < sizeof(line)) {
-                lc_bytes_copy(line, p + 4, len);
-                line[len] = '\0';
-                volume_spec existing = {0};
-                if (parse_volume_spec(line, &existing) == NULL &&
-                    streq(existing.src, needle->src) &&
-                    streq(existing.dst, needle->dst) &&
-                    existing.ro == needle->ro)
-                    return true;
-            }
-        }
-        while (*p && *p != '\n') p++;
-        if (*p == '\n') p++;
-    }
-
-    return false;
-}
-
-
-static void append_container_volume(const char *name, const volume_spec *vol) {
-    char conf_path[MAX_PATH], conf_buf[CONF_MAX], new_buf[CONF_MAX];
-    container_conf_path(conf_path, name);
-    int n = container_conf_read(name, conf_buf);
-    if (n < 0)
-        die2("Error: failed to read container config: ", conf_path);
-
-    int nvols = 0;
-    for (size_t i = 0; conf_buf[i]; ) {
-        if (conf_buf[i] == 'v' && conf_buf[i + 1] == 'o' && conf_buf[i + 2] == 'l' && conf_buf[i + 3] == '=')
-            nvols++;
-        while (conf_buf[i] && conf_buf[i] != '\n') i++;
-        if (conf_buf[i] == '\n') i++;
-    }
-    if (nvols >= MAX_VOLS)
-        die2("Error: container already has the maximum of " STRINGIFY(MAX_VOLS) " volumes: ", name);
-
-    bool overflow = false;
-    size_t pos = 0;
-    new_buf[0] = '\0';
-    if (n > 0)
-        pos = str_append_whole(new_buf, pos, conf_buf, sizeof(new_buf), &overflow);
-    if (pos > 0 && new_buf[pos - 1] != '\n')
-        pos = str_append_whole(new_buf, pos, "\n", sizeof(new_buf), &overflow);
-
-    pos = str_append_whole(new_buf, pos, "vol=", sizeof(new_buf), &overflow);
-    pos = str_append_whole(new_buf, pos, vol->src, sizeof(new_buf), &overflow);
-    pos = str_append_whole(new_buf, pos, ":", sizeof(new_buf), &overflow);
-    pos = str_append_whole(new_buf, pos, vol->dst, sizeof(new_buf), &overflow);
-    if (vol->ro)
-        pos = str_append_whole(new_buf, pos, ":ro", sizeof(new_buf), &overflow);
-    str_append_whole(new_buf, pos, "\n", sizeof(new_buf), &overflow);
-
-    /* Never write a config that lost part of itself. */
-    if (overflow)
-        die2("Error: container config would exceed its size limit: ", conf_path);
-
-    require_write_file_atomic(conf_path, new_buf);
 }
 
 static bool name_char_ok(char c) {
@@ -471,11 +239,12 @@ static bool userns_range_in_use(const char *exclude_name, int uid_start) {
     for (int i = 0; i < count; i++) {
         if (exclude_name && streq(names[i], exclude_name))
             continue;
-        if (conf_get_int(names[i], "userns", 0)) {
-            int existing = conf_get_int(names[i], "uid_start", 0);
-            if (existing > 0 && uid_ranges_overlap(existing, uid_start))
-                return true;
-        }
+        /* one whose configuration cannot be read has no range to keep clear of */
+        static container_config other;
+        if (container_config_load(names[i], &other) != NULL)
+            continue;
+        if (other.userns && other.uid_start > 0 && uid_ranges_overlap(other.uid_start, uid_start))
+            return true;
     }
     return false;
 }
@@ -520,59 +289,53 @@ static bool readable_within(int32_t fd, int64_t ms) {
 
 /* ─── Cgroup management ─────────────────────────────────────────────────── */
 
-static void cgroup_path(char *buf, const char *name) {
-    path_join(buf, MAX_PATH, cfg_global.cgroup_base, name);
+[[nodiscard]] static bool cgroup_path(char *buf, const char *name) {
+    return path_join(buf, MAX_PATH, cfg_global.cgroup_base, name);
 }
 
-static int cgroup_create(const char *name, int pid) {
-    char cg[MAX_PATH], tmp[MAX_PATH];
-    cgroup_path(cg, name);
+/* Write one of a cgroup's files: 0, or -1. */
+[[nodiscard]] static int cgroup_write(const char *cg, const char *file, const char *value) {
+    char path[MAX_PATH];
+    if (!path_join(path, sizeof(path), cg, file))
+        return -1;
+    return write_file(path, value);
+}
+
+static int cgroup_create(const char *name, int pid, const container_config *config) {
+    char cg[MAX_PATH];
+    if (!cgroup_path(cg, name))
+        return -1;
 
     /* ensure parent exists and has controllers */
     lc_kernel_mkdirat(AT_FDCWD, cfg_global.cgroup_base, 0755);
-
-    path_join(tmp, MAX_PATH, cfg_global.cgroup_root, "cgroup.subtree_control");
-    if (write_file(tmp, "+memory +pids +cpu +io") < 0) return -1;
-    path_join(tmp, MAX_PATH, cfg_global.cgroup_base, "cgroup.subtree_control");
-    if (write_file(tmp, "+memory +pids +cpu +io") < 0) return -1;
+    if (cgroup_write(cfg_global.cgroup_root, "cgroup.subtree_control", "+memory +pids +cpu +io") < 0)
+        return -1;
+    if (cgroup_write(cfg_global.cgroup_base, "cgroup.subtree_control", "+memory +pids +cpu +io") < 0)
+        return -1;
 
     lc_kernel_mkdirat(AT_FDCWD, cg, 0755);
 
-    /* read limits from config */
-    char mem[16], pids[8], cpu[4];
-    conf_get(name, "mem", mem, sizeof(mem), cfg_global.default_mem);
-    conf_get(name, "pids", pids, sizeof(pids), cfg_global.default_pids);
-    conf_get(name, "cpu", cpu, sizeof(cpu), cfg_global.default_cpu);
+    if (cgroup_write(cg, "memory.max", config->mem) < 0) return -1;
+    if (cgroup_write(cg, "pids.max", config->pids) < 0) return -1;
 
-    path_join(tmp, MAX_PATH, cg, "memory.max");
-    if (write_file(tmp, mem) < 0) return -1;
-
-    path_join(tmp, MAX_PATH, cg, "pids.max");
-    if (write_file(tmp, pids) < 0) return -1;
-
-    /* cpu: convert cores to quota */
-    int cores = parse_int(cpu);
-    if (cores < 1) cores = 1;
+    /* cpu: so much of every period, on all CPUs together */
+    int quota;
     char cpu_max[32];
-    int quota = cores * 100000;
-    int len = fmt_int(cpu_max, quota);
-    str_append(cpu_max, (size_t)len, " 100000", sizeof(cpu_max));
-    path_join(tmp, MAX_PATH, cg, "cpu.max");
-    if (write_file(tmp, cpu_max) < 0) return -1;
+    bool cut = false;
+    if (!parse_cpu_limit(config->cpu, &quota))
+        return -1;
+    size_t len = (size_t)fmt_int(cpu_max, quota);
+    str_append(cpu_max, len, " " STRINGIFY(CPU_PERIOD_US), sizeof(cpu_max), &cut);
+    if (cut || cgroup_write(cg, "cpu.max", cpu_max) < 0)
+        return -1;
 
-    /* io limits */
-    char io_spec[128];
-    if (conf_get(name, "io", io_spec, sizeof(io_spec), "") && io_spec[0]) {
-        path_join(tmp, MAX_PATH, cg, "io.max");
-        if (write_file(tmp, io_spec) < 0) return -1;
-    }
+    if (config->io[0] && cgroup_write(cg, "io.max", config->io) < 0)
+        return -1;
 
     /* move container process into this cgroup */
     char pidbuf[16];
     fmt_int(pidbuf, pid);
-    path_join(tmp, MAX_PATH, cg, "cgroup.procs");
-    if (write_file(tmp, pidbuf) < 0) return -1;
-    return 0;
+    return cgroup_write(cg, "cgroup.procs", pidbuf);
 }
 
 /*
@@ -626,8 +389,8 @@ static void kill_pid(int pid) {
 /* Does the cgroup's own account say that no process is left in it? */
 static bool cgroup_is_empty(const char *cg) {
     char path[MAX_PATH], events[256];
-    path_join(path, MAX_PATH, cg, "cgroup.events");
-    if (read_file(path, events, sizeof(events)) <= 0)
+    if (!path_join(path, MAX_PATH, cg, "cgroup.events") ||
+        read_file(path, events, sizeof(events)) <= 0)
         return false;
     for (const char *line = events; *line; ) {
         if (lc_string_starts_with(line, lc_string_length(line), "populated 0", 11))
@@ -652,13 +415,14 @@ static bool cgroup_is_empty(const char *cg) {
  */
 static int cgroup_destroy(const char *name) {
     char cg[MAX_PATH], tmp[MAX_PATH];
-    cgroup_path(cg, name);
+    if (!cgroup_path(cg, name) || !path_join(tmp, MAX_PATH, cg, "cgroup.procs")) {
+        print_str(STDERR, "Error: the path of the container's cgroup is too long\n");
+        return -1;
+    }
 
     if (!path_exists(cg)) return 0;
 
-    path_join(tmp, MAX_PATH, cg, "cgroup.kill");
-    bool at_once = write_file(tmp, "1") == 0;
-    path_join(tmp, MAX_PATH, cg, "cgroup.procs");
+    bool at_once = cgroup_write(cg, "cgroup.kill", "1") == 0;
 
     int64_t deadline = monotonic_ms() + CGROUP_EMPTY_MS;
     while (!cgroup_is_empty(cg) && monotonic_ms() < deadline) {
@@ -687,11 +451,10 @@ static int cgroup_destroy(const char *name) {
 }
 
 static void cgroup_join_self(const char *name) {
-    char cg[MAX_PATH], procs_path[MAX_PATH], pidbuf[16];
-    cgroup_path(cg, name);
-    path_join(procs_path, MAX_PATH, cg, "cgroup.procs");
+    char cg[MAX_PATH], pidbuf[16];
     fmt_int(pidbuf, lc_kernel_get_process_id());
-    require_write_file(procs_path, pidbuf);
+    if (!cgroup_path(cg, name) || cgroup_write(cg, "cgroup.procs", pidbuf) < 0)
+        die2("Error: cannot join the cgroup of container ", name);
 }
 
 /* ─── Security: capabilities ────────────────────────────────────────────── */
@@ -832,6 +595,30 @@ static void mask_proc_paths(void) {
     }
 }
 
+/* ─── Options ───────────────────────────────────────────────────────────── */
+
+/* The value of the option at argv[*i]: the argument after it, which *i then
+ * stands on. An option that is the last argument has none, and is told so. */
+static const char *option_value(int argc, char **argv, int *i) {
+    if (*i + 1 >= argc) {
+        print_str(STDERR, "Error: option ");
+        print_str(STDERR, argv[*i]);
+        print_str(STDERR, " requires a value\n");
+        lc_kernel_exit(1);
+    }
+    return argv[++*i];
+}
+
+/* "<prefix><subject> <what>" for an option or a setting, and the end. */
+[[noreturn]] static void die_about(const char *prefix, const char *what, const char *subject) {
+    print_str(STDERR, prefix);
+    print_str(STDERR, subject);
+    print_str(STDERR, ": ");
+    print_str(STDERR, what);
+    lc_print_char(STDERR, '\n');
+    lc_kernel_exit(1);
+}
+
 /* ─── cmd_create ────────────────────────────────────────────────────────── */
 
 static void cmd_create(int argc, char **argv) {
@@ -843,58 +630,74 @@ static void cmd_create(int argc, char **argv) {
     validate_ipv4_address(ip);
     validate_ip_in_subnet(ip, cfg_global.subnet);
 
-    /* parse options */
-    container_config cfg = {0};
-    str_copy(cfg.name, name, sizeof(cfg.name));
-    str_copy(cfg.ip, ip, sizeof(cfg.ip));
-    str_copy(cfg.mem, cfg_global.default_mem, sizeof(cfg.mem));
-    str_copy(cfg.pids, cfg_global.default_pids, sizeof(cfg.pids));
-    str_copy(cfg.cpu, cfg_global.default_cpu, sizeof(cfg.cpu));
-    cfg.oom_score = cfg_global.default_oom;
+    /* The options. A value is what its option takes or the command ends
+     * here, with the option named: none is cut to fit and none is stored to
+     * be found wrong when the container is started. */
+    static container_config cfg;
+    container_config_init(&cfg);
+    char dns[MAX_DNS][16];
+    int ndns = 0;
 
     for (int i = 2; i < argc; i++) {
-        if (streq(argv[i], "--mem") && i + 1 < argc) {
-            str_copy(cfg.mem, argv[++i], sizeof(cfg.mem));
-        } else if (streq(argv[i], "--pids") && i + 1 < argc) {
-            str_copy(cfg.pids, argv[++i], sizeof(cfg.pids));
-            validate_positive_integer_option("Error: pids must be a positive integer: ", cfg.pids);
-        } else if (streq(argv[i], "--cpu") && i + 1 < argc) {
-            str_copy(cfg.cpu, argv[++i], sizeof(cfg.cpu));
-            validate_positive_integer_option("Error: cpu must be a positive integer: ", cfg.cpu);
-        } else if (streq(argv[i], "--userns")) {
+        const char *opt = argv[i];
+        if (streq(opt, "--mem")) {
+            const char *value = option_value(argc, argv, &i);
+            if (!mem_limit_ok(value) || !str_copy(cfg.mem, value, sizeof(cfg.mem)))
+                die2("Error: --mem takes <number>[K|M|G|T] or max, not: ", value);
+        } else if (streq(opt, "--pids")) {
+            const char *value = option_value(argc, argv, &i);
+            if (!pids_limit_ok(value) || !str_copy(cfg.pids, value, sizeof(cfg.pids)))
+                die2("Error: --pids takes a number from 1 to " STRINGIFY(PIDS_LIMIT_MAX) " or max, not: ", value);
+        } else if (streq(opt, "--cpu")) {
+            const char *value = option_value(argc, argv, &i);
+            int quota;
+            if (!parse_cpu_limit(value, &quota) || !str_copy(cfg.cpu, value, sizeof(cfg.cpu)))
+                die2("Error: --cpu takes a number of CPUs from 0.01 to " STRINGIFY(CPU_LIMIT_MAX)
+                     ", such as 2 or 0.5, not: ", value);
+        } else if (streq(opt, "--userns")) {
             die("Error: --userns is not supported yet");
-        } else if (streq(argv[i], "--uid-start") && i + 1 < argc) {
-            (void)argv[++i];
+        } else if (streq(opt, "--uid-start")) {
+            (void)option_value(argc, argv, &i);
             die("Error: --uid-start is not supported yet");
-        } else if (streq(argv[i], "--privileged")) {
-            cfg.privileged = 1;
-        } else if (streq(argv[i], "--rootfs") && i + 1 < argc) {
-            str_copy(cfg_global.rootfs, argv[++i], MAX_PATH);
-        } else if (streq(argv[i], "--read-only")) {
-            cfg.read_only = 1;
-        } else if (streq(argv[i], "--oom-score") && i + 1 < argc) {
-            cfg.oom_score = parse_int(argv[++i]);
-            validate_oom_score(cfg.oom_score);
-        } else if (streq(argv[i], "--vol") && i + 1 < argc) {
-            if (cfg.nvols >= MAX_VOLS) die("Error: too many volumes");
+        } else if (streq(opt, "--privileged")) {
+            cfg.privileged = true;
+        } else if (streq(opt, "--rootfs")) {
+            str_copy_or_die(cfg_global.rootfs, option_value(argc, argv, &i), MAX_PATH, "--rootfs");
+        } else if (streq(opt, "--read-only")) {
+            cfg.read_only = true;
+        } else if (streq(opt, "--oom-score")) {
+            const char *value = option_value(argc, argv, &i);
+            if (!parse_oom_score(value, &cfg.oom_score))
+                die2("Error: --oom-score takes a number from -1000 to 1000, not: ", value);
+        } else if (streq(opt, "--vol")) {
+            const char *value = option_value(argc, argv, &i);
             volume_spec vol = {0};
-            parse_volume_spec_or_die(argv[++i], &vol);
-            str_copy(cfg.vol_src[cfg.nvols], vol.src, sizeof(cfg.vol_src[cfg.nvols]));
-            str_copy(cfg.vol_dst[cfg.nvols], vol.dst, sizeof(cfg.vol_dst[cfg.nvols]));
-            cfg.vol_ro[cfg.nvols] = vol.ro;
-            cfg.nvols++;
-        } else if (streq(argv[i], "--dns") && i + 1 < argc) {
-            if (cfg.ndns >= MAX_DNS) die("Error: more than " STRINGIFY(MAX_DNS) " --dns options: a resolver reads no more");
-            if (!usable_name_server(argv[i + 1]))
-                die2("Error: --dns takes an IPv4 address that a container can reach: ", argv[i + 1]);
-            str_copy(cfg.dns[cfg.ndns++], argv[++i], 16);
-        } else if (streq(argv[i], "--link") && i + 1 < argc) {
+            parse_volume_spec_or_die(value, &vol);
+            const char *wrong = config_add_volume(&cfg, &vol);
+            if (wrong)
+                die_about("Error: --vol: ", wrong, value);
+        } else if (streq(opt, "--dns")) {
+            const char *value = option_value(argc, argv, &i);
+            if (ndns >= MAX_DNS) die("Error: more than " STRINGIFY(MAX_DNS) " --dns options: a resolver reads no more");
+            if (!usable_name_server(value) || !str_copy(dns[ndns], value, sizeof(dns[0])))
+                die2("Error: --dns takes an IPv4 address that a container can reach: ", value);
+            ndns++;
+        } else if (streq(opt, "--link")) {
+            const char *value = option_value(argc, argv, &i);
             if (cfg.nlinks >= MAX_LINKS) die("Error: too many links");
-            validate_name(argv[i + 1]);
-            str_copy(cfg.links[cfg.nlinks++], argv[++i], NAME_MAX_LEN + 1);
+            validate_name(value);
+            str_copy_or_die(cfg.links[cfg.nlinks++], value, sizeof(cfg.links[0]), "--link");
         } else {
-            die2("Error: unknown option: ", argv[i]);
+            die2("Error: unknown option: ", opt);
         }
+    }
+
+    /* what no option gave comes from lightbox.conf */
+    {
+        const char *unusable = container_config_fill_defaults(&cfg);
+        if (unusable)
+            die_about("Error: ", "this setting of lightbox.conf cannot be used, and no option gave the container that limit",
+                      unusable);
     }
 
     /* check if container already exists */
@@ -947,9 +750,9 @@ static void cmd_create(int argc, char **argv) {
          * link to the base, copying the path would make the container's rootfs
          * that link, and everything written to it would land in the base. */
         char base_contents[MAX_PATH + 4];
-        path_join(base_contents, sizeof(base_contents), cfg_global.rootfs, ".");
         const char *cp_argv[] = { "cp", "-a", base_contents, root, NULL };
-        if (run_cmd(tool_path_cp(), cp_argv) != 0) {
+        if (!path_join(base_contents, sizeof(base_contents), cfg_global.rootfs, ".") ||
+            run_cmd(tool_path_cp(), cp_argv) != 0) {
             create_err = "failed to copy rootfs";
             goto fail_create;
         }
@@ -964,22 +767,7 @@ static void cmd_create(int argc, char **argv) {
     }
 
     /* write config */
-    char conf_path[MAX_PATH], conf_buf[CONF_MAX];
-    bool conf_overflow = false;
-    container_conf_path(conf_path, name);
-    size_t cpos = 0;
-    cpos = str_append_whole(conf_buf, cpos, "mem=", sizeof(conf_buf), &conf_overflow);
-    cpos = str_append_whole(conf_buf, cpos, cfg.mem, sizeof(conf_buf), &conf_overflow);
-    cpos = str_append_whole(conf_buf, cpos, "\npids=", sizeof(conf_buf), &conf_overflow);
-    cpos = str_append_whole(conf_buf, cpos, cfg.pids, sizeof(conf_buf), &conf_overflow);
-    cpos = str_append_whole(conf_buf, cpos, "\ncpu=", sizeof(conf_buf), &conf_overflow);
-    cpos = str_append_whole(conf_buf, cpos, cfg.cpu, sizeof(conf_buf), &conf_overflow);
-    cpos = str_append_whole(conf_buf, cpos, "\n", sizeof(conf_buf), &conf_overflow);
-
-    if (cfg.privileged) cpos = str_append_whole(conf_buf, cpos, "privileged=1\n", sizeof(conf_buf), &conf_overflow);
-    if (cfg.read_only) cpos = str_append_whole(conf_buf, cpos, "readonly=1\n", sizeof(conf_buf), &conf_overflow);
     if (cfg.userns) {
-        cpos = str_append_whole(conf_buf, cpos, "userns=1\n", sizeof(conf_buf), &conf_overflow);
         if (cfg.uid_start == 0) {
             cfg.uid_start = allocate_uid_start(name);
             if (cfg.uid_start <= 0) {
@@ -995,39 +783,10 @@ static void cmd_create(int argc, char **argv) {
             create_err = "uid_start overlaps an existing container userns range";
             goto fail_create;
         }
-        char uid_buf[16]; fmt_int(uid_buf, cfg.uid_start);
-        cpos = str_append_whole(conf_buf, cpos, "uid_start=", sizeof(conf_buf), &conf_overflow);
-        cpos = str_append_whole(conf_buf, cpos, uid_buf, sizeof(conf_buf), &conf_overflow);
-        cpos = str_append_whole(conf_buf, cpos, "\n", sizeof(conf_buf), &conf_overflow);
     }
-    {
-        char oom_buf[16]; fmt_int(oom_buf, cfg.oom_score);
-        cpos = str_append_whole(conf_buf, cpos, "oom_score=", sizeof(conf_buf), &conf_overflow);
-        cpos = str_append_whole(conf_buf, cpos, oom_buf, sizeof(conf_buf), &conf_overflow);
-        cpos = str_append_whole(conf_buf, cpos, "\n", sizeof(conf_buf), &conf_overflow);
-    }
-    for (int i = 0; i < cfg.nvols; i++) {
-        cpos = str_append_whole(conf_buf, cpos, "vol=", sizeof(conf_buf), &conf_overflow);
-        cpos = str_append_whole(conf_buf, cpos, cfg.vol_src[i], sizeof(conf_buf), &conf_overflow);
-        cpos = str_append_whole(conf_buf, cpos, ":", sizeof(conf_buf), &conf_overflow);
-        cpos = str_append_whole(conf_buf, cpos, cfg.vol_dst[i], sizeof(conf_buf), &conf_overflow);
-        if (cfg.vol_ro[i]) cpos = str_append_whole(conf_buf, cpos, ":ro", sizeof(conf_buf), &conf_overflow);
-        cpos = str_append_whole(conf_buf, cpos, "\n", sizeof(conf_buf), &conf_overflow);
-    }
-    for (int i = 0; i < cfg.nlinks; i++) {
-        cpos = str_append_whole(conf_buf, cpos, "link=", sizeof(conf_buf), &conf_overflow);
-        cpos = str_append_whole(conf_buf, cpos, cfg.links[i], sizeof(conf_buf), &conf_overflow);
-        cpos = str_append_whole(conf_buf, cpos, "\n", sizeof(conf_buf), &conf_overflow);
-    }
-    /* Never write a config that lost part of itself. */
-    if (conf_overflow) {
-        create_err = "container config exceeds its size limit";
+    create_err = container_config_save(name, &cfg);
+    if (create_err)
         goto fail_create;
-    }
-    if (write_file_atomic(conf_path, conf_buf, MODE_PRIVATE_FILE) < 0) {
-        create_err = "failed to write container config";
-        goto fail_create;
-    }
 
     /*
      * What the container asks for names, what it is called, and that its name
@@ -1040,31 +799,27 @@ static void cmd_create(int argc, char **argv) {
      * ones this host asks, without its own loopback; or two public ones.
      */
     {
-        if (cfg.ndns == 0 && cfg_global.dns[0]) {
-            cfg.ndns = name_servers_listed(cfg_global.dns, cfg.dns);
-            if (cfg.ndns <= 0) {
+        if (ndns == 0 && cfg_global.dns[0]) {
+            ndns = name_servers_listed(cfg_global.dns, dns);
+            if (ndns <= 0) {
                 create_err = "the dns setting in lightbox.conf is not a list of up to " STRINGIFY(MAX_DNS) " IPv4 addresses";
                 goto fail_create;
             }
         }
-        if (cfg.ndns == 0)
-            cfg.ndns = name_servers_of("/etc/resolv.conf", cfg.dns);
-        if (cfg.ndns == 0)      /* behind systemd-resolved's stub, the servers it asks */
-            cfg.ndns = name_servers_of("/run/systemd/resolve/resolv.conf", cfg.dns);
-        if (cfg.ndns == 0) {
-            str_copy(cfg.dns[0], "1.1.1.1", 16);
-            str_copy(cfg.dns[1], "8.8.8.8", 16);
-            cfg.ndns = 2;
-        }
+        if (ndns == 0)
+            ndns = name_servers_of("/etc/resolv.conf", dns);
+        if (ndns == 0)      /* behind systemd-resolved's stub, the servers it asks */
+            ndns = name_servers_of("/run/systemd/resolve/resolv.conf", dns);
+        const char *const public_servers[] = { "1.1.1.1", "8.8.8.8" };
 
         char text[4096];
         bool cut = false;
         size_t pos = 0;
         text[0] = '\0';
-        for (int i = 0; i < cfg.ndns; i++) {
-            pos = str_append_whole(text, pos, "nameserver ", sizeof(text), &cut);
-            pos = str_append_whole(text, pos, cfg.dns[i], sizeof(text), &cut);
-            pos = str_append_whole(text, pos, "\n", sizeof(text), &cut);
+        for (int i = 0; i < (ndns ? ndns : 2); i++) {
+            pos = str_append(text, pos, "nameserver ", sizeof(text), &cut);
+            pos = str_append(text, pos, ndns ? dns[i] : public_servers[i], sizeof(text), &cut);
+            pos = str_append(text, pos, "\n", sizeof(text), &cut);
         }
         /* inside the container's own filesystem, so readable by its users */
         if (cut || write_file_in_root(root, "etc", "resolv.conf", text, MODE_PUBLIC_FILE) < 0) {
@@ -1072,9 +827,9 @@ static void cmd_create(int argc, char **argv) {
             goto fail_create;
         }
 
-        pos = str_copy(text, name, sizeof(text));
-        str_append(text, pos, "\n", sizeof(text));
-        if (write_file_in_root(root, "etc", "hostname", text, MODE_PUBLIC_FILE) < 0) {
+        pos = str_append(text, 0, name, sizeof(text), &cut);
+        str_append(text, pos, "\n", sizeof(text), &cut);
+        if (cut || write_file_in_root(root, "etc", "hostname", text, MODE_PUBLIC_FILE) < 0) {
             create_err = "failed to write the container's hostname file";
             goto fail_create;
         }
@@ -1086,13 +841,13 @@ static void cmd_create(int argc, char **argv) {
         } else {
             pos = (size_t)had;
             if (had == 0)
-                pos = str_append_whole(text, pos, "127.0.0.1\tlocalhost\n", sizeof(text), &cut);
+                pos = str_append(text, pos, "127.0.0.1\tlocalhost\n", sizeof(text), &cut);
             else if (text[pos - 1] != '\n')
-                pos = str_append_whole(text, pos, "\n", sizeof(text), &cut);
-            pos = str_append_whole(text, pos, ip, sizeof(text), &cut);
-            pos = str_append_whole(text, pos, "\t", sizeof(text), &cut);
-            pos = str_append_whole(text, pos, name, sizeof(text), &cut);
-            str_append_whole(text, pos, "\n", sizeof(text), &cut);
+                pos = str_append(text, pos, "\n", sizeof(text), &cut);
+            pos = str_append(text, pos, ip, sizeof(text), &cut);
+            pos = str_append(text, pos, "\t", sizeof(text), &cut);
+            pos = str_append(text, pos, name, sizeof(text), &cut);
+            str_append(text, pos, "\n", sizeof(text), &cut);
             if (cut || write_file_in_root(root, "etc", "hosts", text, MODE_PUBLIC_FILE) < 0) {
                 create_err = "failed to write the container's hosts file";
                 goto fail_create;
@@ -1109,9 +864,8 @@ static void cmd_create(int argc, char **argv) {
         print_str(STDOUT,"Shifting rootfs ownership...\n");
         /* use chown -R via fork+exec for simplicity */
         char uid_str[32];
-        int len = fmt_int(uid_str, cfg.uid_start);
-        str_append(uid_str, (size_t)len, ":", sizeof(uid_str));
-        size_t pos = lc_string_length(uid_str);
+        size_t pos = (size_t)fmt_int(uid_str, cfg.uid_start);
+        uid_str[pos++] = ':';
         fmt_int(uid_str + pos, cfg.uid_start);
 
         const char *chown_argv[] = { "chown", "-R", "-h", uid_str, root, NULL };
@@ -1174,6 +928,7 @@ struct child_args {
     int32_t      starter_signals;           /* the command's signalfd, or -1 */
     int32_t      null_fd, log_fd;           /* init's standard streams once it is built; -1: the command's */
     const char  *name;
+    const container_config *config;         /* read by the command, before the clone */
     const char  *root;
     const char  *hook;                      /* the script init runs when it is ready */
     int          stop_grace;                /* seconds the container gets to end, unless a stop says otherwise */
@@ -1486,18 +1241,10 @@ static int init_main(const struct child_args *ca) {
     return supervisor_loop((int32_t)sfd, ca->report_wr, hook_pid, ca->stop_grace);
 }
 
-static void build_proc_pid_path(char *buf, size_t bufsz, int pid, const char *suffix) {
-    char pidbuf[16];
-    fmt_int(pidbuf, pid);
-    size_t pos = str_copy(buf, "/proc/", bufsz);
-    pos = str_append(buf, pos, pidbuf, bufsz);
-    if (suffix && suffix[0])
-        str_append(buf, pos, suffix, bufsz);
-}
-
 static int open_target_path(int target_pid, const char *suffix) {
     char path[64];
-    build_proc_pid_path(path, sizeof(path), target_pid, suffix);
+    if (!proc_pid_path(path, sizeof(path), target_pid, suffix))
+        return -1;
     return (int)lc_kernel_open_file(path, O_RDONLY | O_CLOEXEC, 0);
 }
 
@@ -1845,8 +1592,9 @@ static void resolve_identity(const struct exec_request *req, const char *passwd_
     id->home[0] = '\0';
     id->ngroups = 0;
     if (known) {
-        str_copy(id->name, account.name, sizeof(id->name));
-        str_copy(id->home, account.home, sizeof(id->home));
+        if (!str_copy(id->name, account.name, sizeof(id->name)) ||
+            !str_copy(id->home, account.home, sizeof(id->home)))
+            die("Error: the account's name or home directory is too long");
         id->ngroups = find_groups(group_path, id->name, id->gid, id->groups, MAX_EXEC_GROUPS);
         if (id->ngroups < 0)
             die2("Error: the container lists more than " STRINGIFY(MAX_EXEC_GROUPS) " groups for user ", id->name);
@@ -1942,20 +1690,23 @@ static bool same_variable(const char *a, const char *b) {
  * for the same variable winning.
  */
 [[noreturn]] static void run_command(const struct exec_request *req, const struct identity *id) {
+    bool cut = false;
     char home_env[MAX_PATH + 6] = "HOME=";
     if (id->home[0])
-        str_append(home_env, 5, id->home, sizeof(home_env));
+        str_append(home_env, 5, id->home, sizeof(home_env), &cut);
     else
-        str_append(home_env, 5, id->uid > 0 ? "/" : "/root", sizeof(home_env));
+        str_append(home_env, 5, id->uid > 0 ? "/" : "/root", sizeof(home_env), &cut);
 
     char user_env[USER_NAME_MAX + 6] = "USER=";
     char logname_env[USER_NAME_MAX + 9] = "LOGNAME=";
     const char *name = id->name[0] ? id->name : (id->uid == 0 ? "root" : "");
-    str_append(user_env, 5, name, sizeof(user_env));
-    str_append(logname_env, 8, name, sizeof(logname_env));
+    str_append(user_env, 5, name, sizeof(user_env), &cut);
+    str_append(logname_env, 8, name, sizeof(logname_env), &cut);
 
     char term_env[80] = "TERM=";
-    str_append(term_env, 5, req->term ? req->term : "xterm", sizeof(term_env));
+    str_append(term_env, 5, req->term ? req->term : "xterm", sizeof(term_env), &cut);
+    if (cut)
+        die("Error: the command's environment does not fit");
 
     const char *base[5];
     int nbase = 0;
@@ -2019,13 +1770,7 @@ static int parse_exec_options(int argc, char **argv, int first, struct exec_requ
             print_str(STDERR, "\nA command that begins with a dash goes after --.\n");
             lc_kernel_exit(1);
         }
-        if (i + 1 >= argc) {
-            print_str(STDERR, "Error: option ");
-            print_str(STDERR, arg);
-            print_str(STDERR, " requires a value\n");
-            lc_kernel_exit(1);
-        }
-        const char *value = argv[++i];
+        const char *value = option_value(argc, argv, &i);
 
         if (user) {
             if (!parse_user_spec(value, req))
@@ -2903,13 +2648,14 @@ static int delete_veth_if_present(const char *ifname) {
 }
 
 /* What a start that failed leaves behind, removed. Init is gone by now. */
-static void cleanup_start_failure(const char *name, const char *ip, const char *veth_host) {
+static void cleanup_start_failure(const char *name, const container_config *config, const char *ip,
+                                  const char *veth_host) {
     if (veth_host && veth_host[0])
         (void)delete_veth_if_present(veth_host);    /* clean-up: best effort */
 
     (void)cgroup_destroy(name);     /* it has said so if it could not */
     if (ip && ip[0])
-        (void)update_link_rules(name, ip, false);
+        (void)update_link_rules(config, ip, false);
 
     container_forget_pid(name);
     (void)record_container_state(name, "failed\n");
@@ -2941,7 +2687,7 @@ struct volume_mount {
     int32_t tree;               /* a clone of the source's mount, attached nowhere yet */
     bool    is_dir;
     bool    ro;
-    char    dst[MAX_PATH];
+    const char *dst;            /* where it goes, in the configuration it is from */
 };
 
 /*
@@ -2949,55 +2695,29 @@ struct volume_mount {
  * that stays good when the host's filesystems are taken out of the
  * container's sight. Ends the process when the volume cannot be had.
  */
-static void open_volume(const char *spec, struct volume_mount *out) {
-    volume_spec vol = {0};
-    const char *wrong = parse_volume_spec(spec, &vol);
-    if (wrong) {
-        print_str(STDERR, "Error: the container's configuration has a volume that cannot be used (");
-        print_str(STDERR, wrong);
-        print_str(STDERR, "): ");
-        print_str(STDERR, spec);
-        lc_print_char(STDERR, '\n');
-        lc_kernel_exit(1);
-    }
-
-    lc_sysret tree = lb_sys_open_tree(AT_FDCWD, vol.src, LB_OPEN_TREE_CLONE | LB_OPEN_TREE_CLOEXEC);
+static void open_volume(const volume_spec *vol, struct volume_mount *out) {
+    lc_sysret tree = lb_sys_open_tree(AT_FDCWD, vol->src, LB_OPEN_TREE_CLONE | LB_OPEN_TREE_CLOEXEC);
     if (tree == -LB_ENOENT)
-        die2("Error: volume source does not exist: ", vol.src);
+        die2("Error: volume source does not exist: ", vol->src);
     struct lb_statx stx;
     if (tree < 0 || lb_sys_statx((int32_t)tree, "", LB_AT_EMPTY_PATH, LB_STATX_TYPE, &stx) < 0) {
         say_with_number("Error: cannot take the volume's source (errno ", (int)(tree < 0 ? -tree : 0), "): ");
-        print_str(STDERR, vol.src);
+        print_str(STDERR, vol->src);
         lc_print_char(STDERR, '\n');
         lc_kernel_exit(1);
     }
 
     out->tree = (int32_t)tree;
     out->is_dir = (stx.stx_mode & LB_S_IFMT) == LB_S_IFDIR;
-    out->ro = vol.ro != 0;
-    str_copy(out->dst, vol.dst, sizeof(out->dst));
+    out->ro = vol->ro;
+    out->dst = vol->dst;
 }
 
 /* The volumes a container is configured with, cloned: how many. */
-static int open_volumes(const char *name, struct volume_mount *out) {
-    static char conf_buf[CONF_MAX];
-    int count = 0;
-    if (container_conf_read(name, conf_buf) <= 0)
-        return 0;
-
-    for (char *p = conf_buf; *p; ) {
-        char *end = p;
-        while (*end && *end != '\n') end++;
-        bool last = *end == '\0';
-        *end = '\0';
-        if (p[0] == 'v' && p[1] == 'o' && p[2] == 'l' && p[3] == '=') {
-            if (count == MAX_VOLS)
-                die("Error: the container's configuration has more than " STRINGIFY(MAX_VOLS) " volumes");
-            open_volume(p + 4, &out[count++]);
-        }
-        p = last ? end : end + 1;
-    }
-    return count;
+static int open_volumes(const container_config *config, struct volume_mount *out) {
+    for (int i = 0; i < config->nvols; i++)
+        open_volume(&config->vols[i], &out[i]);
+    return config->nvols;
 }
 
 /*
@@ -3020,7 +2740,8 @@ static void attach_volumes(const struct volume_mount *vols, int count) {
                 lc_kernel_exit(1);
         } else {
             char parent[MAX_PATH];
-            parent_dir(parent, sizeof(parent), dst);
+            if (!parent_dir(parent, sizeof(parent), dst))
+                die2("Error: invalid path: ", dst);
             if (make_dirs(parent) != 0)
                 lc_kernel_exit(1);
             lc_sysret fd = lc_kernel_open_file(dst, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
@@ -3066,12 +2787,12 @@ static void build_container(const struct child_args *ca) {
      * the host, and attached later, when the container's paths mean what
      * they mean in the container. */
     struct volume_mount volumes[MAX_VOLS];
-    int nvolumes = open_volumes(ca->name, volumes);
+    int nvolumes = open_volumes(ca->config, volumes);
 
     /* set up /dev via bind mounts (works in both userns and non-userns) */
     {
         char dev_path[MAX_PATH];
-        path_join(dev_path, MAX_PATH, ca->root, "dev");
+        path_join_or_die(dev_path, MAX_PATH, ca->root, "dev");
         lc_kernel_mkdirat(AT_FDCWD, dev_path, 0755);   /* a minimal image may not have it */
         require_mount("tmpfs", dev_path, "tmpfs", MS_NOSUID | MS_NOEXEC, "mode=755");
 
@@ -3086,8 +2807,8 @@ static void build_container(const struct child_args *ca) {
 
         for (size_t i = 0; i < sizeof(devs) / sizeof(devs[0]); i++) {
             char host_dev[32], cont_dev[MAX_PATH];
-            path_join(host_dev, sizeof(host_dev), "/dev", devs[i].name);
-            path_join(cont_dev, MAX_PATH, dev_path, devs[i].name);
+            path_join_or_die(host_dev, sizeof(host_dev), "/dev", devs[i].name);
+            path_join_or_die(cont_dev, MAX_PATH, dev_path, devs[i].name);
             /* create empty file as mount point */
             lc_sysret fd = lc_kernel_open_file(cont_dev, O_WRONLY | O_CREAT, devs[i].mode);
             if (fd >= 0) lc_kernel_close_file((int32_t)fd);
@@ -3102,8 +2823,8 @@ static void build_container(const struct child_args *ca) {
 
         /* pts and shm */
         char pts[MAX_PATH], shm[MAX_PATH];
-        path_join(pts, MAX_PATH, dev_path, "pts");
-        path_join(shm, MAX_PATH, dev_path, "shm");
+        path_join_or_die(pts, MAX_PATH, dev_path, "pts");
+        path_join_or_die(shm, MAX_PATH, dev_path, "shm");
         lc_kernel_mkdirat(AT_FDCWD, pts, 0755);
         lc_kernel_mkdirat(AT_FDCWD, shm, 0755);
     }
@@ -3192,14 +2913,27 @@ static int container_child(void *arg) {
 
 /* ─── cmd_start ─────────────────────────────────────────────────────────── */
 
+/* The two ends of a container's interface, as they are called on the host
+ * before one of them is moved: 16 bytes each, which a container's name with
+ * three characters before it fits. */
+_Static_assert(NAME_MAX_LEN + 3 < 16, "an interface name holds a container's name and three more");
+static void veth_names(const char *name, char host[16], char cont[16]) {
+    bool cut = false;       /* never: the name has been checked to be one */
+    size_t pos = str_append(host, 0, "vb-", 16, &cut);
+    str_append(host, pos, name, 16, &cut);
+    pos = str_append(cont, 0, "ve-", 16, &cut);
+    str_append(cont, pos, name, 16, &cut);
+}
+
 /* "<before><number><after>" in buf, for a message that names a number. */
 static const char *text_with_number(char *buf, size_t bufsz, const char *before, int number,
                                     const char *after) {
     char digits[16];
+    bool cut = false;       /* a message that lost its end is still the message */
     fmt_int(digits, number);
-    size_t pos = str_copy(buf, before, bufsz);
-    pos = str_append(buf, pos, digits, bufsz);
-    str_append(buf, pos, after, bufsz);
+    size_t pos = str_append(buf, 0, before, bufsz, &cut);
+    pos = str_append(buf, pos, digits, bufsz, &cut);
+    str_append(buf, pos, after, bufsz, &cut);
     return buf;
 }
 
@@ -3238,12 +2972,15 @@ static void cmd_start(int argc, char **argv) {
     char ip[16];
     if (read_container_ip(name, ip, sizeof(ip)) < 0) die("Error: no IP file for container");
 
-    /* read config */
-    int userns = conf_get_int(name, "userns", 0);
-    int uid_start = conf_get_int(name, "uid_start", 100000);
-    int privileged = conf_get_int(name, "privileged", 0);
-    int read_only = conf_get_int(name, "readonly", 0);
-    int oom_score = conf_get_int(name, "oom_score", cfg_global.default_oom);
+    /* What the container is configured with: read here, once, for the whole
+     * start. Init gets it with the memory it is cloned with. */
+    static container_config config;
+    container_config_load_or_die(name, &config);
+    bool userns = config.userns;
+    int uid_start = config.uid_start;
+    bool privileged = config.privileged;
+    bool read_only = config.read_only;
+    int oom_score = config.oom_score;
 
     if (userns)
         die("Error: containers configured with user namespaces are not supported yet");
@@ -3254,8 +2991,7 @@ static void cmd_start(int argc, char **argv) {
      * to, and then the firewall is all that keeps it to those. The firewall
      * sees what the bridge switches only with br_netfilter, so without that
      * such a container is not started. Decided before anything is set up. */
-    char first_link[NAME_MAX_LEN + 1];
-    bool linked = conf_get(name, "link", first_link, sizeof(first_link), "") == 1;
+    bool linked = config.nlinks > 0;
     if (linked && !bridge_traffic_is_filtered()) {
         print_str(STDERR, "Error: container '");
         print_str(STDERR, name);
@@ -3294,12 +3030,7 @@ static void cmd_start(int argc, char **argv) {
 
     /* set up veth pair */
     char veth_host[16], veth_cont[16];
-    {
-        size_t p1 = str_copy(veth_host, "vb-", sizeof(veth_host));
-        str_append(veth_host, p1, name, sizeof(veth_host));
-        size_t p2 = str_copy(veth_cont, "ve-", sizeof(veth_cont));
-        str_append(veth_cont, p2, name, sizeof(veth_cont));
-    }
+    veth_names(name, veth_host, veth_cont);
 
     /* clean up stale veth endpoints if either name is left behind */
     if (delete_veth_if_present(veth_host) != 0 ||
@@ -3335,6 +3066,7 @@ static void cmd_start(int argc, char **argv) {
         .null_fd = null_fd,
         .log_fd = log_fd,
         .name = name,
+        .config = &config,
         .root = root,
         .hook = "/init.sh",
         .stop_grace = cfg_global.stop_timeout,
@@ -3354,31 +3086,23 @@ static void cmd_start(int argc, char **argv) {
     /* write uid/gid maps if userns */
     if (userns) {
         char proc_path[64], map_buf[32];
-        char pidbuf[16]; fmt_int(pidbuf, child_pid);
+        bool cut = false;
 
         /* deny setgroups */
-        size_t pp = str_copy(proc_path, "/proc/", sizeof(proc_path));
-        pp = str_append(proc_path, pp, pidbuf, sizeof(proc_path));
-        str_append(proc_path, pp, "/setgroups", sizeof(proc_path));
-        if (write_file(proc_path, "deny") < 0) { start_err = "failed to write setgroups"; goto fail_start; }
+        if (!proc_pid_path(proc_path, sizeof(proc_path), child_pid, "/setgroups") ||
+            write_file(proc_path, "deny") < 0) { start_err = "failed to write setgroups"; goto fail_start; }
 
-        /* uid_map */
-        pp = str_copy(proc_path, "/proc/", sizeof(proc_path));
-        pp = str_append(proc_path, pp, pidbuf, sizeof(proc_path));
-        str_append(proc_path, pp, "/uid_map", sizeof(proc_path));
+        /* uid_map and gid_map: the same range for both */
         {
-            size_t mp = str_copy(map_buf, "0 ", sizeof(map_buf));
-            char ub[16]; fmt_int(ub, uid_start);
-            mp = str_append(map_buf, mp, ub, sizeof(map_buf));
-            str_append(map_buf, mp, " 65536", sizeof(map_buf));
+            char first[16]; fmt_int(first, uid_start);
+            size_t mp = str_append(map_buf, 0, "0 ", sizeof(map_buf), &cut);
+            mp = str_append(map_buf, mp, first, sizeof(map_buf), &cut);
+            str_append(map_buf, mp, " 65536", sizeof(map_buf), &cut);
         }
-        if (write_file(proc_path, map_buf) < 0) { start_err = "failed to write uid_map"; goto fail_start; }
-
-        /* gid_map */
-        pp = str_copy(proc_path, "/proc/", sizeof(proc_path));
-        pp = str_append(proc_path, pp, pidbuf, sizeof(proc_path));
-        str_append(proc_path, pp, "/gid_map", sizeof(proc_path));
-        if (write_file(proc_path, map_buf) < 0) { start_err = "failed to write gid_map"; goto fail_start; }
+        if (cut || !proc_pid_path(proc_path, sizeof(proc_path), child_pid, "/uid_map") ||
+            write_file(proc_path, map_buf) < 0) { start_err = "failed to write uid_map"; goto fail_start; }
+        if (!proc_pid_path(proc_path, sizeof(proc_path), child_pid, "/gid_map") ||
+            write_file(proc_path, map_buf) < 0) { start_err = "failed to write gid_map"; goto fail_start; }
     }
 
     /*
@@ -3388,7 +3112,7 @@ static void cmd_start(int argc, char **argv) {
      */
 
     /* set up cgroup */
-    if (cgroup_create(name, child_pid) != 0) {
+    if (cgroup_create(name, child_pid, &config) != 0) {
         start_err = "failed to create cgroup";
         goto fail_start;
     }
@@ -3410,8 +3134,10 @@ static void cmd_start(int argc, char **argv) {
     {
         char nsbuf[16]; fmt_int(nsbuf, child_pid);
         char ip_cidr[20];
-        str_copy(ip_cidr, ip, sizeof(ip_cidr));
-        str_append(ip_cidr, lc_string_length(ip_cidr), "/24", sizeof(ip_cidr));
+        bool cut = false;
+        size_t pos = str_append(ip_cidr, 0, ip, sizeof(ip_cidr), &cut);
+        str_append(ip_cidr, pos, "/24", sizeof(ip_cidr), &cut);
+        if (cut) { start_err = "the container's address is not an address"; goto fail_start; }
 
         const char *a1[] = { "nsenter", "-t", nsbuf, "-n", "--", "ip", "link", "set", veth_cont, "up", NULL };
         if (run_cmd(tool_path_nsenter(), a1) != 0) { start_err = "failed to bring container veth up"; goto fail_start; }
@@ -3424,12 +3150,9 @@ static void cmd_start(int argc, char **argv) {
     /* set OOM score */
     {
         char oom_path[64], oom_buf[16];
-        char pidb[16]; fmt_int(pidb, child_pid);
-        size_t pp = str_copy(oom_path, "/proc/", sizeof(oom_path));
-        pp = str_append(oom_path, pp, pidb, sizeof(oom_path));
-        str_append(oom_path, pp, "/oom_score_adj", sizeof(oom_path));
         fmt_int(oom_buf, oom_score);
-        if (write_file(oom_path, oom_buf) < 0) { start_err = "failed to set oom_score_adj"; goto fail_start; }
+        if (!proc_pid_path(oom_path, sizeof(oom_path), child_pid, "/oom_score_adj") ||
+            write_file(oom_path, oom_buf) < 0) { start_err = "failed to set oom_score_adj"; goto fail_start; }
     }
 
     /* First byte: init builds the container, and says when it is built. */
@@ -3464,7 +3187,7 @@ static void cmd_start(int argc, char **argv) {
         start_err = "failed to record the container's init";
         goto fail_start;
     }
-    if (update_link_rules(name, ip, true) != 0) {
+    if (update_link_rules(&config, ip, true) != 0) {
         start_err = "failed to install link iptables rules";
         goto fail_start;
     }
@@ -3553,7 +3276,7 @@ fail_start:
         lc_print_char(STDERR, '\n');
     }
     if (undo_is_ours)
-        cleanup_start_failure(name, ip, veth_host);
+        cleanup_start_failure(name, &config, ip, veth_host);
     lc_kernel_exit(exit_code);
 }
 
@@ -3641,11 +3364,20 @@ static void cmd_stop(int argc, char **argv) {
     if (cgroup_destroy(name) != 0)
         clean = false;
 
-    /* clean up link iptables rules */
+    /* Clean up link iptables rules. Which links it has is in its
+     * configuration; a container is stopped all the same when that cannot
+     * be read, and then the rules are what is left. */
     {
+        static container_config config;
         char ip_buf[16];
-        if (read_container_ip(name, ip_buf, sizeof(ip_buf)) == 0 &&
-            update_link_rules(name, ip_buf, false) != 0) {
+        const char *wrong = container_config_load(name, &config);
+        if (wrong) {
+            print_str(STDERR, "Error: the firewall rules of the container's links, if it has any, are left in place: ");
+            print_str(STDERR, wrong);
+            lc_print_char(STDERR, '\n');
+            clean = false;
+        } else if (read_container_ip(name, ip_buf, sizeof(ip_buf)) == 0 &&
+                   update_link_rules(&config, ip_buf, false) != 0) {
             print_str(STDERR, "Error: failed to remove link iptables rules\n");
         }
     }
@@ -3653,9 +3385,8 @@ static void cmd_stop(int argc, char **argv) {
     /* the host's end of the container's interface, if the kernel has not
      * removed it with the container's network namespace already */
     {
-        char veth_host[16];
-        size_t p = str_copy(veth_host, "vb-", sizeof(veth_host));
-        str_append(veth_host, p, name, sizeof(veth_host));
+        char veth_host[16], veth_cont[16];
+        veth_names(name, veth_host, veth_cont);
         if (delete_veth_if_present(veth_host) != 0) {
             print_str(STDERR, "Error: cannot remove the interface ");
             print_str(STDERR, veth_host);
@@ -3692,14 +3423,23 @@ static void cmd_add_vol(int argc, char **argv) {
     if (!path_exists(vol.src))
         die2("Error: volume source does not exist: ", vol.src);
 
-    if (container_has_volume(name, &vol)) {
+    static container_config config;
+    container_config_load_or_die(name, &config);
+
+    /* the same volume again is nothing to do, and no error */
+    int at = config_volume_at(&config, vol.dst);
+    if (at >= 0 && streq(config.vols[at].src, vol.src) && config.vols[at].ro == vol.ro) {
         print_str(STDOUT, "Volume already present for container '");
         print_str(STDOUT, name);
         print_str(STDOUT, "'\n");
         return;
     }
 
-    append_container_volume(name, &vol);
+    const char *wrong = config_add_volume(&config, &vol);
+    if (!wrong)
+        wrong = container_config_save(name, &config);
+    if (wrong)
+        die_about("Error: container ", wrong, name);
 
     print_str(STDOUT, "Added volume to container '");
     print_str(STDOUT, name);
@@ -3714,6 +3454,42 @@ static void cmd_add_vol(int argc, char **argv) {
     if (is_running(name)) {
         print_str(STDOUT, "Restart the container for the new volume to take effect\n");
     }
+}
+
+/*
+ * rm-vol <name> <dst>: take the volume at a destination out of a container's
+ * configuration. The destination is given as it is in the container, and is
+ * read as a volume's destination is, so /data/ and /data are the same place.
+ */
+static void cmd_rm_vol(int argc, char **argv) {
+    if (argc != 2) die("Usage: lightbox rm-vol <name> <dst>");
+    const char *name = argv[0];
+    validate_name(name);
+
+    char dst[MAX_PATH];
+    const char *wrong = parse_volume_destination(argv[1], dst);
+    if (wrong)
+        die_about("Error: ", wrong, argv[1]);
+
+    container_lock(name);
+
+    static container_config config;
+    container_config_load_or_die(name, &config);
+    if (config_remove_volumes_at(&config, dst) == 0)
+        die_about("Error: container ", "has no volume at that destination", name);
+
+    wrong = container_config_save(name, &config);
+    if (wrong)
+        die_about("Error: container ", wrong, name);
+
+    print_str(STDOUT, "Removed the volume at ");
+    print_str(STDOUT, dst);
+    print_str(STDOUT, " from container '");
+    print_str(STDOUT, name);
+    print_str(STDOUT, "'\n");
+
+    if (is_running(name))
+        print_str(STDOUT, "It stays mounted until the container is restarted\n");
 }
 
 /* ─── cmd_rm ────────────────────────────────────────────────────────────── */
@@ -3774,9 +3550,13 @@ static void cmd_exec(int argc, char **argv) {
 
     if (!is_running(name)) die2("Error: container is not running: ", name);
 
+    /* what the command may do in the container is what the container may:
+     * without its configuration, nothing is run in it */
+    static container_config config;
+    container_config_load_or_die(name, &config);
     int pid = get_container_pid(name);
-    int userns = conf_get_int(name, "userns", 0);
-    int privileged = conf_get_int(name, "privileged", 0);
+    bool userns = config.userns;
+    bool privileged = config.privileged;
 
     if (userns)
         die("Error: exec into userns containers is not supported yet");
@@ -3816,9 +3596,9 @@ static void cmd_exec(int argc, char **argv) {
         "\n"
         "Commands:\n"
         "  create <name> <ip> [options]  Create a new container\n"
-        "         --mem  <limit>         Memory limit (default: 256M)\n"
-        "         --pids <limit>         Max processes (default: 128)\n"
-        "         --cpu  <num>           CPU cores (default: 1)\n"
+        "         --mem  <limit>         Memory limit: <number>[K|M|G|T] or max (default: 256M)\n"
+        "         --pids <limit>         Max processes, or max (default: 128)\n"
+        "         --cpu  <num>           CPUs, such as 2 or 0.5 (default: 1)\n"
         "         --vol  <src:dst[:ro]>  Bind mount (repeatable)\n"
         "         --rootfs <path>         Base rootfs to copy (default: $LIGHTBOX_ROOTFS or lightbox.conf)\n"
         "         --userns               Future improvement; not supported yet\n"
@@ -3833,6 +3613,7 @@ static void cmd_exec(int argc, char **argv) {
         "  stop   <name> [-t <seconds>]  Stop a running container\n"
         "         -t <seconds>            How long its processes get to end (default: 10)\n"
         "  add-vol <name> <src:dst[:ro]> Add a volume to an existing container\n"
+        "  rm-vol <name> <dst>           Remove the volume at a destination\n"
         "  rm     <name>                 Remove a container (must be stopped)\n"
         "  exec   <name> [options] [--] [cmd [args...]]  Run a command in a running container\n"
         "         --user <name|uid[:gid]> Who to run it as (default: root)\n"
@@ -3886,6 +3667,7 @@ int main(int argc, char **argv, char **envp) {
     else if (streq(cmd, "start"))  cmd_start(sub_argc, sub_argv);
     else if (streq(cmd, "stop"))   cmd_stop(sub_argc, sub_argv);
     else if (streq(cmd, "add-vol")) cmd_add_vol(sub_argc, sub_argv);
+    else if (streq(cmd, "rm-vol")) cmd_rm_vol(sub_argc, sub_argv);
     else if (streq(cmd, "rm"))     cmd_rm(sub_argc, sub_argv);
     else if (streq(cmd, "exec"))   cmd_exec(sub_argc, sub_argv);
     else if (streq(cmd, "logs"))   cmd_logs(sub_argc, sub_argv);

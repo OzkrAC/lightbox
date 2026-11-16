@@ -10,10 +10,28 @@ Not tagged yet, and not complete: the part of Phase 5 that is written so far.
 
 - **`setup`, `start`, `stop` and `exec` refuse to run as an ordinary user**, with "must be run as root", before they look at anything. `start` used to go ahead, fail at its first privileged step and record the container as failed; `setup` changed the modes of the storage directories before it failed.
 - **Commands wait for each other.** `start`, `stop`, `rm` and `add-vol` on the same container, and `create` and `setup` on the store, run one after the other; the one that waits prints "Waiting for another lightbox command to finish". A `stop` typed while a `start` is still waiting for the init hook waits for that `start`. `ls` and `inspect` never wait.
+- **An option's value is what the option takes, or `create` refuses it** with the option named, and makes nothing. `--mem` takes a number of bytes, optionally with `K`, `M`, `G` or `T`, or `max`; `--pids` a number from 1 to 4194304, or `max`; `--cpu` a number of CPUs from 0.01 to 512; `--oom-score` a number from -1000 to 1000. Before, `--mem not-a-size` was stored and failed the start, `--oom-score abc` was stored as 0 and `--oom-score 12abc` as 12, and a long value was cut: `--pids 123456789` became 1234567 and `--cpu 1024` became 102. A number that begins with a 0, as in `--mem 0100M`, is refused too: the kernel would have read it as octal.
+- **The `default_*` settings in `lightbox.conf` are held to the same.** One that is not a limit is reported as a warning by every command, and `create` refuses a container that would have needed it; give that container the option, or correct the setting.
+- **A second volume at a destination is refused**, by `create` and by `add-vol`. The second one used to be mounted over the first. Adding the very same volume again still does nothing and is no error.
+- **A volume path with a control character in it, such as a newline, is refused.**
+- **A setting in `lightbox.conf` that does not fit is an error, not a shorter setting.** A directory may be up to 448 characters long. A `lightbox.conf` of more than 16 KB is refused as a whole; one of more than 2 KB used to be read up to that point, and the settings after it did not count.
+- **A container's `.conf` that lightbox cannot use is an error that names the file and the line**, for `start`, `exec`, `inspect`, `add-vol` and `rm-vol`. `stop` still stops such a container, says that it could not know the container's links, and exits with 1. `rm` removes it as before.
+
+### Added
+
+- **`--cpu` takes parts of a CPU**: `--cpu 0.5` is half of one, `--cpu 1.25` one and a quarter.
+- **`--mem max` and `--pids max`** for a container without that limit.
+- **`lightbox rm-vol <name> <dst>`** takes the volume at a destination out of a container's configuration. Like `add-vol`, it takes effect at the next start.
+- A container's `.conf` begins with `version=1`. Containers made by earlier versions keep working as they are, and get the line the next time `add-vol` or `rm-vol` writes the file.
 
 ### Fixed
 
 - Two commands working on one container at the same time could both go ahead: two `start` could each set up an interface and a cgroup for the same container, and of two `add-vol` one could write over what the other had just added.
+- `LIGHTBOX_ROOTFS` was ignored unless a `lightbox.conf` existed. With the variable set as the README's quick start has it and no file, `create` copied `/var/lib/lightbox/rootfs`, or failed because that is not there. The variable now counts either way: after `--rootfs`, before the `rootfs` setting.
+- A newline in a `--vol` path, or in `--mem`, was written into the container's `.conf` as it was, where the text after it was read as further settings of the container.
+- `create --mem` without a value, and the same for every other option, said "unknown option". It says that the option requires a value.
+- A path or a text that did not fit where lightbox kept it was cut and used: a long `container_dir` could make lightbox work on another directory than the one configured.
+- `start` read the container's `.conf` once for every setting in it, and init read it again. It is read once.
 
 ## 0.4.0
 

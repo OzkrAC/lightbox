@@ -132,6 +132,9 @@ This creates:
 # Custom resource limits
 ./lightbox create app 10.0.0.2 --mem 512M --cpu 2 --pids 256
 
+# Half a CPU, and no limit on memory
+./lightbox create small 10.0.0.8 --cpu 0.5 --mem max
+
 # User namespaces are planned but not supported yet
 # ./lightbox create sandbox 10.0.0.3 --userns
 
@@ -159,6 +162,8 @@ This creates:
 
 # Add a volume to an existing container configuration
 ./lightbox add-vol app /srv/config/app.conf:/etc/app.conf:ro
+# Take the volume at a destination out again
+./lightbox rm-vol app /etc/app.conf
 # Restart if the container is already running
 ```
 
@@ -205,7 +210,8 @@ bridge = br0
 subnet = 10.0.0.0/24
 gw = 10.0.0.1
 
-# Default container resource limits
+# Default container resource limits: what --mem, --pids, --cpu and
+# --oom-score take
 default_mem = 256M
 default_pids = 128
 default_cpu = 1
@@ -224,6 +230,10 @@ dns = 9.9.9.9, 149.112.112.112
 
 If `lightbox_dir` is set, `rootfs` and `container_dir` are automatically derived from it (e.g., `rootfs = <lightbox_dir>/rootfs`) unless explicitly overridden.
 
+No setting is cut to fit. A directory may be up to 448 characters long, and one that is longer, like a bridge name or an address that is too long, ends every command with the setting named: the first part of such a value would be the name of something else. The file itself may be up to 16 KB.
+
+A `default_*` setting has to be a value its option would take. One that is not is reported as a warning by every command, and only stops the command that would have needed it: `create` for a container that is not given that limit as an option. No container gets a limit that nobody chose.
+
 ### Rootfs resolution order
 
 1. `--rootfs <path>` flag on create (highest priority)
@@ -241,6 +251,7 @@ lightbox <command> [args]
   start  <name> [-t <seconds>]  Start a stopped container
   stop   <name> [-t <seconds>]  Stop a running container
   add-vol <name> <src>:<dst>[:ro]  Add a volume to an existing container
+  rm-vol <name> <dst>           Remove the volume at a destination
   rm     <name>                 Remove a container
   exec   <name> [options] [--] [cmd [args...]]   Run a command in a container
   logs   <name> [-f]            Show what a container has printed; -f follows it
@@ -252,17 +263,19 @@ lightbox <command> [args]
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--rootfs <path>` | `$LIGHTBOX_ROOTFS` | Base rootfs to copy |
-| `--mem <limit>` | `256M` | Memory limit |
-| `--pids <limit>` | `128` | Max processes |
-| `--cpu <num>` | `1` | CPU cores |
-| `--vol <src>:<dst>[:ro]` | — | Bind mount (repeatable) |
+| `--mem <limit>` | `256M` | Memory limit: a number of bytes, optionally with `K`, `M`, `G` or `T`, or `max` for none |
+| `--pids <limit>` | `128` | Max processes, 1 to 4194304, or `max` for no limit |
+| `--cpu <num>` | `1` | CPUs, 0.01 to 512, with up to two decimals: `2`, `0.5`, `1.25` |
+| `--vol <src>:<dst>[:ro]` | — | Bind mount (repeatable, up to 16, one at a destination) |
 | `--userns` | — | Future improvement; not supported yet |
 | `--uid-start <n>` | — | Future improvement; not supported yet |
 | `--read-only` | off | Read-only root filesystem |
 | `--privileged` | off | Disable security sandbox |
-| `--oom-score <n>` | `500` | OOM score adjustment |
+| `--oom-score <n>` | `500` | OOM score adjustment, -1000 to 1000 |
 | `--link <name>` | — | Allow network to another container (repeatable) |
 | `--dns <address>` | the host's | A name server for the container (IPv4, up to 3) |
+
+A value that is not what its option takes ends `create` with the option named, and nothing is made: no value is shortened or stored to be found wrong at the next start. An option that is given without its value says so.
 
 ### Exec options
 
@@ -308,6 +321,7 @@ The sandbox covers everything in a container: init, the `/init.sh` hook and all 
 
 - **Namespaces**: `clone()` with PID, mount, UTS, IPC, net (and optionally user) namespace flags
 - **Filesystem**: each container lives under `<container_dir>/<name>/` with `rootfs/` for the filesystem, `.conf`, `.ip`, `.pid` for metadata and `console.log` for its output. `pivot_root` into the rootfs copy
+- **A container's configuration**: `.conf` is lines of `key=value` that begin with `version=1`. One piece of code reads it and one writes it; a command reads it once, and `start` hands it to init. A file with the version line is read strictly: an unknown key, a key given twice or a value that is not one is an error that names the file and the line, and a file written by a newer lightbox is refused, not guessed at. A file from before the version line is still read as it was, and is written in the new form at the next `add-vol` or `rm-vol`. `rm` does not need the file, so a container whose configuration is damaged can always be removed
 - **Devices**: bind-mounted from host (`/dev/null`, `/dev/zero`, `/dev/random`, etc.)
 - **Networking**: veth pair per container connected to a host bridge with NAT. `create` writes the container's `/etc/resolv.conf`, `/etc/hostname` and a line for its own name in `/etc/hosts`, inside the copy of the image, where a link in the image cannot send them anywhere else
 - **Resource limits**: cgroups v2 (memory, PIDs, CPU, I/O)
@@ -316,14 +330,16 @@ The sandbox covers everything in a container: init, the `/init.sh` hook and all 
 - **Output**: init leads a session of its own and keeps nothing that was open in the command that started it. Its standard output and error, and those of the hook and every service, are appended to `<container_dir>/<name>/console.log`, which only root can read. The log is kept from one start to the next and is not rotated or limited yet, so a container that prints without end fills the disk it is on
 - **Starting**: `start` and init talk over two pipes. Init builds the container when `start` has set up its cgroup and network, and reports back when it is built and again when the hook has ended. If either side goes away the other notices: an init whose `start` was killed exits before it runs anything
 - **External tools**: on the host, `ip` and `nsenter` set up a container's network, `iptables` the firewall, and `cp` and `rm` create and remove a container. Everything else is direct syscalls, and nothing from the image is run before `/init.sh`
-- **One command at a time**: `start`, `stop`, `rm` and `add-vol` take a lock on the container they change, and `create` and `setup` one on the whole store, so two commands on one container do their work one after the other. A command that has to wait says so. `ls` and `inspect` never wait. `setup`, `start`, `stop` and `exec` need root and say so before they touch anything
+- **One command at a time**: `start`, `stop`, `rm`, `add-vol` and `rm-vol` take a lock on the container they change, and `create` and `setup` one on the whole store, so two commands on one container do their work one after the other. A command that has to wait says so. `ls` and `inspect` never wait. `setup`, `start`, `stop` and `exec` need root and say so before they touch anything
 - **Configuration**: optional `~/.config/lightbox/lightbox.conf` for all paths and defaults
 
 ## Volume Notes
 
-- A volume is written `src:dst[:ro]`. Both paths are absolute and may not contain `..`; they are stored in one spelling, without doubled slashes. The destination may not be `/` or under `/proc`, `/sys` or `/dev`.
+- A volume is written `src:dst[:ro]`. Both paths are absolute and may not contain `..`, a colon or a control character such as a newline; they are stored in one spelling, without doubled slashes. The destination may not be `/` or under `/proc`, `/sys` or `/dev`.
+- A container has at most 16 volumes, and one at any destination: a second one there would be mounted over the first, which would never be seen. A destination inside another volume is another destination.
 - The source is a path on the host, taken when the container starts. The destination is a path in the container, looked up inside it: where the image has a link on the way, the volume lands where the link leads in the container. A destination that the image lacks is made; one that leads nowhere in the container fails the start.
 - Volumes are mounted on top of everything else, so one below `/tmp` or `/run` is visible there.
 - `--vol` now supports both directory and single-file bind mounts.
-- `lightbox add-vol <name> <src>:<dst>[:ro]` appends a volume to an existing container's config.
-- If the container is already running, added volumes take effect after a restart.
+- `lightbox add-vol <name> <src>:<dst>[:ro]` appends a volume to an existing container's config. Adding the very same volume again does nothing.
+- `lightbox rm-vol <name> <dst>` takes the volume at that destination out of the config. What is in the volume's source is not touched.
+- If the container is already running, added and removed volumes take effect after a restart.

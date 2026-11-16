@@ -644,6 +644,80 @@ t_addvol_applies_at_next_start() {
     [ "$(sh_in addvol 'cat /late/in')" = late ]
 }
 
+t_rmvol_applies_at_next_start() {
+    mkdir -p "$T/vol/going" "$T/vol/staying"
+    echo going > "$T/vol/going/in"
+    echo staying > "$T/vol/staying/in"
+    up rmvol --vol "$T/vol/going:/going" --vol "$T/vol/staying:/staying:ro" || return 1
+    said=$(lb rm-vol rmvol /going) || return 1
+    printf '%s\n' "$said"
+    case $said in *'until the container is restarted'*) ;; *) echo "rm-vol does not say that the volume is still mounted"; return 1 ;; esac
+    [ "$(sh_in rmvol 'cat /going/in')" = going ] || { echo "the volume went away without a restart"; return 1; }
+    lb stop rmvol && start rmvol || return 1
+    refused sh_in rmvol 'cat /going/in' 2>/dev/null || { echo "the removed volume is mounted after a restart"; return 1; }
+    [ "$(sh_in rmvol 'cat /staying/in')" = staying ] || { echo "the other volume is gone as well"; return 1; }
+    [ -e "$T/vol/going/in" ] || { echo "removing the volume removed what was in it"; return 1; }
+}
+
+# A container made by a lightbox from before the configuration had a version
+# line: it starts as it is, with its limits and its volume.
+t_conf_from_before_starts() {
+    mkdir -p "$T/vol/old"
+    echo old > "$T/vol/old/in"
+    box before || return 1
+    printf 'mem=32M\npids=40\ncpu=2\noom_score=200\nnote=by hand\nvol=%s:/old:ro\n' "$T/vol/old" > "$C/before/.conf"
+    start before || return 1
+    pid=$(pid_of before)
+    echo "memory.max $(cat "$CG/before/memory.max"), pids.max $(cat "$CG/before/pids.max"), cpu.max $(cat "$CG/before/cpu.max"), oom_score_adj $(cat "/proc/$pid/oom_score_adj")"
+    [ "$(cat "$CG/before/memory.max")" = 33554432 ] && [ "$(cat "$CG/before/pids.max")" = 40 ] &&
+    [ "$(cat "$CG/before/cpu.max")" = '200000 100000' ] && [ "$(cat "/proc/$pid/oom_score_adj")" = 200 ] &&
+    [ "$(sh_in before 'cat /old/in')" = old ] || return 1
+    lb stop before
+}
+
+# A configuration that cannot be used: nothing is started from it and
+# nothing is run in a container that has it, and the container is stopped
+# all the same, with what stop could not do said.
+t_unusable_conf() {
+    up damaged || return 1
+    pid=$(pid_of damaged)
+    echo 'colour=blue' >> "$C/damaged/.conf"
+    said=$(lb exec damaged /bin/true 2>&1 </dev/null) && { echo "exec ran a command without knowing what the container may do"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *"$C/damaged/.conf: line "*': a key lightbox does not know') ;; *) return 1 ;; esac
+    said=$(lb stop damaged 2>&1) && { echo "stop said that all was well"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *'firewall rules'*'a key lightbox does not know'*) ;; *) echo "stop does not say what it left"; return 1 ;; esac
+    gone "$pid" && no_link vb-damaged && [ ! -d "$CG/damaged" ] || { echo "the container was not stopped"; return 1; }
+    said=$(lb start damaged 2>&1) && { echo "a container with a damaged configuration was started"; return 1; }
+    printf '%s\n' "$said"
+    nothing_left damaged
+}
+
+# A start reads the container's configuration once. The command reads it,
+# and init has it from the command; before, each key was looked up in the
+# file again, by both.
+t_start_reads_conf_once() {
+    command -v strace >/dev/null 2>&1 || { echo "no strace to watch a start with"; return 77; }
+    mkdir -p "$T/vol/traced"
+    box traced --vol "$T/vol/traced:/data" --mem 64M || return 1
+    is_up() { [ "$(state_of traced 2>/dev/null)" = running ]; }
+    # strace follows the command and all it starts, init among them, so it
+    # ends when init does
+    timeout -k 5 80 strace -f -qq -e trace=%file -o "$T/traced.strace" \
+        "$LB" start traced >"$OUT/traced.start" 2>&1 </dev/null &
+    tracer=$!
+    wait_until 60 is_up || { echo "the container did not start under strace:"; cat "$OUT/traced.start"; kill "$tracer" 2>/dev/null; return 1; }
+    settled traced || return 1
+    lb stop traced >/dev/null 2>&1 || { echo "stop failed"; return 1; }
+    wait "$tracer"
+    opens=$(grep -cE '\<open(at2?)?\(.*/traced/\.conf"' "$T/traced.strace")
+    echo "the trace has $(wc -l < "$T/traced.strace") lines from $(awk '{ print $1 }' "$T/traced.strace" | sort -u | wc -l) processes"
+    echo "times the container's .conf was opened: $opens"
+    grep -E '/traced/\.conf"' "$T/traced.strace" | head -n 5
+    [ "$opens" = 1 ]
+}
+
 t_volume_under_run() {
     mkdir -p "$T/vol/secrets"
     echo token > "$T/vol/secrets/token"
@@ -857,7 +931,13 @@ t_limits() {
     pid=$(pid_of limits)
     echo "memory.max $(cat "$CG/limits/memory.max"), pids.max $(cat "$CG/limits/pids.max"), cpu.max $(cat "$CG/limits/cpu.max"), oom_score_adj $(cat "/proc/$pid/oom_score_adj")"
     [ "$(cat "$CG/limits/memory.max")" = 67108864 ] && [ "$(cat "$CG/limits/pids.max")" = 50 ] &&
-    [ "$(cat "$CG/limits/cpu.max")" = '200000 100000' ] && [ "$(cat "/proc/$pid/oom_score_adj")" = 300 ]
+    [ "$(cat "$CG/limits/cpu.max")" = '200000 100000' ] && [ "$(cat "/proc/$pid/oom_score_adj")" = 300 ] || return 1
+    # part of a CPU, and no limit at all
+    up half --mem max --pids max --cpu 0.5 --oom-score -500 || return 1
+    pid=$(pid_of half)
+    echo "memory.max $(cat "$CG/half/memory.max"), pids.max $(cat "$CG/half/pids.max"), cpu.max $(cat "$CG/half/cpu.max"), oom_score_adj $(cat "/proc/$pid/oom_score_adj")"
+    [ "$(cat "$CG/half/memory.max")" = max ] && [ "$(cat "$CG/half/pids.max")" = max ] &&
+    [ "$(cat "$CG/half/cpu.max")" = '50000 100000' ] && [ "$(cat "/proc/$pid/oom_score_adj")" = -500 ]
 }
 
 t_cgroup_membership() {
@@ -1714,6 +1794,10 @@ if [ "$MODE" = inside ]; then
     check 'a file volume is mounted'                                      t_volume_file
     check 'a read-only volume cannot be written'                          t_volume_read_only
     check 'add-vol takes effect at the next start'                        t_addvol_applies_at_next_start
+    check 'rm-vol takes effect at the next start'                         t_rmvol_applies_at_next_start
+    check 'a container from before the version line starts as it is'      t_conf_from_before_starts
+    check 'a configuration that cannot be used: no start, no exec, a stop' t_unusable_conf
+    check 'a start opens the container'"'"'s configuration once'              t_start_reads_conf_once
     check 'a volume under /run is visible'                                t_volume_under_run
     check 'volumes under /tmp and /run, and with a read-only root'        t_volume_under_tmp
     check 'a volume'"'"'s destination is looked up inside the container'      t_volume_destination_is_inside

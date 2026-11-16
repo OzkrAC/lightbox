@@ -2,6 +2,10 @@
 #
 # Place this file at ~/.config/lightbox/lightbox.conf
 # All values are optional — built-in defaults are shown below.
+#
+# No value is cut to fit: a directory of more than 448 characters, or a
+# bridge name or address that is too long, ends every command with the
+# setting named. The file may be up to 16 KB.
 
 # Base directory for lightbox data (base rootfs and container directories).
 # `lightbox setup` makes this directory and container_dir mode 0700, so both
@@ -28,7 +32,14 @@
 # subnet = 10.0.0.0/24
 # gw = 10.0.0.1
 
-# Default container resource limits
+# Default container resource limits, for a container that `create` is not
+# given the option for. Each takes what its option takes:
+#   default_mem    a number of bytes, optionally with K, M, G or T, or max
+#   default_pids   1 to 4194304, or max
+#   default_cpu    CPUs from 0.01 to 512, such as 2 or 0.5
+#   default_oom    -1000 to 1000
+# One that is anything else is reported by every command, and `create`
+# refuses a container that would have needed it.
 # default_mem = 256M
 # default_pids = 128
 # default_cpu = 1

@@ -8,6 +8,7 @@
 #       behaviour and is expected to fail. When it starts passing, the suite
 #       fails until the line is changed to "check", so a fix cannot land
 #       without being recorded in the suite.
+#       A function that does not exist is a failure, not an expected one.
 #
 #   summary SUITE-NAME
 #       Prints the totals. Fails if any case failed or passed unexpectedly.
@@ -70,6 +71,14 @@ check() { # name, function
 }
 
 xfail() { # ledger id, name, function
+    # A case that is not there fails, as one that is expected to fail does.
+    # It is not that: it is a mistake in the suite.
+    if ! declare -F "$3" >/dev/null; then
+        n=$((n + 1)); out="the suite has no function $3"
+        failed=$((failed + 1)); printf 'FAIL   %s\n' "$2"; show
+        annotate "FAIL: $2"
+        return 0
+    fi
     run_case "$3"
     if [ $rc -eq 77 ]; then
         skipped=$((skipped + 1)); printf 'skip   %s\n' "$2"; show

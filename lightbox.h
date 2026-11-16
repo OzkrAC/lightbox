@@ -22,12 +22,24 @@
 #define MAX_LINKS        8
 
 /* The largest legal container .conf: MAX_VOLS volumes of two MAX_PATH paths,
- * MAX_LINKS links and the scalar keys. Every reader and writer of a .conf uses
- * a buffer of exactly this size, so a config is never cut on the way in or
- * out; one that does not fit is an error. */
+ * MAX_LINKS links and the scalar keys. The reader and the writer of a .conf
+ * use a buffer of exactly this size, so a config is never cut on the way in
+ * or out; one that does not fit is an error. */
 #define CONF_MAX         20480
 _Static_assert(CONF_MAX > MAX_VOLS * (2 * MAX_PATH + 8) + MAX_LINKS * (NAME_MAX_LEN + 8) + 512,
                "CONF_MAX is too small for the largest legal container config");
+
+/* The limits as text, the way they are given and the way the file has them. */
+#define MEM_TEXT_MAX    24      /* "<number>[K|M|G|T]" or "max" */
+#define PIDS_TEXT_MAX   12      /* a count or "max" */
+#define CPU_TEXT_MAX    12      /* CPUs, "2" or "0.5" */
+#define IO_TEXT_MAX     128     /* a line for io.max */
+
+#define PIDS_LIMIT_MAX  4194304         /* the most processes Linux numbers */
+#define CPU_LIMIT_MAX   512             /* CPUs */
+#define CPU_PERIOD_US   100000          /* cpu.max: the period a quota is of */
+#define OOM_SCORE_MIN   (-1000)
+#define OOM_SCORE_MAX   1000
 
 typedef struct {
     char lightbox_dir[MAX_PATH];
@@ -39,10 +51,14 @@ typedef struct {
     char bridge[32];
     char subnet[20];
     char gw[16];
-    char default_mem[16];
-    char default_pids[8];
-    char default_cpu[4];
+    /* A default_* setting that cannot be used is an empty string here, and
+     * default_oom_ok is false: said once when the settings are read, and
+     * refused by the command that would have needed it. */
+    char default_mem[MEM_TEXT_MAX];
+    char default_pids[PIDS_TEXT_MAX];
+    char default_cpu[CPU_TEXT_MAX];
     int  default_oom;
+    bool default_oom_ok;
     int  start_timeout;     /* seconds start waits for the init hook; 0: not at all */
     int  stop_timeout;      /* seconds a container gets to end when it is asked to */
     char dns[64];           /* name servers for new containers, as written; empty: the host's */
@@ -50,22 +66,128 @@ typedef struct {
 
 extern global_config cfg_global;
 
+/*
+ * What a container is configured with: the content of its .conf.
+ *
+ * lightbox_container.c holds the one reader and the one writer of that
+ * file. Everything else works on this structure and never on the file's
+ * text, so there is one place that decides what a value may be.
+ */
+
+typedef struct {
+    char src[MAX_PATH];
+    char dst[MAX_PATH];
+    bool ro;
+} volume_spec;
+
+typedef struct {
+    int  version;               /* 0: a file from before it had the line */
+    char mem[MEM_TEXT_MAX];
+    char pids[PIDS_TEXT_MAX];
+    char cpu[CPU_TEXT_MAX];
+    char io[IO_TEXT_MAX];       /* empty: no limit */
+    int  oom_score;
+    bool privileged;
+    bool read_only;
+    bool userns;
+    int  uid_start;
+    int  nvols;
+    volume_spec vols[MAX_VOLS];
+    int  nlinks;
+    char links[MAX_LINKS][NAME_MAX_LEN + 1];
+} container_config;
+
+#define CONTAINER_CONFIG_VERSION 1
+
+/* Is this a limit as an option, a setting and the file may give it? */
+[[nodiscard]] bool mem_limit_ok(const char *text);      /* <number>[K|M|G|T] or max */
+[[nodiscard]] bool pids_limit_ok(const char *text);     /* 1 to PIDS_LIMIT_MAX, or max */
+/* 0.01 to CPU_LIMIT_MAX CPUs with at most two decimals: the quota, in
+ * microseconds of each CPU_PERIOD_US */
+[[nodiscard]] bool parse_cpu_limit(const char *text, int *quota_us);
+[[nodiscard]] bool parse_oom_score(const char *text, int *out);
+
+/*
+ * A volume as it is written: src:dst[:ro]. NULL when it is one, with both
+ * paths normalised in vol; otherwise what is wrong with it. An option and
+ * the file are both read through this, so they agree on what a volume is.
+ */
+[[nodiscard]] const char *parse_volume_spec(const char *spec, volume_spec *vol);
+/* The destination alone, in the one spelling it is stored in. */
+[[nodiscard]] const char *parse_volume_destination(const char *text, char dst[MAX_PATH]);
+
+/* A configuration with nothing in it and no limit given yet. */
+void container_config_init(container_config *config);
+/* Give every limit that has not been given the default of lightbox.conf.
+ * NULL, or the name of a default_* setting that was needed and cannot be
+ * used. */
+[[nodiscard]] const char *container_config_fill_defaults(container_config *config);
+
+/*
+ * Read a container's .conf. NULL, or what is wrong, with the file and the
+ * line named; the text is good until the next call. A key the file does not
+ * have keeps its default. A file with a version line is lightbox's own
+ * writing and is read strictly: an unknown key, a second value for a key and
+ * a line that is not key=value are all errors. One without the line is from
+ * before, and those are passed over as they were then.
+ */
+[[nodiscard]] const char *container_config_load(const char *name, container_config *config);
+/* the same for text in hand, which it cuts into lines; path is for the message */
+[[nodiscard]] const char *container_config_parse(char *text, const char *path, container_config *config);
+void container_config_load_or_die(const char *name, container_config *config);
+
+/* Write it, replacing the file in one step. NULL, or what went wrong. */
+[[nodiscard]] const char *container_config_save(const char *name, const container_config *config);
+
+/* The volume at a destination: its index, or -1. */
+int config_volume_at(const container_config *config, const char *dst);
+/* NULL, or why the volume cannot be added: no room, or the destination is taken. */
+[[nodiscard]] const char *config_add_volume(container_config *config, const volume_spec *vol);
+/* Take out every volume at a destination: how many there were. */
+int config_remove_volumes_at(container_config *config, const char *dst);
+
 void print_str(int32_t fd, const char *s);
 [[noreturn]] void die(const char *msg);
 [[noreturn]] void die2(const char *prefix, const char *detail);
 bool streq(const char *a, const char *b);
-size_t str_copy(char *dst, const char *src, size_t max);
-size_t str_append(char *dst, size_t pos, const char *src, size_t max);
-size_t str_append_whole(char *dst, size_t pos, const char *src, size_t max, bool *overflow);
-void path_join(char *buf, size_t bufsz, const char *a, const char *b);
-int parse_int(const char *s);
+
+/*
+ * Text that has to arrive whole. None of these cut: a source that does not
+ * fit is not copied in part, and the caller is told and has to say what
+ * happens then.
+ *
+ * str_copy and path_join leave an empty string and return false. str_append
+ * appends nothing and sets *overflow, which stays set, so a text can be put
+ * together from many pieces and asked once whether it is whole. The _or_die
+ * forms end the process with the text named; they are for a command's own
+ * arguments and settings, where too long is the user's to correct.
+ */
+[[nodiscard]] bool str_copy(char *dst, const char *src, size_t max);
+size_t str_append(char *dst, size_t pos, const char *src, size_t max, bool *overflow);
+[[nodiscard]] bool path_join(char *buf, size_t bufsz, const char *a, const char *b);
+void str_copy_or_die(char *dst, const char *src, size_t max, const char *what);
+void path_join_or_die(char *buf, size_t bufsz, const char *a, const char *b);
+/* "/proc/<pid><suffix>" */
+[[nodiscard]] bool proc_pid_path(char *buf, size_t bufsz, int pid, const char *suffix);
+/* the directory a path's last component is in */
+[[nodiscard]] bool parent_dir(char *buf, size_t bufsz, const char *path);
+/* a byte below 0x20, or 0x7f: a newline among them */
+bool has_control_chars(const char *s);
+
+/*
+ * A whole number in decimal from min to max: an optional minus sign and
+ * digits, nothing else. Empty text, anything after the digits and a value
+ * out of range are refused, and nothing wraps around.
+ */
+[[nodiscard]] bool parse_number(const char *s, int64_t min, int64_t max, int64_t *out);
+[[nodiscard]] bool parse_int_in(const char *s, int min, int max, int *out);
 
 /* A time limit in whole seconds, as an option or a setting gives it: digits
  * only, 0 to SECONDS_MAX. */
 #define SECONDS_MAX            86400
 #define START_TIMEOUT_DEFAULT  30
 #define STOP_TIMEOUT_DEFAULT   10
-bool parse_seconds(const char *s, int *out);
+[[nodiscard]] bool parse_seconds(const char *s, int *out);
 int fmt_int(char *buf, int val);
 int write_file(const char *path, const char *data);
 void require_write_file(const char *path, const char *data);
@@ -175,9 +297,6 @@ void container_log_path(char *buf, const char *name);
 /* the same, ending the process on failure */
 void set_container_state(const char *name, const char *state);
 void get_container_state(const char *name, char *buf, size_t bufsz);
-int container_conf_read(const char *name, char *buf);
-int conf_get(const char *name, const char *key, char *val, size_t valsz, const char *def);
-int conf_get_int(const char *name, const char *key, int def);
 int get_container_pid(const char *name);
 int get_container_pid_starttime(const char *name, char *buf, size_t bufsz);
 /* write .pid_start and .pid for a running init: 0, or -1 */
@@ -214,7 +333,7 @@ void store_lock(void);
 /* Ends the process, saying which command it was, unless it runs as root. */
 void require_root(const char *command);
 int read_container_ip(const char *name, char *ip, size_t ipsz);
-int update_link_rules(const char *name, const char *ip, bool add_rules);
+int update_link_rules(const container_config *config, const char *ip, bool add_rules);
 /* does iptables see what the bridge switches between containers? */
 bool bridge_traffic_is_filtered(void);
 

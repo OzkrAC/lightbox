@@ -43,49 +43,33 @@ int read_container_ip(const char *name, char *ip, size_t ipsz) {
     return 0;
 }
 
-int update_link_rules(const char *name, const char *ip, bool add_rules) {
-    char conf_buf[CONF_MAX];
-    if (container_conf_read(name, conf_buf) <= 0) return 0;
+/*
+ * The rules that let a container and each container it is linked to reach
+ * one another: put in, or taken out. A link to a container that has no
+ * address on record is passed over.
+ */
+int update_link_rules(const container_config *config, const char *ip, bool add_rules) {
+    for (int i = 0; i < config->nlinks; i++) {
+        char link_ip[16];
+        if (read_container_ip(config->links[i], link_ip, sizeof(link_ip)) != 0)
+            continue;
 
-    char *p = conf_buf;
-    while (*p) {
-        if (p[0] == 'l' && p[1] == 'i' && p[2] == 'n' && p[3] == 'k' && p[4] == '=') {
-            char link_name[NAME_MAX_LEN + 1];
-            char *v = p + 5;
-            char *end = v;
-            while (*end && *end != '\n') end++;
-            size_t ln = (size_t)(end - v);
-            if (ln > NAME_MAX_LEN) ln = NAME_MAX_LEN;
-            lc_bytes_copy(link_name, v, ln);
-            link_name[ln] = '\0';
-
-            char link_ip[16];
-            if (read_container_ip(link_name, link_ip, sizeof(link_ip)) == 0) {
-                const char *c1[] = { "iptables", "-C", "FORWARD",
-                               "-s", ip, "-d", link_ip,
-                               "-i", cfg_global.bridge, "-o", cfg_global.bridge,
-                               "-j", "ACCEPT", NULL };
-                const char *m1[] = { "iptables", add_rules ? "-I" : "-D", "FORWARD",
-                               "-s", ip, "-d", link_ip,
-                               "-i", cfg_global.bridge, "-o", cfg_global.bridge,
-                               "-j", "ACCEPT", NULL };
-                if ((add_rules ? iptables_ensure_rule(c1, m1) : iptables_remove_rule(c1, m1)) != 0)
-                    return -1;
-
-                const char *c2[] = { "iptables", "-C", "FORWARD",
-                               "-s", link_ip, "-d", ip,
-                               "-i", cfg_global.bridge, "-o", cfg_global.bridge,
-                               "-j", "ACCEPT", NULL };
-                const char *m2[] = { "iptables", add_rules ? "-I" : "-D", "FORWARD",
-                               "-s", link_ip, "-d", ip,
-                               "-i", cfg_global.bridge, "-o", cfg_global.bridge,
-                               "-j", "ACCEPT", NULL };
-                if ((add_rules ? iptables_ensure_rule(c2, m2) : iptables_remove_rule(c2, m2)) != 0)
-                    return -1;
-            }
+        /* one rule for each direction */
+        for (int back = 0; back < 2; back++) {
+            const char *from = back ? link_ip : ip;
+            const char *to = back ? ip : link_ip;
+            const char *check[] = { "iptables", "-C", "FORWARD",
+                                    "-s", from, "-d", to,
+                                    "-i", cfg_global.bridge, "-o", cfg_global.bridge,
+                                    "-j", "ACCEPT", NULL };
+            const char *change[] = { "iptables", add_rules ? "-I" : "-D", "FORWARD",
+                                     "-s", from, "-d", to,
+                                     "-i", cfg_global.bridge, "-o", cfg_global.bridge,
+                                     "-j", "ACCEPT", NULL };
+            if ((add_rules ? iptables_ensure_rule(check, change)
+                           : iptables_remove_rule(check, change)) != 0)
+                return -1;
         }
-        while (*p && *p != '\n') p++;
-        if (*p == '\n') p++;
     }
 
     return 0;
@@ -236,8 +220,11 @@ void cmd_setup(void) {
             const char *add[] = { "ip", "link", "add", "name", cfg_global.bridge, "type", "bridge", NULL };
             require_cmd(tool_path_ip(), add);
             char gw_cidr[20];
-            str_copy(gw_cidr, cfg_global.gw, sizeof(gw_cidr));
-            str_append(gw_cidr, lc_string_length(gw_cidr), "/24", sizeof(gw_cidr));
+            bool cut = false;
+            size_t pos = str_append(gw_cidr, 0, cfg_global.gw, sizeof(gw_cidr), &cut);
+            str_append(gw_cidr, pos, "/24", sizeof(gw_cidr), &cut);
+            if (cut)
+                die2("Error: gw in lightbox.conf is not an address: ", cfg_global.gw);
             const char *addr[] = { "ip", "addr", "add", gw_cidr, "dev", cfg_global.bridge, NULL };
             require_cmd(tool_path_ip(), addr);
             const char *up[] = { "ip", "link", "set", cfg_global.bridge, "up", NULL };

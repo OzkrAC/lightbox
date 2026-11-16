@@ -1,49 +1,55 @@
 #include "lightbox.h"
 
+/*
+ * Where a container's files are. Each of these fits MAX_PATH: a container's
+ * name is short, and the settings are refused when they are read if they are
+ * so long that one of these paths would not fit (cfg_global_load). Should
+ * one not fit all the same, the process ends here; no path is ever cut.
+ */
 void container_dir_path(char *buf, const char *name) {
-    path_join(buf, MAX_PATH, cfg_global.container_dir, name);
+    path_join_or_die(buf, MAX_PATH, cfg_global.container_dir, name);
 }
 
 void container_root(char *buf, const char *name) {
     char base[MAX_PATH];
     container_dir_path(base, name);
-    path_join(buf, MAX_PATH, base, "rootfs");
+    path_join_or_die(buf, MAX_PATH, base, "rootfs");
 }
 
 void container_pid_path(char *buf, const char *name) {
     char base[MAX_PATH];
     container_dir_path(base, name);
-    path_join(buf, MAX_PATH, base, ".pid");
+    path_join_or_die(buf, MAX_PATH, base, ".pid");
 }
 
 void container_pid_start_path(char *buf, const char *name) {
     char base[MAX_PATH];
     container_dir_path(base, name);
-    path_join(buf, MAX_PATH, base, ".pid_start");
+    path_join_or_die(buf, MAX_PATH, base, ".pid_start");
 }
 
 void container_ip_path(char *buf, const char *name) {
     char base[MAX_PATH];
     container_dir_path(base, name);
-    path_join(buf, MAX_PATH, base, ".ip");
+    path_join_or_die(buf, MAX_PATH, base, ".ip");
 }
 
 void container_conf_path(char *buf, const char *name) {
     char base[MAX_PATH];
     container_dir_path(base, name);
-    path_join(buf, MAX_PATH, base, ".conf");
+    path_join_or_die(buf, MAX_PATH, base, ".conf");
 }
 
 void container_log_path(char *buf, const char *name) {
     char base[MAX_PATH];
     container_dir_path(base, name);
-    path_join(buf, MAX_PATH, base, "console.log");
+    path_join_or_die(buf, MAX_PATH, base, "console.log");
 }
 
 void container_state_path(char *buf, const char *name) {
     char base[MAX_PATH];
     container_dir_path(base, name);
-    path_join(buf, MAX_PATH, base, ".state");
+    path_join_or_die(buf, MAX_PATH, base, ".state");
 }
 
 int record_container_state(const char *name, const char *state) {
@@ -60,69 +66,27 @@ void set_container_state(const char *name, const char *state) {
 void get_container_state(const char *name, char *buf, size_t bufsz) {
     char path[MAX_PATH];
     container_state_path(path, name);
-    if (read_file(path, buf, bufsz) <= 0) {
-        str_copy(buf, "unknown", bufsz);
-        return;
-    }
-    for (size_t i = 0; buf[i]; i++) {
-        if (buf[i] == '\n') { buf[i] = '\0'; break; }
-    }
-    if (!buf[0]) str_copy(buf, "unknown", bufsz);
-}
-
-/*
- * Read a container's whole .conf into a buffer of CONF_MAX bytes. Returns the
- * length, or -1 if the file cannot be read. A file that does not fit stops the
- * command: a shorter config would silently drop volumes or their ":ro".
- */
-int container_conf_read(const char *name, char *buf) {
-    char path[MAX_PATH];
-    container_conf_path(path, name);
-    int n = read_file(path, buf, CONF_MAX);
-    if (n >= CONF_MAX - 1)
-        die2("Error: container config is larger than lightbox supports: ", path);
-    return n;
-}
-
-int conf_get(const char *name, const char *key, char *val, size_t valsz, const char *def) {
-    char buf[CONF_MAX];
-    if (container_conf_read(name, buf) < 0) {
-        str_copy(val, def, valsz);
-        return 0;
-    }
-
-    size_t keylen = lc_string_length(key);
-    char *p = buf;
-    while (*p) {
-        if (lc_string_starts_with(p, lc_string_length(p), key, keylen) && p[keylen] == '=') {
-            char *v = p + keylen + 1;
-            char *end = v;
-            while (*end && *end != '\n') end++;
-            size_t len = (size_t)(end - v);
-            if (len >= valsz) len = valsz - 1;
-            lc_bytes_copy(val, v, len);
-            val[len] = '\0';
-            return 1;
+    if (read_file(path, buf, bufsz) > 0) {
+        for (size_t i = 0; buf[i]; i++) {
+            if (buf[i] == '\n') { buf[i] = '\0'; break; }
         }
-        while (*p && *p != '\n') p++;
-        if (*p == '\n') p++;
+    } else {
+        buf[0] = '\0';
     }
-    str_copy(val, def, valsz);
-    return 0;
-}
-
-int conf_get_int(const char *name, const char *key, int def) {
-    char val[32];
-    if (conf_get(name, key, val, sizeof(val), "") && val[0])
-        return parse_int(val);
-    return def;
+    if (!buf[0])
+        str_copy_or_die(buf, "unknown", bufsz, "a container's state");
 }
 
 int get_container_pid(const char *name) {
     char path[MAX_PATH], buf[16];
+    int pid;
     container_pid_path(path, name);
-    if (read_file(path, buf, sizeof(buf)) < 0) return -1;
-    return parse_int(buf);
+    if (read_file(path, buf, sizeof(buf)) <= 0) return -1;
+    for (size_t i = 0; buf[i]; i++) {
+        if (buf[i] == '\n') { buf[i] = '\0'; break; }
+    }
+    /* a record that is not the number of a process is no record */
+    return parse_int_in(buf, 1, PIDS_LIMIT_MAX, &pid) ? pid : -1;
 }
 
 static void clear_runtime_identity(const char *name, bool mark_failed) {
@@ -136,13 +100,9 @@ static void clear_runtime_identity(const char *name, bool mark_failed) {
 }
 
 static int read_proc_starttime(int pid, char *buf, size_t bufsz) {
-    char path[64], statbuf[512], pidbuf[16];
-    fmt_int(pidbuf, pid);
-    size_t pos = str_copy(path, "/proc/", sizeof(path));
-    pos = str_append(path, pos, pidbuf, sizeof(path));
-    str_append(path, pos, "/stat", sizeof(path));
-
-    if (read_file(path, statbuf, sizeof(statbuf)) <= 0)
+    char path[64], statbuf[512];
+    if (!proc_pid_path(path, sizeof(path), pid, "/stat") ||
+        read_file(path, statbuf, sizeof(statbuf)) <= 0)
         return -1;
 
     char *p = statbuf;
@@ -238,11 +198,9 @@ container_liveness container_probe(const char *name) {
         return CONTAINER_DEAD;
 
     /* A container's init lives in a PID namespace of its own. */
-    char proc_path[64], pidbuf[16], pid_ns[64], init_ns[64];
-    fmt_int(pidbuf, pid);
-    size_t pos = str_copy(proc_path, "/proc/", sizeof(proc_path));
-    pos = str_append(proc_path, pos, pidbuf, sizeof(proc_path));
-    str_append(proc_path, pos, "/ns/pid", sizeof(proc_path));
+    char proc_path[64], pid_ns[64], init_ns[64];
+    if (!proc_pid_path(proc_path, sizeof(proc_path), pid, "/ns/pid"))
+        return CONTAINER_RUNNING;   /* cannot look; the start time matched */
 
     lc_sysret n1 = lc_kernel_readlinkat(AT_FDCWD, proc_path, pid_ns, sizeof(pid_ns) - 1);
     if (n1 == -LB_ENOENT || n1 == -LB_ESRCH)
@@ -276,12 +234,12 @@ void container_reap_if_dead(const char *name) {
  */
 void container_shown_state(const char *name, container_liveness live, char *buf, size_t bufsz) {
     if (live == CONTAINER_RUNNING) {
-        str_copy(buf, "running", bufsz);
+        str_copy_or_die(buf, "running", bufsz, "a container's state");
         return;
     }
     get_container_state(name, buf, bufsz);
     if (live == CONTAINER_DEAD || streq(buf, "running"))
-        str_copy(buf, "exited", bufsz);
+        str_copy_or_die(buf, "exited", bufsz, "a container's state");
 }
 
 /* ─── Locks ─────────────────────────────────────────────────────────────── */
@@ -329,9 +287,12 @@ static bool still_at(int32_t fd, const char *path) {
 void container_lock(const char *name) {
     char dir[MAX_PATH], whose[NAME_MAX_LEN + 16];
     container_dir_path(dir, name);
-    size_t pos = str_copy(whose, "container '", sizeof(whose));
-    pos = str_append(whose, pos, name, sizeof(whose));
-    str_append(whose, pos, "'", sizeof(whose));
+    bool cut = false;
+    size_t pos = str_append(whose, 0, "container '", sizeof(whose), &cut);
+    pos = str_append(whose, pos, name, sizeof(whose), &cut);
+    str_append(whose, pos, "'", sizeof(whose), &cut);
+    if (cut)
+        die2("Error: not the name of a container: ", name);
 
     lc_sysret fd = lock_directory(dir, false, true, whose);
     if (fd == -LB_ENOENT || (fd >= 0 && !still_at((int32_t)fd, dir)))
@@ -428,7 +389,8 @@ int list_containers(char names[][NAME_MAX_LEN + 1], int max, bool *more) {
                 lc_bytes_copy(names[at], names[at - 1], NAME_MAX_LEN + 1);
                 at--;
             }
-            str_copy(names[at], entry, NAME_MAX_LEN + 1);
+            /* entry is a valid name, so it fits */
+            lc_bytes_copy(names[at], entry, lc_string_length(entry) + 1);
             count++;
         }
     }

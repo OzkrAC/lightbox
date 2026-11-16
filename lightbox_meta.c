@@ -124,12 +124,6 @@ static void print_check(const char *key, bool ok, const char *detail) {
     lc_print_char(STDOUT, '\n');
 }
 
-static void print_conf_kv(const char *name, const char *key, const char *fallback) {
-    char buf[128];
-    conf_get(name, key, buf, sizeof(buf), fallback);
-    print_kv(key, buf);
-}
-
 /*
  * logs <name> [-f]: what the container's init, its hook and its services
  * wrote to stdout and stderr, from every start since the container was made.
@@ -215,8 +209,10 @@ void cmd_inspect(int argc, char **argv) {
     container_state_path(state_path, name);
 
     container_lock_if_free(name);
-    if (read_container_ip(name, ip, sizeof(ip)) < 0)
-        str_copy(ip, "-", sizeof(ip));
+    if (read_container_ip(name, ip, sizeof(ip)) < 0) {
+        ip[0] = '-';
+        ip[1] = '\0';
+    }
     container_liveness live = container_probe(name);
     container_shown_state(name, live, state, sizeof(state));
 
@@ -232,8 +228,10 @@ void cmd_inspect(int argc, char **argv) {
     print_kv("pid_start_path", pid_start_path);
     print_kv("state_path", state_path);
 
-    if (path_exists(pid_path))
-        print_kv_int("pid", get_container_pid(name));
+    /* a record that is not the number of a process is no record */
+    int pid = get_container_pid(name);
+    if (pid > 0)
+        print_kv_int("pid", pid);
     else
         print_kv("pid", "-");
     if (get_container_pid_starttime(name, pid_start, sizeof(pid_start)) == 0)
@@ -241,14 +239,20 @@ void cmd_inspect(int argc, char **argv) {
     else
         print_kv("pid_starttime", "-");
 
-    print_conf_kv(name, "mem", cfg_global.default_mem);
-    print_conf_kv(name, "pids", cfg_global.default_pids);
-    print_conf_kv(name, "cpu", cfg_global.default_cpu);
-    print_kv_int("oom_score", conf_get_int(name, "oom_score", cfg_global.default_oom));
-    print_kv_int("userns", conf_get_int(name, "userns", 0));
-    print_kv_int("uid_start", conf_get_int(name, "uid_start", 0));
-    print_kv_int("privileged", conf_get_int(name, "privileged", 0));
-    print_kv_int("readonly", conf_get_int(name, "readonly", 0));
+    /* What it is configured with. A configuration that cannot be used is
+     * said to be so, after everything that could be shown. */
+    static container_config config;
+    const char *wrong = container_config_load(name, &config);
+    if (wrong)
+        die2("Error: the container's configuration cannot be used: ", wrong);
+    print_kv("mem", config.mem);
+    print_kv("pids", config.pids);
+    print_kv("cpu", config.cpu);
+    print_kv_int("oom_score", config.oom_score);
+    print_kv_int("userns", config.userns);
+    print_kv_int("uid_start", config.uid_start);
+    print_kv_int("privileged", config.privileged);
+    print_kv_int("readonly", config.read_only);
 }
 
 /* doctor: can exec run from a copy of the binary that cannot be written to? */

@@ -73,7 +73,7 @@ CFLAGS  = $(CSTD) -O2 -DNDEBUG $(WARN) $(HARDEN) $(ARCH_CFLAGS) \
 LDFLAGS = -static -no-pie -nostdlib -nostartfiles -nodefaultlibs \
           -T $(LIGHTC)/lightc.ld
 
-SRCS = lightbox.c lightbox_meta.c lightbox_state.c lightbox_net.c lightbox_config.c lightbox_util.c
+SRCS = lightbox.c lightbox_meta.c lightbox_state.c lightbox_container.c lightbox_net.c lightbox_config.c lightbox_util.c
 OBJS = $(SRCS:.c=.o)
 DEPS = $(OBJS:.o=.d)
 

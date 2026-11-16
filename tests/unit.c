@@ -17,6 +17,22 @@
  *   unit maskproc                             mask_proc_paths
  *   unit noipv6  <pid>                        netns_disable_ipv6
  *   unit seconds <text>                       parse_seconds
+ *   unit number  <text> <min> <max>           parse_number: the number, or "refused"
+ *   unit limit   mem|pids|cpu|oom <text>      the check that an option, a setting and a .conf
+ *                                             share: "ok", for cpu "quota <n>", for oom
+ *                                             "score <n>"; or "refused"
+ *   unit text copy   <size> <text>            str_copy into <size> bytes
+ *   unit text append <size> <a> <b>           str_append of <b> after <a>
+ *   unit text join   <size> <a> <b>           path_join
+ *                                             each: "whole <text>", or "cut <what is there>"
+ *   unit config <dir> <name> [nodefaults]     container_config_load of <dir>/<name>/.conf: a line
+ *                                             for each value, or "refused: <why>"; nodefaults
+ *                                             is a lightbox.conf whose default_* are all unusable
+ *   unit config-write <dir> <name> [<field>=<value>...]
+ *                                             container_config_save of a configuration with these
+ *                                             values put in unchecked, as no command would: mem,
+ *                                             pids, cpu, io, link, and src and dst for a volume.
+ *                                             "written", or "refused: <why>"
  *   unit streams <file>                       reserve_standard_streams, then the number
  *                                             the next descriptor gets, written to <file>
  *   unit init    <how> confined|open <seconds> <hook script | -> <log file | -> [<grace>]
@@ -111,6 +127,90 @@ static void put_result(int result) {
     put("\n");
 }
 
+static int number_arg(const char *text) {
+    int number;
+    if (!parse_int_in(text, INT32_MIN, INT32_MAX, &number))
+        die2("unit: not a number: ", text);
+    return number;
+}
+
+/* "<label> <number>" */
+static void put_number(const char *label, int number) {
+    char buf[16];
+    fmt_int(buf, number);
+    put(label);
+    put(" ");
+    put(buf);
+    put("\n");
+}
+
+static void put_line(const char *label, const char *text) {
+    put(label);
+    put(text);
+    put("\n");
+}
+
+/* a text helper's verdict and what it left in the buffer */
+static void put_text(bool whole, const char *text) {
+    put_line(whole ? "whole " : "cut ", text);
+}
+
+static void put_config(const container_config *config) {
+    put_number("version", config->version);
+    put_line("mem ", config->mem);
+    put_line("pids ", config->pids);
+    put_line("cpu ", config->cpu);
+    put_number("oom_score", config->oom_score);
+    put_number("privileged", config->privileged);
+    put_number("readonly", config->read_only);
+    put_number("userns", config->userns);
+    put_number("uid_start", config->uid_start);
+    put_line("io ", config->io[0] ? config->io : "-");
+    for (int i = 0; i < config->nvols; i++) {
+        put("vol ");
+        put(config->vols[i].src);
+        put(" -> ");
+        put(config->vols[i].dst);
+        put(config->vols[i].ro ? " ro\n" : " rw\n");
+    }
+    for (int i = 0; i < config->nlinks; i++)
+        put_line("link ", config->links[i]);
+}
+
+/* A field of a configuration set to a value as it is, however long it is
+ * allowed to be and whatever is in it. */
+static void set_unchecked(container_config *config, const char *assignment) {
+    static const char *const fields[] = { "mem=", "pids=", "cpu=", "io=", "link=", "src=", "dst=" };
+    size_t which = 0, len = 0;
+    for (; which < sizeof(fields) / sizeof(fields[0]); which++) {
+        len = lc_string_length(fields[which]);
+        if (lc_string_starts_with(assignment, lc_string_length(assignment), fields[which], len))
+            break;
+    }
+    const char *value = assignment + len;
+    bool fits = false;
+    switch (which) {
+        case 0: fits = str_copy(config->mem, value, sizeof(config->mem)); break;
+        case 1: fits = str_copy(config->pids, value, sizeof(config->pids)); break;
+        case 2: fits = str_copy(config->cpu, value, sizeof(config->cpu)); break;
+        case 3: fits = str_copy(config->io, value, sizeof(config->io)); break;
+        case 4: fits = config->nlinks < MAX_LINKS &&
+                       str_copy(config->links[config->nlinks], value, sizeof(config->links[0]));
+                config->nlinks++;
+                break;
+        case 5: fits = config->nvols < MAX_VOLS &&
+                       str_copy(config->vols[config->nvols].src, value, MAX_PATH);
+                break;
+        case 6: fits = config->nvols < MAX_VOLS &&
+                       str_copy(config->vols[config->nvols].dst, value, MAX_PATH);
+                config->nvols++;
+                break;
+        default: break;
+    }
+    if (!fits)
+        die2("unit: cannot set ", assignment);
+}
+
 static uint64_t mount_flags_named(const char *names) {
     static const struct { const char *name; uint64_t flag; } known[] = {
         { "ro", MS_RDONLY }, { "nosuid", MS_NOSUID }, { "nodev", MS_NODEV }, { "noexec", MS_NOEXEC },
@@ -160,15 +260,6 @@ static void put_own_privileges(void) {
         }
         line = after ? end + 1 : end;
     }
-}
-
-static void put_number(const char *label, int number) {
-    char buf[16];
-    fmt_int(buf, number);
-    put(label);
-    put(" ");
-    put(buf);
-    put("\n");
 }
 
 /* What init is in the harness: all of a container's init but the container. */
@@ -458,7 +549,7 @@ int main(int argc, char **argv, char **envp) {
     }
     if (argc >= 4 && streq(argv[1], "capture")) {
         static char captured[4096];
-        int size = parse_int(argv[2]);
+        int size = number_arg(argv[2]);
         if (size < 1 || size > (int)sizeof(captured))
             die("unit: capture size must be 1 to 4096");
         put_result(run_cmd_capture(argv[3], (const char *const *)(argv + 3), captured, (size_t)size));
@@ -468,7 +559,7 @@ int main(int argc, char **argv, char **envp) {
         return 0;
     }
     if (argc == 3 && streq(argv[1], "status")) {
-        put_result(exit_code_from_status(parse_int(argv[2])));
+        put_result(exit_code_from_status(number_arg(argv[2])));
         return 0;
     }
     if (argc == 7 && streq(argv[1], "mount")) {
@@ -499,13 +590,97 @@ int main(int argc, char **argv, char **envp) {
         return 0;
     }
     if (argc == 3 && streq(argv[1], "noipv6")) {
-        put_result(netns_disable_ipv6(parse_int(argv[2])));
+        put_result(netns_disable_ipv6(number_arg(argv[2])));
         return 0;
     }
     if (argc == 3 && streq(argv[1], "seconds")) {
         int seconds = -1;
         bool ok = parse_seconds(argv[2], &seconds);
         put_result(ok ? seconds : -1);
+        return 0;
+    }
+    if (argc == 5 && streq(argv[1], "number")) {
+        int64_t min, max, number;
+        if (!parse_number(argv[3], INT64_MIN, INT64_MAX, &min) ||
+            !parse_number(argv[4], INT64_MIN, INT64_MAX, &max))
+            die("unit: number <text> <min> <max>");
+        if (!parse_number(argv[2], min, max, &number)) {
+            put("refused\n");
+            return 0;
+        }
+        /* in two halves: the harness prints ints */
+        if (number < 0) put("-");
+        uint64_t magnitude = number < 0 ? 0 - (uint64_t)number : (uint64_t)number;
+        char digits[24];
+        int at = (int)sizeof(digits);
+        digits[--at] = '\0';
+        do { digits[--at] = (char)('0' + magnitude % 10); magnitude /= 10; } while (magnitude);
+        put_line("", digits + at);
+        return 0;
+    }
+    if (argc == 4 && streq(argv[1], "limit")) {
+        int number = 0;
+        if (streq(argv[2], "mem"))
+            put(mem_limit_ok(argv[3]) ? "ok\n" : "refused\n");
+        else if (streq(argv[2], "pids"))
+            put(pids_limit_ok(argv[3]) ? "ok\n" : "refused\n");
+        else if (streq(argv[2], "cpu") && parse_cpu_limit(argv[3], &number))
+            put_number("quota", number);
+        else if (streq(argv[2], "oom") && parse_oom_score(argv[3], &number))
+            put_number("score", number);
+        else
+            put("refused\n");
+        return 0;
+    }
+    if (argc >= 5 && streq(argv[1], "text")) {
+        static char buf[4096];
+        int size = number_arg(argv[3]);
+        if (size < 1 || size > (int)sizeof(buf))
+            die("unit: text size must be 1 to 4096");
+        lc_bytes_fill(buf, 'x', sizeof(buf));       /* so that what was not written shows */
+        buf[size - 1] = '\0';
+        if (argc == 5 && streq(argv[2], "copy")) {
+            put_text(str_copy(buf, argv[4], (size_t)size), buf);
+        } else if (argc == 6 && streq(argv[2], "append")) {
+            bool cut = false;
+            size_t pos = str_append(buf, 0, argv[4], (size_t)size, &cut);
+            if (cut)
+                die("unit: text append: the first text has to fit");
+            str_append(buf, pos, argv[5], (size_t)size, &cut);
+            put_text(!cut, buf);
+        } else if (argc == 6 && streq(argv[2], "join")) {
+            put_text(path_join(buf, (size_t)size, argv[4], argv[5]), buf);
+        } else {
+            die("unit: text copy|append|join");
+        }
+        return 0;
+    }
+    if ((argc == 4 || argc == 5) && streq(argv[1], "config")) {
+        static container_config config;
+        cfg_global_init();
+        if (argc == 5) {
+            cfg_global.default_mem[0] = cfg_global.default_pids[0] = cfg_global.default_cpu[0] = '\0';
+            cfg_global.default_oom_ok = false;
+        }
+        str_copy_or_die(cfg_global.container_dir, argv[2], MAX_PATH, "the directory");
+        const char *wrong = container_config_load(argv[3], &config);
+        if (wrong)
+            put_line("refused: ", wrong);
+        else
+            put_config(&config);
+        return 0;
+    }
+    if (argc >= 4 && streq(argv[1], "config-write")) {
+        static container_config config;
+        cfg_global_init();
+        str_copy_or_die(cfg_global.container_dir, argv[2], MAX_PATH, "the directory");
+        container_config_init(&config);
+        if (container_config_fill_defaults(&config) != NULL)
+            die("unit: no defaults");
+        for (int i = 4; i < argc; i++)
+            set_unchecked(&config, argv[i]);
+        const char *wrong = container_config_save(argv[3], &config);
+        put_line(wrong ? "refused: " : "written", wrong ? wrong : "");
         return 0;
     }
     if (argc == 3 && streq(argv[1], "streams")) {
@@ -533,7 +708,7 @@ int main(int argc, char **argv, char **envp) {
         int seconds = 0;
         if (!parse_seconds(argv[3], &seconds))
             die("unit: stop <pid> <seconds>");
-        lc_sysret pidfd = lb_sys_pidfd_open(parse_int(argv[2]), 0);
+        lc_sysret pidfd = lb_sys_pidfd_open(number_arg(argv[2]), 0);
         if (pidfd < 0)
             die2("unit: no process ", argv[2]);
         put(ask_init_to_stop((int32_t)pidfd, seconds) ? "asked\n" : "gone\n");
@@ -557,6 +732,7 @@ int main(int argc, char **argv, char **envp) {
     }
     if (argc >= 3 && streq(argv[1], "volumes")) {
         static struct volume_mount volumes[MAX_VOLS];
+        static volume_spec specs[MAX_VOLS];
         const char *root = argv[2];
         int count = 0, i = 3;
 
@@ -564,7 +740,10 @@ int main(int argc, char **argv, char **envp) {
         for (; i < argc && !streq(argv[i], "--"); i++) {
             if (count == MAX_VOLS)
                 die("unit: too many volumes");
-            open_volume(argv[i], &volumes[count++]);
+            if (parse_volume_spec(argv[i], &specs[count]) != NULL)
+                die2("unit: not a volume: ", argv[i]);
+            open_volume(&specs[count], &volumes[count]);
+            count++;
         }
 
         /* into the root as build_container goes into a container's */
