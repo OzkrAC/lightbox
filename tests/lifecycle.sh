@@ -906,17 +906,26 @@ t_conf_from_before_starts() {
 # A configuration that cannot be used: nothing is started from it and
 # nothing is run in a container that has it, and the container is stopped
 # all the same, with what stop could not do said.
+# A configuration that cannot be used: exec and start refuse. stop stops the
+# container all the same and takes away all it had, the rules of its links
+# among them, which it knows from their record and not from the .conf.
 t_unusable_conf() {
-    up damaged || return 1
+    if brnf 1; then
+        box dpeer && box damaged --link dpeer || return 1
+        start damaged || return 1
+        iptables -n -L LB-damaged >/dev/null || { echo "the link put in no chain"; return 1; }
+    else
+        echo "br_netfilter is not loaded: the container has no link"
+        up damaged || return 1
+    fi
     pid=$(pid_of damaged)
     echo 'colour=blue' >> "$C/damaged/.conf"
     said=$(lb exec damaged /bin/true 2>&1 </dev/null) && { echo "exec ran a command without knowing what the container may do"; return 1; }
     printf '%s\n' "$said"
     case $said in *"$C/damaged/.conf: line "*': a key lightbox does not know') ;; *) return 1 ;; esac
-    said=$(lb stop damaged 2>&1) && { echo "stop said that all was well"; return 1; }
+    said=$(lb stop damaged 2>&1) || { printf '%s\n' "$said"; echo "stop failed"; return 1; }
     printf '%s\n' "$said"
-    case $said in *'firewall rules'*'a key lightbox does not know'*) ;; *) echo "stop does not say what it left"; return 1 ;; esac
-    gone "$pid" && no_link vb-damaged && [ ! -d "$CG/damaged" ] || { echo "the container was not stopped"; return 1; }
+    gone "$pid" && nothing_left damaged || { echo "the container was not stopped and cleared away"; return 1; }
     said=$(lb start damaged 2>&1) && { echo "a container with a damaged configuration was started"; return 1; }
     printf '%s\n' "$said"
     nothing_left damaged
