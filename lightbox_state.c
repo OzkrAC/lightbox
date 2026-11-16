@@ -16,18 +16,6 @@ void container_root(char *buf, const char *name) {
     path_join_or_die(buf, MAX_PATH, base, "rootfs");
 }
 
-void container_pid_path(char *buf, const char *name) {
-    char base[MAX_PATH];
-    container_dir_path(base, name);
-    path_join_or_die(buf, MAX_PATH, base, ".pid");
-}
-
-void container_pid_start_path(char *buf, const char *name) {
-    char base[MAX_PATH];
-    container_dir_path(base, name);
-    path_join_or_die(buf, MAX_PATH, base, ".pid_start");
-}
-
 void container_ip_path(char *buf, const char *name) {
     char base[MAX_PATH];
     container_dir_path(base, name);
@@ -46,16 +34,132 @@ void container_log_path(char *buf, const char *name) {
     path_join_or_die(buf, MAX_PATH, base, "console.log");
 }
 
-void container_state_path(char *buf, const char *name) {
+/* A mark that create has not finished with the container. It is in the
+ * container's directory, written to stay: a container that is half made is
+ * still half made after a reboot. */
+void container_creating_path(char *buf, const char *name) {
     char base[MAX_PATH];
     container_dir_path(base, name);
-    path_join_or_die(buf, MAX_PATH, base, ".state");
+    path_join_or_die(buf, MAX_PATH, base, ".creating");
+}
+
+/*
+ * The records of a container that is running, or was: <run_dir>/<name>/ with
+ * the PID of its init, that process's start time, the state of the container
+ * and what init said when it ended. They are of no use after a reboot, which
+ * ends every container, so they are kept where a reboot takes them away,
+ * and are written without waiting for a disk.
+ */
+void container_run_path(char *buf, const char *name) {
+    path_join_or_die(buf, MAX_PATH, cfg_global.run_dir, name);
+}
+
+static void run_file_path(char *buf, const char *name, const char *file) {
+    char base[MAX_PATH];
+    container_run_path(base, name);
+    path_join_or_die(buf, MAX_PATH, base, file);
+}
+
+void container_pid_path(char *buf, const char *name)       { run_file_path(buf, name, "pid"); }
+void container_pid_start_path(char *buf, const char *name) { run_file_path(buf, name, "pid_start"); }
+void container_state_path(char *buf, const char *name)     { run_file_path(buf, name, "state"); }
+void container_exit_path(char *buf, const char *name)      { run_file_path(buf, name, "exit"); }
+
+/*
+ * Before 0.5 these records were files in the container's directory: .pid,
+ * .pid_start and .state. A container that an older lightbox started, and
+ * that is still running, has them there. They are read where the records of
+ * today are missing, so that such a container is seen to be running and can
+ * be stopped, and they are removed with today's.
+ */
+static void old_record_path(char *buf, const char *name, const char *file) {
+    char base[MAX_PATH];
+    container_dir_path(base, name);
+    path_join_or_die(buf, MAX_PATH, base, file);
+}
+
+/* A record's text, without the newline after it: its length, 0 for an empty
+ * one and -1 for one that is not there, in either place. */
+static int read_record(const char *name, const char *file, const char *old_file, char *buf, size_t bufsz) {
+    char path[MAX_PATH];
+    run_file_path(path, name, file);
+    int n = read_file(path, buf, bufsz);
+    if (n < 0) {
+        old_record_path(path, name, old_file);
+        n = read_file(path, buf, bufsz);
+    }
+    if (n < 0)
+        return -1;
+    for (size_t i = 0; buf[i]; i++) {
+        if (buf[i] == '\n') { buf[i] = '\0'; break; }
+    }
+    return (int)lc_string_length(buf);
+}
+
+static void forget_old_record(const char *name, const char *old_file) {
+    char path[MAX_PATH];
+    old_record_path(path, name, old_file);
+    lc_kernel_unlinkat(AT_FDCWD, path, 0);
+}
+
+static int report_run_dir(const char *what, const char *path) {
+    print_str(STDERR, "Error: ");
+    print_str(STDERR, what);
+    print_str(STDERR, path);
+    print_str(STDERR, "\n");
+    return -1;
+}
+
+/*
+ * Make run_dir, if a reboot or nobody yet has left none, and the container's
+ * directory in it, both for root alone. A directory that is there is left as
+ * it is; a name that is there and is no directory is an error, a link too.
+ */
+int container_run_dir_make(const char *name) {
+    lc_sysret rc = lc_kernel_mkdirat(AT_FDCWD, cfg_global.run_dir, MODE_PRIVATE_DIR);
+    if (rc == -LB_ENOENT) {
+        /* its parents are missing as well */
+        if (make_dirs(cfg_global.run_dir) != 0)
+            return -1;
+        (void)lc_kernel_fchmodat(AT_FDCWD, cfg_global.run_dir, MODE_PRIVATE_DIR, 0);
+    } else if (rc < 0 && rc != -LB_EEXIST) {
+        return report_run_dir("cannot make the directory for runtime records: ", cfg_global.run_dir);
+    }
+
+    char dir[MAX_PATH];
+    container_run_path(dir, name);
+    rc = lc_kernel_mkdirat(AT_FDCWD, dir, MODE_PRIVATE_DIR);
+    if (rc < 0 && rc != -LB_EEXIST)
+        return report_run_dir("cannot make the directory for the container's runtime records: ", dir);
+
+    struct lb_statx stx;
+    if (lb_sys_statx(AT_FDCWD, dir, AT_SYMLINK_NOFOLLOW, LB_STATX_TYPE, &stx) < 0 ||
+        (stx.stx_mode & LB_S_IFMT) != LB_S_IFDIR)
+        return report_run_dir("not a directory: ", dir);
+    return 0;
+}
+
+/* Take the container's runtime records away, and their directory: what is
+ * left says that the container is stopped. */
+void container_forget_run(const char *name) {
+    char path[MAX_PATH];
+    container_forget_pid(name);
+    container_state_path(path, name);
+    lc_kernel_unlinkat(AT_FDCWD, path, 0);
+    forget_old_record(name, ".state");
+    container_run_path(path, name);
+    lc_kernel_unlinkat(AT_FDCWD, path, AT_REMOVEDIR);
 }
 
 int record_container_state(const char *name, const char *state) {
     char path[MAX_PATH];
+    if (container_run_dir_make(name) != 0)
+        return -1;
     container_state_path(path, name);
-    return write_file_atomic(path, state, MODE_PRIVATE_FILE);
+    if (write_file_volatile(path, state) < 0)
+        return -1;
+    forget_old_record(name, ".state");      /* what an older lightbox last said */
+    return 0;
 }
 
 void set_container_state(const char *name, const char *state) {
@@ -63,40 +167,39 @@ void set_container_state(const char *name, const char *state) {
         die2("Error: cannot record the state of container ", name);
 }
 
+/*
+ * The state on record. Without a runtime record a container is stopped,
+ * whether it was stopped, never started or running before a reboot; unless
+ * create never finished with it.
+ */
 void get_container_state(const char *name, char *buf, size_t bufsz) {
     char path[MAX_PATH];
-    container_state_path(path, name);
-    if (read_file(path, buf, bufsz) > 0) {
-        for (size_t i = 0; buf[i]; i++) {
-            if (buf[i] == '\n') { buf[i] = '\0'; break; }
-        }
-    } else {
-        buf[0] = '\0';
+    if (read_record(name, "state", ".state", buf, bufsz) > 0)
+        return;
+    container_creating_path(path, name);
+    str_copy_or_die(buf, path_exists(path) ? "creating" : "stopped", bufsz, "a container's state");
+}
+
+/* What init said when it ended: its exit status. False when it said
+ * nothing, as an init that was killed does. */
+bool container_exit_report(const char *name, int *status) {
+    char path[MAX_PATH], text[16];
+    container_exit_path(path, name);
+    if (read_file(path, text, sizeof(text)) <= 0)
+        return false;
+    for (size_t i = 0; text[i]; i++) {
+        if (text[i] == '\n') { text[i] = '\0'; break; }
     }
-    if (!buf[0])
-        str_copy_or_die(buf, "unknown", bufsz, "a container's state");
+    return parse_int_in(text, 0, 255, status);
 }
 
 int get_container_pid(const char *name) {
-    char path[MAX_PATH], buf[16];
+    char buf[16];
     int pid;
-    container_pid_path(path, name);
-    if (read_file(path, buf, sizeof(buf)) <= 0) return -1;
-    for (size_t i = 0; buf[i]; i++) {
-        if (buf[i] == '\n') { buf[i] = '\0'; break; }
-    }
+    if (read_record(name, "pid", ".pid", buf, sizeof(buf)) <= 0)
+        return -1;
     /* a record that is not the number of a process is no record */
     return parse_int_in(buf, 1, PIDS_LIMIT_MAX, &pid) ? pid : -1;
-}
-
-static void clear_runtime_identity(const char *name, bool mark_failed) {
-    char path[MAX_PATH];
-    container_pid_path(path, name);
-    lc_kernel_unlinkat(AT_FDCWD, path, 0);
-    container_pid_start_path(path, name);
-    lc_kernel_unlinkat(AT_FDCWD, path, 0);
-    if (mark_failed)
-        set_container_state(name, "failed\n");
 }
 
 static int read_proc_starttime(int pid, char *buf, size_t bufsz) {
@@ -144,30 +247,34 @@ int container_record_pid(const char *name, int pid) {
 
     if (read_proc_starttime(pid, started, sizeof(started)) < 0)
         return -1;
+    if (container_run_dir_make(name) != 0)
+        return -1;
     container_pid_start_path(path, name);
-    if (write_file_atomic(path, started, MODE_PRIVATE_FILE) < 0)
+    if (write_file_volatile(path, started) < 0)
         return -1;
     fmt_int(pidbuf, pid);
     container_pid_path(path, name);
-    if (write_file_atomic(path, pidbuf, MODE_PRIVATE_FILE) < 0)
+    if (write_file_volatile(path, pidbuf) < 0)
         return -1;
     return 0;
 }
 
-/* Forget whatever is recorded about a container's init. */
+/* Forget whatever is recorded about a container's init: which process it
+ * was, and what it said when it ended. */
 void container_forget_pid(const char *name) {
-    clear_runtime_identity(name, false);
+    char path[MAX_PATH];
+    container_pid_path(path, name);
+    lc_kernel_unlinkat(AT_FDCWD, path, 0);
+    container_pid_start_path(path, name);
+    lc_kernel_unlinkat(AT_FDCWD, path, 0);
+    container_exit_path(path, name);
+    lc_kernel_unlinkat(AT_FDCWD, path, 0);
+    forget_old_record(name, ".pid");
+    forget_old_record(name, ".pid_start");
 }
 
 int get_container_pid_starttime(const char *name, char *buf, size_t bufsz) {
-    char path[MAX_PATH];
-    container_pid_start_path(path, name);
-    if (read_file(path, buf, bufsz) <= 0)
-        return -1;
-    for (size_t i = 0; buf[i]; i++) {
-        if (buf[i] == '\n') { buf[i] = '\0'; break; }
-    }
-    return buf[0] ? 0 : -1;
+    return read_record(name, "pid_start", ".pid_start", buf, bufsz) > 0 ? 0 : -1;
 }
 
 /*
@@ -216,16 +323,6 @@ container_liveness container_probe(const char *name) {
 
 bool is_running(const char *name) {
     return container_probe(name) == CONTAINER_RUNNING;
-}
-
-/*
- * The clean-up for a container whose init is gone: forget the PID and record
- * the state as failed. Only commands that change a container call this (start
- * and stop). ls, inspect and exec report what they see and write nothing.
- */
-void container_reap_if_dead(const char *name) {
-    if (container_probe(name) == CONTAINER_DEAD)
-        clear_runtime_identity(name, true);
 }
 
 /*

@@ -199,7 +199,9 @@ rootfs = /var/lib/lightbox/rootfs
 # Where containers are stored (each gets a subdirectory)
 container_dir = /var/lib/lightbox/containers
 
-# PID file directory
+# Records of the containers that run: one directory for each, with the PID of
+# its init and its state. It belongs on a tmpfs, as /run is: a reboot ends
+# every container and has to take these along
 run_dir = /run/lightbox
 
 # cgroup v2 mount point
@@ -320,7 +322,10 @@ The sandbox covers everything in a container: init, the `/init.sh` hook and all 
 ## How it works
 
 - **Namespaces**: `clone()` with PID, mount, UTS, IPC, net (and optionally user) namespace flags
-- **Filesystem**: each container lives under `<container_dir>/<name>/` with `rootfs/` for the filesystem, `.conf`, `.ip`, `.pid` for metadata and `console.log` for its output. `pivot_root` into the rootfs copy
+- **Filesystem**: each container lives under `<container_dir>/<name>/` with `rootfs/` for the filesystem, `.conf` and `.ip` for what it is configured with and `console.log` for its output. `pivot_root` into the rootfs copy
+- **Runtime records**: what is known about a container while it runs is in `<run_dir>/<name>/`: `pid` and `pid_start` for its init, `state`, and `exit`, where init writes its exit status as the last thing it does. These are written without waiting for a disk, and a reboot takes them away with everything else in `/run`; a container without them is stopped. `start` makes the directory again when it is missing, for root alone
+- **States**: `ls` and `inspect` show `stopped`, `running`, `starting` and `stopping` while a command is at work, `exited` for a container that ended by itself, `failed` for one that was killed or whose start or hook failed, and `creating` for one that `create` did not finish. A half-made container is not started: remove it and create it again
+- **A container that ended without a stop**: when init is killed, or is told to stop by a signal from somewhere other than `lightbox stop`, from inside the container too, nobody is there to clear up. `ls` shows such a container as `exited` and changes nothing. The next `start`, `stop` or `rm` clears away what it left, its cgroup, its interface and the firewall rules of its links, says that it did, and records `exited` if init had ended with status 0 and `failed` otherwise
 - **A container's configuration**: `.conf` is lines of `key=value` that begin with `version=1`. One piece of code reads it and one writes it; a command reads it once, and `start` hands it to init. A file with the version line is read strictly: an unknown key, a key given twice or a value that is not one is an error that names the file and the line, and a file written by a newer lightbox is refused, not guessed at. A file from before the version line is still read as it was, and is written in the new form at the next `add-vol` or `rm-vol`. `rm` does not need the file, so a container whose configuration is damaged can always be removed
 - **Devices**: bind-mounted from host (`/dev/null`, `/dev/zero`, `/dev/random`, etc.)
 - **Networking**: veth pair per container connected to a host bridge with NAT. `create` writes the container's `/etc/resolv.conf`, `/etc/hostname` and a line for its own name in `/etc/hosts`, inside the copy of the image, where a link in the image cannot send them anywhere else

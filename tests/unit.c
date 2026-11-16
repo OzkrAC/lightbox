@@ -40,6 +40,13 @@
  *   unit stop    <pid> <seconds>              ask_init_to_stop, then wait as stop does:
  *                                             "asked" or "gone", then "ended" or "still there"
  *   unit pids    <file>                       each_listed_pid: a line for each, then the count
+ *   unit remove  <file>                       remove_file_durably
+ *   unit record  <run_dir> <name> <state>     record_container_state, which makes run_dir and the
+ *                                             container's directory in it when they are missing
+ *   unit reconcile <container_dir> <run_dir> <name>
+ *                                             reconcile, as start, stop and rm call it for a
+ *                                             container that ended without a stop: "cleared" or
+ *                                             "nothing", then "state <what is on record now>"
  *   unit volspec <spec>                       parse_volume_spec: "<src> -> <dst> ro|rw",
  *                                             or "invalid: <what is wrong>"
  *   unit volumes <root> <spec>... [-- <probe>...]
@@ -88,7 +95,9 @@
  *                   prints "left" and leaves init running
  *
  * With a log file, init gets /dev/null and that file as its standard streams
- * once it is ready, as in a container; with "-" it keeps the harness's.
+ * once it is ready, as in a container; with "-" it keeps the harness's. When
+ * UNIT_EXIT names a file, init has it as the record of how it ends, as in a
+ * container, and writes its exit status there as its last act.
  * <grace> is how many seconds init gives its processes when a SIGTERM comes
  * without a number of its own; 10 when it is not given.
  *
@@ -266,7 +275,7 @@ static void put_own_privileges(void) {
 static int unit_init_child(void *arg) {
     const struct child_args *ca = (const struct child_args *)arg;
     init_begin(ca);
-    return init_main(ca);
+    return init_ends(ca, init_main(ca));
 }
 
 /* Give init five seconds to end. */
@@ -300,15 +309,19 @@ static void unit_init(const char *how, bool confined, int seconds, const char *s
     if (signal_fd < 0)
         die("unit: cannot hold signals back");
 
-    int32_t null_fd = -1, log_fd = -1;
+    int32_t null_fd = -1, log_fd = -1, exit_fd = -1;
     if (log && !open_container_streams(log, &null_fd, &log_fd))
         die2("unit: cannot open ", log);
+    const char *exit_record = env_get(caller_env, "UNIT_EXIT");
+    if (exit_record && (exit_fd = open_exit_record(exit_record)) < 0)
+        die2("unit: cannot open ", exit_record);
 
     struct init_link link = INIT_LINK_NONE;
     struct child_args ca = {
         .starter_signals = signal_fd,
         .null_fd = null_fd,
         .log_fd = log_fd,
+        .exit_fd = exit_fd,
         .name = "unit",
         .root = "/",
         .hook = script,
@@ -317,6 +330,8 @@ static void unit_init(const char *how, bool confined, int seconds, const char *s
     };
     const char *failed = init_spawn(&link, &ca, CLONE_NEWPID, unit_init_child);
     close_container_streams(&null_fd, &log_fd);
+    if (exit_fd >= 0)
+        lc_kernel_close_file(exit_fd);
     if (failed) {
         init_abandon(&link);
         die2("unit: ", failed);
@@ -681,6 +696,34 @@ int main(int argc, char **argv, char **envp) {
             set_unchecked(&config, argv[i]);
         const char *wrong = container_config_save(argv[3], &config);
         put_line(wrong ? "refused: " : "written", wrong ? wrong : "");
+        return 0;
+    }
+    if (argc == 3 && streq(argv[1], "remove")) {
+        put_result(remove_file_durably(argv[2]));
+        return 0;
+    }
+    if (argc == 5 && streq(argv[1], "record")) {
+        char text[32];
+        bool cut = false;
+        cfg_global_init();
+        str_copy_or_die(cfg_global.run_dir, argv[2], MAX_PATH, "the directory");
+        size_t pos = str_append(text, 0, argv[4], sizeof(text), &cut);
+        str_append(text, pos, "\n", sizeof(text), &cut);
+        if (cut)
+            die("unit: record <run_dir> <name> <state>");
+        put_result(record_container_state(argv[3], text));
+        return 0;
+    }
+    if (argc == 5 && streq(argv[1], "reconcile")) {
+        char state[32];
+        cfg_global_init();
+        str_copy_or_die(cfg_global.container_dir, argv[2], MAX_PATH, "the directory");
+        str_copy_or_die(cfg_global.run_dir, argv[3], MAX_PATH, "the directory");
+        /* a cgroup tree that is not there: the container has nothing in it */
+        path_join_or_die(cfg_global.cgroup_base, MAX_PATH, argv[3], "no-cgroups");
+        put(reconcile(argv[4]) ? "cleared\n" : "nothing\n");
+        get_container_state(argv[4], state, sizeof(state));
+        put_line("state ", state);
         return 0;
     }
     if (argc == 3 && streq(argv[1], "streams")) {

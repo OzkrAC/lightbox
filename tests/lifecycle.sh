@@ -78,6 +78,7 @@ settings() { # after LIFECYCLE_T is known
     BB=${LIFECYCLE_BB:-}
     [ -n "$T" ] && [ -d "$T" ] || { echo "lifecycle: no work directory" >&2; exit 2; }
     C="$T/lb/containers"
+    RUN="$T/run"                # run_dir: the records of a container that runs are in $RUN/<name>/
     BASE="$T/base"
     OUT="$T/out"
     CG=$(cat "$T/cgroup_base")
@@ -109,8 +110,9 @@ alive()   { kill -0 "$1" 2>/dev/null && [ "$(status_field "$1" State)" != Z ]; }
 gone()    { ! kill -0 "$1" 2>/dev/null; }          # exited and reaped
 no_link() { ! ip link show "$1" >/dev/null 2>&1; }
 
-pid_of()   { cat "$C/$1/.pid"; }
-state_of() { cat "$C/$1/.state"; }
+pid_of()   { cat "$RUN/$1/pid"; }
+# what is on record; a container without a record of its state is stopped
+state_of() { if [ -e "$RUN/$1/state" ]; then cat "$RUN/$1/state"; else echo stopped; fi; }
 addr_of()  { cat "$C/$1/.ip"; }
 
 next_ip() {
@@ -174,8 +176,8 @@ children_of() { # pid program : the children of a process that run this program
 # What must not remain of a container that is not running.
 nothing_left() { # name
     local bad=0
-    if [ -e "$C/$1/.pid" ] || [ -e "$C/$1/.pid_start" ]; then
-        echo "runtime files are left: $(ls -A "$C/$1" | tr '\n' ' ')"; bad=1
+    if [ -e "$RUN/$1/pid" ] || [ -e "$RUN/$1/pid_start" ] || [ -e "$RUN/$1/exit" ]; then
+        echo "runtime records are left: $(ls -A "$RUN/$1" | tr '\n' ' ')"; bad=1
     fi
     no_link "vb-$1" || { echo "the interface vb-$1 is left"; bad=1; }
     [ ! -d "$CG/$1" ] || { echo "the cgroup $CG/$1 is left"; bad=1; }
@@ -227,8 +229,8 @@ t_setup() {
     iptables -C FORWARD -i "$WAN" -o "$BR" -m state --state RELATED,ESTABLISHED -j ACCEPT &&
     iptables -C FORWARD -i "$BR" -o "$BR" -j DROP || { echo "a rule is missing:"; iptables-save; return 1; }
     # the fixture made these 0755, as installations before 0.2 did
-    echo "storage modes after setup: $(stat -c %a "$T/lb") $(stat -c %a "$C")"
-    [ "$(stat -c %a "$T/lb")" = 700 ] && [ "$(stat -c %a "$C")" = 700 ]
+    echo "storage modes after setup: $(stat -c %a "$T/lb") $(stat -c %a "$C"), and of run_dir: $(stat -c %a "$RUN")"
+    [ "$(stat -c %a "$T/lb")" = 700 ] && [ "$(stat -c %a "$C")" = 700 ] && [ "$(stat -c %a "$RUN")" = 700 ]
 }
 
 firewall_rules() { iptables-save | grep -v '^#' | sed 's/\[[0-9]*:[0-9]*\]//'; }
@@ -374,10 +376,111 @@ t_stop_of_a_dead_container_cleans_up() {
     pid=$(pid_of dead)
     kill -KILL "$pid"
     wait_until 5 gone "$pid" || { echo "init $pid survived SIGKILL"; return 1; }
-    refused lb stop dead || { echo "stop of a container whose init is gone succeeded"; return 1; }
+    [ -d "$CG/dead" ] || { echo "the dead container's cgroup is gone before any command looked"; return 1; }
+    said=$(lb stop dead 2>&1) && { echo "stop of a container whose init is gone succeeded"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *"had ended without a stop"*"not running"*) ;; *) echo "stop does not say what it found"; return 1 ;; esac
     echo "state after stop: $(state_of dead)"
-    [ ! -e "$C/dead/.pid" ] && [ ! -e "$C/dead/.pid_start" ] && [ "$(state_of dead)" = failed ]
+    # killed, init said nothing about its end: that is a failure
+    nothing_left dead && [ "$(state_of dead)" = failed ]
 }
+
+# A container that is told to stop from inside, or by a signal from anywhere,
+# ends as it does for lightbox stop. No command is there to clear up after
+# it: the next one that changes it does, and records that it ended well.
+t_stopped_from_inside_is_exited() {
+    up inside || return 1
+    pid=$(pid_of inside)
+    sh_in inside 'kill -TERM 1' >/dev/null 2>&1     # the shell that says it ends with the container
+    wait_until 15 gone "$pid" || { echo "init $pid did not end when a process in the container sent it SIGTERM"; return 1; }
+    # ls says what it sees and changes nothing
+    before=$(ls -A "$RUN/inside" | tr '\n' ' ')
+    lb ls
+    lb ls | grep -Eq '^inside +[0-9.]+ +exited' || { echo "ls does not show it as exited"; return 1; }
+    [ "$(ls -A "$RUN/inside" | tr '\n' ' ')" = "$before" ] && [ -d "$CG/inside" ] ||
+        { echo "ls changed something: records '$before' -> '$(ls -A "$RUN/inside" | tr '\n' ' ')'"; return 1; }
+    echo "what init said when it ended: $(cat "$RUN/inside/exit")"
+    said=$(lb stop inside 2>&1) && { echo "stop of a container that had ended succeeded"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *"had stopped by itself"*) ;; *) echo "stop does not say what it found"; return 1 ;; esac
+    echo "state after stop: $(state_of inside)"
+    nothing_left inside && [ "$(state_of inside)" = exited ] || return 1
+    # and it starts again
+    start inside && [ "$(state_of inside)" = running ]
+}
+
+# A container that was started by a lightbox before 0.5 has its records in
+# its own directory. After an upgrade it is still seen to be running, a
+# command can be run in it, and stop stops it and takes the old records away.
+t_container_started_before_the_upgrade() {
+    up oldstyle || return 1
+    pid=$(pid_of oldstyle)
+    mv "$RUN/oldstyle/pid" "$C/oldstyle/.pid" && mv "$RUN/oldstyle/pid_start" "$C/oldstyle/.pid_start" &&
+    mv "$RUN/oldstyle/state" "$C/oldstyle/.state" && rm -rf -- "$RUN/oldstyle" || return 1
+    lb ls
+    lb ls | grep -Eq "^oldstyle +[0-9.]+ +running +$pid" || { echo "ls does not show it as running"; return 1; }
+    [ "$(sh_in oldstyle 'echo here')" = here ] || { echo "exec does not find it"; return 1; }
+    refused lb start oldstyle 2>/dev/null || { echo "a container that is running was started again"; return 1; }
+    alive "$pid" || { echo "the refused start ended the container"; return 1; }
+    lb stop oldstyle || return 1
+    gone "$pid" || { echo "init $pid is still there"; return 1; }
+    echo "left in the container's directory: $(ls -A "$C/oldstyle" | tr '\n' ' ')"
+    [ ! -e "$C/oldstyle/.pid" ] && [ ! -e "$C/oldstyle/.pid_start" ] && [ ! -e "$C/oldstyle/.state" ] &&
+    nothing_left oldstyle && [ "$(state_of oldstyle)" = stopped ]
+}
+
+# After a reboot nothing runs and run_dir, on a tmpfs, is empty or gone. The
+# containers are stopped, not stale, and start as they did.
+t_after_a_reboot() {
+    up was-up && box never-up || return 1
+    pid=$(pid_of was-up)
+    echo "run_dir is mode $(stat -c %a "$RUN"), a container's records $(stat -c %a "$RUN/was-up"), its PID record $(stat -c %a "$RUN/was-up/pid")"
+    [ "$(stat -c %a "$RUN")" = 700 ] && [ "$(stat -c %a "$RUN/was-up")" = 700 ] && [ "$(stat -c %a "$RUN/was-up/pid")" = 600 ] || return 1
+    # what a reboot does to it, as far as that can be done here
+    kill -KILL "$pid"
+    wait_until 5 gone "$pid" || return 1
+    wait_until 5 no_link vb-was-up || return 1
+    rm -rf -- "$RUN"
+    lb ls
+    lb ls | grep -Eq '^was-up +[0-9.]+ +stopped' && lb ls | grep -Eq '^never-up +[0-9.]+ +stopped' ||
+        { echo "ls does not show them as stopped"; return 1; }
+    [ ! -e "$RUN" ] || { echo "ls made run_dir"; return 1; }
+    start was-up && start never-up || return 1
+    [ "$(sh_in was-up 'echo back')" = back ] && [ "$(stat -c %a "$RUN")" = 700 ] && [ "$(state_of never-up)" = running ]
+}
+
+# A create that was killed half way leaves half a root filesystem. Such a
+# container is not started.
+t_half_made_container_is_not_started() {
+    box halfmade || return 1
+    : > "$C/halfmade/.creating"
+    said=$(lb start halfmade 2>&1) && { echo "a half-made container was started"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *'was not created completely'*) ;; *) return 1 ;; esac
+    lb ls | grep -Eq '^halfmade +[0-9.]+ +creating' || { echo "ls does not show it as being created"; return 1; }
+    nothing_left halfmade && lb rm halfmade && [ ! -e "$C/halfmade" ]
+}
+
+# Init has files of the host open: its log, and the record of how it ends.
+# A process in the container cannot get at them by way of init.
+t_init_is_closed_to_the_container() {
+    up closedinit || return 1
+    said=$(sh_in closedinit 'readlink /proc/1/fd/1; echo "readlink: $?"; ( : < /proc/1/fd/1 ) 2>/dev/null; echo "open: $?"; ( : < /proc/1/environ ) 2>/dev/null; echo "environ: $?"' 2>&1)
+    printf '%s\n' "$said"
+    printf '%s\n' "$said" | grep -qx 'readlink: 1' && printf '%s\n' "$said" | grep -qx 'open: [12]' &&
+    printf '%s\n' "$said" | grep -qx 'environ: [12]' || { echo "a process in the container looked into init"; return 1; }
+    # and what it is closed for is there: the host's root can see both files
+    holds() { # a path: is one of init's descriptors this file?
+        local fd
+        for fd in "/proc/$(pid_of closedinit)/fd"/*; do
+            [ "$(readlink "$fd")" = "$1" ] && return 0
+        done
+        echo "init does not have $1 open"
+        return 1
+    }
+    holds "$C/closedinit/console.log" && holds "$RUN/closedinit/exit"
+}
+
 
 # Two starts of one container at once: one starts it, and the other waits for
 # the first to be done and then finds it running.
@@ -704,7 +807,7 @@ t_start_reads_conf_once() {
     is_up() { [ "$(state_of traced 2>/dev/null)" = running ]; }
     # strace follows the command and all it starts, init among them, so it
     # ends when init does
-    timeout -k 5 80 strace -f -qq -e trace=%file -o "$T/traced.strace" \
+    timeout -k 5 80 strace -f -qq -e trace=%file,fsync,fdatasync,sync,syncfs -o "$T/traced.strace" \
         "$LB" start traced >"$OUT/traced.start" 2>&1 </dev/null &
     tracer=$!
     wait_until 60 is_up || { echo "the container did not start under strace:"; cat "$OUT/traced.start"; kill "$tracer" 2>/dev/null; return 1; }
@@ -715,7 +818,13 @@ t_start_reads_conf_once() {
     echo "the trace has $(wc -l < "$T/traced.strace") lines from $(awk '{ print $1 }' "$T/traced.strace" | sort -u | wc -l) processes"
     echo "times the container's .conf was opened: $opens"
     grep -E '/traced/\.conf"' "$T/traced.strace" | head -n 5
-    [ "$opens" = 1 ]
+    [ "$opens" = 1 ] || return 1
+    # A start writes its records where no disk has to be waited for: nothing
+    # it does, and nothing it runs, asks for a write to reach the disk.
+    syncs=$(grep -cE '\<(fsync|fdatasync|sync|syncfs)\(' "$T/traced.strace")
+    echo "times the start waited for a disk: $syncs"
+    grep -E '\<(fsync|fdatasync|sync|syncfs)\(' "$T/traced.strace" | head -n 5
+    [ "$syncs" = 0 ]
 }
 
 t_volume_under_run() {
@@ -1371,7 +1480,8 @@ t_killed_start_leaves_no_container() {
 
 t_stale_pid_start() {
     box stale || return 1
-    printf '12345' > "$C/stale/.pid_start"
+    mkdir -p "$RUN/stale"
+    printf '12345' > "$RUN/stale/pid_start"
     start stale
 }
 
@@ -1700,6 +1810,8 @@ teardown() {
     [ -s "$T/firewall" ] && iptables-restore < "$T/firewall"
     [ -w "$BRNF" ] && echo 1 > "$BRNF"
     find "$C" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+    # and the records of the ones that ran; a case may have taken run_dir away
+    [ -d "$RUN" ] && find "$RUN" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
     rm -f "$T/nsenter.reached" "$T/mount.ran"
 } 2>/dev/null
 
@@ -1774,7 +1886,12 @@ if [ "$MODE" = inside ]; then
     check 'a running container cannot be started again or removed'        t_running_container_is_protected
     check 'a stopped container starts again and keeps its files'          t_restart_keeps_files
     check 'a container whose init died starts again'                      t_start_after_init_died
-    check 'stop of a container whose init died cleans up its record'      t_stop_of_a_dead_container_cleans_up
+    check 'stop of a container whose init died clears it away, as failed' t_stop_of_a_dead_container_cleans_up
+    check 'a container stopped from inside is exited, and cleared away by the next command' t_stopped_from_inside_is_exited
+    check 'after a reboot containers are stopped, and start'              t_after_a_reboot
+    check 'a container started before the upgrade is seen, and stopped'   t_container_started_before_the_upgrade
+    check 'a container that create did not finish is not started'         t_half_made_container_is_not_started
+    check 'a process in the container cannot get at what init has open'   t_init_is_closed_to_the_container
     check 'of two starts at once, one starts the container and one finds it running' t_two_starts_at_once
     check 'a start that fails leaves no interface, cgroup or runtime file' t_failed_start_leaves_nothing
 
@@ -1797,7 +1914,7 @@ if [ "$MODE" = inside ]; then
     check 'rm-vol takes effect at the next start'                         t_rmvol_applies_at_next_start
     check 'a container from before the version line starts as it is'      t_conf_from_before_starts
     check 'a configuration that cannot be used: no start, no exec, a stop' t_unusable_conf
-    check 'a start opens the container'"'"'s configuration once'              t_start_reads_conf_once
+    check 'a start opens the container'"'"'s configuration once and waits for no disk' t_start_reads_conf_once
     check 'a volume under /run is visible'                                t_volume_under_run
     check 'volumes under /tmp and /run, and with a read-only root'        t_volume_under_tmp
     check 'a volume'"'"'s destination is looked up inside the container'      t_volume_destination_is_inside
@@ -1853,7 +1970,7 @@ if [ "$MODE" = inside ]; then
     check 'a container with a link is refused where nothing filters bridged traffic' t_link_needs_filtering
     check 'linked containers reach each other, and a third reaches neither' t_linked_containers
     xfail NET-link-leak        'a link to a container created later applies'           t_link_to_later_container
-    xfail NET-link-leak        'rm of a dead container leaves no firewall rule'        t_rm_leaves_no_rule
+    check 'rm of a dead container leaves no firewall rule'                t_rm_leaves_no_rule
     xfail NET-veth-clobber     'start leaves alone an interface it did not create'     t_start_spares_foreign_interface
     xfail NET-ifname           'the interface in the container is eth0'                t_interface_is_eth0
     check 'a container has no IPv6 address'                               t_no_ipv6_in_container

@@ -207,6 +207,8 @@ void cmd_setup(void) {
 
     ensure_private_dir(cfg_global.lightbox_dir);
     ensure_private_dir(cfg_global.container_dir);
+    /* gone again after a reboot, when start makes it anew */
+    ensure_private_dir(cfg_global.run_dir);
 
     /* one setup at a time, and no create while the bridge is being made */
     store_lock();

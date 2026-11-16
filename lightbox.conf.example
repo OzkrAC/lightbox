@@ -21,7 +21,11 @@
 # Derived from lightbox_dir if not set explicitly
 # container_dir = /var/lib/lightbox/containers
 
-# PID file directory
+# Records of the containers that run: <run_dir>/<name>/ holds the PID of a
+# container's init, its state, and how it ended. Keep it on a tmpfs, as /run
+# is: a reboot ends every container, and has to take these records along. A
+# container without them is stopped. `lightbox setup` makes it mode 0700, and
+# `start` makes it again when a reboot took it.
 # run_dir = /run/lightbox
 
 # cgroup v2 mount point

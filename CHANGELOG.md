@@ -15,6 +15,9 @@ Not tagged yet, and not complete: the part of Phase 5 that is written so far.
 - **A second volume at a destination is refused**, by `create` and by `add-vol`. The second one used to be mounted over the first. Adding the very same volume again still does nothing and is no error.
 - **A volume path with a control character in it, such as a newline, is refused.**
 - **A setting in `lightbox.conf` that does not fit is an error, not a shorter setting.** A directory may be up to 448 characters long. A `lightbox.conf` of more than 16 KB is refused as a whole; one of more than 2 KB used to be read up to that point, and the settings after it did not count.
+- **The records of a running container are in `run_dir`**, `/run/lightbox` unless set otherwise, and no longer in the container's directory: `<run_dir>/<name>/pid`, `pid_start`, `state` and `exit`. Scripts that read `<container_dir>/<name>/.pid` or `.state` have to read these, or better `lightbox inspect`. A container that an older lightbox started and that is still running is found through its old records, and can be stopped as usual. If `run_dir` is set to a directory that is not on a tmpfs, the records outlast a reboot and containers show as `exited` after one until a command clears them.
+- **A container that ended without `lightbox stop` is cleared away by the next `start`, `stop` or `rm`**, which prints a note saying so: its cgroup, its interface and the firewall rules of its links are removed, and its state becomes `exited` if its init ended with status 0, as it does when it is sent SIGTERM, and `failed` otherwise. Before, such a container became `failed` in every case, and its cgroup and rules stayed; `rm` left the rules for good.
+- **A container that `create` did not finish is not started.** A `create` that is interrupted while it copies the root filesystem leaves a container that `ls` shows as `creating`; `start` used to run it with whatever had been copied.
 - **A container's `.conf` that lightbox cannot use is an error that names the file and the line**, for `start`, `exec`, `inspect`, `add-vol` and `rm-vol`. `stop` still stops such a container, says that it could not know the container's links, and exits with 1. `rm` removes it as before.
 
 ### Added
@@ -32,6 +35,8 @@ Not tagged yet, and not complete: the part of Phase 5 that is written so far.
 - `create --mem` without a value, and the same for every other option, said "unknown option". It says that the option requires a value.
 - A path or a text that did not fit where lightbox kept it was cut and used: a long `container_dir` could make lightbox work on another directory than the one configured.
 - `start` read the container's `.conf` once for every setting in it, and init read it again. It is read once.
+- `start` waited for the disk each time it wrote a record of the container, several times in every start. It no longer waits for any.
+- After a reboot, containers that had been running were shown as `exited`, from records that were kept on disk. They are shown as `stopped`.
 
 ## 0.4.0
 

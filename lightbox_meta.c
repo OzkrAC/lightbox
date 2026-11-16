@@ -289,6 +289,7 @@ void cmd_doctor(void) {
     print_kv("lightbox_dir", cfg_global.lightbox_dir);
     print_kv("rootfs", cfg_global.rootfs);
     print_kv("container_dir", cfg_global.container_dir);
+    print_kv("run_dir", cfg_global.run_dir);
     print_kv("cgroup_root", cfg_global.cgroup_root);
     print_kv("cgroup_base", cfg_global.cgroup_base);
     print_kv("bridge", cfg_global.bridge);

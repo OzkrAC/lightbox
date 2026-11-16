@@ -36,9 +36,11 @@ trap cleanup EXIT
 # Every case gets its own directory tree and configuration:
 #   $W       root of the tree            $C     container_dir
 #   $BASE    base rootfs to copy         $CONF  the host configuration file
+#   $R       run_dir: the records of a container that runs are in $R/<name>/
 sandbox() {
     W="$ROOT/$1"
     C="$W/data/containers"
+    R="$W/run"
     BASE="$W/base"
     CONF="$W/home/.config/lightbox/lightbox.conf"
     mkdir -p "$W/home/.config/lightbox" "$C" "$BASE/etc" "$BASE/bin" "$BASE/dev" \
@@ -63,6 +65,16 @@ conf_has()  { grep -qxF -- "$2" "$C/$1/.conf"; }
 vol_count() { grep -c '^vol=' "$C/$1/.conf"; }
 mode_of()   { stat -c %a "$1"; }
 tree_sum()  { (cd "$1" && find . -print0 | sort -z | xargs -0 stat -c '%n %F %s %Y' | sha256sum); }
+# everything lightbox keeps: the containers, and the records of the ones that run
+kept_sum()  { tree_sum "$W/data"; tree_sum "$R"; }
+
+# The runtime records of a container, as a start leaves them.
+record() { # name, pid, start time, state
+    mkdir -p "$R/$1"
+    printf '%s' "$2" > "$R/$1/pid"
+    printf '%s' "$3" > "$R/$1/pid_start"
+    printf '%s\n' "$4" > "$R/$1/state"
+}
 
 # Reads stdin. 0 valid JSON, 1 invalid, 77 no tool to tell.
 json_valid() {
@@ -594,42 +606,170 @@ stale_record() {
     lb create web 10.0.0.2 || return 1
     sleep 0 & dead=$!
     wait "$dead"
-    printf '%s' "$dead" > "$C/web/.pid"
-    printf '12345' > "$C/web/.pid_start"
-    printf 'running\n' > "$C/web/.state"
+    record web "$dead" 12345 running
 }
 # A record that is not the number of a process is no record. It is not the
 # process whose number it begins with.
 t_pid_record_is_a_number() {
     lb create web 10.0.0.2 || return 1
+    mkdir -p "$R/web"
     for record in "$$abc" "$$ 1" "-$$" 0 '' 99999999999999999999 0x10; do
-        printf '%s' "$record" > "$C/web/.pid"
-        printf '12345' > "$C/web/.pid_start"
+        printf '%s' "$record" > "$R/web/pid"
+        printf '12345' > "$R/web/pid_start"
         report=$(lb inspect web) || { echo "inspect failed with the record '$record'"; return 1; }
         printf '%s\n' "$report" | grep -qx 'pid: -' && printf '%s\n' "$report" | grep -qx 'running: no' &&
         printf '%s\n' "$report" | grep -qx 'state: stopped' ||
             { echo "the record '$record' was taken for a process:"; printf '%s\n' "$report" | grep -E '^(pid|running|state): '; return 1; }
     done
     # with a newline after it, as an editor leaves a file, the number is the record
-    printf '%s\n' "$$" > "$C/web/.pid"
+    printf '%s\n' "$$" > "$R/web/pid"
     lb inspect web | grep -x "pid: $$"
 }
 
 t_ls_writes_nothing() {
     stale_record || return 1
-    before=$(tree_sum "$C/web")
+    before=$(kept_sum)
     lb ls >/dev/null
-    [ -e "$C/web/.pid" ] || echo ".pid was deleted"
-    echo "state is now: $(cat "$C/web/.state")"
-    [ "$before" = "$(tree_sum "$C/web")" ]
+    [ -e "$R/web/pid" ] || echo "the PID record was deleted"
+    echo "state is now: $(cat "$R/web/state")"
+    [ "$before" = "$(kept_sum)" ]
 }
 t_inspect_writes_nothing() {
     stale_record || return 1
-    before=$(tree_sum "$C/web")
+    before=$(kept_sum)
     lb inspect web >/dev/null
-    [ -e "$C/web/.pid" ] || echo ".pid was deleted"
-    echo "state is now: $(cat "$C/web/.state")"
-    [ "$before" = "$(tree_sum "$C/web")" ]
+    [ -e "$R/web/pid" ] || echo "the PID record was deleted"
+    echo "state is now: $(cat "$R/web/state")"
+    [ "$before" = "$(kept_sum)" ]
+}
+
+# What a container is made of is in its directory, and what is known about it
+# while it runs is in run_dir, which a reboot empties. Without those records a
+# container is stopped.
+t_runtime_records_are_apart() {
+    lb create web 10.0.0.2 || return 1
+    echo "the container's directory: $(ls -A "$C/web" | tr '\n' ' ')"
+    echo "run_dir: $(ls -A "$R" | tr '\n' ' ')"
+    [ "$(ls -A "$C/web" | tr '\n' ' ')" = '.conf .ip rootfs ' ] || { echo "create left more than a container is made of"; return 1; }
+    [ -z "$(ls -A "$R")" ] || { echo "create made a runtime record"; return 1; }
+    report=$(lb inspect web)
+    for line in 'state: stopped' 'running: no' 'pid: -' "pid_path: $R/web/pid" "pid_start_path: $R/web/pid_start" \
+                "state_path: $R/web/state" "config_path: $C/web/.conf"; do
+        printf '%s\n' "$report" | grep -qxF -- "$line" || { echo "inspect does not say: $line"; return 1; }
+    done
+    lb doctor 2>/dev/null | grep -x "run_dir: $R" || return 1
+
+    # A container that was removed by hand, and not by rm, leaves its
+    # records. A new container of that name does not take them for its own.
+    record again 1 1 running
+    lb create again 10.0.0.3 >/dev/null || return 1
+    lb inspect again | grep -x 'state: stopped' && [ ! -e "$R/again" ] ||
+        { echo "a new container has the records of an old one: $(ls -A "$R/again" | tr '\n' ' ')"; return 1; }
+
+    # a stand-in for init, with the records a start leaves
+    [ "$(id -u)" -ne 0 ] || return 0
+    sleep 30 &
+    holder=$!
+    record web "$holder" "$(awk '{ printf "%s", $22 }' "/proc/$holder/stat")" running
+    lb ls | grep -Eq '^web +10\.0\.0\.2 +running' || { kill "$holder"; echo "the records in run_dir are not read"; return 1; }
+    # a reboot: nothing runs and run_dir is empty. The container is stopped, not stale.
+    kill "$holder"
+    find "$R" -mindepth 1 -delete
+    lb ls
+    lb ls | grep -Eq '^web +10\.0\.0\.2 +stopped' && lb inspect web | grep -qx 'state: stopped' || return 1
+    # and without run_dir itself, as after a reboot with /run on a tmpfs
+    rmdir "$R"
+    lb ls | grep -Eq '^web +10\.0\.0\.2 +stopped' && [ ! -e "$R" ] || { echo "a query made run_dir, or failed without it"; return 1; }
+}
+
+# A create that was killed half way leaves a container with half a root
+# filesystem. It says so for as long as it is there.
+t_half_made_container() {
+    lb create web 10.0.0.2 || return 1
+    : > "$C/web/.creating"
+    lb ls
+    lb ls | grep -Eq '^web +10\.0\.0\.2 +creating' && lb inspect web | grep -qx 'state: creating' || return 1
+    lb rm web && [ ! -e "$C/web" ]
+}
+
+# Before 0.5 the records of a running container were files in its own
+# directory. A container that such a lightbox started, and that is still
+# running after an upgrade, is seen to be running.
+t_records_from_before_are_read() {
+    [ "$(id -u)" -ne 0 ] || return 77
+    lb create web 10.0.0.2 || return 1
+    sleep 30 &
+    holder=$!
+    printf '%s' "$holder" > "$C/web/.pid"
+    awk '{ printf "%s", $22 }' "/proc/$holder/stat" > "$C/web/.pid_start"
+    printf 'running\n' > "$C/web/.state"
+    lb ls
+    report=$(lb inspect web)
+    kill "$holder"
+    lb ls | grep -Eq "^web +10\.0\.0\.2 +exited" || { echo "the container is not seen to have been running"; return 1; }
+    printf '%s\n' "$report" | grep -qx 'running: yes' && printf '%s\n' "$report" | grep -qx "pid: $holder" &&
+    printf '%s\n' "$report" | grep -qx 'state: running' || { echo "inspect did not see it running"; return 1; }
+    # what is recorded where records are kept now comes first
+    record web "$$" "$(awk '{ printf "%s", $22 }' /proc/$$/stat)" stopping
+    lb inspect web | grep -x "pid: $$" && lb inspect web | grep -x 'state: running'
+}
+
+# A create that is killed while it copies the root filesystem. It runs here
+# as the root of a user namespace, in a mount namespace where a stand-in is
+# mounted over cp: one that looks whether the container is marked as being
+# created when the copy begins, and, the second time, ends the lightbox that
+# runs it.
+t_create_killed_half_way() {
+    unshare -r --mount true 2>/dev/null || { echo "user namespaces are not available to this user"; return 77; }
+    real=$(readlink -f "$(type -P cp)") && cp "$real" "$W/cp.real" || return 1
+    {
+        echo '#!/bin/sh'
+        echo 'for last; do :; done'                             # the destination: <container>/rootfs
+        echo "if [ -e \"\${last%/rootfs}/.creating\" ]; then echo marked; else echo unmarked; fi >> $W/seen"
+        echo "if [ -e $W/end-it ]; then kill -KILL \$PPID; exit 1; fi"
+        echo "exec $W/cp.real \"\$@\""
+    } > "$W/cp.shim"
+    chmod +x "$W/cp.shim"
+    # shellcheck disable=SC2016     # the script is for the shell in the namespace
+    HOME="$W/home" unshare -r --mount -- sh -c '
+        for cp in /bin/cp /usr/bin/cp; do
+            [ -e "$cp" ] && { mount --bind "$1/cp.shim" "$(readlink -f "$cp")" || exit 77; }
+        done
+        "$2" create whole 10.0.0.2 || exit 1
+        : > "$1/end-it"
+        "$2" create half 10.0.0.3
+        echo "the create that was killed: status $?"
+        "$2" ls
+        "$2" start half
+        echo "start of the half-made container: status $?"
+        "$2" rm half
+    ' _ "$W" "$LB" > "$W/ns.out" 2>&1
+    rc=$?
+    cat "$W/ns.out"
+    [ $rc -ne 77 ] || { echo "a stand-in could not be mounted over cp here"; return 77; }
+    [ $rc -eq 0 ] || return 1
+    echo "the mark, when each copy began: $(paste -sd' ' "$W/seen")"
+    [ "$(paste -sd' ' "$W/seen")" = 'marked marked' ] || { echo "a container was being copied into without being marked"; return 1; }
+    [ ! -e "$C/whole/.creating" ] || { echo "a finished container is still marked"; return 1; }
+    grep -Eq '^whole +10\.0\.0\.2 +stopped' "$W/ns.out" && grep -Eq '^half +- +creating' "$W/ns.out" ||
+        { echo "ls does not tell the finished container from the half-made one"; return 1; }
+    grep -q 'was not created completely' "$W/ns.out" && grep -qx 'start of the half-made container: status 1' "$W/ns.out" ||
+        { echo "the half-made container was not refused by start as one"; return 1; }
+    [ ! -e "$C/half" ] || { echo "rm did not remove the half-made container"; return 1; }
+}
+
+# rm clears away what a container that ended without a stop still had, and
+# its runtime records go with it.
+t_rm_of_a_dead_container() {
+    stale_record || return 1
+    printf '0\n' > "$R/web/exit"
+    msg=$(lb rm web 2>&1) || { printf '%s\n' "$msg"; return 1; }
+    printf '%s\n' "$msg"
+    case $msg in *"Note: container 'web' had stopped by itself"*"Container 'web' removed") ;; *) echo "rm does not say what it found"; return 1 ;; esac
+    [ ! -e "$C/web" ] && [ ! -e "$R/web" ] || { echo "left: $(ls -A "$C" "$R" | tr '\n' ' ')"; return 1; }
+    # a container that was simply stopped has nothing to be said about
+    lb create web 10.0.0.2 >/dev/null && msg=$(lb rm web 2>&1) || return 1
+    case $msg in *Note:*) echo "rm found something to clear away in a stopped container"; return 1 ;; esac
 }
 
 # PID 1 is alive and belongs to root. For an ordinary user kill(1, 0) fails
@@ -637,14 +777,12 @@ t_inspect_writes_nothing() {
 t_other_users_process_is_not_gone() {
     [ "$(id -u)" -ne 0 ] || return 77
     lb create web 10.0.0.2 || return 1
-    printf '1' > "$C/web/.pid"
-    awk '{ printf "%s", $22 }' /proc/1/stat > "$C/web/.pid_start"
-    printf 'running\n' > "$C/web/.state"
-    before=$(tree_sum "$C/web")
+    record web 1 "$(awk '{ printf "%s", $22 }' /proc/1/stat)" running
+    before=$(kept_sum)
     json=$(lb ls --json)
     printf '%s\n' "$json"
     lb inspect web | grep -x 'running: yes' || return 1
-    printf '%s' "$json" | grep -q '"status":"running"' && [ "$before" = "$(tree_sum "$C/web")" ]
+    printf '%s' "$json" | grep -q '"status":"running"' && [ "$before" = "$(kept_sum)" ]
 }
 
 # What a query shows for a container whose init is gone, without recording it.
@@ -662,7 +800,7 @@ t_root_is_asked_for_first() {
     [ "$(id -u)" -ne 0 ] || return 77
     stale_record || return 1
     chmod 755 "$W/data" "$C"
-    before=$(tree_sum "$W/data")
+    before=$(kept_sum)
     bad=0
     for words in setup 'start web' 'stop web' 'exec web /bin/true'; do
         # shellcheck disable=SC2086
@@ -670,7 +808,7 @@ t_root_is_asked_for_first() {
         echo "lightbox $words: $msg"
         [ "$msg" = "Error: lightbox ${words%% *} must be run as root" ] || bad=1
     done
-    [ "$before" = "$(tree_sum "$W/data")" ] || { echo "something under $W/data changed"; bad=1; }
+    [ "$before" = "$(kept_sum)" ] || { echo "something under $W/data or $R changed"; bad=1; }
     [ "$(mode_of "$C")" = 755 ] || { echo "setup changed the mode of container_dir"; bad=1; }
     return $bad
 }
@@ -850,18 +988,18 @@ t_rm_handles_every_argument() {
 t_start_without_root_is_a_clean_error() {
     [ "$(id -u)" -ne 0 ] || return 77
     lb create web 10.0.0.2 || return 1
-    before=$(cat "$C/web/.state")
+    before=$(kept_sum)
     msg=$(lb start web 2>&1) && return 1
     printf '%s\n' "$msg" | head -5
-    echo "state: $before -> $(cat "$C/web/.state")"
-    printf '%s\n' "$msg" | grep -qi 'root' && [ "$(cat "$C/web/.state")" = "$before" ]
+    lb inspect web | grep -x 'state: stopped' || return 1
+    printf '%s\n' "$msg" | grep -qi 'root' && [ "$(kept_sum)" = "$before" ]
 }
 
 # start reads its options before it touches anything, so a mistyped one
 # changes nothing, with or without root.
 t_start_options_are_checked() {
     lb create web 10.0.0.2 || return 1
-    before=$(tree_sum "$C/web")
+    before=$(kept_sum)
     said() { msg=$(lb start web "$@" 2>&1) && { echo "start web $* succeeded"; return 1; }; echo "start web $*: $msg"; }
     said -t soon   && case $msg in *soon*) ;; *) return 1 ;; esac || return 1
     said -t 86401  && case $msg in *86401*) ;; *) return 1 ;; esac || return 1
@@ -869,7 +1007,7 @@ t_start_options_are_checked() {
     said -t        && case $msg in *'number of seconds'*) ;; *) return 1 ;; esac || return 1
     said --bogus   && case $msg in *'unknown option'*--bogus*) ;; *) return 1 ;; esac || return 1
     said another   && case $msg in *'unexpected argument'*another*) ;; *) return 1 ;; esac || return 1
-    [ "$before" = "$(tree_sum "$C/web")" ] || { echo "the container's records changed"; return 1; }
+    [ "$before" = "$(kept_sum)" ] || { echo "the container's records changed"; return 1; }
 }
 
 # A start_timeout or stop_timeout that cannot be read is said so, and stops
@@ -891,7 +1029,7 @@ t_start_timeout_setting() {
 # stop reads its options before it looks at the container.
 t_stop_options_are_checked() {
     lb create web 10.0.0.2 || return 1
-    before=$(tree_sum "$C/web")
+    before=$(kept_sum)
     said() { msg=$(lb stop web "$@" 2>&1) && { echo "stop web $* succeeded"; return 1; }; echo "stop web $*: $msg"; }
     said -t soon   && case $msg in *soon*) ;; *) return 1 ;; esac || return 1
     said -t        && case $msg in *'number of seconds'*) ;; *) return 1 ;; esac || return 1
@@ -899,7 +1037,7 @@ t_stop_options_are_checked() {
     said another   && case $msg in *'unexpected argument'*another*) ;; *) return 1 ;; esac || return 1
     # with options that are fine it goes on: to who runs it, and as root to the container, which is not running
     said -t 3      && case $msg in *'must be run as root'*|*'not running'*) ;; *) return 1 ;; esac || return 1
-    [ "$before" = "$(tree_sum "$C/web")" ] || { echo "the container's records changed"; return 1; }
+    [ "$before" = "$(kept_sum)" ] || { echo "the container's records changed"; return 1; }
 }
 
 # logs prints the container's log, and nothing for a container that has none.
@@ -930,9 +1068,7 @@ t_logs_follows() {
     lb create web 10.0.0.2 || return 1
     sleep 30 &
     holder=$!
-    printf '%s' "$holder" > "$C/web/.pid"
-    awk '{ printf "%s", $22 }' "/proc/$holder/stat" > "$C/web/.pid_start"
-    printf 'running\n' > "$C/web/.state"
+    record web "$holder" "$(awk '{ printf "%s", $22 }' "/proc/$holder/stat")" running
     lb inspect web | grep -qx 'running: yes' || { echo "the stand-in does not read as running"; kill "$holder"; return 77; }
     printf 'first\n' > "$C/web/console.log"
     lb logs web -f > "$W/followed" 2>&1 &
@@ -961,8 +1097,9 @@ last" ]
 # of its own for one of them: its messages would be written into the file.
 t_closed_streams_are_harmless() {
     HOME="$W/home" "$LB" create web 10.0.0.2 <&- >&- 2>&- || { echo "create failed with status $?"; return 1; }
-    echo "state: $(cat "$C/web/.state"), ip: $(cat "$C/web/.ip")"
-    [ "$(cat "$C/web/.state")" = stopped ] && [ "$(cat "$C/web/.ip")" = 10.0.0.2 ] && conf_has web 'mem=256M' || return 1
+    echo "$(lb inspect web | grep '^state: '), ip: $(cat "$C/web/.ip")"
+    lb inspect web | grep -qx 'state: stopped' && [ ! -e "$C/web/.creating" ] &&
+    [ "$(cat "$C/web/.ip")" = 10.0.0.2 ] && conf_has web 'mem=256M' || return 1
     ! grep -rl "Creating container" "$C/web" "$W/home" 2>/dev/null | grep -q . || { echo "a message was written into a file"; return 1; }
     lb ls | grep -q '^web '
 }
@@ -1041,9 +1178,9 @@ t_create_writes_stay_in_the_rootfs() {
 
 t_storage_is_private() {
     lb create web 10.0.0.2 || return 1
-    echo "modes: dir $(mode_of "$C/web"), .conf $(mode_of "$C/web/.conf"), .ip $(mode_of "$C/web/.ip"), .state $(mode_of "$C/web/.state")"
+    echo "modes: dir $(mode_of "$C/web"), .conf $(mode_of "$C/web/.conf"), .ip $(mode_of "$C/web/.ip")"
     [ "$(mode_of "$C/web")" = 700 ] && [ "$(mode_of "$C/web/.conf")" = 600 ] &&
-    [ "$(mode_of "$C/web/.ip")" = 600 ] && [ "$(mode_of "$C/web/.state")" = 600 ] &&
+    [ "$(mode_of "$C/web/.ip")" = 600 ] &&
     lb add-vol web "$W/vol:/more" >/dev/null && [ "$(mode_of "$C/web/.conf")" = 600 ] &&
     [ "$(mode_of "$C/web/rootfs/etc/resolv.conf")" = 644 ]   # the container's own file
 }
@@ -1070,6 +1207,11 @@ check 'stop and exec refuse a stopped container'            t_stopped_container_
 check 'an unknown command prints usage and fails'           t_unknown_command_prints_usage
 check 'ls writes nothing'                                   t_ls_writes_nothing
 check 'a PID record is a number and nothing else'           t_pid_record_is_a_number
+check 'runtime records are in run_dir, and none means stopped' t_runtime_records_are_apart
+check 'records an older lightbox left in the container are read' t_records_from_before_are_read
+check 'a half-made container says that it is one'           t_half_made_container
+check 'a create that is killed leaves a container start refuses' t_create_killed_half_way
+check 'rm clears away a container that ended without a stop' t_rm_of_a_dead_container
 check 'inspect writes nothing'                              t_inspect_writes_nothing
 check 'a process owned by another user is not gone'         t_other_users_process_is_not_gone
 check 'a dead container is shown as exited'                 t_dead_container_shown_as_exited

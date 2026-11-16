@@ -318,7 +318,12 @@ void require_tool(const char *label, const char *path) {
 }
 
 
-int write_file_atomic(const char *path, const char *data, int32_t mode) {
+/*
+ * Give a file its content in one step: written under another name and then
+ * renamed, so a reader finds the old content or the new and never part of
+ * either. Durable, it is on the disk when this returns, and so is its name.
+ */
+static int write_file_replacing(const char *path, const char *data, int32_t mode, bool durable) {
     char tmp[MAX_PATH];
     if (!temporary_name(tmp, sizeof(tmp), path))
         return -1;
@@ -339,7 +344,7 @@ int write_file_atomic(const char *path, const char *data, int32_t mode) {
         off += (size_t)n;
     }
 
-    if (lb_sys_fsync((int32_t)fd) < 0) {
+    if (durable && lb_sys_fsync((int32_t)fd) < 0) {
         lc_kernel_close_file((int32_t)fd);
         lc_kernel_unlinkat(AT_FDCWD, tmp, 0);
         return -1;
@@ -351,9 +356,24 @@ int write_file_atomic(const char *path, const char *data, int32_t mode) {
         return -1;
     }
 
-    if (sync_parent_dir(path) < 0)
+    if (durable && sync_parent_dir(path) < 0)
         return -1;
     return 0;
+}
+
+int write_file_atomic(const char *path, const char *data, int32_t mode) {
+    return write_file_replacing(path, data, mode, true);
+}
+
+int write_file_volatile(const char *path, const char *data) {
+    return write_file_replacing(path, data, MODE_PRIVATE_FILE, false);
+}
+
+int remove_file_durably(const char *path) {
+    lc_sysret rc = lc_kernel_unlinkat(AT_FDCWD, path, 0);
+    if (rc < 0 && rc != -LB_ENOENT)
+        return -1;
+    return sync_parent_dir(path);
 }
 
 /* <root>/<dir>, opened as a process whose root is <root> would find it. */
@@ -438,10 +458,6 @@ int read_file_in_root(const char *root, const char *dir, const char *name, char 
     return (int)n;
 }
 
-void require_write_file_atomic(const char *path, const char *data) {
-    if (write_file_atomic(path, data, MODE_PRIVATE_FILE) < 0)
-        die2("Error: atomic write failed: ", path);
-}
 
 int read_file(const char *path, char *buf, size_t bufsz) {
     lc_sysret fd = lc_kernel_open_file(path, O_RDONLY, 0);

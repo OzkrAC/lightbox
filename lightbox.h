@@ -199,7 +199,16 @@ void require_write_file(const char *path, const char *data);
 #define MODE_PRIVATE_FILE  0600
 #define MODE_PUBLIC_FILE   0644
 
-int write_file_atomic(const char *path, const char *data, int32_t mode);
+/* A file given its content in one step, by a rename: a reader finds the old
+ * content or the new. write_file_atomic is for what has to outlast a power
+ * cut, and is on the disk when it returns. write_file_volatile is for the
+ * records of what is running, which no reboot outlives anyway: the same
+ * step without the wait for the disk, always MODE_PRIVATE_FILE. */
+[[nodiscard]] int write_file_atomic(const char *path, const char *data, int32_t mode);
+[[nodiscard]] int write_file_volatile(const char *path, const char *data);
+/* Remove a file, and have it stay removed after a power cut. One that is
+ * not there is removed. 0, or -1. */
+[[nodiscard]] int remove_file_durably(const char *path);
 
 /* Files in a root filesystem that is not this process's root: <root>/<dir>/<name>,
  * with every link on the way followed as that root's own processes would
@@ -213,8 +222,6 @@ int write_file_atomic(const char *path, const char *data, int32_t mode);
                                      const char *data, int32_t mode);
 [[nodiscard]] int read_file_in_root(const char *root, const char *dir, const char *name,
                                     char *buf, size_t bufsz);
-/* For lightbox's own records: always MODE_PRIVATE_FILE. */
-void require_write_file_atomic(const char *path, const char *data);
 void cfg_global_init(void);
 /* the value of a variable in an environment, or NULL */
 const char *env_get(char **envp, const char *name);
@@ -282,27 +289,52 @@ bool name_is_valid(const char *name);
  * says whether some did not fit. */
 int list_containers(char names[][NAME_MAX_LEN + 1], int max, bool *more);
 
+/*
+ * What a container is made of is in <container_dir>/<name>/ and is written
+ * to stay: its root filesystem, its configuration, its address, its log,
+ * and a mark while create has not finished with it.
+ */
 void container_dir_path(char *buf, const char *name);
 void container_root(char *buf, const char *name);
-void container_pid_path(char *buf, const char *name);
-void container_pid_start_path(char *buf, const char *name);
 void container_ip_path(char *buf, const char *name);
 void container_conf_path(char *buf, const char *name);
-void container_state_path(char *buf, const char *name);
+void container_creating_path(char *buf, const char *name);
 /* what the container's init, its hook and its services write to stdout and stderr */
 void container_log_path(char *buf, const char *name);
+
+/*
+ * What is known about a container that is running, or was, is in
+ * <run_dir>/<name>/: the PID of its init and that process's start time, the
+ * state, and what init said when it ended. A reboot ends every container
+ * and, with run_dir where it belongs, takes these along; a container
+ * without them is stopped.
+ */
+void container_run_path(char *buf, const char *name);
+void container_pid_path(char *buf, const char *name);
+void container_pid_start_path(char *buf, const char *name);
+void container_state_path(char *buf, const char *name);
+void container_exit_path(char *buf, const char *name);
+/* run_dir and the container's directory in it, for root alone: 0, or -1 with
+ * the failure reported */
+[[nodiscard]] int container_run_dir_make(const char *name);
+/* every runtime record of the container, and their directory */
+void container_forget_run(const char *name);
 
 /* 0, or -1 when the state could not be written */
 [[nodiscard]] int record_container_state(const char *name, const char *state);
 /* the same, ending the process on failure */
 void set_container_state(const char *name, const char *state);
+/* what is on record; "stopped" when nothing is, or "creating" for a
+ * container that create did not finish */
 void get_container_state(const char *name, char *buf, size_t bufsz);
 int get_container_pid(const char *name);
 int get_container_pid_starttime(const char *name, char *buf, size_t bufsz);
-/* write .pid_start and .pid for a running init: 0, or -1 */
+/* record a running init, its start time before its PID: 0, or -1 */
 [[nodiscard]] int container_record_pid(const char *name, int pid);
-/* remove both */
+/* forget which process init was and what it said when it ended */
 void container_forget_pid(const char *name);
+/* the exit status init reported; false when it reported none */
+[[nodiscard]] bool container_exit_report(const char *name, int *status);
 
 /* What the runtime files say about a container's init process. */
 typedef enum {
@@ -313,7 +345,6 @@ typedef enum {
 
 container_liveness container_probe(const char *name);
 bool is_running(const char *name);
-void container_reap_if_dead(const char *name);
 void container_shown_state(const char *name, container_liveness live, char *buf, size_t bufsz);
 
 /*

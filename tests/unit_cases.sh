@@ -475,6 +475,8 @@ sleeping() {
     return 1
 }
 
+t_init_reports_its_end() { in_handshake_dir h_init_reports_its_end; }
+
 h_without_hook() {
     handshake whole confined 5 - -
     [ "$(story)" = "ready hook 0 sent SIGTERM init-exit 0" ] || return 1
@@ -1849,6 +1851,193 @@ t_conf_has_one_reader() {
     return $bad
 }
 
+# ─── A container that ended without a stop ──────────────────────────────────
+
+# Init says how it ends, where the command that comes next finds it: 0 when
+# it was asked to stop, something else when its hook failed, and nothing at
+# all when it was killed. While it lives no process it starts can look into
+# it, which keeps the files it holds open on the host its own.
+h_init_reports_its_end() {
+    UNIT_EXIT="$D/exit" handshake whole confined 5 - -
+    echo "asked to stop, init wrote: $(cat "$D/exit")"
+    [ "$(story)" = "ready hook 0 sent SIGTERM init-exit 0" ] && [ "$(cat "$D/exit")" = 0 ] || return 1
+
+    printf 'exit 3\n' > "$D/hook"
+    UNIT_EXIT="$D/exit" handshake whole confined 5 "$D/hook" -
+    echo "after a hook that failed, init wrote: $(cat "$D/exit")"
+    [ "$(story)" = "ready hook 3 init-exit 1" ] && [ "$(cat "$D/exit")" = 1 ] || return 1
+
+    # What init starts cannot get at the files init has open, which are files
+    # of the host: not by asking where one of init's descriptors leads, and
+    # not by opening it. The hook is such a process. /proc is the host's
+    # here, so the hook finds init there as its parent. That init has such
+    # descriptors can be seen, which is no more than their numbers.
+    {
+        # read by the shell itself: a program run for it would name the shell as its parent
+        echo 'while read -r key value; do [ "$key" = PPid: ] && init=$value; done < /proc/self/status'
+        echo 'echo "the hook sees init as process $init"'
+        echo "{"
+        echo "    if readlink /proc/\$init/fd/1 >/dev/null 2>&1; then echo 'read where it leads'; else echo 'not told where it leads'; fi"
+        echo "    if ( : < /proc/\$init/fd/1 ) 2>/dev/null; then echo 'opened it'; else echo 'not let open it'; fi"
+        echo "    if ( : < /proc/\$init/environ ) 2>/dev/null; then echo 'opened its environment'; else echo 'not let see its environment'; fi"
+        echo "} > $D/look"
+    } > "$D/hook"
+    UNIT_EXIT="$D/exit" handshake whole confined 5 "$D/hook" -
+    echo "the hook, at init's first descriptor: $(paste -sd, "$D/look")"
+    seen=$(printf '%s\n' "$out" | sed -n 's/^the hook sees init as process //p')
+    [ -n "$seen" ] && [ "$seen" = "$(printf '%s\n' "$out" | sed -n 's/^init //p')" ] ||
+        { echo "the hook looked at process '$seen', which is not init"; return 1; }
+    out=$(printf '%s\n' "$out" | grep -v '^the hook sees init')
+    [ "$(story)" = "ready hook 0 sent SIGTERM init-exit 0" ] &&
+    [ "$(paste -sd, "$D/look")" = 'not told where it leads,not let open it,not let see its environment' ] || return 1
+
+    # The next start empties the record before init can write it. Init stays
+    # here, and with it whatever it writes to: so its output goes to a file,
+    # as no pipe would end before init does.
+    UNIT_EXIT="$D/exit" handshake_begins leave confined 5 - -
+    handshake_ends
+    pid=$(printf '%s\n' "$out" | sed -n 's/^init //p')
+    [ -n "$pid" ] || { echo "the command did not say which process init is"; return 1; }
+    kill -0 "$pid" 2>/dev/null || { echo "init is not there to be looked at"; return 1; }
+    bad=0
+    [ ! -s "$D/exit" ] || { echo "a start kept the record of the run before: $(cat "$D/exit")"; bad=1; }
+    kill -KILL "$pid"
+    wait_for 5 gone "$pid" || { echo "init $pid survived SIGKILL"; return 1; }
+    echo "killed, init wrote: '$(cat "$D/exit")'"
+    [ ! -s "$D/exit" ] || { echo "an init that was killed left a report"; bad=1; }
+    return $bad
+}
+gone() { ! kill -0 "$1" 2>/dev/null; }
+
+# The records of a container that runs are in run_dir, which a reboot empties:
+# the first record after one makes the directory again, for root alone. The
+# container's own directory there has to be a directory, and no link to one.
+run_dir_cases() {
+    recorded() { result_of "$("$UNIT" record "$@" 2>"$D/err")"; }
+    # run_dir is not there, and neither is what it is in
+    [ "$(recorded "$D/a/b/run" web starting)" = 0 ] || { cat "$D/err"; return 1; }
+    echo "run_dir $(stat -c %a "$D/a/b/run"), the container's directory $(stat -c %a "$D/a/b/run/web"), the record $(stat -c %a "$D/a/b/run/web/state")"
+    [ "$(stat -c %a "$D/a/b/run")" = 700 ] && [ "$(stat -c %a "$D/a/b/run/web")" = 700 ] &&
+    [ "$(stat -c %a "$D/a/b/run/web/state")" = 600 ] && [ "$(cat "$D/a/b/run/web/state")" = starting ] || return 1
+    # a second record replaces the first, and leaves nothing beside it
+    [ "$(recorded "$D/a/b/run" web running)" = 0 ] && [ "$(cat "$D/a/b/run/web/state")" = running ] &&
+    [ "$(ls -A "$D/a/b/run/web")" = state ] || { echo "left: $(ls -A "$D/a/b/run/web")"; return 1; }
+    # a run_dir that is there is left as it is
+    mkdir -m 755 "$D/open"
+    [ "$(recorded "$D/open" web starting)" = 0 ] && [ "$(stat -c %a "$D/open")" = 755 ] && [ "$(stat -c %a "$D/open/web")" = 700 ] || return 1
+    # where the container's directory should be there is a link, or a file
+    mkdir "$D/run" "$D/elsewhere"
+    ln -s "$D/elsewhere" "$D/run/linked"
+    : > "$D/run/file"
+    [ "$(recorded "$D/run" linked starting)" = -1 ] && [ -z "$(ls -A "$D/elsewhere")" ] || { echo "a record was written through a link"; return 1; }
+    cat "$D/err"
+    [ "$(recorded "$D/run" file starting)" = -1 ] || { echo "a file was taken for the container's directory"; return 1; }
+}
+t_run_dir_is_made_when_missing() { in_config_dir run_dir_cases; }
+
+# The mark of a half-made container is removed to stay removed. A file that
+# is gone already is removed; one that cannot be removed is said to be there.
+remove_cases() {
+    removed() { result_of "$("$UNIT" remove "$1")"; }
+    : > "$D/mark"
+    [ "$(removed "$D/mark")" = 0 ] && [ ! -e "$D/mark" ] || { echo "a file was not removed"; return 1; }
+    [ "$(removed "$D/mark")" = 0 ] || { echo "a file that is gone is an error"; return 1; }
+    mkdir "$D/dir"
+    [ "$(removed "$D/dir")" = -1 ] && [ -d "$D/dir" ] || { echo "a directory was taken for a file"; return 1; }
+    [ "$(removed "$D/nowhere/mark")" = -1 ] || { echo "a file in no directory was reported as removed for good"; return 1; }
+}
+t_remove_durably() { in_config_dir remove_cases; }
+
+# What start, stop and rm do first about a container that ended without a
+# stop. The container here has no cgroup, no interface and no links, so what
+# is seen is what goes on record. Its name is one no real container has: the
+# interface that is looked for is called after it.
+REC=zz-unit-rec
+in_records_dir() { # function
+    D=$(mktemp -d "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    mkdir -p "$D/c/$REC" "$D/run"
+    printf 'version=1\nmem=1G\npids=max\ncpu=1\noom_score=0\n' > "$D/c/$REC/.conf"
+    ( "$1" )
+    rc=$?
+    rm -rf -- "$D"
+    return $rc
+}
+reconciled() { "$UNIT" reconcile "$D/c" "$D/run" "$REC" 2>"$D/err"; }
+a_pid_that_is_gone() { sleep 0 & wait $!; echo $!; }
+records() { # pid | -, state | -, what init said | -
+    rm -rf -- "$D/run/$REC"
+    mkdir -p "$D/run/$REC"
+    [ "$1" = - ] || { printf '%s' "$1" > "$D/run/$REC/pid"; printf '1' > "$D/run/$REC/pid_start"; }
+    [ "$2" = - ] || printf '%s\n' "$2" > "$D/run/$REC/state"
+    [ "$3" = - ] || printf '%s\n' "$3" > "$D/run/$REC/exit"
+}
+expect_reconciled() { # what it says, the state after
+    got=$(reconciled)
+    [ "$got" = "$1
+state $2" ] || { echo "expected '$1' and state $2, got: $got"; cat "$D/err"; return 1; }
+}
+reconcile_cases() {
+    RD="$D/run/$REC"
+    # nothing on record: nothing to do, and nothing is made
+    expect_reconciled nothing stopped && [ ! -e "$RD" ] || return 1
+
+    # an init that is gone and said that it ended with 0
+    records "$(a_pid_that_is_gone)" running 0
+    expect_reconciled cleared exited || return 1
+    cat "$D/err"
+    grep -q "had stopped by itself" "$D/err" || { echo "it does not say what it found"; return 1; }
+    [ ! -e "$RD/pid" ] && [ ! -e "$RD/pid_start" ] && [ ! -e "$RD/exit" ] || { echo "records are left: $(ls -A "$RD")"; return 1; }
+    # and a second time there is nothing more to do: the state stays
+    expect_reconciled nothing exited || return 1
+
+    # one that said anything else, or nothing, or was never able to say
+    for said in 1 137 - '' 0x 256 -0 '0 0' zero; do
+        records "$(a_pid_that_is_gone)" running "$said"
+        expect_reconciled cleared failed || { echo "  after init said '$said'"; return 1; }
+        grep -q "had ended without a stop" "$D/err" || { echo "it does not say what it found, for '$said'"; return 1; }
+    done
+
+    # a command that died in the middle: the record says it was at work, and
+    # with the lock held nothing is
+    for state in starting stopping running; do
+        records - "$state" -
+        expect_reconciled cleared failed || { echo "  for a record that says $state"; return 1; }
+    done
+    # a record that says it is at rest is left alone
+    for state in failed exited; do
+        records - "$state" -
+        expect_reconciled nothing "$state" || return 1
+    done
+    rm -rf -- "$RD"
+    : > "$D/c/$REC/.creating"
+    expect_reconciled nothing creating || return 1
+    rm "$D/c/$REC/.creating"
+
+    # A container that a lightbox before 0.5 started has its records in its
+    # own directory. They are read from there, and go when it is cleared away.
+    rm -rf -- "$RD"
+    printf '%s' "$(a_pid_that_is_gone)" > "$D/c/$REC/.pid"
+    printf '1' > "$D/c/$REC/.pid_start"
+    printf 'running\n' > "$D/c/$REC/.state"
+    expect_reconciled cleared failed || { echo "  for records in the place they had before"; return 1; }
+    [ "$(ls -A "$D/c/$REC")" = .conf ] || { echo "old records are left: $(ls -A "$D/c/$REC" | tr '\n' ' ')"; return 1; }
+    [ "$(cat "$RD/state")" = failed ] || return 1
+    # with records in both places, the old ones are not looked at
+    printf 'running\n' > "$D/c/$REC/.state"
+    expect_reconciled nothing failed || return 1
+    rm "$D/c/$REC/.state"
+
+    # an init that is there is not touched, whatever the record says. Only an
+    # ordinary user can stand in for one here: root sees that this shell is
+    # in no PID namespace of its own.
+    if [ "$(id -u)" -ne 0 ]; then
+        records $$ stopping 0
+        awk '{ printf "%s", $22 }' /proc/$$/stat > "$RD/pid_start"
+        expect_reconciled nothing stopping && [ "$(cat "$RD/pid")" = $$ ] && [ "$(cat "$RD/exit")" = 0 ] || return 1
+    fi
+}
+t_reconcile() { in_records_dir reconcile_cases; }
+
 check 'a program that succeeds gives 0'                          t_success
 check 'a non-zero exit status is returned as it is'              t_exit_status
 check 'a program killed by a signal is a failure, and reported'  t_killed_by_signal
@@ -1948,5 +2137,9 @@ check 'a .conf with a version is read strictly, by line'         t_config_is_rea
 check 'a .conf from before the version line is still read'       t_config_from_before_the_version_line
 check 'a .conf is written as it will be read, or not written'    t_config_is_written_as_it_will_be_read
 check 'one file reads and writes a .conf, and none looks into it' t_conf_has_one_reader
+check 'a runtime record makes its directory when a reboot took it'  t_run_dir_is_made_when_missing
+check 'a file is removed for good, or said not to be'             t_remove_durably
+check 'init says how it ends, and nothing it starts can look into it' t_init_reports_its_end
+check 'a container that ended without a stop is cleared away, and how it ended recorded' t_reconcile
 
 summary unit

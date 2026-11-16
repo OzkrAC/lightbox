@@ -739,10 +739,18 @@ static void cmd_create(int argc, char **argv) {
         goto fail_create;
     }
     created_dir = true;
-    /* nobody starts or removes it while it is half made */
+    /* Nobody starts or removes it while it is half made: not while this
+     * command works on it, which the lock sees to, and not after this
+     * command was killed half way, which the mark says for as long as the
+     * directory is there. */
     container_lock(name);
-    if (record_container_state(name, "creating\n") != 0) {
-        create_err = "failed to record the container's state";
+    /* A container that was removed by hand, and not by rm, leaves the
+     * records of its last run. They are not this container's. */
+    container_forget_run(name);
+    char creating[MAX_PATH];
+    container_creating_path(creating, name);
+    if (write_file_atomic(creating, "", MODE_PRIVATE_FILE) != 0) {
+        create_err = "failed to mark the container as being created";
         goto fail_create;
     }
     {
@@ -875,8 +883,9 @@ static void cmd_create(int argc, char **argv) {
         }
     }
 
-    if (record_container_state(name, "stopped\n") != 0) {
-        create_err = "failed to record the container's state";
+    /* made: and with no runtime record, stopped */
+    if (remove_file_durably(creating) != 0) {
+        create_err = "failed to mark the container as created";
         goto fail_create;
     }
     print_str(STDOUT,"Container '");
@@ -927,6 +936,7 @@ struct child_args {
     int32_t      report_rd, report_wr;      /* init writes the second */
     int32_t      starter_signals;           /* the command's signalfd, or -1 */
     int32_t      null_fd, log_fd;           /* init's standard streams once it is built; -1: the command's */
+    int32_t      exit_fd;                   /* where init says how it ended; -1: nowhere */
     const char  *name;
     const container_config *config;         /* read by the command, before the clone */
     const char  *root;
@@ -1011,6 +1021,14 @@ static void init_begin(const struct child_args *ca) {
     if (lc_kernel_set_signal_mask(LC_SIG_SETMASK, &blocked, NULL) < 0)
         die("Error: failed to block init's signals");
 
+    /* Init holds descriptors of files on the host: its log, and the record
+     * of how it ends. They are init's alone, and a process in the container
+     * must not get at them by way of init. Not dumpable, init is nobody's to
+     * trace or to look into under /proc but the host's root. Programs that
+     * init starts are dumpable again once they are executed. */
+    if (lc_kernel_prctl(LB_PR_SET_DUMPABLE, 0, 0, 0, 0) < 0)
+        die("Error: failed to close init to the processes it will start");
+
     if (lc_kernel_create_session() < 0)
         die("Error: failed to give init a session of its own");
 
@@ -1020,7 +1038,7 @@ static void init_begin(const struct child_args *ca) {
     lc_kernel_close_file(ca->report_rd);
     if (ca->starter_signals >= 0)
         lc_kernel_close_file(ca->starter_signals);
-    const int32_t keep[] = { ca->go_rd, ca->report_wr, ca->null_fd, ca->log_fd };
+    const int32_t keep[] = { ca->go_rd, ca->report_wr, ca->null_fd, ca->log_fd, ca->exit_fd };
     close_all_but(keep, sizeof(keep) / sizeof(keep[0]));
 
     if (!go_received(ca->go_rd))
@@ -2485,6 +2503,14 @@ static bool open_container_streams(const char *log_path, int32_t *null_fd, int32
     return true;
 }
 
+/* The record init writes its exit status into: empty until it does. The
+ * descriptor, or -1. */
+static int32_t open_exit_record(const char *path) {
+    lc_sysret fd = lc_kernel_open_file(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC,
+                                       MODE_PRIVATE_FILE);
+    return fd < 0 ? -1 : (int32_t)fd;
+}
+
 static void close_container_streams(int32_t *null_fd, int32_t *log_fd) {
     if (*null_fd >= 0) {
         lc_kernel_close_file(*null_fd);
@@ -2647,6 +2673,18 @@ static int delete_veth_if_present(const char *ifname) {
     return run_cmd_quiet(tool_path_ip(), show) != 0 ? 0 : -1;
 }
 
+/* The two ends of a container's interface, as they are called on the host
+ * before one of them is moved: 16 bytes each, which a container's name with
+ * three characters before it fits. */
+_Static_assert(NAME_MAX_LEN + 3 < 16, "an interface name holds a container's name and three more");
+static void veth_names(const char *name, char host[16], char cont[16]) {
+    bool cut = false;       /* never: the name has been checked to be one */
+    size_t pos = str_append(host, 0, "vb-", 16, &cut);
+    str_append(host, pos, name, 16, &cut);
+    pos = str_append(cont, 0, "ve-", 16, &cut);
+    str_append(cont, pos, name, 16, &cut);
+}
+
 /* What a start that failed leaves behind, removed. Init is gone by now. */
 static void cleanup_start_failure(const char *name, const container_config *config, const char *ip,
                                   const char *veth_host) {
@@ -2659,6 +2697,92 @@ static void cleanup_start_failure(const char *name, const container_config *conf
 
     container_forget_pid(name);
     (void)record_container_state(name, "failed\n");
+}
+
+/*
+ * Take away what a container whose init has ended still has on the host:
+ * whatever is left in its cgroup and the cgroup itself, the firewall rules
+ * of its links, and the host's end of its interface. True when all of it is
+ * gone; otherwise what is left has been said.
+ */
+static bool release_container(const char *name) {
+    bool clean = true;
+
+    if (cgroup_destroy(name) != 0)
+        clean = false;
+
+    /* Which links it has is in its configuration. A container is cleared
+     * away all the same when that cannot be read, and then the rules are
+     * what is left. */
+    {
+        static container_config config;
+        char ip_buf[16];
+        const char *wrong = container_config_load(name, &config);
+        if (wrong) {
+            print_str(STDERR, "Error: the firewall rules of the container's links, if it has any, are left in place: ");
+            print_str(STDERR, wrong);
+            lc_print_char(STDERR, '\n');
+            clean = false;
+        } else if (config.nlinks > 0 && read_container_ip(name, ip_buf, sizeof(ip_buf)) == 0 &&
+                   update_link_rules(&config, ip_buf, false) != 0) {
+            print_str(STDERR, "Error: failed to remove link iptables rules\n");
+        }
+    }
+
+    /* the host's end of the container's interface, if the kernel has not
+     * removed it with the container's network namespace already */
+    {
+        char veth_host[16], veth_cont[16];
+        veth_names(name, veth_host, veth_cont);
+        if (delete_veth_if_present(veth_host) != 0) {
+            print_str(STDERR, "Error: cannot remove the interface ");
+            print_str(STDERR, veth_host);
+            lc_print_char(STDERR, '\n');
+            clean = false;
+        }
+    }
+    return clean;
+}
+
+/*
+ * A container that ended without a stop: cleared away, and its end put on
+ * record. Called with the container's lock held, by the commands that change
+ * a container, before they do anything else.
+ *
+ * Such a container is one whose init is on record and gone, because it was
+ * killed, or told to stop by something other than lightbox, or because its
+ * hook failed after the start had returned. It is also one whose record
+ * says that a command was in the middle of starting or stopping it: with the
+ * lock held no command is, so that command died there.
+ *
+ * What it left is taken away as a stop takes it away. Its state becomes
+ * "exited" when init said that it ended with status 0, which is what it does
+ * when it is asked to stop, and "failed" when it said anything else or
+ * nothing at all. True when there was something to clear away.
+ */
+static bool reconcile(const char *name) {
+    container_liveness live = container_probe(name);
+    if (live == CONTAINER_RUNNING)
+        return false;
+
+    char state[32];
+    get_container_state(name, state, sizeof(state));
+    bool cut_short = streq(state, "starting") || streq(state, "running") || streq(state, "stopping");
+    if (live != CONTAINER_DEAD && !cut_short)
+        return false;
+
+    int status = 0;
+    bool ended_well = container_exit_report(name, &status) && status == 0;
+
+    (void)release_container(name);      /* it has said what it could not remove */
+    container_forget_pid(name);
+    (void)record_container_state(name, ended_well ? "exited\n" : "failed\n");
+
+    print_str(STDERR, "Note: container '");
+    print_str(STDERR, name);
+    print_str(STDERR, ended_well ? "' had stopped by itself; what it left has been cleared away\n"
+                                 : "' had ended without a stop; what it left has been cleared away\n");
+    return true;
 }
 
 static void enter_user_namespace_root(void) {
@@ -2903,27 +3027,33 @@ static void build_container(const struct child_args *ca) {
 }
 
 /* What the clone that becomes a container's init runs. */
+/*
+ * The last thing init does: say how it ends. Its exit status goes into the
+ * record that was opened for it before the container was built, where the
+ * next command that changes this container finds it: 0 after it was asked
+ * to stop, by lightbox or by a signal from anywhere, and something else
+ * after the hook failed. An init that is killed says nothing, and that is
+ * told from this.
+ */
+static int init_ends(const struct child_args *ca, int status) {
+    if (ca->exit_fd >= 0) {
+        char text[16];
+        size_t len = (size_t)fmt_int(text, status);
+        text[len++] = '\n';
+        (void)lc_kernel_write_all(ca->exit_fd, text, len);
+    }
+    return status;
+}
+
 static int container_child(void *arg) {
     const struct child_args *ca = (const struct child_args *)arg;
 
     init_begin(ca);
     build_container(ca);
-    return init_main(ca);
+    return init_ends(ca, init_main(ca));
 }
 
 /* ─── cmd_start ─────────────────────────────────────────────────────────── */
-
-/* The two ends of a container's interface, as they are called on the host
- * before one of them is moved: 16 bytes each, which a container's name with
- * three characters before it fits. */
-_Static_assert(NAME_MAX_LEN + 3 < 16, "an interface name holds a container's name and three more");
-static void veth_names(const char *name, char host[16], char cont[16]) {
-    bool cut = false;       /* never: the name has been checked to be one */
-    size_t pos = str_append(host, 0, "vb-", 16, &cut);
-    str_append(host, pos, name, 16, &cut);
-    pos = str_append(cont, 0, "ve-", 16, &cut);
-    str_append(cont, pos, name, 16, &cut);
-}
 
 /* "<before><number><after>" in buf, for a message that names a number. */
 static const char *text_with_number(char *buf, size_t bufsz, const char *before, int number,
@@ -2960,13 +3090,22 @@ static void cmd_start(int argc, char **argv) {
     /* from here to the end, no other command works on this container */
     container_lock(name);
 
+    /* a create that was killed half way left it with half a root filesystem,
+     * or with none */
+    {
+        char creating[MAX_PATH];
+        container_creating_path(creating, name);
+        if (path_exists(creating))
+            die2("Error: the container was not created completely; remove it and create it again: ", name);
+    }
+
     char root[MAX_PATH];
     container_root(root, name);
     if (!path_exists(root)) die2("Error: container does not exist: ", name);
 
     if (is_running(name)) die2("Error: container is already running: ", name);
-    container_reap_if_dead(name);   /* a previous init that died without a stop */
-    container_forget_pid(name);     /* and whatever else an earlier run left on record */
+    (void)reconcile(name);          /* an earlier run that ended without a stop */
+    container_forget_pid(name);     /* and whatever else one left on record */
 
     /* read container IP */
     char ip[16];
@@ -3021,9 +3160,8 @@ static void cmd_start(int argc, char **argv) {
     const char *start_err = NULL;
     char err_buf[96];
     int exit_code = 1;
-    bool undo_is_ours = true;
     bool hook_failed = false;
-    int32_t null_fd = -1, log_fd = -1;
+    int32_t null_fd = -1, log_fd = -1, exit_fd = -1;
     struct init_link init = INIT_LINK_NONE;
     struct start_report report = { 0, 0 };
     int stop_signal = 0;
@@ -3059,12 +3197,23 @@ static void cmd_start(int argc, char **argv) {
         start_err = "failed to open the container's log";
         goto fail_start;
     }
+    /* and where init says how it ended, for the command that comes after */
+    {
+        char exit_path[MAX_PATH];
+        container_exit_path(exit_path, name);
+        exit_fd = open_exit_record(exit_path);
+        if (exit_fd < 0) {
+            start_err = "failed to open the record of how the container ends";
+            goto fail_start;
+        }
+    }
 
     /* clone init; it waits for its first byte */
     struct child_args ca = {
         .starter_signals = signal_fd,
         .null_fd = null_fd,
         .log_fd = log_fd,
+        .exit_fd = exit_fd,
         .name = name,
         .config = &config,
         .root = root,
@@ -3079,6 +3228,8 @@ static void cmd_start(int argc, char **argv) {
 
     start_err = init_spawn(&init, &ca, clone_flags, container_child);
     close_container_streams(&null_fd, &log_fd);     /* init has its own copies */
+    lc_kernel_close_file(exit_fd);
+    exit_fd = -1;
     if (start_err)
         goto fail_start;
     int child_pid = (int)init.pid;
@@ -3213,15 +3364,11 @@ static void cmd_start(int argc, char **argv) {
                     goto fail_start;
                 }
                 break;
-            case AWAIT_CLOSED: {
-                /* a stop that got to it first clears up after itself */
-                char state[32];
-                get_container_state(name, state, sizeof(state));
-                undo_is_ours = !streq(state, "stopping") && !streq(state, "stopped");
-                start_err = undo_is_ours ? "the container stopped while its init hook was running"
-                                         : "the container was stopped while its init hook was running";
+            case AWAIT_CLOSED:
+                /* No stop did this: a stop waits for this command to be done
+                 * with the container. Init was ended from somewhere else. */
+                start_err = "the container stopped while its init hook was running";
                 goto fail_start;
-            }
             case AWAIT_TIMEOUT:
                 hook_still_running = true;
                 break;
@@ -3265,6 +3412,8 @@ interrupted:
 fail_start:
     init_abandon(&init);
     close_container_streams(&null_fd, &log_fd);
+    if (exit_fd >= 0)
+        lc_kernel_close_file(exit_fd);
     if (start_err) {
         print_str(STDERR, "Error: ");
         print_str(STDERR, start_err);
@@ -3275,8 +3424,7 @@ fail_start:
         print_str(STDERR, name);
         lc_print_char(STDERR, '\n');
     }
-    if (undo_is_ours)
-        cleanup_start_failure(name, &config, ip, veth_host);
+    cleanup_start_failure(name, &config, ip, veth_host);
     lc_kernel_exit(exit_code);
 }
 
@@ -3323,7 +3471,7 @@ static void cmd_stop(int argc, char **argv) {
     container_lock(name);
 
     if (!is_running(name)) {
-        container_reap_if_dead(name);
+        (void)reconcile(name);      /* one that ended without a stop is cleared away here */
         die2("Error: container is not running: ", name);
     }
 
@@ -3335,7 +3483,7 @@ static void cmd_stop(int argc, char **argv) {
     if (pidfd < 0 || !is_running(name)) {
         if (pidfd >= 0)
             lc_kernel_close_file((int32_t)pidfd);
-        container_reap_if_dead(name);
+        (void)reconcile(name);
         die2("Error: container is not running: ", name);
     }
 
@@ -3360,43 +3508,12 @@ static void cmd_stop(int argc, char **argv) {
     if (!ended)
         print_str(STDERR, "Error: the container's init is still there\n");
 
-    /* whatever is still in the cgroup, and the cgroup itself */
-    if (cgroup_destroy(name) != 0)
+    /* what is still in its cgroup, the cgroup, its rules and its interface */
+    if (!release_container(name))
         clean = false;
 
-    /* Clean up link iptables rules. Which links it has is in its
-     * configuration; a container is stopped all the same when that cannot
-     * be read, and then the rules are what is left. */
-    {
-        static container_config config;
-        char ip_buf[16];
-        const char *wrong = container_config_load(name, &config);
-        if (wrong) {
-            print_str(STDERR, "Error: the firewall rules of the container's links, if it has any, are left in place: ");
-            print_str(STDERR, wrong);
-            lc_print_char(STDERR, '\n');
-            clean = false;
-        } else if (read_container_ip(name, ip_buf, sizeof(ip_buf)) == 0 &&
-                   update_link_rules(&config, ip_buf, false) != 0) {
-            print_str(STDERR, "Error: failed to remove link iptables rules\n");
-        }
-    }
-
-    /* the host's end of the container's interface, if the kernel has not
-     * removed it with the container's network namespace already */
-    {
-        char veth_host[16], veth_cont[16];
-        veth_names(name, veth_host, veth_cont);
-        if (delete_veth_if_present(veth_host) != 0) {
-            print_str(STDERR, "Error: cannot remove the interface ");
-            print_str(STDERR, veth_host);
-            lc_print_char(STDERR, '\n');
-            clean = false;
-        }
-    }
-
-    container_forget_pid(name);
-    set_container_state(name, "stopped\n");
+    /* with no runtime record it is stopped */
+    container_forget_run(name);
 
     if (!clean) {
         print_str(STDERR, "Error: container '");
@@ -3504,6 +3621,10 @@ static void cmd_rm(int argc, char **argv) {
 
     if (is_running(name)) die2("Error: container is running (stop it first): ", name);
 
+    /* one that ended without a stop still has a cgroup, and firewall rules
+     * that only its configuration can name: cleared away while that is there */
+    (void)reconcile(name);
+
     char cdir[MAX_PATH];
     container_dir_path(cdir, name);
 
@@ -3511,10 +3632,11 @@ static void cmd_rm(int argc, char **argv) {
     print_str(STDOUT,name);
     print_str(STDOUT,"'...\n");
 
-    cgroup_destroy(name);
+    (void)cgroup_destroy(name);
 
     /* remove entire container directory (rootfs + metadata) */
     require_rm_rf(cdir);
+    container_forget_run(name);
 
     print_str(STDOUT,"Container '");
     print_str(STDOUT,name);
