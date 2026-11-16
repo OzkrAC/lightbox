@@ -295,6 +295,24 @@ void cmd_doctor(void) {
     print_kv("bridge", cfg_global.bridge);
     print_kv("subnet", cfg_global.subnet);
     print_kv("gw", cfg_global.gw);
+    {
+        /* the two as one network: what setup, create and start go by */
+        container_network net;
+        const char *setting;
+        const char *wrong = container_network_parse(cfg_global.subnet, cfg_global.gw, &net, &setting);
+        if (wrong) {
+            print_str(STDOUT, "network: unusable (");
+            print_str(STDOUT, setting);
+            print_str(STDOUT, " ");
+            print_str(STDOUT, wrong);
+            print_str(STDOUT, ")\n");
+            missing++;
+        } else {
+            char subnet[CIDR_TEXT_MAX];
+            subnet_text(subnet, &net);
+            print_kv("network", subnet);
+        }
+    }
     /* told, not counted as missing: only a container with links depends on it */
     print_kv("bridge_filtering", bridge_traffic_is_filtered()
              ? "yes" : "no (a container with --link will not start; it needs br_netfilter)");

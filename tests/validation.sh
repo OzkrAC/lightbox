@@ -291,13 +291,116 @@ t_addvol_respects_the_volume_limit() {
     refused lb add-vol web "/tmp:/m17"
 }
 
+# The address of another container, the gateway's, and the first and the
+# last of the subnet: each refused with the reason, and nothing is made.
 t_duplicate_address_refused() {
     lb create a 10.0.0.9 || return 1
-    refused lb create b 10.0.0.9
+    msg=$(lb create b 10.0.0.9 2>&1) && { echo "a second container got 10.0.0.9"; return 1; }
+    printf '%s\n' "$msg"
+    case $msg in *"it is the address of the container 'a'"*) ;; *) return 1 ;; esac
+    [ ! -e "$C/b" ] || { echo "the refused create left $C/b"; return 1; }
+    # whether a holds it or not is what a's record says, not what was typed
+    refused lb create c 10.0.0.9 --mem 64M 2>/dev/null
 }
-t_gateway_address_refused()   { refused lb create a 10.0.0.1; }
-t_network_address_refused()   { refused lb create a 10.0.0.0; }
-t_broadcast_address_refused() { refused lb create a 10.0.0.255; }
+reserved_address_refused() { # address, what the refusal says
+    msg=$(lb create a "$1" 2>&1) && { echo "a container got $1"; return 1; }
+    printf '%s\n' "$msg"
+    case $msg in *"$2"*) ;; *) return 1 ;; esac
+    [ ! -e "$C/a" ] || { echo "the refused create left $C/a"; return 1; }
+}
+t_gateway_address_refused()   { reserved_address_refused 10.0.0.1 "the gateway's"; }
+t_network_address_refused()   { reserved_address_refused 10.0.0.0 'the address of the subnet itself'; }
+t_broadcast_address_refused() { reserved_address_refused 10.0.0.255 'the broadcast address'; }
+
+# Without an address, create takes the lowest that is free: not the
+# gateway's, and one that rm gave back.
+t_create_takes_the_lowest_free_address() {
+    lb create a && lb create b 10.0.0.3 && lb create c && lb create d --mem 64M || return 1
+    lb ls
+    [ "$(cat "$C/a/.ip")" = 10.0.0.2 ] && [ "$(cat "$C/c/.ip")" = 10.0.0.4 ] && [ "$(cat "$C/d/.ip")" = 10.0.0.5 ] ||
+        { echo "the addresses taken: $(cat "$C"/*/.ip | tr '\n' ' ')"; return 1; }
+    conf_has d 'mem=64M' || { echo "the option after the name was not taken as one"; return 1; }
+    lb rm a >/dev/null && lb create e || return 1
+    [ "$(cat "$C/e/.ip")" = 10.0.0.2 ] || { echo "after rm a, the next got $(cat "$C/e/.ip")"; return 1; }
+    printf 'subnet = 10.0.0.0/24\ngw = 10.0.0.9\n' >> "$CONF"
+    lb rm e >/dev/null && lb create f && lb create g || return 1
+    # with the gateway elsewhere, the first address is a container's
+    [ "$(cat "$C/f/.ip")" = 10.0.0.1 ] && [ "$(cat "$C/g/.ip")" = 10.0.0.2 ] ||
+        { echo "with gw = 10.0.0.9: f got $(cat "$C/f/.ip"), g got $(cat "$C/g/.ip")"; return 1; }
+}
+
+# A subnet with every address taken refuses the next container, and makes
+# nothing of it.
+t_full_subnet() {
+    printf 'subnet = 192.168.7.0/30\ngw = 192.168.7.1\n' >> "$CONF"
+    lb create one || return 1
+    msg=$(lb create two 2>&1) && { echo "a container was made on a full subnet: $(cat "$C/two/.ip")"; return 1; }
+    printf '%s\n' "$msg"
+    case $msg in *'every address of the subnet has a container: 192.168.7.0/30'*) ;; *) return 1 ;; esac
+    [ "$(cat "$C/one/.ip")" = 192.168.7.2 ] && [ ! -e "$C/two" ]
+}
+
+# On a /16, an address in a /24 other than the gateway's is a container's;
+# the broadcast address is the last of the /16.
+t_wide_subnet() {
+    printf 'subnet = 10.9.0.0/16\ngw = 10.9.0.1\n' >> "$CONF"
+    lb create wide 10.9.5.2 && lb create last 10.9.255.254 && lb create next || return 1
+    refused lb create bcast 10.9.255.255 && refused lb create out 10.10.0.2 || return 1
+    [ "$(cat "$C/wide/.ip")" = 10.9.5.2 ] && [ "$(cat "$C/next/.ip")" = 10.9.0.2 ]
+}
+
+# subnet and gw that are no network end every command that would use them,
+# before anything is made; doctor says so.
+t_network_settings_are_checked() {
+    cp "$CONF" "$W/conf.good"
+    bad=0
+    for settings in 'subnet = 10.9.0.0/16|gw = 10.8.0.1' 'subnet = 10.0.0.0/31|gw = 10.0.0.1' \
+                    'subnet = 10.0.0.0|gw = 10.0.0.1' 'subnet = 10.0.0.0/24|gw = 10.0.0.255' \
+                    'subnet = 10.0.0.0/24|gw = 10.0.0.01'; do
+        { cat "$W/conf.good"; printf '%s\n' "$settings" | tr '|' '\n'; } > "$CONF"
+        msg=$(lb create x 2>&1) && { echo "create worked with: $settings"; bad=1; continue; }
+        case $msg in "Error: subnet in lightbox.conf "*|"Error: gw in lightbox.conf "*) ;;
+            *) echo "with $settings, create said: $msg"; bad=1 ;; esac
+        [ ! -e "$C/x" ] || { echo "with $settings, create left $C/x"; bad=1; }
+        report=$(lb doctor 2>&1) && { echo "doctor exits 0 with: $settings"; bad=1; }
+        printf '%s\n' "$report" | grep -q '^network: unusable (' || { echo "doctor does not say: $settings"; bad=1; }
+        echo "$settings: $msg"
+    done
+    cp "$W/conf.good" "$CONF"
+    lb doctor | grep -x 'network: 10.0.0.0/24' || { echo "doctor does not show the network"; bad=1; }
+    return $bad
+}
+
+# A zero in front of a number is read as octal by some of the programs an
+# address is handed to and refused by others: an address has none.
+t_address_with_leading_zeros_refused() {
+    refused lb create a 10.0.0.05 && refused lb create b 010.0.0.5 && refused lb create c 10.0.0.007 &&
+    [ ! -e "$C/a" ] && [ ! -e "$C/b" ] && [ ! -e "$C/c" ]
+}
+
+# Two creates at once, neither given an address, get two: the second chooses
+# when the first has made its choice, which the copy here makes long.
+t_creates_at_once_get_two_addresses() {
+    unshare -r --mount true 2>/dev/null || { echo "user namespaces are not available to this user"; return 77; }
+    real=$(readlink -f "$(type -P cp)") && cp "$real" "$W/cp.real" || return 1
+    printf '#!/bin/sh\nsleep 1\nexec %s "$@"\n' "$W/cp.real" > "$W/cp.shim"
+    chmod +x "$W/cp.shim"
+    # shellcheck disable=SC2016     # the script is for the shell in the namespace
+    HOME="$W/home" unshare -r --mount -- sh -c '
+        for cp in /bin/cp /usr/bin/cp; do
+            [ -e "$cp" ] && { mount --bind "$1/cp.shim" "$(readlink -f "$cp")" || exit 77; }
+        done
+        "$2" create one > "$1/one.out" 2>&1 &
+        "$2" create two > "$1/two.out" 2>&1 &
+        wait
+    ' _ "$W" "$LB"
+    rc=$?
+    cat "$W/one.out" "$W/two.out"
+    [ $rc -ne 77 ] || { echo "a stand-in could not be mounted over cp here"; return 77; }
+    one=$(cat "$C/one/.ip" 2>/dev/null) && two=$(cat "$C/two/.ip" 2>/dev/null) || { echo "a create failed"; return 1; }
+    echo "one got $one, two got $two"
+    [ "$(printf '%s\n%s\n' "$one" "$two" | sort | paste -sd' ' -)" = '10.0.0.2 10.0.0.3' ]
+}
 
 # ─── Option values ──────────────────────────────────────────────────────────
 
@@ -876,16 +979,23 @@ t_ls_json_escapes_names() {
 # one field of the first entry of ls --json, decoded by a real JSON parser
 json_field() { python3 -I -c 'import json, sys; sys.stdout.write(str(json.load(sys.stdin)[0][sys.argv[1]]))' "$1"; }
 
-# A record is a file anyone with access can damage. Whatever it holds, the
-# listing stays JSON and gives the value back unchanged.
+# A record is a file anyone with access can damage. Whatever the state record
+# holds, the listing stays JSON and gives the value back unchanged; an address
+# record that is no address is not shown at all.
 t_ls_json_escapes_values() {
     command -v python3 >/dev/null 2>&1 || { echo "no python3 to decode JSON with"; return 77; }
     lb create web 10.0.0.2 || return 1
-    printf '1"2\\3\t4\001' > "$C/web/.ip"
+    mkdir -p "$R/web"
+    printf '1"2\\3\t4\001' > "$R/web/state"
     json=$(lb ls --json)
     printf '%s\n' "$json"
     printf '%s' "$json" | json_valid || return 1
-    [ "$(printf '%s' "$json" | json_field ip | od -An -c | tr -s ' ')" = "$(printf '1"2\\3\t4\001' | od -An -c | tr -s ' ')" ]
+    [ "$(printf '%s' "$json" | json_field status | od -An -c | tr -s ' ')" = "$(printf '1"2\\3\t4\001' | od -An -c | tr -s ' ')" ] ||
+        { echo "the state record did not come back as it is"; return 1; }
+    printf '1"2\\3\t4\001' > "$C/web/.ip"
+    json=$(lb ls --json)
+    printf '%s\n' "$json"
+    printf '%s' "$json" | json_valid && [ "$(printf '%s' "$json" | json_field ip)" = - ]
 }
 
 t_ls_json_pid_is_null_when_stopped() {
@@ -1251,10 +1361,16 @@ check 'default_* settings are checked, and said if unusable' t_default_settings_
 check 'a setting or a settings file is never cut to fit'    t_settings_are_not_cut
 check 'LIGHTBOX_ROOTFS counts with or without a lightbox.conf' t_rootfs_from_the_environment
 
-xfail NET-ip-validate      'a duplicate address is refused'                  t_duplicate_address_refused
-xfail NET-ip-validate      'the gateway address is refused'                  t_gateway_address_refused
-xfail NET-ip-validate      'the network address is refused'                  t_network_address_refused
-xfail NET-ip-validate      'the broadcast address is refused'                t_broadcast_address_refused
+check 'a duplicate address is refused, with its holder named' t_duplicate_address_refused
+check 'the gateway address is refused'                        t_gateway_address_refused
+check 'the network address is refused'                        t_network_address_refused
+check 'the broadcast address is refused'                      t_broadcast_address_refused
+check 'create without an address takes the lowest free one'   t_create_takes_the_lowest_free_address
+check 'a full subnet refuses one more container'              t_full_subnet
+check 'a /16 subnet has the addresses of a /16'               t_wide_subnet
+check 'subnet and gw that are no network are refused'         t_network_settings_are_checked
+check 'an address with a zero in front of a number is refused' t_address_with_leading_zeros_refused
+check 'two creates at once get two addresses'                 t_creates_at_once_get_two_addresses
 check 'ls --json stays JSON next to an odd directory name'    t_ls_json_escapes_names
 check 'ls --json escapes whatever a record holds'             t_ls_json_escapes_values
 check 'ls --json gives pid as null for a stopped container'   t_ls_json_pid_is_null_when_stopped

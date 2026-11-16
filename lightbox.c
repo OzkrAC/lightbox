@@ -6,7 +6,7 @@
  *
  * Usage: lightbox <command> [args]
  *   setup                         — initialize host networking
- *   create <name> <ip> [options]  — create a container
+ *   create <name> [<ip>] [options] — create a container
  *   start  <name> [-t <seconds>]  — start a container
  *   stop   <name> [-t <seconds>]  — stop a container
  *   rm     <name>                 — remove a container
@@ -49,83 +49,11 @@ global_config cfg_global;
 
 /* ─── Utility functions ─────────────────────────────────────────────────── */
 
-static bool parse_ipv4(const char *s, uint8_t out[4]) {
-    uint32_t cur = 0;
-    int octet = 0;
-    bool have_digit = false;
-    if (!s || !s[0]) return false;
-
-    for (size_t i = 0;; i++) {
-        char c = s[i];
-        if (c >= '0' && c <= '9') {
-            have_digit = true;
-            cur = cur * 10u + (uint32_t)(c - '0');
-            if (cur > 255u) return false;
-        } else if (c == '.' || c == '\0') {
-            if (!have_digit || octet >= 4) return false;
-            out[octet++] = (uint8_t)cur;
-            cur = 0;
-            have_digit = false;
-            if (c == '\0') break;
-        } else {
-            return false;
-        }
-    }
-
-    return octet == 4;
-}
-
-static uint32_t ipv4_to_u32(const uint8_t ip[4]) {
-    return ((uint32_t)ip[0] << 24) |
-           ((uint32_t)ip[1] << 16) |
-           ((uint32_t)ip[2] << 8) |
-           (uint32_t)ip[3];
-}
-
-static bool parse_cidr_ipv4(const char *cidr, uint8_t net[4], uint32_t *prefix) {
-    const char *slash = NULL;
-    for (const char *p = cidr; *p; p++) {
-        if (*p == '/') { slash = p; break; }
-    }
-    if (!slash) return false;
-
-    char ip_part[20];
-    size_t ip_len = (size_t)(slash - cidr);
-    if (ip_len == 0 || ip_len >= sizeof(ip_part)) return false;
-    lc_bytes_copy(ip_part, cidr, ip_len);
-    ip_part[ip_len] = '\0';
-
-    if (!parse_ipv4(ip_part, net)) return false;
-    int64_t bits;
-    if (!parse_number(slash + 1, 0, 32, &bits)) return false;
-    *prefix = (uint32_t)bits;
-    return true;
-}
-
-static void validate_ipv4_address(const char *ip) {
-    uint8_t tmp[4];
-    if (!parse_ipv4(ip, tmp))
-        die2("Error: invalid IPv4 address: ", ip);
-}
-
-static void validate_ip_in_subnet(const char *ip, const char *cidr) {
-    uint8_t ip_octets[4], net_octets[4];
-    uint32_t prefix = 0;
-    if (!parse_ipv4(ip, ip_octets))
-        die2("Error: invalid IPv4 address: ", ip);
-    if (!parse_cidr_ipv4(cidr, net_octets, &prefix))
-        die2("Error: invalid subnet in config: ", cidr);
-
-    uint32_t mask = (prefix == 0) ? 0u : (0xffffffffu << (32u - prefix));
-    if ((ipv4_to_u32(ip_octets) & mask) != (ipv4_to_u32(net_octets) & mask))
-        die2("Error: IP is outside configured subnet: ", ip);
-}
-
 /* Is this an address a container can ask for names: IPv4, and not this
  * host's own loopback, which in a container is the container's? */
 static bool usable_name_server(const char *text) {
-    uint8_t ip[4];
-    return parse_ipv4(text, ip) && ip[0] != 127 && ipv4_to_u32(ip) != 0;
+    uint32_t addr;
+    return parse_ipv4(text, &addr) && (addr >> 24) != 127 && addr != 0;
 }
 
 /*
@@ -621,14 +549,86 @@ static const char *option_value(int argc, char **argv, int *i) {
 
 /* ─── cmd_create ────────────────────────────────────────────────────────── */
 
+[[noreturn]] static void die_about_address(const char *address, const char *why) {
+    print_str(STDERR, "Error: a container cannot have the address ");
+    print_str(STDERR, address);
+    print_str(STDERR, ": ");
+    print_str(STDERR, why);
+    lc_print_char(STDERR, '\n');
+    lc_kernel_exit(1);
+}
+
+/*
+ * The address of a new container: the one asked for, when no container has
+ * it, or with none asked for the lowest of the subnet that is free. Decided
+ * with the store locked, so that no other create decides at the same time,
+ * and from what every container has on record, running or not.
+ */
+static void choose_address(const container_network *net, const uint32_t *asked, char out[IPV4_TEXT_MAX]) {
+    static char names[MAX_LISTED][NAME_MAX_LEN + 1];
+    static uint32_t taken[MAX_LISTED];
+    static int holder[MAX_LISTED];
+    bool more = false;
+    int count = list_containers(names, MAX_LISTED, &more);
+    if (more)
+        die("Error: there are more than " STRINGIFY(MAX_LISTED) " containers, and which addresses they have cannot be told");
+
+    int ntaken = 0;
+    for (int i = 0; i < count; i++) {
+        char text[IPV4_TEXT_MAX];
+        if (read_container_ip(names[i], text, sizeof(text)) == 0 && parse_ipv4(text, &taken[ntaken]))
+            holder[ntaken++] = i;
+    }
+
+    if (asked) {
+        format_ipv4(out, *asked);
+        for (int i = 0; i < ntaken; i++) {
+            if (taken[i] != *asked)
+                continue;
+            print_str(STDERR, "Error: a container cannot have the address ");
+            print_str(STDERR, out);
+            print_str(STDERR, ": it is the address of the container '");
+            print_str(STDERR, names[holder[i]]);
+            print_str(STDERR, "'\n");
+            lc_kernel_exit(1);
+        }
+        return;
+    }
+
+    for (uint32_t candidate = net->network + 1; candidate < net->broadcast; candidate++) {
+        if (candidate == net->gateway)
+            continue;
+        bool is_free = true;
+        for (int i = 0; i < ntaken && is_free; i++)
+            is_free = taken[i] != candidate;
+        if (is_free) {
+            format_ipv4(out, candidate);
+            return;
+        }
+    }
+    die2("Error: every address of the subnet has a container: ", cfg_global.subnet);
+}
+
 static void cmd_create(int argc, char **argv) {
     require_tool("cp", tool_path_cp());
-    if (argc < 2) die("Usage: lightbox create <name> <ip> [options]");
+    if (argc < 1) die("Usage: lightbox create <name> [<ip>] [options]");
     const char *name = argv[0];
-    const char *ip = argv[1];
     validate_name(name);
-    validate_ipv4_address(ip);
-    validate_ip_in_subnet(ip, cfg_global.subnet);
+
+    /* The address, when there is one: what follows the name and is not an
+     * option. Whether another container has it is looked at further down,
+     * with the store locked. */
+    container_network net;
+    container_network_load_or_die(&net);
+    bool address_given = argc >= 2 && argv[1][0] != '-';
+    uint32_t asked = 0;
+    if (address_given) {
+        if (!parse_ipv4(argv[1], &asked))
+            die2("Error: invalid IPv4 address: ", argv[1]);
+        const char *why = address_unusable(&net, asked);
+        if (why)
+            die_about_address(argv[1], why);
+    }
 
     /* The options. A value is what its option takes or the command ends
      * here, with the option named: none is cut to fit and none is stored to
@@ -638,7 +638,7 @@ static void cmd_create(int argc, char **argv) {
     char dns[MAX_DNS][16];
     int ndns = 0;
 
-    for (int i = 2; i < argc; i++) {
+    for (int i = address_given ? 2 : 1; i < argc; i++) {
         const char *opt = argv[i];
         if (streq(opt, "--mem")) {
             const char *value = option_value(argc, argv, &i);
@@ -722,16 +722,18 @@ static void cmd_create(int argc, char **argv) {
             die2("Error: base rootfs is empty: ", cfg_global.rootfs);
     }
 
+    /* One create at a time: what one decides about names and addresses holds
+     * until it is done. */
+    store_lock();
+    char ip[IPV4_TEXT_MAX];
+    choose_address(&net, address_given ? &asked : NULL, ip);
+
     print_str(STDOUT,"Creating container '");
     print_str(STDOUT,name);
     print_str(STDOUT,"'...\n");
 
     const char *create_err = NULL;
     bool created_dir = false;
-
-    /* One create at a time: what one decides about names and addresses holds
-     * until it is done. */
-    store_lock();
 
     /* create container directory and copy rootfs into it */
     if (lc_kernel_mkdirat(AT_FDCWD, cdir, MODE_PRIVATE_DIR) < 0) {
@@ -3107,9 +3109,21 @@ static void cmd_start(int argc, char **argv) {
     (void)reconcile(name);          /* an earlier run that ended without a stop */
     container_forget_pid(name);     /* and whatever else one left on record */
 
-    /* read container IP */
-    char ip[16];
-    if (read_container_ip(name, ip, sizeof(ip)) < 0) die("Error: no IP file for container");
+    /* The container's address, which has to be one of the network as it is
+     * set now: with another subnet since the container was created, it would
+     * start and reach nothing. */
+    char ip[IPV4_TEXT_MAX], ip_cidr[CIDR_TEXT_MAX];
+    {
+        container_network net;
+        container_network_load_or_die(&net);
+        uint32_t addr;
+        if (read_container_ip(name, ip, sizeof(ip)) < 0 || !parse_ipv4(ip, &addr))
+            die2("Error: the container has no address on record; remove it and create it again: ", name);
+        const char *why = address_unusable(&net, addr);
+        if (why)
+            die_about_address(ip, why);
+        address_with_prefix(ip_cidr, addr, &net);
+    }
 
     /* What the container is configured with: read here, once, for the whole
      * start. Init gets it with the memory it is cloned with. */
@@ -3284,11 +3298,6 @@ static void cmd_start(int argc, char **argv) {
     /* configure networking inside the container */
     {
         char nsbuf[16]; fmt_int(nsbuf, child_pid);
-        char ip_cidr[20];
-        bool cut = false;
-        size_t pos = str_append(ip_cidr, 0, ip, sizeof(ip_cidr), &cut);
-        str_append(ip_cidr, pos, "/24", sizeof(ip_cidr), &cut);
-        if (cut) { start_err = "the container's address is not an address"; goto fail_start; }
 
         const char *a1[] = { "nsenter", "-t", nsbuf, "-n", "--", "ip", "link", "set", veth_cont, "up", NULL };
         if (run_cmd(tool_path_nsenter(), a1) != 0) { start_err = "failed to bring container veth up"; goto fail_start; }
@@ -3717,7 +3726,8 @@ static void cmd_exec(int argc, char **argv) {
         "Usage: lightbox <command> [args]\n"
         "\n"
         "Commands:\n"
-        "  create <name> <ip> [options]  Create a new container\n"
+        "  create <name> [<ip>] [options]\n"
+        "                                Create a new container; without <ip>, the lowest free address\n"
         "         --mem  <limit>         Memory limit: <number>[K|M|G|T] or max (default: 256M)\n"
         "         --pids <limit>         Max processes, or max (default: 128)\n"
         "         --cpu  <num>           CPUs, such as 2 or 0.5 (default: 1)\n"

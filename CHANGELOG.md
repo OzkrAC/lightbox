@@ -18,12 +18,19 @@ Not tagged yet, and not complete: the part of Phase 5 that is written so far.
 - **The records of a running container are in `run_dir`**, `/run/lightbox` unless set otherwise, and no longer in the container's directory: `<run_dir>/<name>/pid`, `pid_start`, `state` and `exit`. Scripts that read `<container_dir>/<name>/.pid` or `.state` have to read these, or better `lightbox inspect`. A container that an older lightbox started and that is still running is found through its old records, and can be stopped as usual. If `run_dir` is set to a directory that is not on a tmpfs, the records outlast a reboot and containers show as `exited` after one until a command clears them.
 - **A container that ended without `lightbox stop` is cleared away by the next `start`, `stop` or `rm`**, which prints a note saying so: its cgroup, its interface and the firewall rules of its links are removed, and its state becomes `exited` if its init ended with status 0, as it does when it is sent SIGTERM, and `failed` otherwise. Before, such a container became `failed` in every case, and its cgroup and rules stayed; `rm` left the rules for good.
 - **A container that `create` did not finish is not started.** A `create` that is interrupted while it copies the root filesystem leaves a container that `ls` shows as `creating`; `start` used to run it with whatever had been copied.
+- **`create` refuses an address that no container can have**: another container's, which it names, the gateway's, and the first and the last address of the subnet. It took them all; two containers on one address, or one on the bridge's, could not be reached.
+- **An address with a zero in front of one of its numbers, such as `10.0.0.05`, is refused**, by `create`, `--dns` and the `dns` setting: some programs read such a number as octal and others refuse it. A container that was created with one does not start; create it again.
+- **`subnet` and `gw` are checked together** by `setup`, `create` and `start`, and reported by `doctor`: `subnet` is `<address>/<bits>` with 8 to 30 bits, and `gw` is an address in it that is neither its first nor its last. Either one wrong ends the command, with the setting named, before anything is made.
+- **The prefix of `subnet` is used.** `setup` gave the bridge a `/24`, and `start` gave every container one, whatever `subnet` said: on a `/16`, a container outside the gateway's `/24` did not start. A bridge that an earlier `setup` made keeps the address it was given, so with a `subnet` that is not a `/24`, delete the bridge while no container runs (`ip link delete br0`) and run `setup` again.
+- **`start` refuses a container whose address is not in `subnet`**, as after a change of `subnet`. It would have started and reached nothing.
 - **A container's `.conf` that lightbox cannot use is an error that names the file and the line**, for `start`, `exec`, `inspect`, `add-vol` and `rm-vol`. `stop` still stops such a container, says that it could not know the container's links, and exits with 1. `rm` removes it as before.
 
 ### Added
 
 - **`--cpu` takes parts of a CPU**: `--cpu 0.5` is half of one, `--cpu 1.25` one and a quarter.
 - **`--mem max` and `--pids max`** for a container without that limit.
+- **`lightbox create <name>` without an address** gives the container the lowest address of the subnet that is free: not the gateway's and not another container's. Two `create` at once get two addresses.
+- `doctor` shows the network that `subnet` and `gw` make, or what is wrong with them.
 - **`lightbox rm-vol <name> <dst>`** takes the volume at a destination out of a container's configuration. Like `add-vol`, it takes effect at the next start.
 - A container's `.conf` begins with `version=1`. Containers made by earlier versions keep working as they are, and get the line the next time `add-vol` or `rm-vol` writes the file.
 

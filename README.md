@@ -94,7 +94,7 @@ Run once to create the bridge, enable NAT, and mount cgroups. Safe to re-run (id
 ```
 
 This creates:
-- A `br0` bridge on `10.0.0.1/24`
+- A `br0` bridge with the address `gw` and the prefix of `subnet`, `10.0.0.1/24` unless `lightbox.conf` sets them
 - iptables NAT masquerade for outbound traffic
 - FORWARD rules for container-to-WAN communication
 - A DROP rule for inter-container traffic (isolation by default, together with isolated bridge ports)
@@ -103,8 +103,9 @@ This creates:
 ### 3. Create, start, and use containers
 
 ```sh
-# Create a container with IP 10.0.0.2
-./lightbox create mybox 10.0.0.2
+# Create a container; it gets the lowest free address of the subnet, 10.0.0.2 on a new host
+./lightbox create mybox
+# or give it one: ./lightbox create mybox 10.0.0.20
 
 # Start it
 ./lightbox start mybox
@@ -130,32 +131,32 @@ This creates:
 
 ```sh
 # Custom resource limits
-./lightbox create app 10.0.0.2 --mem 512M --cpu 2 --pids 256
+./lightbox create app --mem 512M --cpu 2 --pids 256
 
-# Half a CPU, and no limit on memory
+# Half a CPU, and no limit on memory, at an address of your choosing
 ./lightbox create small 10.0.0.8 --cpu 0.5 --mem max
 
 # User namespaces are planned but not supported yet
-# ./lightbox create sandbox 10.0.0.3 --userns
+# ./lightbox create sandbox --userns
 
 # Read-only rootfs with a data volume
-./lightbox create web 10.0.0.4 --read-only --vol /data/www:/var/www:ro
+./lightbox create web --read-only --vol /data/www:/var/www:ro
 
 # Mount a host file into the container
-./lightbox create app 10.0.0.6 --vol /srv/config/app.conf:/etc/app.conf:ro
+./lightbox create conf --vol /srv/config/app.conf:/etc/app.conf:ro
 
 # Use a different rootfs image
-./lightbox create deb 10.0.0.5 --rootfs /opt/rootfs/debian
+./lightbox create deb --rootfs /opt/rootfs/debian
 
 # Choose the name servers the container asks
-./lightbox create web 10.0.0.7 --dns 9.9.9.9 --dns 149.112.112.112
+./lightbox create resolver --dns 9.9.9.9 --dns 149.112.112.112
 
 # Disable the security sandbox
-./lightbox create dev 10.0.0.6 --privileged
+./lightbox create dev --privileged
 
-# Allow two containers to talk to each other
-./lightbox create api 10.0.0.10 --link db
-./lightbox create db  10.0.0.11
+# Allow two containers to talk to each other; the one linked to comes first
+./lightbox create db
+./lightbox create api --link db
 
 # Run a command as one of the container's users, with a variable set, in a directory
 ./lightbox exec app --user www-data --env MODE=debug --workdir /var/www -- ls -la
@@ -207,7 +208,8 @@ run_dir = /run/lightbox
 # cgroup v2 mount point
 cgroup_root = /sys/fs/cgroup
 
-# Bridge interface and network
+# Bridge interface and network: subnet is <address>/<bits>, with 8 to 30
+# bits, and gw is the bridge's address in it
 bridge = br0
 subnet = 10.0.0.0/24
 gw = 10.0.0.1
@@ -234,6 +236,8 @@ If `lightbox_dir` is set, `rootfs` and `container_dir` are automatically derived
 
 No setting is cut to fit. A directory may be up to 448 characters long, and one that is longer, like a bridge name or an address that is too long, ends every command with the setting named: the first part of such a value would be the name of something else. The file itself may be up to 16 KB.
 
+`subnet` and `gw` are read as one network by `setup`, `create`, `start` and `doctor`: a `gw` that is not in `subnet`, or that is its first or its last address, ends the command with the setting named. The bridge and every container have the prefix of `subnet`. A container's address is one of `subnet` and not its first or its last address, `gw` or another container's; `create` refuses any other, and without one takes the lowest that is free. An address is written as four numbers without a zero in front of any, since programs read `10.0.0.05` differently. `start` refuses a container whose address is not in `subnet` as it is now, after a change of `subnet`. `setup` leaves a bridge that is there as it is: after changing `subnet` or `gw`, delete the bridge while no container runs, with `ip link delete br0`, and run `setup` again.
+
 A `default_*` setting has to be a value its option would take. One that is not is reported as a warning by every command, and only stops the command that would have needed it: `create` for a container that is not given that limit as an option. No container gets a limit that nobody chose.
 
 ### Rootfs resolution order
@@ -249,7 +253,7 @@ A `default_*` setting has to be a value its option would take. One that is not i
 lightbox <command> [args]
 
   setup                         Initialize host networking
-  create <name> <ip> [options]  Create a new container
+  create <name> [<ip>] [options]  Create a new container; without <ip>, the lowest free address
   start  <name> [-t <seconds>]  Start a stopped container
   stop   <name> [-t <seconds>]  Stop a running container
   add-vol <name> <src>:<dst>[:ro]  Add a volume to an existing container

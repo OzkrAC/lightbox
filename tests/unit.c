@@ -58,6 +58,13 @@
  *                                             where an executable memfd is refused
  *   unit relay <ptmx> -- <command...>         what exec does about a command's standard streams,
  *                                             without a container: see below
+ *   unit address <text>                       parse_ipv4: the address as format_ipv4 writes it,
+ *                                             or "refused"
+ *   unit network <subnet> <gw> [<address>...] container_network_parse: "subnet <net>/<bits>
+ *                                             broadcast <b> gateway <g>", or "<setting> <what is
+ *                                             wrong>"; then for each address "<address>: " and
+ *                                             what address_with_prefix gives, or why
+ *                                             address_unusable refuses it
  *   unit nameservers <resolv.conf>            name_servers_of: a line for each, then the count
  *   unit dnslist <text>                       name_servers_listed: the same for the dns setting
  *   unit userspec <text>                      parse_user_spec: "name <n>", "uid <n>",
@@ -645,6 +652,52 @@ int main(int argc, char **argv, char **envp) {
             put_number("score", number);
         else
             put("refused\n");
+        return 0;
+    }
+    if (argc == 3 && streq(argv[1], "address")) {
+        uint32_t addr;
+        char text[IPV4_TEXT_MAX];
+        if (!parse_ipv4(argv[2], &addr)) {
+            put("refused\n");
+            return 0;
+        }
+        format_ipv4(text, addr);
+        put(text);
+        put("\n");
+        return 0;
+    }
+    if (argc >= 4 && streq(argv[1], "network")) {
+        container_network net;
+        const char *setting;
+        const char *wrong = container_network_parse(argv[2], argv[3], &net, &setting);
+        if (wrong) {
+            put(setting);
+            put(" ");
+            put(wrong);
+            put("\n");
+            return 0;
+        }
+        char text[CIDR_TEXT_MAX];
+        subnet_text(text, &net);
+        put("subnet ");
+        put(text);
+        format_ipv4(text, net.broadcast);
+        put(" broadcast ");
+        put(text);
+        format_ipv4(text, net.gateway);
+        put(" gateway ");
+        put(text);
+        put("\n");
+        for (int i = 4; i < argc; i++) {
+            uint32_t addr;
+            put(argv[i]);
+            put(": ");
+            const char *why = parse_ipv4(argv[i], &addr) ? address_unusable(&net, addr) : "not an address";
+            if (!why)
+                address_with_prefix(text, addr, &net);
+            put(why ? why : text);
+            put("\n");
+        }
         return 0;
     }
     if (argc >= 5 && streq(argv[1], "text")) {

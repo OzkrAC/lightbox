@@ -31,7 +31,11 @@
 # cgroup v2 mount point
 # cgroup_root = /sys/fs/cgroup
 
-# Bridge interface and network
+# Bridge interface and network. subnet is <address>/<bits>, with 8 to 30 bits;
+# the bridge and every container have its prefix. gw is the bridge's address
+# in it, neither its first nor its last. A bridge that setup has made keeps
+# its address: after a change, delete it while no container runs and run
+# setup again.
 # bridge = br0
 # subnet = 10.0.0.0/24
 # gw = 10.0.0.1

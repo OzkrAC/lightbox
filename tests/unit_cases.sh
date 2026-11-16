@@ -1535,6 +1535,86 @@ t_numbers_are_strict() {
 
 # What --mem, --pids, --cpu and --oom-score take; the settings default_* and
 # the lines of a .conf are held to the same.
+# An address is four numbers of 0 to 255 and three dots, and nothing else:
+# no shorter form, and no zero in front of a number, which some programs
+# read as octal.
+t_addresses_are_strict() {
+    bad=0
+    expect() { # text, expected
+        got=$("$UNIT" address "$1")
+        [ "$got" = "$2" ] || { echo "'$1': $got, expected $2"; bad=1; }
+    }
+    expect 10.0.0.2 10.0.0.2
+    expect 0.0.0.0 0.0.0.0
+    expect 255.255.255.255 255.255.255.255
+    expect 192.168.100.10 192.168.100.10
+    expect 10.0.0.0 10.0.0.0
+    for text in '' 10 10.0 10.0.0 10.0.0.0.0 10.0.0. .10.0.0 10..0.0 10.0.0.256 10.0.0.1000 256.0.0.1 \
+                '10.0.0.2 ' ' 10.0.0.2' '10.0.0.2
+' 10.0.0.2/24 10.0.0.-2 10.0.0.+2 10.0.0.0x2 1e1.0.0.2 10.0.0.a 10,0,0,2 ::1 \
+                010.0.0.2 10.0.0.02 10.00.0.2 10.0.0.007 00.0.0.0; do
+        expect "$text" refused
+    done
+    return $bad
+}
+
+# subnet and gw are one network, read and checked together: any address of
+# the subnet names it, its prefix is 8 to 30 bits, and the gateway is one of
+# its addresses that an interface can have. On it, a container can have any
+# address but the first, the last and the gateway's, with the subnet's prefix.
+t_network_settings() {
+    bad=0
+    expect() { # subnet, gw, expected
+        got=$("$UNIT" network "$1" "$2")
+        [ "$got" = "$3" ] || { echo "subnet '$1', gw '$2': $got, expected $3"; bad=1; }
+    }
+    expect 10.0.0.0/24 10.0.0.1 'subnet 10.0.0.0/24 broadcast 10.0.0.255 gateway 10.0.0.1'
+    expect 10.9.0.0/16 10.9.0.1 'subnet 10.9.0.0/16 broadcast 10.9.255.255 gateway 10.9.0.1'
+    expect 10.9.5.7/16 10.9.200.1 'subnet 10.9.0.0/16 broadcast 10.9.255.255 gateway 10.9.200.1'
+    expect 10.0.0.0/8 10.255.255.254 'subnet 10.0.0.0/8 broadcast 10.255.255.255 gateway 10.255.255.254'
+    expect 192.168.7.0/30 192.168.7.2 'subnet 192.168.7.0/30 broadcast 192.168.7.3 gateway 192.168.7.2'
+    for subnet in 10.0.0.0 10.0.0.0/ 10.0.0.0/7 10.0.0.0/31 10.0.0.0/32 10.0.0.0/024 10.0.0.0/24x 10.0.0/24 \
+                  /24 10.0.0.0/-24 '10.0.0.0/24 ' 010.0.0.0/24 10.0.0.0//24 ''; do
+        got=$("$UNIT" network "$subnet" 10.0.0.1)
+        case $got in 'subnet is not <address>/<bits>'|'subnet takes 8 to 30 bits after the /') ;;
+            *) echo "subnet '$subnet' was taken: $got"; bad=1 ;; esac
+    done
+    expect 10.0.0.0/24 10.0.1.1 'gw is not in the subnet'
+    expect 10.9.0.0/16 10.8.0.1 'gw is not in the subnet'
+    expect 10.0.0.0/24 10.0.0.0 'gw is the first or the last address of the subnet, which no interface can have'
+    expect 10.0.0.0/24 10.0.0.255 'gw is the first or the last address of the subnet, which no interface can have'
+    expect 10.0.0.0/24 10.0.0.01 'gw is not an IPv4 address'
+    expect 10.0.0.0/24 '' 'gw is not an IPv4 address'
+
+    got=$("$UNIT" network 10.9.0.0/16 10.9.0.1 10.9.5.2 10.9.0.1 10.9.0.0 10.9.255.255 10.10.0.2 10.8.255.255 \
+                  10.9.255.254 10.9.0.2 10.9.0.02 | tail -n +2)
+    want='10.9.5.2: 10.9.5.2/16
+10.9.0.1: it is the gateway'"'"'s, the address of the bridge
+10.9.0.0: it is the address of the subnet itself
+10.9.255.255: it is the broadcast address of the subnet
+10.10.0.2: it is outside the subnet of lightbox.conf
+10.8.255.255: it is outside the subnet of lightbox.conf
+10.9.255.254: 10.9.255.254/16
+10.9.0.2: 10.9.0.2/16
+10.9.0.02: not an address'
+    [ "$got" = "$want" ] || { echo "on 10.9.0.0/16:"; printf '%s\n' "$got"; bad=1; }
+    # a gateway that is not the first address leaves the first to a container
+    got=$("$UNIT" network 10.0.0.0/24 10.0.0.254 10.0.0.1 10.0.0.254 | tail -n +2 | paste -sd'|' -)
+    [ "$got" = "10.0.0.1: 10.0.0.1/24|10.0.0.254: it is the gateway's, the address of the bridge" ] ||
+        { echo "with the gateway at .254: $got"; bad=1; }
+    return $bad
+}
+
+# The prefix of every address an interface is given comes from subnet: no
+# source names one of its own.
+t_no_prefix_of_its_own() {
+    src=$HERE/..
+    if grep -nE '"/[0-9]+"' "$src"/lightbox*.c; then
+        echo "a prefix is written into the source"
+        return 1
+    fi
+}
+
 t_limits() {
     bad=0
     expect() { # kind, text, expected
@@ -2135,6 +2215,9 @@ check 'cmd_start has one way out once it has changed the host'   t_start_has_one
 check 'text is put into a buffer whole or not at all'            t_text_is_whole_or_refused
 check 'a number is digits in its range, and never wraps'         t_numbers_are_strict
 check 'memory, process, CPU and OOM limits are what they say'    t_limits
+check 'an address is four numbers and three dots, and no zero in front' t_addresses_are_strict
+check 'subnet and gw are one network, and an address on it is one a container can have' t_network_settings
+check 'no prefix is written into the source: subnet gives it'      t_no_prefix_of_its_own
 check 'a .conf is read into one structure, whole'                t_config_is_read_whole
 check 'what a .conf leaves out is the default, if that is usable' t_config_defaults
 check 'a .conf with a version is read strictly, by line'         t_config_is_read_strictly

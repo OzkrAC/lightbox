@@ -363,6 +363,39 @@ void store_lock(void);
 
 /* Ends the process, saying which command it was, unless it runs as root. */
 void require_root(const char *command);
+
+/* ─── Addresses ─────────────────────────────────────────────────────────── */
+
+#define IPV4_TEXT_MAX      16       /* "255.255.255.255" and its end */
+#define CIDR_TEXT_MAX      19       /* with "/32" */
+#define SUBNET_PREFIX_MIN  8        /* the widest subnet containers can be on */
+#define SUBNET_PREFIX_MAX  30       /* the narrowest: the bridge and one container */
+
+/* The network containers are on, as the settings subnet and gw give it. */
+typedef struct {
+    uint32_t network;       /* the first address of the subnet, which is nobody's */
+    uint32_t broadcast;     /* the last, which is everybody's */
+    uint32_t gateway;       /* the bridge's */
+    int      prefix;        /* how many bits of an address name the subnet */
+} container_network;
+
+/* Four numbers of 0 to 255 with dots between them and nothing else. A number
+ * with a zero in front of it is refused. */
+[[nodiscard]] bool parse_ipv4(const char *text, uint32_t *addr);
+void format_ipv4(char out[IPV4_TEXT_MAX], uint32_t addr);
+/* NULL, or what is wrong with the setting that *setting then names. */
+const char *container_network_parse(const char *subnet, const char *gw, container_network *net,
+                                    const char **setting);
+/* From lightbox.conf; ends the process when the two settings are no network. */
+void container_network_load_or_die(container_network *net);
+/* NULL, or why no container can have this address on that network. */
+const char *address_unusable(const container_network *net, uint32_t addr);
+/* "<address>/<bits>": an address as an interface of that network is given it */
+void address_with_prefix(char out[CIDR_TEXT_MAX], uint32_t addr, const container_network *net);
+/* "<network>/<bits>": the subnet, however the setting spelled it */
+void subnet_text(char out[CIDR_TEXT_MAX], const container_network *net);
+/* The address a container was created with, as text that parse_ipv4 takes;
+ * -1 when it has none on record, and ip is left as it was. */
 int read_container_ip(const char *name, char *ip, size_t ipsz);
 int update_link_rules(const container_config *config, const char *ip, bool add_rules);
 /* does iptables see what the bridge switches between containers? */

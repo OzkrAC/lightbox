@@ -33,14 +33,158 @@ static int iptables_remove_rule(const char *const check_argv[], const char *cons
     return run_cmd(tool_path_iptables(), del_argv);
 }
 
-int read_container_ip(const char *name, char *ip, size_t ipsz) {
-    char ip_path[MAX_PATH];
-    container_ip_path(ip_path, name);
-    if (read_file(ip_path, ip, ipsz) <= 0) return -1;
-    for (size_t i = 0; ip[i]; i++) {
-        if (ip[i] == '\n') { ip[i] = '\0'; break; }
+/* ─── Addresses ─────────────────────────────────────────────────────────── */
+
+/*
+ * An IPv4 address the one way everything that is handed the text reads it
+ * alike: four numbers and three dots. No shorter form, no sign, no space,
+ * and no zero in front of a number, which some programs read as octal and
+ * others refuse.
+ */
+bool parse_ipv4(const char *text, uint32_t *addr) {
+    if (!text)
+        return false;
+    uint32_t value = 0;
+    const char *p = text;
+    for (int octets = 1;; octets++) {
+        uint32_t octet = 0;
+        int digits = 0;
+        while (*p >= '0' && *p <= '9') {
+            if (digits == 3 || (digits > 0 && octet == 0))
+                return false;       /* too long to be one, or a zero in front */
+            octet = octet * 10u + (uint32_t)(*p - '0');
+            digits++;
+            p++;
+        }
+        if (digits == 0 || octet > 255u)
+            return false;
+        value = (value << 8) | octet;
+        if (octets == 4)
+            break;
+        if (*p != '.')
+            return false;
+        p++;
     }
-    return 0;
+    if (*p != '\0')
+        return false;
+    *addr = value;
+    return true;
+}
+
+void format_ipv4(char out[IPV4_TEXT_MAX], uint32_t addr) {
+    size_t pos = 0;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        pos += (size_t)fmt_int(out + pos, (int)((addr >> shift) & 0xffu));
+        out[pos++] = shift ? '.' : '\0';
+    }
+}
+
+static void with_prefix(char out[CIDR_TEXT_MAX], uint32_t addr, int prefix) {
+    format_ipv4(out, addr);
+    size_t pos = lc_string_length(out);
+    out[pos++] = '/';
+    pos += (size_t)fmt_int(out + pos, prefix);
+    out[pos] = '\0';
+}
+
+void address_with_prefix(char out[CIDR_TEXT_MAX], uint32_t addr, const container_network *net) {
+    with_prefix(out, addr, net->prefix);
+}
+
+void subnet_text(char out[CIDR_TEXT_MAX], const container_network *net) {
+    with_prefix(out, net->network, net->prefix);
+}
+
+/*
+ * The network of the containers from its two settings: subnet, as
+ * <address>/<bits>, and gw, the address the bridge has in it. The address in
+ * subnet may be any of the subnet's. Both are checked here, together, by every
+ * command that puts an address to use: a gateway that is not in the subnet
+ * gives containers that start and reach nothing.
+ */
+const char *container_network_parse(const char *subnet, const char *gw, container_network *net,
+                                    const char **setting) {
+    *setting = "subnet";
+    const char *slash = subnet;
+    while (*slash && *slash != '/')
+        slash++;
+    size_t len = (size_t)(slash - subnet);
+    char address[IPV4_TEXT_MAX];
+    uint32_t base;
+    if (*slash != '/' || len >= sizeof(address))
+        return "is not <address>/<bits>";
+    lc_bytes_copy(address, subnet, len);
+    address[len] = '\0';
+    if (!parse_ipv4(address, &base))
+        return "is not <address>/<bits>";
+    int64_t bits;
+    if (slash[1] == '0' || !parse_number(slash + 1, SUBNET_PREFIX_MIN, SUBNET_PREFIX_MAX, &bits))
+        return "takes " STRINGIFY(SUBNET_PREFIX_MIN) " to " STRINGIFY(SUBNET_PREFIX_MAX) " bits after the /";
+
+    uint32_t mask = 0xffffffffu << (32 - (int)bits);
+    net->prefix = (int)bits;
+    net->network = base & mask;
+    net->broadcast = net->network | ~mask;
+
+    *setting = "gw";
+    if (!parse_ipv4(gw, &net->gateway))
+        return "is not an IPv4 address";
+    if ((net->gateway & mask) != net->network)
+        return "is not in the subnet";
+    if (net->gateway == net->network || net->gateway == net->broadcast)
+        return "is the first or the last address of the subnet, which no interface can have";
+    return NULL;
+}
+
+void container_network_load_or_die(container_network *net) {
+    const char *setting;
+    const char *wrong = container_network_parse(cfg_global.subnet, cfg_global.gw, net, &setting);
+    if (!wrong)
+        return;
+    print_str(STDERR, "Error: ");
+    print_str(STDERR, setting);
+    print_str(STDERR, " in lightbox.conf ");
+    print_str(STDERR, wrong);
+    print_str(STDERR, ": ");
+    print_str(STDERR, streq(setting, "gw") ? cfg_global.gw : cfg_global.subnet);
+    if (streq(setting, "gw")) {
+        print_str(STDERR, " (subnet = ");
+        print_str(STDERR, cfg_global.subnet);
+        print_str(STDERR, ")");
+    }
+    lc_print_char(STDERR, '\n');
+    lc_kernel_exit(1);
+}
+
+const char *address_unusable(const container_network *net, uint32_t addr) {
+    if (addr < net->network || addr > net->broadcast)
+        return "it is outside the subnet of lightbox.conf";
+    if (addr == net->network)
+        return "it is the address of the subnet itself";
+    if (addr == net->broadcast)
+        return "it is the broadcast address of the subnet";
+    if (addr == net->gateway)
+        return "it is the gateway's, the address of the bridge";
+    return NULL;
+}
+
+/*
+ * What is on record is used as it is read, in rules and in commands, so it
+ * is an address or it is not read: a file that is longer than one, or that
+ * holds anything beside it, gives nothing.
+ */
+int read_container_ip(const char *name, char *ip, size_t ipsz) {
+    char ip_path[MAX_PATH], text[IPV4_TEXT_MAX + 2];
+    container_ip_path(ip_path, name);
+    int n = read_file(ip_path, text, sizeof(text));
+    if (n <= 0)
+        return -1;
+    if (text[n - 1] == '\n')
+        text[n - 1] = '\0';
+    uint32_t addr;
+    if (!parse_ipv4(text, &addr) || lc_string_length(text) >= ipsz)
+        return -1;
+    return str_copy(ip, text, ipsz) ? 0 : -1;
 }
 
 /*
@@ -199,8 +343,12 @@ void cmd_setup(void) {
     require_tool("ip", tool_path_ip());
     require_tool("iptables", tool_path_iptables());
 
-    /* Before anything on the host changes: a host without cgroup v2 cannot
-     * run containers, so setup stops here and leaves no bridge behind. */
+    /* Before anything on the host changes: the bridge gets an address of a
+     * network that the settings do describe, */
+    container_network net;
+    container_network_load_or_die(&net);
+    /* and a host without cgroup v2 cannot run containers, so setup stops
+     * here and leaves no bridge behind. */
     ensure_cgroup2_root();
 
     print_str(STDOUT, "Setting up host networking...\n");
@@ -221,12 +369,8 @@ void cmd_setup(void) {
             print_str(STDOUT, "...\n");
             const char *add[] = { "ip", "link", "add", "name", cfg_global.bridge, "type", "bridge", NULL };
             require_cmd(tool_path_ip(), add);
-            char gw_cidr[20];
-            bool cut = false;
-            size_t pos = str_append(gw_cidr, 0, cfg_global.gw, sizeof(gw_cidr), &cut);
-            str_append(gw_cidr, pos, "/24", sizeof(gw_cidr), &cut);
-            if (cut)
-                die2("Error: gw in lightbox.conf is not an address: ", cfg_global.gw);
+            char gw_cidr[CIDR_TEXT_MAX];
+            address_with_prefix(gw_cidr, net.gateway, &net);
             const char *addr[] = { "ip", "addr", "add", gw_cidr, "dev", cfg_global.bridge, NULL };
             require_cmd(tool_path_ip(), addr);
             const char *up[] = { "ip", "link", "set", cfg_global.bridge, "up", NULL };
@@ -247,10 +391,12 @@ void cmd_setup(void) {
     lc_print_char(STDOUT, '\n');
 
     {
+        char subnet[CIDR_TEXT_MAX];
+        subnet_text(subnet, &net);
         const char *chk[] = { "iptables", "-t", "nat", "-C", "POSTROUTING",
-                        "-s", cfg_global.subnet, "-o", wan_if, "-j", "MASQUERADE", NULL };
+                        "-s", subnet, "-o", wan_if, "-j", "MASQUERADE", NULL };
         const char *add[] = { "iptables", "-t", "nat", "-A", "POSTROUTING",
-                        "-s", cfg_global.subnet, "-o", wan_if, "-j", "MASQUERADE", NULL };
+                        "-s", subnet, "-o", wan_if, "-j", "MASQUERADE", NULL };
         iptables_idempotent(chk, add);
     }
 

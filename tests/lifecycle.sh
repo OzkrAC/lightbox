@@ -64,6 +64,7 @@ esac
 # ─── Names used by every stage ──────────────────────────────────────────────
 
 BR=lbt0                     # the bridge; not br0, in case a namespace ever fails to be private
+WIDE_BR=lbt16               # the bridge of the case with a /16
 SUBNET=10.199.0.0/24
 NETP=10.199.0
 GW=10.199.0.1
@@ -234,6 +235,20 @@ t_setup() {
 }
 
 firewall_rules() { iptables-save | grep -v '^#' | sed 's/\[[0-9]*:[0-9]*\]//'; }
+
+# setup reads subnet and gw as one network before it changes anything: a
+# gateway outside the subnet ends it, with no bridge made and no rule added.
+t_setup_refuses_a_gateway_outside() {
+    mkdir -p "$T/gwout/home/.config/lightbox"
+    sed -e 's#^bridge = .*#bridge = lbt9#' -e 's#^gw = .*#gw = 10.198.0.1#' "$HOME/.config/lightbox/lightbox.conf" \
+        > "$T/gwout/home/.config/lightbox/lightbox.conf"
+    rules=$(firewall_rules)
+    said=$(HOME="$T/gwout/home" timeout -k 5 60 "$LB" setup 2>&1) && { echo "setup succeeded"; return 1; }
+    printf '%s\n' "$said"
+    no_link lbt9 || { echo "a bridge was made before the refusal"; return 1; }
+    [ "$rules" = "$(firewall_rules)" ] || { echo "the firewall rules changed:"; firewall_rules; return 1; }
+    case $said in *'gw in lightbox.conf is not in the subnet'*) ;; *) return 1 ;; esac
+}
 
 t_setup_again() {
     mounts=$(cat /proc/self/mountinfo)
@@ -1611,6 +1626,40 @@ t_reaches_outside() {
     reaches tonat "$OUTSIDE"
 }
 
+# A subnet that is not a /24: the bridge, the address translation and the
+# container's interface have its prefix, and a container at an address
+# outside the gateway's /24 reaches the gateway. lightbox.conf here is the
+# suite's but for the bridge and the network.
+t_wide_subnet() {
+    mkdir -p "$T/wide/home/.config/lightbox"
+    sed -e "s#^bridge = .*#bridge = $WIDE_BR#" -e 's#^subnet = .*#subnet = 10.9.0.0/16#' -e 's#^gw = .*#gw = 10.9.0.1#' \
+        "$HOME/.config/lightbox/lightbox.conf" > "$T/wide/home/.config/lightbox/lightbox.conf"
+    suite_home=$HOME
+    export HOME="$T/wide/home"
+    lb setup >"$OUT/wide.setup" 2>&1 || { cat "$OUT/wide.setup"; return 1; }
+    ip -o -4 addr show dev "$WIDE_BR"
+    ip -o -4 addr show dev "$WIDE_BR" | grep -q ' 10\.9\.0\.1/16 ' || { echo "the bridge does not have 10.9.0.1/16"; return 1; }
+    iptables -t nat -C POSTROUTING -s 10.9.0.0/16 -o "$WAN" -j MASQUERADE || { echo "no address translation for 10.9.0.0/16"; return 1; }
+    lb create wide 10.9.5.2 >"$OUT/wide.create" 2>&1 || { cat "$OUT/wide.create"; return 1; }
+    start wide || return 1
+    said=$(sh_in wide 'ip addr; ip route')
+    printf '%s\n' "$said"
+    printf '%s\n' "$said" | grep -q 'inet 10\.9\.5\.2/16' && printf '%s\n' "$said" | grep -q '^default via 10\.9\.0\.1 ' ||
+        { echo "the container does not have 10.9.5.2/16 and a route by 10.9.0.1"; return 1; }
+    if [ -e "$T/have_nc" ]; then
+        reaches wide 10.9.0.1 || return 1
+    else
+        echo "this image has no nc: whether the gateway answers is not tried"
+    fi
+    lb stop wide >/dev/null || return 1
+    # on the suite's network that address is no container's, and start says so
+    export HOME="$suite_home"
+    said=$(lb start wide 2>&1) && { echo "a container outside the subnet was started"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *'it is outside the subnet of lightbox.conf'*) ;; *) return 1 ;; esac
+    nothing_left wide
+}
+
 t_isolated_when_filtered() {
     need_nc || return 77
     brnf 1 || { echo "br_netfilter is not loaded, so bridged traffic cannot be filtered here"; return 77; }
@@ -1808,7 +1857,7 @@ teardown() {
     for d in "$CG"/*/; do
         [ -d "$d" ] && kill_cgroup "${d%/}"
     done
-    for p in $(ip -o link show | awk -F': ' '{ sub(/@.*/, "", $2); print $2 }' | grep -E '^(vb-|ve-|lbt-foreign$)'); do
+    for p in $(ip -o link show | awk -F': ' '{ sub(/@.*/, "", $2); print $2 }' | grep -E "^(vb-|ve-|lbt-foreign\$|$WIDE_BR\$)"); do
         ip link delete "$p"
     done
     [ -s "$T/firewall" ] && iptables-restore < "$T/firewall"
@@ -1880,6 +1929,7 @@ if [ "$MODE" = inside ]; then
 
     check 'setup again changes no mount and adds no rule'                 t_setup_again
     check 'setup refuses a cgroup_root that is not cgroup v2'             t_setup_refuses_other_cgroup_root
+    check 'setup refuses a gateway outside the subnet, and changes nothing' t_setup_refuses_a_gateway_outside
     check 'doctor finds nothing missing'                                  t_doctor
 
     check 'create, start, exec, stop and rm'                              t_lifecycle
@@ -1969,6 +2019,7 @@ if [ "$MODE" = inside ]; then
     check 'a container has loopback, its address and a default route'     t_network_inside
     check 'a container reaches the bridge address'                        t_reaches_gateway
     check 'a container reaches an outside address through address translation' t_reaches_outside
+    check 'on a /16, a container far from the gateway has its prefix and reaches it' t_wide_subnet
     check 'containers cannot reach each other when bridged traffic is filtered' t_isolated_when_filtered
     check 'containers cannot reach each other without br_netfilter'      t_isolated_when_not_filtered
     check 'a container with a link is refused where nothing filters bridged traffic' t_link_needs_filtering
