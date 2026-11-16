@@ -643,6 +643,36 @@ t_conf_from_before_is_read() {
 # A default_* setting is held to what the option takes. One that is not a
 # limit is said by every command and stops only the one that would have had
 # to use it: no container gets a limit that nobody chose.
+# The four firewall settings, as Docker's daemon.json has them: doctor shows
+# what they are; one that is not true or false is said, and the built-in
+# value is kept, so that a mistake does not open the firewall.
+t_firewall_settings() {
+    report=$(lb doctor 2>&1)
+    printf '%s\n' "$report" | grep -E '^(firewall|ip_forward|ip_forward_no_drop|ip_masq):'
+    printf '%s\n' "$report" | grep -qx 'firewall: true' && printf '%s\n' "$report" | grep -qx 'ip_forward: true' &&
+    printf '%s\n' "$report" | grep -qx 'ip_forward_no_drop: false' && printf '%s\n' "$report" | grep -qx 'ip_masq: true' ||
+        { echo "the built-in values are not what Docker's are"; return 1; }
+    cp "$CONF" "$W/conf.good"
+    printf 'firewall = false\nip_forward = false\nip_forward_no_drop = true\n' >> "$CONF"
+    report=$(lb doctor 2>&1)
+    printf '%s\n' "$report" | grep -qx 'firewall: false (lightbox makes no firewall rules)' &&
+    printf '%s\n' "$report" | grep -qx 'ip_forward: false' && printf '%s\n' "$report" | grep -qx 'ip_forward_no_drop: true' &&
+    printf '%s\n' "$report" | grep -qx 'ip_masq: true' || { echo "the settings were not taken"; return 1; }
+    { cat "$W/conf.good"; echo 'ip_masq = false'; } > "$CONF"
+    report=$(lb doctor 2>&1)
+    printf '%s\n' "$report" | grep -qx 'ip_masq: false' && printf '%s\n' "$report" | grep -qx 'ip_forward: true' &&
+    printf '%s\n' "$report" | grep -qx 'firewall: true' || { echo "ip_masq = false was not taken by itself"; return 1; }
+    cp "$W/conf.good" "$CONF"
+    sed -i -e '/^firewall = /d' -e '/^ip_forward/d' -e '/^ip_masq = /d' "$CONF"
+    printf 'firewall = no\nip_forward_no_drop = yes\nip_masq = 0\n' >> "$CONF"
+    report=$(lb doctor 2>&1)
+    printf '%s\n' "$report" | grep '^Warning'
+    printf '%s\n' "$report" | grep -qx 'Warning: firewall in lightbox.conf is not true or false: no; using true' &&
+    printf '%s\n' "$report" | grep -qx 'Warning: ip_forward_no_drop in lightbox.conf is not true or false: yes; using false' &&
+    printf '%s\n' "$report" | grep -qx 'Warning: ip_masq in lightbox.conf is not true or false: 0; using true' &&
+    printf '%s\n' "$report" | grep -qx 'firewall: true' && printf '%s\n' "$report" | grep -qx 'ip_forward_no_drop: false'
+}
+
 t_default_settings_are_checked() {
     printf 'default_mem = 64M\ndefault_pids = 32\ndefault_cpu = 0.5\ndefault_oom = -200\n' >> "$CONF"
     lb create web 10.0.0.2 || return 1
@@ -1431,6 +1461,7 @@ check 'an address with a zero in front of a number is refused' t_address_with_le
 check 'two creates at once get two addresses'                 t_creates_at_once_get_two_addresses
 check '--swap takes what --mem does and 0, and is none unless given' t_swap_option
 check '--io-max is a line of io.max for a whole disk that is there' t_io_max_option
+check 'the firewall settings are Docker'"'"'s, and a wrong one keeps the built-in' t_firewall_settings
 check 'ls --json stays JSON next to an odd directory name'    t_ls_json_escapes_names
 check 'ls --json escapes whatever a record holds'             t_ls_json_escapes_values
 check 'ls --json gives pid as null for a stopped container'   t_ls_json_pid_is_null_when_stopped

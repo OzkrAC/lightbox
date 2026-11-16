@@ -25,6 +25,11 @@ Not tagged yet, and not complete: the part of Phase 5 that is written so far.
 - **`start` refuses a container whose address is not in `subnet`**, as after a change of `subnet`. It would have started and reached nothing.
 - **A container has no swap unless `--swap` gives it some**, containers made before included. Past its memory limit a process is killed instead of going on in swap, and with `memory.oom.group` the kernel ends the whole container, which the next `start`, `stop` or `rm` clears away. Give a container that needs swap `--swap`, by creating it again or by adding `swap=<size>` to its `.conf`.
 - **The `io` line of a `.conf` is checked**: `<major>:<minor>` and one or more of `rbps`, `wbps`, `riops` and `wiops`, each `=<number>` or `=max`, without a zero in front of a number. One that is not is an error that names the line. It could only have come from an edit by hand.
+- **lightbox's firewall rules are in chains of its own**, as Docker's are: `LIGHTBOX-FORWARD`, `LIGHTBOX-LINKS` with an `LB-<name>` chain for each running container with links, and `LIGHTBOX-POSTROUTING`, reached from the top of `FORWARD` and `POSTROUTING`. Run `setup` after the upgrade: it makes them and takes out the rules that earlier versions put straight into `FORWARD` and `POSTROUTING`. A container with links that is running through the upgrade gets its link rules back when it is started again. Scripts that looked for lightbox's rules in `FORWARD` have to look in these chains.
+- **When `setup` turns IPv4 forwarding on, the `FORWARD` policy becomes DROP**, as Docker does it: the host forwards what a rule accepts and nothing else. A host that had forwarding on keeps its policy. `ip_forward_no_drop = true` in `lightbox.conf` leaves the policy in any case.
+- **Rules of the host's that are to decide before lightbox's go in `LIGHTBOX-USER`**, like Docker's `DOCKER-USER`. lightbox makes the chain and never changes it.
+- **Masquerading no longer names the interface of the default route.** What leaves by any interface but the bridge is masqueraded, and forwarded out of the bridge: a host whose default route moves to another interface, or that reaches some networks by another one, does not cut its containers off. `setup` no longer fails on a host without a default route.
+- **`setup` fills `LIGHTBOX-FORWARD` and `LIGHTBOX-POSTROUTING` for the bridge of its `lightbox.conf`**: one host has one lightbox network. Before, a second `lightbox.conf` with another bridge added rules beside the first one's.
 - **A container's `.conf` that lightbox cannot use is an error that names the file and the line**, for `start`, `exec`, `inspect`, `add-vol` and `rm-vol`. `stop` still stops such a container, says that it could not know the container's links, and exits with 1. `rm` removes it as before.
 
 ### Added
@@ -36,6 +41,7 @@ Not tagged yet, and not complete: the part of Phase 5 that is written so far.
 - **`--swap <limit>`** lets a container use swap: `0`, a size as for `--mem`, or `max`.
 - **`--io-max "<major>:<minor> <key>=<value>..."`** gives a container an I/O limit for one whole disk, as `io.max` takes it. Before, only an edit of the `.conf` could. `create` refuses a device that the host does not have, and a partition, for which the kernel takes no limit.
 - `inspect` shows `swap` and `io`.
+- **Four firewall settings in `lightbox.conf`, those of Docker's `daemon.json`**: `firewall` (Docker's `iptables`), `ip_forward`, `ip_forward_no_drop` and `ip_masq`, each `true` or `false`. `firewall = false` makes no rules at all, and then a container with links is not started. `doctor` shows the four.
 - **`lightbox rm-vol <name> <dst>`** takes the volume at a destination out of a container's configuration. Like `add-vol`, it takes effect at the next start.
 - A container's `.conf` begins with `version=1`. Containers made by earlier versions keep working as they are, and get the line the next time `add-vol` or `rm-vol` writes the file.
 
@@ -51,6 +57,9 @@ Not tagged yet, and not complete: the part of Phase 5 that is written so far.
 - After a reboot, containers that had been running were shown as `exited`, from records that were kept on disk. They are shown as `stopped`.
 - `start` enabled the `memory`, `pids`, `cpu` and `io` controllers in one write, which failed as a whole when any one was missing: on a host without `io` no container started, I/O limit or not. Each is enabled on its own, and a missing one stops only a container whose limits need it.
 - A command that `exec` ran had the OOM score of whoever ran `exec`, not the container's.
+- A link to a container that was created after the one with the link never applied: the rule named the other's address, which it did not have yet. Link rules name the two ports on the bridge, and hold whichever of the two starts first.
+- A container's link rules stayed when it ended without a stop, and `stop` left them when the container's `.conf` could not be read. They are in a chain of the container's own, which `stop`, `rm` and the clearing away of a dead container remove without reading the `.conf`.
+- A start put in each link rule with two `iptables` processes, a check and an insert, for each direction of each link. It runs `iptables-restore` once.
 
 ## 0.4.0
 

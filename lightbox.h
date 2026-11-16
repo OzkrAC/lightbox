@@ -62,6 +62,11 @@ typedef struct {
     int  start_timeout;     /* seconds start waits for the init hook; 0: not at all */
     int  stop_timeout;      /* seconds a container gets to end when it is asked to */
     char dns[64];           /* name servers for new containers, as written; empty: the host's */
+    /* The firewall, as Docker's daemon.json has these: */
+    bool firewall;              /* lightbox makes its rules (Docker: "iptables") */
+    bool ip_forward;            /* setup turns IPv4 forwarding on ("ip-forward") */
+    bool ip_forward_no_drop;    /* and then leaves the FORWARD policy as it is ("ip-forward-no-drop") */
+    bool ip_masq;               /* what leaves by anything but the bridge is masqueraded ("ip-masq") */
 } global_config;
 
 extern global_config cfg_global;
@@ -259,6 +264,9 @@ extern const char *const TOOL_ENV[];   /* what tools run with: a fixed PATH */
 [[nodiscard]] int run_cmd_env(const char *prog, const char *const argv[], const char *const envp[]);
 /* the same with the program's stdout collected in out as a string, cut to fit */
 [[nodiscard]] int run_cmd_capture(const char *prog, const char *const argv[], char *out, size_t outsz);
+/* the same with input as the program's standard input, at most RUN_INPUT_MAX bytes of it */
+#define RUN_INPUT_MAX 32768
+[[nodiscard]] int run_cmd_input(const char *prog, const char *const argv[], const char *input, bool quiet);
 
 lc_sysret exec_program(const char *prog, const char *const argv[], const char *const envp[]);
 [[nodiscard]] int wait_child(int32_t pid, int32_t *status);
@@ -272,6 +280,7 @@ void require_mount(const char *source, const char *target,
                    const char *fstype, uint64_t flags, const char *data);
 const char *tool_path_ip(void);
 const char *tool_path_iptables(void);
+const char *tool_path_iptables_restore(void);
 const char *tool_path_cp(void);
 const char *tool_path_chown(void);
 const char *tool_path_rm(void);
@@ -302,6 +311,9 @@ int list_containers(char names[][NAME_MAX_LEN + 1], int max, bool *more);
 void container_dir_path(char *buf, const char *name);
 void container_root(char *buf, const char *name);
 void container_ip_path(char *buf, const char *name);
+/* <run_dir>/<name>/firewall: there while the container may have link rules.
+ * container_forget_run leaves it, and so its directory, in place. */
+void container_firewall_path(char *buf, const char *name);
 void container_conf_path(char *buf, const char *name);
 void container_creating_path(char *buf, const char *name);
 /* what the container's init, its hook and its services write to stdout and stderr */
@@ -402,7 +414,32 @@ void subnet_text(char out[CIDR_TEXT_MAX], const container_network *net);
 /* The address a container was created with, as text that parse_ipv4 takes;
  * -1 when it has none on record, and ip is left as it was. */
 int read_container_ip(const char *name, char *ip, size_t ipsz);
-int update_link_rules(const container_config *config, const char *ip, bool add_rules);
+
+/* ─── The firewall ──────────────────────────────────────────────────────── */
+
+/*
+ * lightbox's rules are in chains of its own, as Docker's are, so that they
+ * come before a host firewall's and are taken out whole:
+ *
+ *   filter  FORWARD -> LIGHTBOX-USER       the host's own rules, which lightbox never changes
+ *           FORWARD -> LIGHTBOX-FORWARD    what the bridge forwards
+ *           LIGHTBOX-FORWARD -> LIGHTBOX-LINKS -> LB-<name>, one chain for each running
+ *                                          container with links
+ *   nat     POSTROUTING -> LIGHTBOX-POSTROUTING
+ */
+/* The two ends of a container's interface, as they are called on the host
+ * before one of them is moved: vb-<name> stays on the bridge, ve-<name> goes
+ * into the container. 16 bytes each, which a name with three more fits. */
+void veth_names(const char *name, char host[16], char cont[16]);
+#define FIREWALL_TEXT_MAX 4096
+/* What iptables-restore is given: for a container's links, or for setup.
+ * False when it does not fit. */
+[[nodiscard]] bool firewall_links_text(const char *name, const container_config *config, char *out, size_t outsz);
+[[nodiscard]] bool firewall_setup_text(const container_network *net, char *out, size_t outsz);
+/* A container's link rules put in, with one process: 0, or -1 once said. */
+int firewall_add_links(const char *name, const container_config *config);
+/* What firewall_add_links put in, taken out: 0 when nothing of it is left. */
+int firewall_remove_links(const char *name);
 /* does iptables see what the bridge switches between containers? */
 bool bridge_traffic_is_filtered(void);
 

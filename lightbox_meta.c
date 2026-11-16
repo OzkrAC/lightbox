@@ -280,6 +280,7 @@ void cmd_doctor(void) {
     } bins[] = {
         { "bin.ip", tool_path_ip },
         { "bin.iptables", tool_path_iptables },
+        { "bin.iptables-restore", tool_path_iptables_restore },
         { "bin.cp", tool_path_cp },
         { "bin.chown", tool_path_chown },
         { "bin.rm", tool_path_rm },
@@ -315,6 +316,10 @@ void cmd_doctor(void) {
             print_kv("network", subnet);
         }
     }
+    print_kv("firewall", cfg_global.firewall ? "true" : "false (lightbox makes no firewall rules)");
+    print_kv("ip_forward", cfg_global.ip_forward ? "true" : "false");
+    print_kv("ip_forward_no_drop", cfg_global.ip_forward_no_drop ? "true" : "false");
+    print_kv("ip_masq", cfg_global.ip_masq ? "true" : "false");
     /* told, not counted as missing: only a container with links depends on it */
     print_kv("bridge_filtering", bridge_traffic_is_filtered()
              ? "yes" : "no (a container with --link will not start; it needs br_netfilter)");

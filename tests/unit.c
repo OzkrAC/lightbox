@@ -8,6 +8,12 @@
  *   unit run     <program> [args...]          run_cmd
  *   unit quiet   <program> [args...]          run_cmd_quiet
  *   unit capture <size> <program> [args...]   run_cmd_capture, into <size> bytes
+ *   unit input   <text> <program> [args...]   run_cmd_input, with <text> as its input; then
+ *                                             "left open <n>": descriptors it left open
+ *   unit firewall links <name> [<link>...]    firewall_links_text for a container with those links;
+ *                                             links-into-64 gives it 64 bytes to write into
+ *   unit firewall setup <subnet> <gw> <bridge> <ip_masq>
+ *                                             firewall_setup_text for that network
  *   unit status  <wait status>                exit_code_from_status
  *   unit mount   <source> <target> <fstype> <flags> <data>     do_mount
  *   unit mkdirs  <path>                       make_dirs
@@ -139,6 +145,34 @@
 #undef main
 
 static void put(const char *s) { print_str(STDOUT, s); }
+
+/* How many descriptors this process has open, from /proc/self/fd: its
+ * entries, as getdents64 gives them, but for "." and "..". The record's
+ * length is at byte 16 and its name at 19. */
+static int open_descriptors(void) {
+    enum { RECLEN_AT = 16, NAME_AT = 19 };
+    lc_sysret fd = lc_kernel_open_file("/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+    if (fd < 0)
+        return -1;
+    char buf[4096];
+    int count = 0;
+    for (;;) {
+        lc_sysret n = lc_kernel_read_directory((int32_t)fd, buf, sizeof(buf));
+        if (n <= 0)
+            break;
+        for (lc_sysret pos = 0; pos < n; ) {
+            uint16_t reclen;
+            lc_bytes_copy(&reclen, buf + pos + RECLEN_AT, sizeof(reclen));
+            if (reclen == 0)
+                break;
+            if (buf[pos + NAME_AT] != '.')
+                count++;
+            pos += reclen;
+        }
+    }
+    lc_kernel_close_file((int32_t)fd);
+    return count;
+}
 
 static void put_result(int result) {
     char buf[16];
@@ -585,6 +619,37 @@ int main(int argc, char **argv, char **envp) {
         put("captured ");
         put(captured);
         put("\n");
+        return 0;
+    }
+    if (argc >= 4 && streq(argv[1], "input")) {
+        int before = open_descriptors();
+        put_result(run_cmd_input(argv[3], (const char *const *)(argv + 3), argv[2], false));
+        put_number("left open", open_descriptors() - before);
+        return 0;
+    }
+    if (argc >= 4 && streq(argv[1], "firewall")) {
+        static char text[FIREWALL_TEXT_MAX];
+        static container_config config;
+        bool fits = false;
+        cfg_global_init();
+        if (streq(argv[2], "links") || streq(argv[2], "links-into-64")) {
+            container_config_init(&config);
+            for (int i = 4; i < argc && config.nlinks < MAX_LINKS; i++)
+                if (!str_copy(config.links[config.nlinks++], argv[i], sizeof(config.links[0])))
+                    die("unit: a link that is too long");
+            fits = firewall_links_text(argv[3], &config, text, streq(argv[2], "links") ? sizeof(text) : 64);
+        } else if (streq(argv[2], "setup") && argc == 7) {
+            container_network net;
+            const char *setting;
+            if (container_network_parse(argv[3], argv[4], &net, &setting) != NULL ||
+                !str_copy(cfg_global.bridge, argv[5], sizeof(cfg_global.bridge)))
+                die("unit: firewall setup <subnet> <gw> <bridge> <true|false>");
+            cfg_global.ip_masq = streq(argv[6], "true");
+            fits = firewall_setup_text(&net, text, sizeof(text));
+        } else {
+            die("unit: firewall links <name> [<link>...] | firewall setup <subnet> <gw> <bridge> <true|false>");
+        }
+        put(fits ? text : "too long\n");
         return 0;
     }
     if (argc == 3 && streq(argv[1], "status")) {

@@ -46,6 +46,24 @@ void cfg_global_init(void) {
     cfg_global.start_timeout = START_TIMEOUT_DEFAULT;
     cfg_global.stop_timeout = STOP_TIMEOUT_DEFAULT;
     cfg_global.dns[0] = '\0';
+    cfg_global.firewall = true;
+    cfg_global.ip_forward = true;
+    cfg_global.ip_forward_no_drop = false;
+    cfg_global.ip_masq = true;
+}
+
+/* true or false. Anything else is said, and the built-in value kept: a
+ * firewall setting that is wrong does not get to open the firewall. */
+static void cfg_set_flag(const char *key, const char *val, bool *setting) {
+    if (streq(val, "true") || streq(val, "false")) {
+        *setting = val[0] == 't';
+        return;
+    }
+    print_str(STDERR, "Warning: ");
+    print_str(STDERR, key);
+    print_str(STDERR, " in lightbox.conf is not true or false: ");
+    print_str(STDERR, val);
+    print_str(STDERR, *setting ? "; using true\n" : "; using false\n");
 }
 
 /* A setting in seconds. One that cannot be read must not stop every command,
@@ -147,6 +165,14 @@ static void cfg_set(const char *key, const char *val, bool derived[3]) {
         cfg_set_seconds(key, val, &cfg_global.start_timeout);
     } else if (streq(key, "stop_timeout")) {
         cfg_set_seconds(key, val, &cfg_global.stop_timeout);
+    } else if (streq(key, "firewall")) {
+        cfg_set_flag(key, val, &cfg_global.firewall);
+    } else if (streq(key, "ip_forward")) {
+        cfg_set_flag(key, val, &cfg_global.ip_forward);
+    } else if (streq(key, "ip_forward_no_drop")) {
+        cfg_set_flag(key, val, &cfg_global.ip_forward_no_drop);
+    } else if (streq(key, "ip_masq")) {
+        cfg_set_flag(key, val, &cfg_global.ip_masq);
     } else if (streq(key, "dns")) {
         /* create reads it, and says so if it is not a list of addresses */
         cfg_set_text(key, val, cfg_global.dns, sizeof(cfg_global.dns));

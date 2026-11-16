@@ -95,9 +95,8 @@ Run once to create the bridge, enable NAT, and mount cgroups. Safe to re-run (id
 
 This creates:
 - A `br0` bridge with the address `gw` and the prefix of `subnet`, `10.0.0.1/24` unless `lightbox.conf` sets them
-- iptables NAT masquerade for outbound traffic
-- FORWARD rules for container-to-WAN communication
-- A DROP rule for inter-container traffic (isolation by default, together with isolated bridge ports)
+- lightbox's firewall chains, reached from the top of `FORWARD` and `POSTROUTING` (see [Firewall](#firewall))
+- IPv4 forwarding, if it was off, with the `FORWARD` policy set to DROP as Docker does
 - cgroup v2 mount at `/sys/fs/cgroup`
 
 ### 3. Create, start, and use containers
@@ -230,6 +229,16 @@ stop_timeout = 10
 # Name servers for new containers, up to three. Without this they are the ones
 # this host asks, or 1.1.1.1 and 8.8.8.8 if those are of no use to a container
 dns = 9.9.9.9, 149.112.112.112
+
+# The firewall, as Docker's daemon.json has it (see Firewall below): whether
+# lightbox makes its rules ("iptables"), whether setup turns IPv4 forwarding on
+# ("ip-forward"), whether it then leaves the FORWARD policy instead of setting
+# it to DROP ("ip-forward-no-drop"), and whether containers are masqueraded
+# ("ip-masq")
+firewall = true
+ip_forward = true
+ip_forward_no_drop = false
+ip_masq = true
 ```
 
 If `lightbox_dir` is set, `rootfs` and `container_dir` are automatically derived from it (e.g., `rootfs = <lightbox_dir>/rootfs`) unless explicitly overridden.
@@ -239,6 +248,26 @@ No setting is cut to fit. A directory may be up to 448 characters long, and one 
 `subnet` and `gw` are read as one network by `setup`, `create`, `start` and `doctor`: a `gw` that is not in `subnet`, or that is its first or its last address, ends the command with the setting named. The bridge and every container have the prefix of `subnet`. A container's address is one of `subnet` and not its first or its last address, `gw` or another container's; `create` refuses any other, and without one takes the lowest that is free. An address is written as four numbers without a zero in front of any, since programs read `10.0.0.05` differently. `start` refuses a container whose address is not in `subnet` as it is now, after a change of `subnet`. `setup` leaves a bridge that is there as it is: after changing `subnet` or `gw`, delete the bridge while no container runs, with `ip link delete br0`, and run `setup` again.
 
 A `default_*` setting has to be a value its option would take. One that is not is reported as a warning by every command, and only stops the command that would have needed it: `create` for a container that is not given that limit as an option. No container gets a limit that nobody chose.
+
+### Firewall
+
+lightbox keeps its iptables rules in chains of its own, as Docker does with its iptables backend, and `setup` jumps to them from the top of the host's chains. They come before the host firewall's own rules and its policy, so a host whose firewall drops forwarded traffic, as Docker, ufw and firewalld set up, still forwards what the bridge needs:
+
+| Chain | Reached from | What is in it |
+|-------|--------------|---------------|
+| `LIGHTBOX-USER` | the top of `FORWARD` | This host's rules that are to decide before lightbox's, like Docker's `DOCKER-USER`. lightbox makes it and never changes it |
+| `LIGHTBOX-FORWARD` | `FORWARD`, after `LIGHTBOX-USER` | Between two ports of the bridge, what a link allows and nothing else; out of the bridge by any interface, and back what belongs to such a connection |
+| `LIGHTBOX-LINKS` | `LIGHTBOX-FORWARD` | A jump to `LB-<name>` for each running container with links, whose rules name the two ports of each link |
+| `LIGHTBOX-POSTROUTING` | the top of `POSTROUTING` (nat) | Masquerading of `subnet` for what leaves by any interface but the bridge |
+
+The settings are Docker's:
+
+- `firewall = false` (Docker's `iptables`): lightbox makes no firewall rules at all, and a container with links is not started, since nothing would keep it to its links. Without masquerading, containers do not reach beyond the host unless the host routes their subnet.
+- `ip_forward = false` (`ip-forward`): `setup` leaves IPv4 forwarding as it is, and says so when it is off.
+- `ip_forward_no_drop = true` (`ip-forward-no-drop`): when `setup` turns forwarding on, it leaves the `FORWARD` policy as it is. Without it the policy becomes DROP, so that the host forwards what a rule accepts and nothing else. A host that had forwarding on already keeps its policy in any case.
+- `ip_masq = false` (`ip-masq`): nothing is masqueraded.
+
+A setting that is not `true` or `false` is said, and its built-in value is kept. `setup` flushes and fills `LIGHTBOX-FORWARD` and `LIGHTBOX-POSTROUTING` for the bridge of its `lightbox.conf`, so one host has one lightbox network. On a host where lightbox 0.4 or earlier ran `setup`, the next `setup` takes out the rules that it put straight into `FORWARD` and `POSTROUTING`; a running container with links gets its link rules back when it is started again.
 
 ### Rootfs resolution order
 
@@ -323,7 +352,7 @@ The sandbox covers everything in a container: init, the `/init.sh` hook and all 
 | /proc and /sys masking | The paths Docker masks by default are covered, files with `/dev/null` and directories with an empty read-only tmpfs. A mask that cannot be made fails the start |
 | /proc read-only | Remounts /proc/sys, /proc/bus, /proc/fs, /proc/irq read-only |
 | Root filesystem | Mounted `nodev`, and `nosuid` unless privileged. Devices come from the `/dev` that lightbox builds |
-| Container isolation | A container without `--link` has an isolated port on the bridge: it reaches the host and the outside, and no other container. IPv6 is off inside containers. A container with `--link` shares the bridge, is kept to its links by iptables, and does not start unless `br_netfilter` lets iptables see bridged traffic |
+| Container isolation | A container without `--link` has an isolated port on the bridge: it reaches the host and the outside, and no other container. IPv6 is off inside containers. A container with `--link` shares the bridge, is kept to its links by iptables rules that name the two ports of each link, and does not start unless `br_netfilter` lets iptables see bridged traffic. A link holds whichever of the two starts first, and a container's link rules go with it when it stops, is removed or is found dead |
 | The terminal of whoever runs `exec` | A command never holds it. Typed at a terminal, `exec` gives the command a pseudo-terminal of the container and carries the bytes; where only one of its streams is a terminal, a pipe stands in for it |
 | The binary `exec` enters with | `exec` executes itself again from a sealed copy in memory before it enters a container, so the processes it puts there are never the installed binary. Where the kernel refuses executable memfds (`vm.memfd_noexec=2`) it takes the binary through a read-only mount of its own instead. Its worker is not dumpable. `lightbox doctor` says which of the two is in use |
 | User namespaces | Planned future improvement |
@@ -344,7 +373,7 @@ The sandbox covers everything in a container: init, the `/init.sh` hook and all 
 - **Stopping**: `stop` sends init a SIGTERM that carries the number of seconds the container may take. Init passes SIGTERM on to every process in the container, the ones `exec` put there included, reaps them, and exits when none is left or the time is over; the kernel kills whatever remains with it. `stop` waits for init through a pidfd, so it returns as soon as the container has ended. It then kills anything still in the cgroup, waits until the kernel reports the cgroup empty, and removes it. A SIGTERM sent to init by other means has the same effect, with the `stop_timeout` that was set when the container started
 - **Output**: init leads a session of its own and keeps nothing that was open in the command that started it. Its standard output and error, and those of the hook and every service, are appended to `<container_dir>/<name>/console.log`, which only root can read. The log is kept from one start to the next and is not rotated or limited yet, so a container that prints without end fills the disk it is on
 - **Starting**: `start` and init talk over two pipes. Init builds the container when `start` has set up its cgroup and network, and reports back when it is built and again when the hook has ended. If either side goes away the other notices: an init whose `start` was killed exits before it runs anything
-- **External tools**: on the host, `ip` and `nsenter` set up a container's network, `iptables` the firewall, and `cp` and `rm` create and remove a container. Everything else is direct syscalls, and nothing from the image is run before `/init.sh`
+- **External tools**: on the host, `ip` and `nsenter` set up a container's network, `iptables` and `iptables-restore` the firewall (a start with links runs `iptables-restore` once), and `cp` and `rm` create and remove a container. Everything else is direct syscalls, and nothing from the image is run before `/init.sh`
 - **One command at a time**: `start`, `stop`, `rm`, `add-vol` and `rm-vol` take a lock on the container they change, and `create` and `setup` one on the whole store, so two commands on one container do their work one after the other. A command that has to wait says so. `ls` and `inspect` never wait. `setup`, `start`, `stop` and `exec` need root and say so before they touch anything
 - **Configuration**: optional `~/.config/lightbox/lightbox.conf` for all paths and defaults
 

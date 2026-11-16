@@ -182,6 +182,9 @@ nothing_left() { # name
     fi
     no_link "vb-$1" || { echo "the interface vb-$1 is left"; bad=1; }
     [ ! -d "$CG/$1" ] || { echo "the cgroup $CG/$1 is left"; bad=1; }
+    if [ -e "$RUN/$1/firewall" ] || iptables -n -L "LB-$1" >/dev/null 2>&1; then
+        echo "the firewall chain LB-$1 of its links, or the record of it, is left"; bad=1
+    fi
     echo "state: $(state_of "$1")"
     return $bad
 }
@@ -220,21 +223,128 @@ shim() { # path script
 
 # ─── Cases: host setup ──────────────────────────────────────────────────────
 
+# setup makes lightbox's chains and jumps to them from the top of FORWARD and
+# POSTROUTING. Forwarding was off (the fixture turned it off), so, as Docker
+# does, setup turns it on with the FORWARD policy at DROP: from then on every
+# case runs with a host firewall that drops what lightbox does not accept.
 t_setup() {
-    lb setup || return 1
+    lb setup >"$OUT/setup" 2>&1 || { cat "$OUT/setup"; return 1; }
+    cat "$OUT/setup"
     ip -o -4 addr show dev "$BR" | grep -q " $GW/24 " || { echo "the bridge has no address:"; ip addr show dev "$BR"; return 1; }
     ip link show dev "$BR" | head -n 1 | grep -q '[<,]UP[,>]' || { echo "the bridge is not up"; return 1; }
     [ "$(cat /proc/sys/net/ipv4/ip_forward)" = 1 ] || { echo "forwarding is off"; return 1; }
-    iptables -t nat -C POSTROUTING -s "$SUBNET" -o "$WAN" -j MASQUERADE &&
-    iptables -C FORWARD -i "$BR" -o "$WAN" -j ACCEPT &&
-    iptables -C FORWARD -i "$WAN" -o "$BR" -m state --state RELATED,ESTABLISHED -j ACCEPT &&
-    iptables -C FORWARD -i "$BR" -o "$BR" -j DROP || { echo "a rule is missing:"; iptables-save; return 1; }
+    iptables -S FORWARD
+    [ "$(iptables -S FORWARD | head -n 1)" = '-P FORWARD DROP' ] || { echo "the FORWARD policy is not DROP"; return 1; }
+    [ "$(iptables -S FORWARD | sed -n '2,3p' | paste -sd'|' -)" = '-A FORWARD -j LIGHTBOX-USER|-A FORWARD -j LIGHTBOX-FORWARD' ] ||
+        { echo "FORWARD does not begin with the jumps to LIGHTBOX-USER and LIGHTBOX-FORWARD"; return 1; }
+    [ "$(iptables -t nat -S POSTROUTING | sed -n 2p)" = '-A POSTROUTING -j LIGHTBOX-POSTROUTING' ] ||
+        { echo "POSTROUTING does not begin with the jump to LIGHTBOX-POSTROUTING"; iptables -t nat -S POSTROUTING; return 1; }
+    iptables -S LIGHTBOX-FORWARD; iptables -t nat -S LIGHTBOX-POSTROUTING
+    iptables -C LIGHTBOX-FORWARD -i "$BR" -o "$BR" -j LIGHTBOX-LINKS &&
+    iptables -C LIGHTBOX-FORWARD -i "$BR" -o "$BR" -j DROP &&
+    iptables -C LIGHTBOX-FORWARD -i "$BR" ! -o "$BR" -j ACCEPT &&
+    iptables -C LIGHTBOX-FORWARD -o "$BR" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT &&
+    iptables -t nat -C LIGHTBOX-POSTROUTING -s "$SUBNET" ! -o "$BR" -j MASQUERADE &&
+    iptables -n -L LIGHTBOX-USER >/dev/null && iptables -n -L LIGHTBOX-LINKS >/dev/null ||
+        { echo "a rule or a chain is missing:"; iptables-save; return 1; }
+    # nothing names the interface the default route leaves by
+    ! iptables-save | grep -qw -- "$WAN" || { echo "a rule names $WAN"; return 1; }
     # the fixture made these 0755, as installations before 0.2 did
     echo "storage modes after setup: $(stat -c %a "$T/lb") $(stat -c %a "$C"), and of run_dir: $(stat -c %a "$RUN")"
     [ "$(stat -c %a "$T/lb")" = 700 ] && [ "$(stat -c %a "$C")" = 700 ] && [ "$(stat -c %a "$RUN")" = 700 ]
 }
 
 firewall_rules() { iptables-save | grep -v '^#' | sed 's/\[[0-9]*:[0-9]*\]//'; }
+
+# A lightbox.conf of the suite's with more settings, for a case: sets $ALT.
+alt_conf() { # directory name, settings...
+    ALT=$T/$1/home
+    shift
+    mkdir -p "$ALT/.config/lightbox" || return 1
+    { cat "$HOME/.config/lightbox/lightbox.conf"; printf '%s\n' "$@"; } > "$ALT/.config/lightbox/lightbox.conf"
+}
+alt_lb() { HOME="$ALT" timeout -k 5 60 "$LB" "$@"; }
+
+# What lightbox 0.4 put straight into FORWARD and POSTROUTING, taken out by
+# setup; a rule of the host's that looks like one stays.
+t_setup_takes_out_old_rules() {
+    iptables -t nat -A POSTROUTING -s "$SUBNET" -o "$WAN" -j MASQUERADE &&
+    iptables -A FORWARD -i "$BR" -o "$WAN" -j ACCEPT &&
+    iptables -A FORWARD -i "$WAN" -o "$BR" -m state --state RELATED,ESTABLISHED -j ACCEPT &&
+    iptables -A FORWARD -i "$BR" -o "$BR" -j DROP &&
+    iptables -A FORWARD -s "$NETP.40/32" -d "$NETP.41/32" -i "$BR" -o "$BR" -j ACCEPT &&
+    iptables -A FORWARD -s 192.0.2.7/32 -d 192.0.2.8/32 -j ACCEPT || return 1
+    said=$(lb setup 2>&1) || { printf '%s\n' "$said"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *'Removed 5 firewall rules'*) ;; *) echo "setup did not say that it removed five rules"; return 1 ;; esac
+    old=$( { iptables -S FORWARD; iptables -t nat -S POSTROUTING; } | grep -E -- "$WAN|$NETP\.4[01]/32|-A FORWARD -i $BR -o $BR -j DROP")
+    [ -z "$old" ] || { echo "left: $old"; return 1; }
+    iptables -C FORWARD -s 192.0.2.7/32 -d 192.0.2.8/32 -j ACCEPT || { echo "the host's own rule was taken out"; return 1; }
+    iptables -C FORWARD -j LIGHTBOX-FORWARD && iptables -C LIGHTBOX-FORWARD -i "$BR" ! -o "$BR" -j ACCEPT
+}
+
+# The host's own rules go in LIGHTBOX-USER, which decides before lightbox's
+# rules, and setup leaves them there.
+t_user_chain() {
+    need_nc || return 77
+    up user1 || return 1
+    reaches user1 "$OUTSIDE" || return 1
+    ip=$(addr_of user1)
+    iptables -A LIGHTBOX-USER -s "$ip" -d "$OUTSIDE" -j DROP || return 1
+    lb setup >/dev/null || return 1
+    iptables -C LIGHTBOX-USER -s "$ip" -d "$OUTSIDE" -j DROP || { echo "setup took the host's rule out"; return 1; }
+    reaches user1 "$OUTSIDE" && { echo "the host's rule in LIGHTBOX-USER did not decide"; return 1; }
+    iptables -F LIGHTBOX-USER
+    reaches user1 "$OUTSIDE"
+}
+
+# A host firewall that drops all that is forwarded after lightbox's jumps, as
+# a DROP policy and a last rule of ufw's do: the bridge's traffic still passes.
+t_host_firewall_drops_the_rest() {
+    need_nc || return 77
+    iptables -A FORWARD -j DROP || return 1
+    up behind || return 1
+    reaches behind "$OUTSIDE"
+}
+
+# ip_forward_no_drop = true: setup turns forwarding on and leaves the policy.
+t_ip_forward_no_drop() {
+    alt_conf nodrop 'ip_forward_no_drop = true' || return 1
+    echo 0 > /proc/sys/net/ipv4/ip_forward && iptables -P FORWARD ACCEPT || return 1
+    alt_lb setup >"$OUT/nodrop.setup" 2>&1 || { cat "$OUT/nodrop.setup"; return 1; }
+    cat "$OUT/nodrop.setup"
+    echo "forwarding $(cat /proc/sys/net/ipv4/ip_forward), $(iptables -S FORWARD | head -n 1)"
+    [ "$(cat /proc/sys/net/ipv4/ip_forward)" = 1 ] && [ "$(iptables -S FORWARD | head -n 1)" = '-P FORWARD ACCEPT' ]
+}
+
+# ip_masq = false: nothing is masqueraded, and a container gets no answer
+# from the outside, which has no route back to it.
+t_ip_masq_false() {
+    need_nc || return 77
+    alt_conf nomasq 'ip_masq = false' || return 1
+    alt_lb setup >"$OUT/nomasq.setup" 2>&1 || { cat "$OUT/nomasq.setup"; return 1; }
+    left=$(iptables -t nat -S LIGHTBOX-POSTROUTING | tail -n +2)
+    [ -z "$left" ] || { echo "LIGHTBOX-POSTROUTING has: $left"; return 1; }
+    up nomasq || return 1
+    reaches nomasq "$OUTSIDE" && { echo "the outside answered a container that was not masqueraded"; return 1; }
+    return 0
+}
+
+# firewall = false: setup makes no rule, and a container with links is not
+# started, since only lightbox's rules keep it to them.
+t_firewall_false() {
+    alt_conf nofw 'firewall = false' || return 1
+    rules=$(firewall_rules)
+    said=$(alt_lb setup 2>&1) || { printf '%s\n' "$said"; return 1; }
+    printf '%s\n' "$said"
+    [ "$rules" = "$(firewall_rules)" ] || { echo "setup with firewall = false changed the firewall:"; firewall_rules; return 1; }
+    case $said in *'no firewall rules were made'*) ;; *) return 1 ;; esac
+    box fwpeer && box fwlinked --link fwpeer || return 1
+    said=$(alt_lb start fwlinked 2>&1 </dev/null) && { echo "a container with links started with firewall = false"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *'firewall = false'*) ;; *) return 1 ;; esac
+    nothing_left fwlinked
+}
 
 # setup reads subnet and gw as one network before it changes anything: a
 # gateway outside the subnet ends it, with no bridge made and no rule added.
@@ -1719,7 +1829,7 @@ t_wide_subnet() {
     lb setup >"$OUT/wide.setup" 2>&1 || { cat "$OUT/wide.setup"; return 1; }
     ip -o -4 addr show dev "$WIDE_BR"
     ip -o -4 addr show dev "$WIDE_BR" | grep -q ' 10\.9\.0\.1/16 ' || { echo "the bridge does not have 10.9.0.1/16"; return 1; }
-    iptables -t nat -C POSTROUTING -s 10.9.0.0/16 -o "$WAN" -j MASQUERADE || { echo "no address translation for 10.9.0.0/16"; return 1; }
+    iptables -t nat -C LIGHTBOX-POSTROUTING -s 10.9.0.0/16 ! -o "$WIDE_BR" -j MASQUERADE || { echo "no address translation for 10.9.0.0/16"; return 1; }
     lb create wide 10.9.5.2 >"$OUT/wide.create" 2>&1 || { cat "$OUT/wide.create"; return 1; }
     start wide || return 1
     said=$(sh_in wide 'ip addr; ip route')
@@ -1784,7 +1894,26 @@ t_linked_containers() {
     reaches linked "$(addr_of peer)" && reaches peer "$(addr_of linked)" || return 1
     up third || return 1
     reaches third "$(addr_of peer)" && { echo "a container without the link reached peer"; return 1; }
-    return 0
+    lb stop linked >/dev/null && nothing_left linked
+}
+
+# A start puts in a container's link rules with one process, iptables-restore.
+t_link_rules_in_one_process() {
+    command -v strace >/dev/null 2>&1 || { echo "no strace to watch a start with"; return 77; }
+    brnf 1 || { echo "br_netfilter is not loaded, and a container with a link does not start without it"; return 77; }
+    box onepeer && box onelinked --link onepeer || return 1
+    is_up() { [ "$(state_of onelinked 2>/dev/null)" = running ]; }
+    timeout -k 5 80 strace -f -qq -e trace=execve -o "$T/links.strace" \
+        "$LB" start onelinked >"$OUT/onelinked.start" 2>&1 </dev/null &
+    tracer=$!
+    wait_until 60 is_up || { echo "the container did not start under strace:"; cat "$OUT/onelinked.start"; kill "$tracer" 2>/dev/null; return 1; }
+    settled onelinked || return 1
+    lb stop onelinked >/dev/null 2>&1 || { echo "stop failed"; return 1; }
+    wait "$tracer"
+    grep -E 'execve\("[^"]*/(ip6?tables[^"]*|nft)"' "$T/links.strace" | grep -v ' = -1 '
+    count=$(grep -E 'execve\("[^"]*/(ip6?tables[^"]*|nft)"' "$T/links.strace" | grep -vc ' = -1 ')
+    echo "firewall tools the start ran: $count"
+    [ "$count" = 1 ] && grep -E 'execve\("[^"]*/(ip6?tables[^"]*|nft)"' "$T/links.strace" | grep -v ' = -1 ' | grep -q 'restore'
 }
 
 t_link_to_later_container() {
@@ -1800,15 +1929,15 @@ t_rm_leaves_no_rule() {
     brnf 1 || { echo "br_netfilter is not loaded, and a container with a link does not start without it"; return 77; }
     box lpeer && box lmain --link lpeer || return 1
     start lpeer && start lmain || return 1
-    ip=$(addr_of lmain)
     pid=$(pid_of lmain)
-    iptables -S FORWARD | grep -qF -- "$ip/32" || { echo "the link added no rule to begin with"; return 77; }
+    iptables -S LB-lmain && iptables -C LIGHTBOX-LINKS -j LB-lmain || { echo "the link put in no chain to begin with"; return 1; }
+    echo "the record: $(cat "$RUN/lmain/firewall")"
     kill -KILL "$pid"
     wait_until 5 gone "$pid" || return 1
     lb rm lmain || return 1
-    left=$(iptables -S FORWARD | grep -cF -- "$ip/32")
-    echo "FORWARD rules that still name $ip after rm: $left"
-    [ "$left" -eq 0 ]
+    iptables -n -L LB-lmain >/dev/null 2>&1 && { echo "the chain LB-lmain is left"; return 1; }
+    iptables -C LIGHTBOX-LINKS -j LB-lmain 2>/dev/null && { echo "the jump to LB-lmain is left"; return 1; }
+    [ ! -e "$RUN/lmain" ] || { echo "left in run_dir: $(ls -A "$RUN/lmain")"; return 1; }
 }
 
 t_start_spares_foreign_interface() {
@@ -1870,6 +1999,8 @@ build_rootfs() {
 
 network() {
     ip link set lo up || return 1
+    # as on a host that forwards nothing until lightbox's setup
+    echo 0 > /proc/sys/net/ipv4/ip_forward || return 1
     # A second namespace stands for the internet: setup wants a default route,
     # and address translation needs somewhere to go.
     unshare --net -- sleep 86400 >/dev/null 2>&1 </dev/null &
@@ -2014,6 +2145,9 @@ if [ "$MODE" = inside ]; then
     check 'setup again changes no mount and adds no rule'                 t_setup_again
     check 'setup refuses a cgroup_root that is not cgroup v2'             t_setup_refuses_other_cgroup_root
     check 'setup refuses a gateway outside the subnet, and changes nothing' t_setup_refuses_a_gateway_outside
+    check 'setup takes out the rules lightbox 0.4 put in FORWARD and POSTROUTING' t_setup_takes_out_old_rules
+    check 'ip_forward_no_drop = true leaves the FORWARD policy'           t_ip_forward_no_drop
+    check 'firewall = false: no rule is made, and a container with links is refused' t_firewall_false
     check 'doctor finds nothing missing'                                  t_doctor
 
     check 'create, start, exec, stop and rm'                              t_lifecycle
@@ -2107,11 +2241,15 @@ if [ "$MODE" = inside ]; then
     check 'a container reaches the bridge address'                        t_reaches_gateway
     check 'a container reaches an outside address through address translation' t_reaches_outside
     check 'on a /16, a container far from the gateway has its prefix and reaches it' t_wide_subnet
+    check 'the host'"'"'s own rules in LIGHTBOX-USER decide first, and setup keeps them' t_user_chain
+    check 'a host firewall that drops the rest does not stop the bridge'   t_host_firewall_drops_the_rest
+    check 'ip_masq = false: nothing is masqueraded'                       t_ip_masq_false
     check 'containers cannot reach each other when bridged traffic is filtered' t_isolated_when_filtered
     check 'containers cannot reach each other without br_netfilter'      t_isolated_when_not_filtered
     check 'a container with a link is refused where nothing filters bridged traffic' t_link_needs_filtering
     check 'linked containers reach each other, and a third reaches neither' t_linked_containers
-    xfail NET-link-leak        'a link to a container created later applies'           t_link_to_later_container
+    check 'a link to a container created later applies'                  t_link_to_later_container
+    check 'a start puts in its link rules with one process'               t_link_rules_in_one_process
     check 'rm of a dead container leaves no firewall rule'                t_rm_leaves_no_rule
     xfail NET-veth-clobber     'start leaves alone an interface it did not create'     t_start_spares_foreign_interface
     xfail NET-ifname           'the interface in the container is eth0'                t_interface_is_eth0

@@ -254,6 +254,20 @@ const char *tool_path_ip(void) {
     return pick_tool_path(candidates, sizeof(candidates) / sizeof(candidates[0]));
 }
 
+const char *tool_path_iptables_restore(void) {
+    static const char *const candidates[] = {
+        "/usr/sbin/iptables-restore",
+        "/sbin/iptables-restore",
+        "/usr/bin/iptables-restore",
+        "/bin/iptables-restore",
+        "/usr/sbin/iptables-nft-restore",
+        "/sbin/iptables-nft-restore",
+        "/usr/bin/iptables-nft-restore",
+        "/bin/iptables-nft-restore",
+    };
+    return pick_tool_path(candidates, sizeof(candidates) / sizeof(candidates[0]));
+}
+
 const char *tool_path_iptables(void) {
     static const char *const candidates[] = {
         "/usr/sbin/iptables",
@@ -570,6 +584,7 @@ struct run_opts {
     bool   quiet;               /* the program's stdout and stderr go to /dev/null */
     char  *capture;             /* when set, its stdout is collected here as a string */
     size_t capture_size;
+    const char *input;          /* when set, its stdin, at most RUN_INPUT_MAX bytes */
 };
 
 /*
@@ -589,6 +604,30 @@ struct run_opts {
 static int run_program(const char *prog, const char *const argv[], const struct run_opts *opts) {
     int32_t exec_pipe[2];
     int32_t out_pipe[2] = { -1, -1 };
+    int32_t in_pipe[2] = { -1, -1 };
+
+    /* The input is in its pipe before there is a program to read it: a pipe
+     * holds this much, so the write does not wait, and nothing can make it
+     * fail half way, as a program that ends before it has read would. */
+    if (opts->input) {
+        size_t len = lc_string_length(opts->input);
+        if (len > RUN_INPUT_MAX) {
+            report_failure("the input is too long for ", prog, NULL, 0);
+            return RUN_FORK_FAILED;
+        }
+        lc_sysret made = lc_kernel_create_pipe(in_pipe, O_CLOEXEC);
+        if (made < 0) {
+            report_failure("cannot start ", prog, " (no pipe for its input, errno ", (int)-made);
+            return RUN_FORK_FAILED;
+        }
+        lc_sysret wrote = lc_kernel_write_all(in_pipe[1], opts->input, len);
+        lc_kernel_close_file(in_pipe[1]);
+        if (wrote < 0 || (size_t)wrote != len) {
+            lc_kernel_close_file(in_pipe[0]);
+            report_failure("the input did not go into the pipe of ", prog, NULL, 0);
+            return RUN_FORK_FAILED;
+        }
+    }
 
     lc_sysret rc = lc_kernel_create_pipe(exec_pipe, O_CLOEXEC);
     if (rc >= 0 && opts->capture) {
@@ -599,12 +638,16 @@ static int run_program(const char *prog, const char *const argv[], const struct 
         }
     }
     if (rc < 0) {
+        if (in_pipe[0] >= 0)
+            lc_kernel_close_file(in_pipe[0]);
         report_failure("cannot start ", prog, " (pipe failed, errno ", (int)-rc);
         return RUN_FORK_FAILED;
     }
 
     lc_sysret pid = lc_kernel_fork();
     if (pid < 0) {
+        if (in_pipe[0] >= 0)
+            lc_kernel_close_file(in_pipe[0]);
         lc_kernel_close_file(exec_pipe[0]);
         lc_kernel_close_file(exec_pipe[1]);
         if (opts->capture) {
@@ -629,6 +672,8 @@ static int run_program(const char *prog, const char *const argv[], const struct 
         }
         if (opts->capture)
             lc_kernel_duplicate_fd(out_pipe[1], STDOUT, 0);
+        if (in_pipe[0] >= 0)
+            lc_kernel_duplicate_fd(in_pipe[0], STDIN, 0);
 
         lc_sysret failed = exec_program(prog, argv, opts->envp ? opts->envp : TOOL_ENV);
         int32_t exec_errno = (int32_t)-failed;
@@ -637,6 +682,8 @@ static int run_program(const char *prog, const char *const argv[], const struct 
     }
 
     lc_kernel_close_file(exec_pipe[1]);
+    if (in_pipe[0] >= 0)
+        lc_kernel_close_file(in_pipe[0]);
 
     if (opts->capture) {
         lc_kernel_close_file(out_pipe[1]);
@@ -693,6 +740,10 @@ int run_cmd_env(const char *prog, const char *const argv[], const char *const en
 
 int run_cmd_capture(const char *prog, const char *const argv[], char *out, size_t outsz) {
     return run_program(prog, argv, &(struct run_opts){ .capture = out, .capture_size = outsz });
+}
+
+int run_cmd_input(const char *prog, const char *const argv[], const char *input, bool quiet) {
+    return run_program(prog, argv, &(struct run_opts){ .input = input, .quiet = quiet });
 }
 
 void require_rm_rf(const char *path) {

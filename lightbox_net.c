@@ -21,16 +21,12 @@ static void iptables_idempotent(const char *const check_argv[], const char *cons
         require_cmd(tool_path_iptables(), add_argv);
 }
 
-static int iptables_ensure_rule(const char *const check_argv[], const char *const add_argv[]) {
-    if (iptables_check(check_argv) == 0)
-        return 0;
-    return run_cmd(tool_path_iptables(), add_argv);
-}
-
-static int iptables_remove_rule(const char *const check_argv[], const char *const del_argv[]) {
-    if (iptables_check(check_argv) != 0)
-        return 0;
-    return run_cmd(tool_path_iptables(), del_argv);
+/* Run a rule's delete until there is no such rule left. How many went. */
+static int iptables_delete_all(const char *const del_argv[]) {
+    int removed = 0;
+    while (removed < 64 && run_cmd_quiet(tool_path_iptables(), del_argv) == 0)
+        removed++;
+    return removed;
 }
 
 /* ─── Addresses ─────────────────────────────────────────────────────────── */
@@ -187,35 +183,169 @@ int read_container_ip(const char *name, char *ip, size_t ipsz) {
     return str_copy(ip, text, ipsz) ? 0 : -1;
 }
 
-/*
- * The rules that let a container and each container it is linked to reach
- * one another: put in, or taken out. A link to a container that has no
- * address on record is passed over.
- */
-int update_link_rules(const container_config *config, const char *ip, bool add_rules) {
-    for (int i = 0; i < config->nlinks; i++) {
-        char link_ip[16];
-        if (read_container_ip(config->links[i], link_ip, sizeof(link_ip)) != 0)
-            continue;
+/* ─── The firewall ──────────────────────────────────────────────────────── */
 
-        /* one rule for each direction */
+_Static_assert(NAME_MAX_LEN + 3 < 16, "an interface name holds a container's name and three more");
+void veth_names(const char *name, char host[16], char cont[16]) {
+    bool cut = false;       /* never: the name has been checked to be one */
+    size_t pos = str_append(host, 0, "vb-", 16, &cut);
+    str_append(host, pos, name, 16, &cut);
+    pos = str_append(cont, 0, "ve-", 16, &cut);
+    str_append(cont, pos, name, 16, &cut);
+}
+
+struct text_out {
+    char  *text;
+    size_t max;
+    size_t pos;
+    bool   cut;
+};
+
+static void out_put(struct text_out *out, const char *s) {
+    out->pos = str_append(out->text, out->pos, s, out->max, &out->cut);
+}
+
+/* LB-<name>: the chain of a container's links */
+static void link_chain(char out[32], const char *name) {
+    bool cut = false;       /* never: the name has been checked to be one */
+    size_t pos = str_append(out, 0, "LB-", 32, &cut);
+    str_append(out, pos, name, 32, &cut);
+}
+
+/*
+ * A container's links, as iptables-restore is given them: a chain of the
+ * container's own, which LIGHTBOX-LINKS jumps to, with a rule for each way of
+ * each link. The rules name the two ports on the bridge and no address, so
+ * a link holds whichever of the two starts first, and to a container that
+ * did not exist yet when this one was created.
+ */
+bool firewall_links_text(const char *name, const container_config *config, char *text, size_t max) {
+    struct text_out out = { .text = text, .max = max, .pos = 0, .cut = false };
+    char chain[32], port[16], unused[16];
+    link_chain(chain, name);
+    veth_names(name, port, unused);
+    text[0] = '\0';
+    out_put(&out, "*filter\n:");
+    out_put(&out, chain);
+    out_put(&out, " - [0:0]\n");
+    for (int i = 0; i < config->nlinks; i++) {
+        char other[16];
+        veth_names(config->links[i], other, unused);
         for (int back = 0; back < 2; back++) {
-            const char *from = back ? link_ip : ip;
-            const char *to = back ? ip : link_ip;
-            const char *check[] = { "iptables", "-C", "FORWARD",
-                                    "-s", from, "-d", to,
-                                    "-i", cfg_global.bridge, "-o", cfg_global.bridge,
-                                    "-j", "ACCEPT", NULL };
-            const char *change[] = { "iptables", add_rules ? "-I" : "-D", "FORWARD",
-                                     "-s", from, "-d", to,
-                                     "-i", cfg_global.bridge, "-o", cfg_global.bridge,
-                                     "-j", "ACCEPT", NULL };
-            if ((add_rules ? iptables_ensure_rule(check, change)
-                           : iptables_remove_rule(check, change)) != 0)
-                return -1;
+            out_put(&out, "-A ");
+            out_put(&out, chain);
+            out_put(&out, " -m physdev --physdev-in ");
+            out_put(&out, back ? other : port);
+            out_put(&out, " --physdev-out ");
+            out_put(&out, back ? port : other);
+            out_put(&out, " -j ACCEPT\n");
         }
     }
+    out_put(&out, "-A LIGHTBOX-LINKS -j ");
+    out_put(&out, chain);
+    out_put(&out, "\nCOMMIT\n");
+    return !out.cut;
+}
 
+/*
+ * What setup puts in LIGHTBOX-FORWARD and LIGHTBOX-POSTROUTING, each flushed
+ * and filled again in one transaction, so that a second setup changes
+ * nothing and no packet meets a chain half made. Between two of its ports
+ * the bridge forwards what a link allows and nothing else; out of it,
+ * anything that leaves by an interface other than the bridge, whichever it
+ * is, and back what belongs to such a connection.
+ */
+bool firewall_setup_text(const container_network *net, char *text, size_t max) {
+    struct text_out out = { .text = text, .max = max, .pos = 0, .cut = false };
+    const char *br = cfg_global.bridge;
+    char subnet[CIDR_TEXT_MAX];
+    subnet_text(subnet, net);
+    text[0] = '\0';
+    out_put(&out, "*filter\n-F LIGHTBOX-FORWARD\n");
+    out_put(&out, "-A LIGHTBOX-FORWARD -i "); out_put(&out, br); out_put(&out, " -o "); out_put(&out, br);
+    out_put(&out, " -j LIGHTBOX-LINKS\n");
+    out_put(&out, "-A LIGHTBOX-FORWARD -i "); out_put(&out, br); out_put(&out, " -o "); out_put(&out, br);
+    out_put(&out, " -j DROP\n");
+    out_put(&out, "-A LIGHTBOX-FORWARD -i "); out_put(&out, br); out_put(&out, " ! -o "); out_put(&out, br);
+    out_put(&out, " -j ACCEPT\n");
+    out_put(&out, "-A LIGHTBOX-FORWARD -o "); out_put(&out, br);
+    out_put(&out, " -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT\nCOMMIT\n");
+    out_put(&out, "*nat\n-F LIGHTBOX-POSTROUTING\n");
+    if (cfg_global.ip_masq) {
+        out_put(&out, "-A LIGHTBOX-POSTROUTING -s "); out_put(&out, subnet);
+        out_put(&out, " ! -o "); out_put(&out, br); out_put(&out, " -j MASQUERADE\n");
+    }
+    out_put(&out, "COMMIT\n");
+    return !out.cut;
+}
+
+int firewall_remove_links(const char *name) {
+    char record[MAX_PATH], chain[32];
+    container_firewall_path(record, name);
+    if (!path_exists(record))
+        return 0;
+    link_chain(chain, name);
+
+    /* As a start left it: the jump, the chain's rules and the chain, in one
+     * transaction. Anything else, one piece at a time, as far as it is there. */
+    static char text[256];
+    struct text_out out = { .text = text, .max = sizeof(text), .pos = 0, .cut = false };
+    text[0] = '\0';
+    out_put(&out, "*filter\n-D LIGHTBOX-LINKS -j "); out_put(&out, chain);
+    out_put(&out, "\n-F "); out_put(&out, chain);
+    out_put(&out, "\n-X "); out_put(&out, chain);
+    out_put(&out, "\nCOMMIT\n");
+    const char *restore[] = { "iptables-restore", "--noflush", NULL };
+    bool gone = !out.cut && run_cmd_input(tool_path_iptables_restore(), restore, text, true) == 0;
+    if (!gone) {
+        const char *jump[] = { "iptables", "-D", "LIGHTBOX-LINKS", "-j", chain, NULL };
+        const char *flush[] = { "iptables", "-F", chain, NULL };
+        const char *drop[] = { "iptables", "-X", chain, NULL };
+        const char *look[] = { "iptables", "-n", "-L", chain, NULL };
+        (void)iptables_delete_all(jump);
+        (void)run_cmd_quiet(tool_path_iptables(), flush);
+        (void)run_cmd_quiet(tool_path_iptables(), drop);
+        gone = run_cmd_quiet(tool_path_iptables(), look) != 0;
+    }
+    if (!gone) {
+        print_str(STDERR, "Error: cannot remove the firewall chain of the container's links: ");
+        print_str(STDERR, chain);
+        lc_print_char(STDERR, '\n');
+        return -1;
+    }
+    lc_kernel_unlinkat(AT_FDCWD, record, 0);
+    return 0;
+}
+
+int firewall_add_links(const char *name, const container_config *config) {
+    if (config->nlinks == 0)
+        return 0;
+    static char text[FIREWALL_TEXT_MAX];
+    if (!firewall_links_text(name, config, text, sizeof(text))) {
+        print_str(STDERR, "Error: the firewall rules of the container's links are too long\n");
+        return -1;
+    }
+    /* what an earlier run left of them */
+    if (firewall_remove_links(name) != 0)
+        return -1;
+
+    /* On record before they are there: a command that is killed in between
+     * leaves the record, and the next command takes away what it names. */
+    char record[MAX_PATH], chain[32], line[34];
+    container_firewall_path(record, name);
+    link_chain(chain, name);
+    bool cut = false;
+    str_append(line, str_append(line, 0, chain, sizeof(line), &cut), "\n", sizeof(line), &cut);
+    if (container_run_dir_make(name) != 0 || write_file_volatile(record, line) != 0) {
+        print_str(STDERR, "Error: cannot record the firewall rules of the container's links\n");
+        return -1;
+    }
+    const char *restore[] = { "iptables-restore", "--noflush", NULL };
+    if (run_cmd_input(tool_path_iptables_restore(), restore, text, false) != 0) {
+        print_str(STDERR, "Error: the firewall rules of the container's links could not be put in;\n"
+                          "lightbox setup makes the chains they go into\n");
+        return -1;
+    }
     return 0;
 }
 
@@ -231,11 +361,12 @@ bool bridge_traffic_is_filtered(void) {
            value[0] == '1';
 }
 
-static void detect_wan_interface(char *wan_if, size_t bufsz) {
+/* The interface of the default route, if there is one. */
+static bool find_wan_interface(char *wan_if, size_t bufsz) {
     char route_buf[256];
     const char *argv[] = { "ip", "route", "show", "default", NULL };
     if (run_cmd_capture(tool_path_ip(), argv, route_buf, sizeof(route_buf)) != 0 || !route_buf[0])
-        die("Error: could not detect default network interface");
+        return false;
 
     const char *dev = NULL;
     for (char *p = route_buf; *p; p++) {
@@ -244,13 +375,129 @@ static void detect_wan_interface(char *wan_if, size_t bufsz) {
             break;
         }
     }
-    if (!dev) die("Error: could not parse default route");
+    if (!dev)
+        return false;
     size_t i = 0;
     while (dev[i] && dev[i] != ' ' && dev[i] != '\n' && i < bufsz - 1) {
         wan_if[i] = dev[i];
         i++;
     }
     wan_if[i] = '\0';
+    return i > 0;
+}
+
+/*
+ * The rules that lightbox 0.4 and before put straight into FORWARD and
+ * POSTROUTING, taken out: what setup made, with the interface of the default
+ * route, and the rules of links, which name two addresses. How many went.
+ */
+static int forget_old_rules(const container_network *net) {
+    const char *br = cfg_global.bridge;
+    int removed = 0;
+    char wan[32], subnet[CIDR_TEXT_MAX];
+    subnet_text(subnet, net);
+    if (find_wan_interface(wan, sizeof(wan))) {
+        const char *masq[] = { "iptables", "-t", "nat", "-D", "POSTROUTING", "-s", subnet, "-o", wan,
+                               "-j", "MASQUERADE", NULL };
+        const char *out[] = { "iptables", "-D", "FORWARD", "-i", br, "-o", wan, "-j", "ACCEPT", NULL };
+        const char *back[] = { "iptables", "-D", "FORWARD", "-i", wan, "-o", br, "-m", "state",
+                               "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT", NULL };
+        removed += iptables_delete_all(masq) + iptables_delete_all(out) + iptables_delete_all(back);
+    }
+    const char *apart[] = { "iptables", "-D", "FORWARD", "-i", br, "-o", br, "-j", "DROP", NULL };
+    removed += iptables_delete_all(apart);
+
+    /* -A FORWARD -s <a>/32 -d <b>/32 -i <br> -o <br> -j ACCEPT */
+    static char rules[65536];
+    const char *list[] = { "iptables", "-S", "FORWARD", NULL };
+    if (run_cmd_capture(tool_path_iptables(), list, rules, sizeof(rules)) != 0)
+        return removed;
+    for (char *line = rules; *line; ) {
+        char *end = line;
+        while (*end && *end != '\n') end++;
+        bool last = *end == '\0';
+        *end = '\0';
+        const char *word[16];
+        int n = 0;
+        for (char *p = line; *p && n < 16; ) {
+            while (*p == ' ') *p++ = '\0';
+            if (!*p) break;
+            word[n++] = p;
+            while (*p && *p != ' ') p++;
+        }
+        if (n == 12 && streq(word[0], "-A") && streq(word[1], "FORWARD") && streq(word[2], "-s") &&
+            streq(word[4], "-d") && streq(word[6], "-i") && streq(word[7], br) && streq(word[8], "-o") &&
+            streq(word[9], br) && streq(word[10], "-j") && streq(word[11], "ACCEPT")) {
+            const char *del[] = { "iptables", "-D", "FORWARD", "-s", word[3], "-d", word[5],
+                                  "-i", br, "-o", br, "-j", "ACCEPT", NULL };
+            removed += iptables_delete_all(del);
+        }
+        line = last ? end : end + 1;
+    }
+    return removed;
+}
+
+static bool iptables_chain_exists(const char *table, const char *chain) {
+    const char *look[] = { "iptables", "-t", table, "-n", "-L", chain, NULL };
+    return run_cmd_quiet(tool_path_iptables(), look) == 0;
+}
+
+/*
+ * lightbox's chains, its rules in them, and the jumps to them from the top
+ * of FORWARD and POSTROUTING: there, before the host's own rules and its
+ * policy, they decide for the bridge whatever comes after them. LIGHTBOX-USER
+ * is the host's, for rules that are to decide before lightbox's; it is made
+ * when it is not there and never changed.
+ */
+static void firewall_setup(const container_network *net) {
+    require_tool("iptables-restore", tool_path_iptables_restore());
+    static const struct { const char *table, *chain; } chains[] = {
+        { "filter", "LIGHTBOX-USER" }, { "filter", "LIGHTBOX-LINKS" },
+        { "filter", "LIGHTBOX-FORWARD" }, { "nat", "LIGHTBOX-POSTROUTING" },
+    };
+    for (size_t i = 0; i < sizeof(chains) / sizeof(chains[0]); i++) {
+        if (iptables_chain_exists(chains[i].table, chains[i].chain))
+            continue;
+        const char *make[] = { "iptables", "-t", chains[i].table, "-N", chains[i].chain, NULL };
+        require_cmd(tool_path_iptables(), make);
+    }
+
+    static char text[FIREWALL_TEXT_MAX];
+    const char *restore[] = { "iptables-restore", "--noflush", NULL };
+    if (!firewall_setup_text(net, text, sizeof(text)))
+        die("Error: setup's firewall rules are too long");
+    if (run_cmd_input(tool_path_iptables_restore(), restore, text, false) != 0)
+        die("Error: setup's firewall rules could not be put in");
+
+    /* LIGHTBOX-USER first, then LIGHTBOX-FORWARD: when either is missing,
+     * both are put back at the top in that order. */
+    const char *has_user[] = { "iptables", "-C", "FORWARD", "-j", "LIGHTBOX-USER", NULL };
+    const char *has_fwd[] = { "iptables", "-C", "FORWARD", "-j", "LIGHTBOX-FORWARD", NULL };
+    if (iptables_check(has_user) != 0 || iptables_check(has_fwd) != 0) {
+        const char *del_user[] = { "iptables", "-D", "FORWARD", "-j", "LIGHTBOX-USER", NULL };
+        const char *del_fwd[] = { "iptables", "-D", "FORWARD", "-j", "LIGHTBOX-FORWARD", NULL };
+        const char *ins_user[] = { "iptables", "-I", "FORWARD", "1", "-j", "LIGHTBOX-USER", NULL };
+        const char *ins_fwd[] = { "iptables", "-I", "FORWARD", "1", "-j", "LIGHTBOX-FORWARD", NULL };
+        (void)iptables_delete_all(del_user);
+        (void)iptables_delete_all(del_fwd);
+        require_cmd(tool_path_iptables(), ins_fwd);
+        require_cmd(tool_path_iptables(), ins_user);
+    }
+    const char *has_nat[] = { "iptables", "-t", "nat", "-C", "POSTROUTING", "-j", "LIGHTBOX-POSTROUTING", NULL };
+    const char *ins_nat[] = { "iptables", "-t", "nat", "-I", "POSTROUTING", "1", "-j", "LIGHTBOX-POSTROUTING", NULL };
+    iptables_idempotent(has_nat, ins_nat);
+
+    int old = forget_old_rules(net);
+    if (old > 0) {
+        char digits[16];
+        fmt_int(digits, old);
+        print_str(STDOUT, "Removed ");
+        print_str(STDOUT, digits);
+        print_str(STDOUT, " firewall rules that an earlier lightbox put straight into FORWARD and POSTROUTING;\n"
+                          "a running container with links has its link rules back when it is started again\n");
+    }
+    print_str(STDOUT, "Firewall rules are in LIGHTBOX-FORWARD, LIGHTBOX-LINKS and LIGHTBOX-POSTROUTING;\n"
+                      "rules of this host's that are to decide first go in LIGHTBOX-USER\n");
 }
 
 [[noreturn]] static void die_cgroup_root(const char *root, const char *reason) {
@@ -341,7 +588,8 @@ static void ensure_private_dir(const char *path) {
 void cmd_setup(void) {
     require_root("setup");
     require_tool("ip", tool_path_ip());
-    require_tool("iptables", tool_path_iptables());
+    if (cfg_global.firewall)
+        require_tool("iptables", tool_path_iptables());
 
     /* Before anything on the host changes: the bridge gets an address of a
      * network that the settings do describe, */
@@ -382,48 +630,34 @@ void cmd_setup(void) {
         }
     }
 
-    require_write_file("/proc/sys/net/ipv4/ip_forward", "1");
+    if (cfg_global.firewall)
+        firewall_setup(&net);
+    else
+        print_str(STDOUT, "firewall = false in lightbox.conf: no firewall rules were made\n");
 
-    char wan_if[32];
-    detect_wan_interface(wan_if, sizeof(wan_if));
-    print_str(STDOUT, "WAN interface: ");
-    print_str(STDOUT, wan_if);
-    lc_print_char(STDOUT, '\n');
-
-    {
-        char subnet[CIDR_TEXT_MAX];
-        subnet_text(subnet, &net);
-        const char *chk[] = { "iptables", "-t", "nat", "-C", "POSTROUTING",
-                        "-s", subnet, "-o", wan_if, "-j", "MASQUERADE", NULL };
-        const char *add[] = { "iptables", "-t", "nat", "-A", "POSTROUTING",
-                        "-s", subnet, "-o", wan_if, "-j", "MASQUERADE", NULL };
-        iptables_idempotent(chk, add);
-    }
-
-    {
-        const char *chk[] = { "iptables", "-C", "FORWARD", "-i", cfg_global.bridge,
-                        "-o", wan_if, "-j", "ACCEPT", NULL };
-        const char *add[] = { "iptables", "-A", "FORWARD", "-i", cfg_global.bridge,
-                        "-o", wan_if, "-j", "ACCEPT", NULL };
-        iptables_idempotent(chk, add);
-    }
-
-    {
-        const char *chk[] = { "iptables", "-C", "FORWARD", "-i", wan_if,
-                        "-o", cfg_global.bridge, "-m", "state", "--state", "RELATED,ESTABLISHED",
-                        "-j", "ACCEPT", NULL };
-        const char *add[] = { "iptables", "-A", "FORWARD", "-i", wan_if,
-                        "-o", cfg_global.bridge, "-m", "state", "--state", "RELATED,ESTABLISHED",
-                        "-j", "ACCEPT", NULL };
-        iptables_idempotent(chk, add);
-    }
-
-    {
-        const char *chk[] = { "iptables", "-C", "FORWARD", "-i", cfg_global.bridge,
-                        "-o", cfg_global.bridge, "-j", "DROP", NULL };
-        const char *add[] = { "iptables", "-A", "FORWARD", "-i", cfg_global.bridge,
-                        "-o", cfg_global.bridge, "-j", "DROP", NULL };
-        iptables_idempotent(chk, add);
+    /*
+     * Forwarding, as Docker does it: when setup is the one that turns it on,
+     * the FORWARD policy becomes DROP first, so that the host forwards what a
+     * rule accepts and nothing else. A host that had forwarding on already
+     * keeps its policy, and ip_forward_no_drop keeps it in any case.
+     */
+    char forwarding[8];
+    bool was_on = read_file("/proc/sys/net/ipv4/ip_forward", forwarding, sizeof(forwarding)) > 0 &&
+                  forwarding[0] == '1';
+    if (!was_on && cfg_global.ip_forward) {
+        if (cfg_global.firewall && !cfg_global.ip_forward_no_drop) {
+            const char *drop[] = { "iptables", "-P", "FORWARD", "DROP", NULL };
+            require_cmd(tool_path_iptables(), drop);
+            print_str(STDOUT, "IPv4 forwarding was off. It is on, and the FORWARD policy is DROP: this host\n"
+                              "forwards what a rule accepts and nothing else (ip_forward_no_drop = true\n"
+                              "in lightbox.conf leaves the policy as it is)\n");
+        } else {
+            print_str(STDOUT, "IPv4 forwarding was off, and is on\n");
+        }
+        require_write_file("/proc/sys/net/ipv4/ip_forward", "1");
+    } else if (!was_on) {
+        print_str(STDOUT, "Warning: IPv4 forwarding is off, and ip_forward = false in lightbox.conf:\n"
+                          "containers reach this host and nothing beyond it\n");
     }
 
     if (!bridge_traffic_is_filtered())

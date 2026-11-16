@@ -2816,27 +2816,13 @@ static int delete_veth_if_present(const char *ifname) {
     return run_cmd_quiet(tool_path_ip(), show) != 0 ? 0 : -1;
 }
 
-/* The two ends of a container's interface, as they are called on the host
- * before one of them is moved: 16 bytes each, which a container's name with
- * three characters before it fits. */
-_Static_assert(NAME_MAX_LEN + 3 < 16, "an interface name holds a container's name and three more");
-static void veth_names(const char *name, char host[16], char cont[16]) {
-    bool cut = false;       /* never: the name has been checked to be one */
-    size_t pos = str_append(host, 0, "vb-", 16, &cut);
-    str_append(host, pos, name, 16, &cut);
-    pos = str_append(cont, 0, "ve-", 16, &cut);
-    str_append(cont, pos, name, 16, &cut);
-}
-
 /* What a start that failed leaves behind, removed. Init is gone by now. */
-static void cleanup_start_failure(const char *name, const container_config *config, const char *ip,
-                                  const char *veth_host) {
+static void cleanup_start_failure(const char *name, const char *veth_host) {
     if (veth_host && veth_host[0])
         (void)delete_veth_if_present(veth_host);    /* clean-up: best effort */
 
     (void)cgroup_destroy(name);     /* it has said so if it could not */
-    if (ip && ip[0])
-        (void)update_link_rules(config, ip, false);
+    (void)firewall_remove_links(name);
 
     container_forget_pid(name);
     (void)record_container_state(name, "failed\n");
@@ -2854,23 +2840,10 @@ static bool release_container(const char *name) {
     if (cgroup_destroy(name) != 0)
         clean = false;
 
-    /* Which links it has is in its configuration. A container is cleared
-     * away all the same when that cannot be read, and then the rules are
-     * what is left. */
-    {
-        static container_config config;
-        char ip_buf[16];
-        const char *wrong = container_config_load(name, &config);
-        if (wrong) {
-            print_str(STDERR, "Error: the firewall rules of the container's links, if it has any, are left in place: ");
-            print_str(STDERR, wrong);
-            lc_print_char(STDERR, '\n');
-            clean = false;
-        } else if (config.nlinks > 0 && read_container_ip(name, ip_buf, sizeof(ip_buf)) == 0 &&
-                   update_link_rules(&config, ip_buf, false) != 0) {
-            print_str(STDERR, "Error: failed to remove link iptables rules\n");
-        }
-    }
+    /* its link rules: what the record of them names, whatever its
+     * configuration says or whether it can be read */
+    if (firewall_remove_links(name) != 0)
+        clean = false;
 
     /* the host's end of the container's interface, if the kernel has not
      * removed it with the container's network namespace already */
@@ -3286,6 +3259,16 @@ static void cmd_start(int argc, char **argv) {
      * sees what the bridge switches only with br_netfilter, so without that
      * such a container is not started. Decided before anything is set up. */
     bool linked = config.nlinks > 0;
+    if (linked && !cfg_global.firewall) {
+        print_str(STDERR, "Error: container '");
+        print_str(STDERR, name);
+        print_str(STDERR, "' has links, and firewall = false in lightbox.conf. A linked container\n"
+                          "shares the bridge with the others, and only lightbox's rules keep it to its\n"
+                          "links, so it is not started without them\n");
+        lc_kernel_exit(1);
+    }
+    if (linked)
+        require_tool("iptables-restore", tool_path_iptables_restore());
     if (linked && !bridge_traffic_is_filtered()) {
         print_str(STDERR, "Error: container '");
         print_str(STDERR, name);
@@ -3487,8 +3470,8 @@ static void cmd_start(int argc, char **argv) {
         start_err = "failed to record the container's init";
         goto fail_start;
     }
-    if (update_link_rules(&config, ip, true) != 0) {
-        start_err = "failed to install link iptables rules";
+    if (firewall_add_links(name, &config) != 0) {
+        start_err = "failed to put in the firewall rules of the container's links";
         goto fail_start;
     }
 
@@ -3573,7 +3556,7 @@ fail_start:
         print_str(STDERR, name);
         lc_print_char(STDERR, '\n');
     }
-    cleanup_start_failure(name, &config, ip, veth_host);
+    cleanup_start_failure(name, veth_host);
     lc_kernel_exit(exit_code);
 }
 
@@ -3770,9 +3753,11 @@ static void cmd_rm(int argc, char **argv) {
 
     if (is_running(name)) die2("Error: container is running (stop it first): ", name);
 
-    /* one that ended without a stop still has a cgroup, and firewall rules
-     * that only its configuration can name: cleared away while that is there */
+    /* one that ended without a stop still has a cgroup and firewall rules:
+     * cleared away, and the rules of a command that was cut short with them */
     (void)reconcile(name);
+    if (firewall_remove_links(name) != 0)
+        die2("Error: the container is not removed while the firewall rules of its links are there: ", name);
 
     char cdir[MAX_PATH];
     container_dir_path(cdir, name);

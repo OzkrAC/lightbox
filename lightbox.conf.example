@@ -31,6 +31,22 @@
 # cgroup v2 mount point
 # cgroup_root = /sys/fs/cgroup
 
+# The firewall, with the settings of Docker's daemon.json; each true or false.
+# firewall: lightbox makes its rules, in its own chains reached from the top
+#   of FORWARD and POSTROUTING ("iptables"). Without them a container with
+#   links is not started.
+# ip_forward: setup turns IPv4 forwarding on ("ip-forward").
+# ip_forward_no_drop: when setup turns forwarding on, it leaves the FORWARD
+#   policy; otherwise the policy becomes DROP ("ip-forward-no-drop").
+# ip_masq: what containers send out by any interface but the bridge is
+#   masqueraded ("ip-masq").
+# Rules of this host's that are to decide before lightbox's go in the chain
+# LIGHTBOX-USER, which lightbox makes and never changes.
+# firewall = true
+# ip_forward = true
+# ip_forward_no_drop = false
+# ip_masq = true
+
 # Bridge interface and network. subnet is <address>/<bits>, with 8 to 30 bits;
 # the bridge and every container have its prefix. gw is the bridge's address
 # in it, neither its first nor its last. A bridge that setup has made keeps

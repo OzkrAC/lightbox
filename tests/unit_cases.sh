@@ -36,6 +36,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 SH=$(type -P sh)
 TRUE=$(type -P true)
 ENV=$(type -P env)
+CAT=$(type -P cat)
 
 RUN_FORK_FAILED=256 RUN_EXEC_FAILED=257 RUN_SIGNALED=258
 
@@ -1615,6 +1616,81 @@ t_no_prefix_of_its_own() {
     fi
 }
 
+# A program gets its input whole, whether it reads it or not, and an input
+# that is too long is refused before anything runs.
+t_program_input() {
+    out=$("$UNIT" input 'two
+lines
+' "$CAT")
+    [ "$out" = 'two
+lines
+result 0
+left open 0' ] || { echo "cat said: $out"; return 1; }
+    # one that ends without reading: no wait, and no signal for lightbox
+    long=$(head -c 30000 /dev/zero | tr '\0' x)
+    out=$(timeout 10 "$UNIT" input "$long" "$TRUE") || { echo "status $? with a program that does not read"; return 1; }
+    [ "$out" = 'result 0
+left open 0' ] || { echo "true said: $out"; return 1; }
+    out=$(timeout 10 "$UNIT" input "$long" "$CAT" | tail -c 21)
+    [ "$out" = 'result 0
+left open 0' ] || { echo "the end of what cat said: $out"; return 1; }
+    [ "$(timeout 10 "$UNIT" input "$long" "$CAT" | head -n 1 | tr -d x)" = 'result 0' ] || { echo "cat did not get all of it"; return 1; }
+    [ "$(timeout 10 "$UNIT" input "$long" "$CAT" | head -n 1 | tr -cd x | wc -c)" = 30000 ] || { echo "cat did not get all 30000 bytes"; return 1; }
+    out=$("$UNIT" input "$(head -c 40000 /dev/zero | tr '\0' x)" "$CAT" 2>&1)
+    printf '%s\n' "$out"
+    [ "$(printf '%s\n' "$out" | tail -n 2)" = 'result 256
+left open 0' ] || return 1
+    case $out in *'the input is too long for '*) ;; *) return 1 ;; esac
+}
+
+# What iptables-restore is given for a container's links: a chain of its own,
+# a rule for each way of each link that names the two ports and no address,
+# and the jump to it.
+t_firewall_links_text() {
+    got=$("$UNIT" firewall links web db cache)
+    want='*filter
+:LB-web - [0:0]
+-A LB-web -m physdev --physdev-in vb-web --physdev-out vb-db -j ACCEPT
+-A LB-web -m physdev --physdev-in vb-db --physdev-out vb-web -j ACCEPT
+-A LB-web -m physdev --physdev-in vb-web --physdev-out vb-cache -j ACCEPT
+-A LB-web -m physdev --physdev-in vb-cache --physdev-out vb-web -j ACCEPT
+-A LIGHTBOX-LINKS -j LB-web
+COMMIT'
+    [ "$got" = "$want" ] || { printf '%s\n' "$got"; return 1; }
+    # eight links of the longest names fit
+    long=abcdefghijkl
+    got=$("$UNIT" firewall links "$long" "${long%?}1" "${long%?}2" "${long%?}3" "${long%?}4" \
+          "${long%?}5" "${long%?}6" "${long%?}7" "${long%?}8" | grep -c -- '--physdev-in')
+    [ "$got" = 16 ] || { echo "rules for eight links: $got"; return 1; }
+    # and a text that does not fit is no text
+    got=$("$UNIT" firewall links-into-64 web db)
+    [ "$got" = 'too long' ] || { echo "into 64 bytes: $got"; return 1; }
+}
+
+# What setup puts in its chains: between two ports of the bridge what a link
+# allows and nothing else; out by any interface but the bridge, and back what
+# belongs to that; masquerading of the subnet, as the network spells it, when
+# ip_masq is true.
+t_firewall_setup_text() {
+    got=$("$UNIT" firewall setup 10.9.5.0/16 10.9.0.1 br7 true)
+    want='*filter
+-F LIGHTBOX-FORWARD
+-A LIGHTBOX-FORWARD -i br7 -o br7 -j LIGHTBOX-LINKS
+-A LIGHTBOX-FORWARD -i br7 -o br7 -j DROP
+-A LIGHTBOX-FORWARD -i br7 ! -o br7 -j ACCEPT
+-A LIGHTBOX-FORWARD -o br7 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+COMMIT
+*nat
+-F LIGHTBOX-POSTROUTING
+-A LIGHTBOX-POSTROUTING -s 10.9.0.0/16 ! -o br7 -j MASQUERADE
+COMMIT'
+    [ "$got" = "$want" ] || { printf '%s\n' "$got"; return 1; }
+    got=$("$UNIT" firewall setup 10.0.0.0/24 10.0.0.1 br0 false | sed -n '/^\*nat/,$p')
+    [ "$got" = '*nat
+-F LIGHTBOX-POSTROUTING
+COMMIT' ] || { echo "with ip_masq = false:"; printf '%s\n' "$got"; return 1; }
+}
+
 t_limits() {
     bad=0
     expect() { # kind, text, expected
@@ -2281,6 +2357,9 @@ check 'text is put into a buffer whole or not at all'            t_text_is_whole
 check 'a number is digits in its range, and never wraps'         t_numbers_are_strict
 check 'memory, process, CPU and OOM limits are what they say'    t_limits
 check 'a cgroup without a controller: refused when a limit needs it, said when not' t_controllers
+check 'a program gets its input whole, read or not, and too much is refused' t_program_input
+check 'a container'"'"'s link rules are a chain of its own, by port and not address' t_firewall_links_text
+check 'setup'"'"'s rules: links between ports, out by any interface, masquerade if set' t_firewall_setup_text
 check 'an address is four numbers and three dots, and no zero in front' t_addresses_are_strict
 check 'subnet and gw are one network, and an address on it is one a container can have' t_network_settings
 check 'no prefix is written into the source: subnet gives it'      t_no_prefix_of_its_own
