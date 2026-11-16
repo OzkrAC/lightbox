@@ -1287,14 +1287,16 @@ printed by the service" ] || { echo "logs -f showed:"; cat "$OUT/logged.followed
 }
 
 # Nothing that was open in the command stays open in the container: init has
-# /dev/null, the log twice, and its signalfd. The command here has a file on
-# descriptor 9, and no standard streams of its own the second time.
+# /dev/null, the log twice, its signalfd, and the record of how it ends, once.
+# The command here has a file on descriptor 9, and no standard streams of its
+# own the second time.
 t_init_keeps_nothing_of_the_command() {
     box clean || return 1
     look() { # name
-        local pid fd n to log bad=0
+        local pid fd n to log record records=0 bad=0
         pid=$(pid_of "$1") || return 1
         log=$C/$1/console.log
+        record=$RUN/$1/exit
         for fd in "/proc/$pid/fd"/*; do
             n=${fd##*/}
             to=$(readlink "$fd")
@@ -1303,10 +1305,12 @@ t_init_keeps_nothing_of_the_command() {
             if [ "$n" = 0 ] && [ "$fd" -ef /dev/null ]; then continue; fi
             if { [ "$n" = 1 ] || [ "$n" = 2 ]; } && [ "$fd" -ef "$log" ]; then continue; fi
             if [ "$n" -gt 2 ] && [ "$to" = 'anon_inode:[signalfd]' ]; then continue; fi
+            if [ "$n" -gt 2 ] && [ "$fd" -ef "$record" ]; then records=$((records + 1)); continue; fi
             echo "  init should not have that"
             bad=1
         done
         [ -e "/proc/$pid/fd/0" ] && [ -e "/proc/$pid/fd/1" ] && [ -e "/proc/$pid/fd/2" ] || { echo "  init lacks a standard stream"; bad=1; }
+        [ "$records" = 1 ] || { echo "  init has the record of how it ends open $records times, not once"; bad=1; }
         return $bad
     }
     : > "$T/open-in-the-command"

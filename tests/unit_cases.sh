@@ -569,12 +569,13 @@ h_command_gone() {
 }
 
 # The hook gets three standard streams and nothing else: not init's pipes to
-# the command, not its signalfd, no blocked signal, and nothing that was open
-# in the command, which here has a file on descriptor 9.
+# the command, not its signalfd, not the record of how init ends, no blocked
+# signal, and nothing that was open in the command, which here has a file on
+# descriptor 9.
 h_hook_inherits_nothing() {
     printf 'grep SigBlk: /proc/self/status > %s/blocked\nexec ls /proc/self/fd > %s/fds\n' "$D" "$D" > "$D/hook"
     : > "$D/open-in-the-command"
-    handshake whole confined 5 "$D/hook" - 9< "$D/open-in-the-command"
+    UNIT_EXIT="$D/exit" handshake whole confined 5 "$D/hook" - 9< "$D/open-in-the-command"
     # ls itself has the directory it lists on 3
     echo "descriptors in the hook: $(tr '\n' ' ' < "$D/fds")"
     echo "blocked in the hook: $(cat "$D/blocked")"
@@ -601,15 +602,15 @@ complained by the hook" ] && [ "$(cat "$D/stdin")" -ef /dev/null ] || return 1
 
 # A start that worked ends and leaves init running. A shell that captures the
 # command's output must get it then: init holds nothing of the command, is in
-# a session and a process group of its own, and has only its three streams and
-# its signalfd open.
+# a session and a process group of its own, and has only its three streams,
+# its signalfd and the record of how it ends open, as after a real start.
 #
 # The command writes to a pipe here, as it does under $( ). What reads the
 # pipe ends when nothing has it open any more, and is given ten seconds: an
 # init that held on to the pipe must fail this case, not stall it.
 h_command_returns_and_init_stays() {
     : > "$D/open-in-the-command"
-    ( unshare -r "$UNIT" init leave confined 5 - "$D/log" 2>&1 9< "$D/open-in-the-command" | cat > "$D/out" ) &
+    ( UNIT_EXIT="$D/exit" unshare -r "$UNIT" init leave confined 5 - "$D/log" 2>&1 9< "$D/open-in-the-command" | cat > "$D/out" ) &
     reader=$!
     i=0
     while kill -0 "$reader" 2>/dev/null && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
@@ -630,6 +631,7 @@ h_command_returns_and_init_stays() {
     read -r _ _ _ _ group session _ < "/proc/$init/stat"
     echo "init $init is in process group $group and session $session; this shell is $$"
     [ "$session" = "$init" ] && [ "$group" = "$init" ] || { echo "init does not lead a session of its own"; bad=1; }
+    records=0
     for fd in "/proc/$init/fd"/*; do
         n=${fd##*/}
         to=$(readlink "$fd")
@@ -638,10 +640,12 @@ h_command_returns_and_init_stays() {
         if [ "$n" = 0 ] && [ "$fd" -ef /dev/null ]; then continue; fi
         if { [ "$n" = 1 ] || [ "$n" = 2 ]; } && [ "$fd" -ef "$D/log" ]; then continue; fi
         if [ "$n" -gt 2 ] && [ "$to" = 'anon_inode:[signalfd]' ]; then continue; fi
+        if [ "$n" -gt 2 ] && [ "$fd" -ef "$D/exit" ]; then records=$((records + 1)); continue; fi
         echo "  init should not have that"
         bad=1
     done
     [ -e "/proc/$init/fd/0" ] && [ -e "/proc/$init/fd/1" ] && [ -e "/proc/$init/fd/2" ] || { echo "  init lacks a standard stream"; bad=1; }
+    [ "$records" = 1 ] || { echo "  init has the record of how it ends open $records times, not once"; bad=1; }
     kill -KILL "$init"
     wait "$reader" 2>/dev/null
     return $bad
