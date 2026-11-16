@@ -83,6 +83,7 @@ typedef struct {
 typedef struct {
     int  version;               /* 0: a file from before it had the line */
     char mem[MEM_TEXT_MAX];
+    char swap[MEM_TEXT_MAX];    /* empty: not given, which is none */
     char pids[PIDS_TEXT_MAX];
     char cpu[CPU_TEXT_MAX];
     char io[IO_TEXT_MAX];       /* empty: no limit */
@@ -101,6 +102,10 @@ typedef struct {
 
 /* Is this a limit as an option, a setting and the file may give it? */
 [[nodiscard]] bool mem_limit_ok(const char *text);      /* <number>[K|M|G|T] or max */
+[[nodiscard]] bool swap_limit_ok(const char *text);     /* the same, or 0 */
+/* A line for io.max: <major>:<minor> and one or more of rbps, wbps, riops and
+ * wiops, each =<number> or =max, with a space before each */
+[[nodiscard]] bool io_limit_ok(const char *text);
 [[nodiscard]] bool pids_limit_ok(const char *text);     /* 1 to PIDS_LIMIT_MAX, or max */
 /* 0.01 to CPU_LIMIT_MAX CPUs with at most two decimals: the quota, in
  * microseconds of each CPU_PERIOD_US */

@@ -246,8 +246,10 @@ void cmd_inspect(int argc, char **argv) {
     if (wrong)
         die2("Error: the container's configuration cannot be used: ", wrong);
     print_kv("mem", config.mem);
+    print_kv("swap", config.swap[0] ? config.swap : "0");
     print_kv("pids", config.pids);
     print_kv("cpu", config.cpu);
+    print_kv("io", config.io[0] ? config.io : "-");
     print_kv_int("oom_score", config.oom_score);
     print_kv_int("userns", config.userns);
     print_kv_int("uid_start", config.uid_start);

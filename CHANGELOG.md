@@ -23,6 +23,8 @@ Not tagged yet, and not complete: the part of Phase 5 that is written so far.
 - **`subnet` and `gw` are checked together** by `setup`, `create` and `start`, and reported by `doctor`: `subnet` is `<address>/<bits>` with 8 to 30 bits, and `gw` is an address in it that is neither its first nor its last. Either one wrong ends the command, with the setting named, before anything is made.
 - **The prefix of `subnet` is used.** `setup` gave the bridge a `/24`, and `start` gave every container one, whatever `subnet` said: on a `/16`, a container outside the gateway's `/24` did not start. A bridge that an earlier `setup` made keeps the address it was given, so with a `subnet` that is not a `/24`, delete the bridge while no container runs (`ip link delete br0`) and run `setup` again.
 - **`start` refuses a container whose address is not in `subnet`**, as after a change of `subnet`. It would have started and reached nothing.
+- **A container has no swap unless `--swap` gives it some**, containers made before included. Past its memory limit a process is killed instead of going on in swap, and with `memory.oom.group` the kernel ends the whole container, which the next `start`, `stop` or `rm` clears away. Give a container that needs swap `--swap`, by creating it again or by adding `swap=<size>` to its `.conf`.
+- **The `io` line of a `.conf` is checked**: `<major>:<minor>` and one or more of `rbps`, `wbps`, `riops` and `wiops`, each `=<number>` or `=max`, without a zero in front of a number. One that is not is an error that names the line. It could only have come from an edit by hand.
 - **A container's `.conf` that lightbox cannot use is an error that names the file and the line**, for `start`, `exec`, `inspect`, `add-vol` and `rm-vol`. `stop` still stops such a container, says that it could not know the container's links, and exits with 1. `rm` removes it as before.
 
 ### Added
@@ -31,6 +33,9 @@ Not tagged yet, and not complete: the part of Phase 5 that is written so far.
 - **`--mem max` and `--pids max`** for a container without that limit.
 - **`lightbox create <name>` without an address** gives the container the lowest address of the subnet that is free: not the gateway's and not another container's. Two `create` at once get two addresses.
 - `doctor` shows the network that `subnet` and `gw` make, or what is wrong with them.
+- **`--swap <limit>`** lets a container use swap: `0`, a size as for `--mem`, or `max`.
+- **`--io-max "<major>:<minor> <key>=<value>..."`** gives a container an I/O limit for one whole disk, as `io.max` takes it. Before, only an edit of the `.conf` could. `create` refuses a device that the host does not have, and a partition, for which the kernel takes no limit.
+- `inspect` shows `swap` and `io`.
 - **`lightbox rm-vol <name> <dst>`** takes the volume at a destination out of a container's configuration. Like `add-vol`, it takes effect at the next start.
 - A container's `.conf` begins with `version=1`. Containers made by earlier versions keep working as they are, and get the line the next time `add-vol` or `rm-vol` writes the file.
 
@@ -44,6 +49,8 @@ Not tagged yet, and not complete: the part of Phase 5 that is written so far.
 - `start` read the container's `.conf` once for every setting in it, and init read it again. It is read once.
 - `start` waited for the disk each time it wrote a record of the container, several times in every start. It no longer waits for any.
 - After a reboot, containers that had been running were shown as `exited`, from records that were kept on disk. They are shown as `stopped`.
+- `start` enabled the `memory`, `pids`, `cpu` and `io` controllers in one write, which failed as a whole when any one was missing: on a host without `io` no container started, I/O limit or not. Each is enabled on its own, and a missing one stops only a container whose limits need it.
+- A command that `exec` ran had the OOM score of whoever ran `exec`, not the container's.
 
 ## 0.4.0
 

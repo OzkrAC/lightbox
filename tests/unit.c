@@ -58,6 +58,11 @@
  *                                             where an executable memfd is refused
  *   unit relay <ptmx> -- <command...>         what exec does about a command's standard streams,
  *                                             without a container: see below
+ *   unit controllers <listed> <mem> <pids> <swap|-> <io|->
+ *                                             controllers_check for a container with those
+ *                                             limits and a cgroup.controllers of <listed>:
+ *                                             "have <controller>..." after the warnings, on
+ *                                             standard error, or "refused: <why>"
  *   unit address <text>                       parse_ipv4: the address as format_ipv4 writes it,
  *                                             or "refused"
  *   unit network <subnet> <gw> [<address>...] container_network_parse: "subnet <net>/<bits>
@@ -182,6 +187,7 @@ static void put_config(const container_config *config) {
     put_number("userns", config->userns);
     put_number("uid_start", config->uid_start);
     put_line("io ", config->io[0] ? config->io : "-");
+    put_line("swap ", config->swap[0] ? config->swap : "-");
     for (int i = 0; i < config->nvols; i++) {
         put("vol ");
         put(config->vols[i].src);
@@ -196,7 +202,7 @@ static void put_config(const container_config *config) {
 /* A field of a configuration set to a value as it is, however long it is
  * allowed to be and whatever is in it. */
 static void set_unchecked(container_config *config, const char *assignment) {
-    static const char *const fields[] = { "mem=", "pids=", "cpu=", "io=", "link=", "src=", "dst=" };
+    static const char *const fields[] = { "mem=", "pids=", "cpu=", "io=", "link=", "src=", "dst=", "swap=" };
     size_t which = 0, len = 0;
     for (; which < sizeof(fields) / sizeof(fields[0]); which++) {
         len = lc_string_length(fields[which]);
@@ -221,6 +227,7 @@ static void set_unchecked(container_config *config, const char *assignment) {
                        str_copy(config->vols[config->nvols].dst, value, MAX_PATH);
                 config->nvols++;
                 break;
+        case 7: fits = str_copy(config->swap, value, sizeof(config->swap)); break;
         default: break;
     }
     if (!fits)
@@ -644,6 +651,10 @@ int main(int argc, char **argv, char **envp) {
         int number = 0;
         if (streq(argv[2], "mem"))
             put(mem_limit_ok(argv[3]) ? "ok\n" : "refused\n");
+        else if (streq(argv[2], "swap"))
+            put(swap_limit_ok(argv[3]) ? "ok\n" : "refused\n");
+        else if (streq(argv[2], "io"))
+            put(io_limit_ok(argv[3]) ? "ok\n" : "refused\n");
         else if (streq(argv[2], "pids"))
             put(pids_limit_ok(argv[3]) ? "ok\n" : "refused\n");
         else if (streq(argv[2], "cpu") && parse_cpu_limit(argv[3], &number))
@@ -652,6 +663,31 @@ int main(int argc, char **argv, char **envp) {
             put_number("score", number);
         else
             put("refused\n");
+        return 0;
+    }
+    if (argc == 7 && streq(argv[1], "controllers")) {
+        static container_config config;
+        container_config_init(&config);
+        if (!str_copy(config.mem, argv[3], sizeof(config.mem)) ||
+            !str_copy(config.pids, argv[4], sizeof(config.pids)) ||
+            !str_copy(config.swap, streq(argv[5], "-") ? "" : argv[5], sizeof(config.swap)) ||
+            !str_copy(config.io, streq(argv[6], "-") ? "" : argv[6], sizeof(config.io)) ||
+            !str_copy(config.cpu, "1", sizeof(config.cpu)))
+            die("unit: controllers <listed> <mem> <pids> <swap|-> <io|->");
+        bool have[CTL_COUNT];
+        const char *lacking = controllers_check(argv[2], &config, have);
+        if (lacking) {
+            put_line("refused: ", lacking);
+            return 0;
+        }
+        put("have");
+        for (int i = 0; i < CTL_COUNT; i++) {
+            if (have[i]) {
+                put(" ");
+                put(CONTROLLER_NAMES[i]);
+            }
+        }
+        put("\n");
         return 0;
     }
     if (argc == 3 && streq(argv[1], "address")) {

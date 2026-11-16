@@ -1050,18 +1050,98 @@ t_start_runs_nothing_from_the_image() {
 
 # ─── Cases: limits ──────────────────────────────────────────────────────────
 
+# The limits are in the cgroup, with no swap and the whole container for the
+# kernel to kill unless --swap gives some; init and what exec runs have the
+# container's OOM score.
 t_limits() {
     up limits --mem 64M --pids 50 --cpu 2 --oom-score 300 || return 1
     pid=$(pid_of limits)
     echo "memory.max $(cat "$CG/limits/memory.max"), pids.max $(cat "$CG/limits/pids.max"), cpu.max $(cat "$CG/limits/cpu.max"), oom_score_adj $(cat "/proc/$pid/oom_score_adj")"
     [ "$(cat "$CG/limits/memory.max")" = 67108864 ] && [ "$(cat "$CG/limits/pids.max")" = 50 ] &&
     [ "$(cat "$CG/limits/cpu.max")" = '200000 100000' ] && [ "$(cat "/proc/$pid/oom_score_adj")" = 300 ] || return 1
-    # part of a CPU, and no limit at all
-    up half --mem max --pids max --cpu 0.5 --oom-score -500 || return 1
+    echo "memory.swap.max $(cat "$CG/limits/memory.swap.max"), memory.oom.group $(cat "$CG/limits/memory.oom.group"), oom_score_adj of what exec runs $(sh_in limits 'cat /proc/self/oom_score_adj')"
+    [ "$(cat "$CG/limits/memory.swap.max")" = 0 ] && [ "$(cat "$CG/limits/memory.oom.group")" = 1 ] &&
+    [ "$(sh_in limits 'cat /proc/self/oom_score_adj')" = 300 ] || return 1
+    # part of a CPU, no limit at all, and some swap
+    up half --mem max --pids max --cpu 0.5 --oom-score -500 --swap 64M || return 1
     pid=$(pid_of half)
-    echo "memory.max $(cat "$CG/half/memory.max"), pids.max $(cat "$CG/half/pids.max"), cpu.max $(cat "$CG/half/cpu.max"), oom_score_adj $(cat "/proc/$pid/oom_score_adj")"
+    echo "memory.max $(cat "$CG/half/memory.max"), pids.max $(cat "$CG/half/pids.max"), cpu.max $(cat "$CG/half/cpu.max"), oom_score_adj $(cat "/proc/$pid/oom_score_adj"), memory.swap.max $(cat "$CG/half/memory.swap.max")"
     [ "$(cat "$CG/half/memory.max")" = max ] && [ "$(cat "$CG/half/pids.max")" = max ] &&
-    [ "$(cat "$CG/half/cpu.max")" = '50000 100000' ] && [ "$(cat "/proc/$pid/oom_score_adj")" = -500 ]
+    [ "$(cat "$CG/half/cpu.max")" = '50000 100000' ] && [ "$(cat "/proc/$pid/oom_score_adj")" = -500 ] &&
+    [ "$(cat "$CG/half/memory.swap.max")" = 67108864 ] && [ "$(sh_in half 'cat /proc/self/oom_score_adj')" = -500 ]
+}
+
+# A whole disk of this host, as <major>:<minor>: not a partition, a loop
+# device, a RAM disk or an optical drive.
+whole_disk() {
+    local d name
+    for d in /sys/dev/block/*; do
+        [ -e "$d/uevent" ] && [ ! -e "$d/partition" ] || continue
+        name=$(sed -n 's/^DEVNAME=//p' "$d/uevent")
+        case $name in loop*|ram*|zram*|sr*|'') continue ;; esac
+        echo "${d##*/}"
+        return 0
+    done
+    return 1
+}
+
+# --io-max reaches io.max.
+t_io_limit() {
+    disk=$(whole_disk) || { echo "this host has no whole disk to limit"; return 77; }
+    up iolimit --io-max "$disk wbps=1048576 riops=max" || return 1
+    echo "io.max: $(cat "$CG/iolimit/io.max")"
+    grep -qx "$disk rbps=max wbps=1048576 riops=max wiops=max" "$CG/iolimit/io.max"
+}
+
+# Past its memory limit a process is killed, and does not go on in swap; and
+# with it the whole container, which the next command clears away.
+t_past_the_memory_limit() {
+    chroot "$BASE" /bin/sh -c 'command -v dd' >/dev/null 2>&1 || { echo "this image has no dd to fill memory with"; return 77; }
+    echo "swap on this host: $(awk 'NR > 1 { n++; k += $3 } END { print n + 0 " areas, " k + 0 " KiB" }' /proc/swaps)"
+    up hungry --mem 32M || return 1
+    pid=$(pid_of hungry)
+    # 64 MiB in one buffer, which dd fills from /dev/zero
+    sh_in hungry 'dd if=/dev/zero of=/dev/null bs=67108864 count=1' >"$OUT/hungry.dd" 2>&1
+    rc=$?
+    cat "$OUT/hungry.dd"
+    echo "exec ended with status $rc"
+    [ $rc -ne 0 ] || { echo "dd went past the memory limit and finished"; return 1; }
+    echo "memory.events: $(tr '\n' ' ' < "$CG/hungry/memory.events")"
+    kills=$(awk '$1 == "oom_kill" { print $2 }' "$CG/hungry/memory.events")
+    [ "${kills:-0}" -ge 1 ] || { echo "the kernel killed nothing for the limit"; return 1; }
+    wait_until 5 gone "$pid" || { echo "init $pid outlived the kill of a process in its container"; return 1; }
+    lb stop hungry
+    nothing_left hungry && [ "$(state_of hungry)" = failed ]
+}
+
+# Without the io controller, which a kernel may lack or a parent keep to
+# itself, a container without an I/O limit starts and is told so once; one
+# with an I/O limit is refused, and nothing of it is left. Here the suite's
+# cgroup keeps io from the one below it, which this case's lightbox.conf has
+# for its cgroup_root.
+t_without_io_controller() {
+    sub=$CG/noio
+    mkdir -p "$T/noio/home/.config/lightbox" "$sub" || return 1
+    echo -io > "$CG/cgroup.subtree_control" || { echo "io could not be kept from below the suite's cgroup"; return 1; }
+    sed -e "s#^cgroup_root = .*#cgroup_root = $sub#" -e "s#^cgroup_base = .*#cgroup_base = $sub/base#" \
+        "$HOME/.config/lightbox/lightbox.conf" > "$T/noio/home/.config/lightbox/lightbox.conf"
+    echo "controllers below the suite's cgroup: $(cat "$sub/cgroup.controllers")"
+    export HOME="$T/noio/home"
+    box plain || return 1
+    lb start plain >"$OUT/plain.start" 2>&1 </dev/null || { cat "$OUT/plain.start"; return 1; }
+    cat "$OUT/plain.start"
+    [ "$(grep -c '^Warning:' "$OUT/plain.start")" = 1 ] && grep -q '^Warning: .* no io controller' "$OUT/plain.start" ||
+        { echo "start did not warn once, about io"; return 1; }
+    settled plain || return 1
+    echo "the container's cgroup has: $(cat "$sub/base/plain/cgroup.controllers"); memory.max $(cat "$sub/base/plain/memory.max")"
+    [ "$(cat "$sub/base/plain/memory.max")" = 268435456 ] || { echo "the other limits are not there"; return 1; }
+    lb stop plain >/dev/null || return 1
+    disk=$(whole_disk) || { echo "this host has no whole disk for an I/O limit, so that refusal is not tried"; return 0; }
+    box limited --io-max "$disk wbps=1048576" || return 1
+    said=$(lb start limited 2>&1 </dev/null) && { echo "a container with an I/O limit started without io"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *"has no io controller, and the container has an I/O limit"*) ;; *) return 1 ;; esac
+    [ ! -d "$sub/base/limited" ] && no_link vb-limited
 }
 
 t_cgroup_membership() {
@@ -1827,8 +1907,12 @@ EOF
     build_rootfs && network
 }
 
-kill_cgroup() { # directory
+kill_cgroup() { # directory, after every cgroup below it
     [ -d "$1" ] || return 0
+    local sub
+    for sub in "$1"/*/; do
+        [ -d "$sub" ] && kill_cgroup "${sub%/}"
+    done
     if [ -e "$1/cgroup.kill" ]; then
         echo 1 > "$1/cgroup.kill"
     else
@@ -1981,7 +2065,10 @@ if [ "$MODE" = inside ]; then
     check 'an image of one static binary starts'                          t_image_with_one_binary
     check 'start runs nothing from the image'                             t_start_runs_nothing_from_the_image
 
-    check 'limits reach the cgroup and the oom score reaches init'        t_limits
+    check 'limits reach the cgroup, without swap, and the oom score init and exec' t_limits
+    check '--io-max reaches io.max'                                        t_io_limit
+    check 'past its memory limit a process is killed, and its container with it' t_past_the_memory_limit
+    check 'without io, a container starts and is told once; with an I/O limit, not' t_without_io_controller
     check 'init and commands run by exec are in the container cgroup'     t_cgroup_membership
 
     check 'the init hook runs with /tmp and /run mounted'                 t_hook_runs
@@ -2148,8 +2235,8 @@ remove_cgroups() {
     done
 }
 
-# lightbox enables controllers at the cgroup root and leaves them enabled
-# (RT-cgroup-controllers). Switch off the ones that were off before.
+# lightbox enables controllers at the cgroup root, which its containers' cgroups
+# need, and leaves them enabled. Switch off the ones that were off before.
 restore_controllers() {
     local c
     for c in $(cat /sys/fs/cgroup/cgroup.subtree_control); do

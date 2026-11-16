@@ -444,8 +444,66 @@ t_limits_are_stored_as_given() {
     lb inspect a | grep -x 'cpu: 0.5' && lb inspect a | grep -x 'mem: 512m'
 }
 
+# --swap takes what --mem does, and 0. Without it the file says nothing, and
+# the container has none.
+t_swap_option() {
+    lb create a --swap 64M && lb create b && lb create c --swap 0 && lb create d --swap max || return 1
+    conf_has a 'swap=64M' && conf_has c 'swap=0' && conf_has d 'swap=max' || return 1
+    ! grep -q '^swap=' "$C/b/.conf" || { echo "a swap limit nobody gave is stored"; return 1; }
+    lb inspect a | grep -x 'swap: 64M' && lb inspect b | grep -x 'swap: 0' || return 1
+    for value in lots 0100M 00 -1 '' MAX '64M
+privileged=1'; do
+        msg=$(lb create e --swap "$value" 2>&1) && { echo "--swap '$value' was taken"; return 1; }
+        case $msg in 'Error: --swap takes '*) ;; *) echo "--swap '$value': $msg"; return 1 ;; esac
+        [ ! -e "$C/e" ] || { echo "--swap '$value' left a container"; return 1; }
+    done
+}
+
+# A whole disk of this host, as <major>:<minor>; with "partition", one of its
+# partitions instead.
+block_device() {
+    local d
+    for d in /sys/dev/block/*; do
+        [ -e "$d/uevent" ] || continue
+        if [ "${1:-}" = partition ]; then [ -e "$d/partition" ] || continue; else [ ! -e "$d/partition" ] || continue; fi
+        echo "${d##*/}"
+        return 0
+    done
+    return 1
+}
+
+# --io-max is a line of io.max for one disk that this host has: a partition,
+# a device that is not there, a second --io-max and anything the kernel
+# would read otherwise are refused, and nothing is made.
+t_io_max_option() {
+    bad=0
+    for value in 8:0 '8:0 rbps' '8:0 rbps=01' '8:0 xbps=1' '8:0 rbps=1 rbps=2' '08:0 rbps=1' '8:0 rbps=1
+privileged=1'; do
+        msg=$(lb create e --io-max "$value" 2>&1) && { echo "--io-max '$value' was taken"; bad=1; continue; }
+        case $msg in 'Error: --io-max takes '*) ;; *) echo "--io-max '$value': $msg"; bad=1 ;; esac
+    done
+    msg=$(lb create e --io-max '4095:1048575 rbps=1' 2>&1) && { echo "a device that is not there was taken"; bad=1; }
+    printf '%s\n' "$msg"
+    case $msg in *'no block device with that number'*) ;; *) bad=1 ;; esac
+    if part=$(block_device partition); then
+        msg=$(lb create e --io-max "$part wbps=1048576" 2>&1) && { echo "the partition $part was taken"; bad=1; }
+        printf '%s\n' "$msg"
+        case $msg in *'that is a partition'*) ;; *) bad=1 ;; esac
+    else
+        echo "this host has no partition to try"
+    fi
+    [ ! -e "$C/e" ] || { echo "a refused --io-max left a container"; bad=1; }
+    disk=$(block_device) || { echo "this host has no whole disk to give a limit for"; return $bad; }
+    msg=$(lb create e --io-max "$disk wbps=1" --io-max "$disk rbps=1" 2>&1) && { echo "two --io-max were taken"; bad=1; }
+    case $msg in *'--io-max is given once'*) ;; *) echo "two --io-max: $msg"; bad=1 ;; esac
+    lb create io --io-max "$disk wbps=1048576 riops=max" || return 1
+    conf_has io "io=$disk wbps=1048576 riops=max" && lb inspect io | grep -x "io: $disk wbps=1048576 riops=max" || bad=1
+    lb inspect e >/dev/null 2>&1 && { echo "a refused --io-max left a container"; bad=1; }
+    return $bad
+}
+
 t_missing_value_is_named() {
-    for option in --mem --pids --cpu --oom-score --vol --dns --link --rootfs; do
+    for option in --mem --swap --pids --cpu --oom-score --io-max --vol --dns --link --rootfs; do
         msg=$(lb create web 10.0.0.2 "$option" 2>&1) && { echo "$option without a value was accepted"; return 1; }
         printf '%s\n' "$msg"
         [ "$msg" = "Error: option $option requires a value" ] || return 1
@@ -1371,6 +1429,8 @@ check 'a /16 subnet has the addresses of a /16'               t_wide_subnet
 check 'subnet and gw that are no network are refused'         t_network_settings_are_checked
 check 'an address with a zero in front of a number is refused' t_address_with_leading_zeros_refused
 check 'two creates at once get two addresses'                 t_creates_at_once_get_two_addresses
+check '--swap takes what --mem does and 0, and is none unless given' t_swap_option
+check '--io-max is a line of io.max for a whole disk that is there' t_io_max_option
 check 'ls --json stays JSON next to an odd directory name'    t_ls_json_escapes_names
 check 'ls --json escapes whatever a record holds'             t_ls_json_escapes_values
 check 'ls --json gives pid as null for a stopped container'   t_ls_json_pid_is_null_when_stopped

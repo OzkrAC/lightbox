@@ -270,8 +270,10 @@ lightbox <command> [args]
 |------|---------|-------------|
 | `--rootfs <path>` | `$LIGHTBOX_ROOTFS` | Base rootfs to copy |
 | `--mem <limit>` | `256M` | Memory limit: a number of bytes, optionally with `K`, `M`, `G` or `T`, or `max` for none |
+| `--swap <limit>` | `0` | Swap the container may use beyond its memory: `0`, a size as for `--mem`, or `max` |
 | `--pids <limit>` | `128` | Max processes, 1 to 4194304, or `max` for no limit |
 | `--cpu <num>` | `1` | CPUs, 0.01 to 512, with up to two decimals: `2`, `0.5`, `1.25` |
+| `--io-max "<major>:<minor> <key>=<value>..."` | none | I/O limit for one whole disk of the host, as `io.max` takes it: `"8:0 wbps=10485760 riops=1000"`, with `rbps`, `wbps`, `riops` and `wiops`, each a number or `max` |
 | `--vol <src>:<dst>[:ro]` | — | Bind mount (repeatable, up to 16, one at a destination) |
 | `--userns` | — | Future improvement; not supported yet |
 | `--uid-start <n>` | — | Future improvement; not supported yet |
@@ -282,6 +284,10 @@ lightbox <command> [args]
 | `--dns <address>` | the host's | A name server for the container (IPv4, up to 3) |
 
 A value that is not what its option takes ends `create` with the option named, and nothing is made: no value is shortened or stored to be found wrong at the next start. An option that is given without its value says so.
+
+A container's memory limit is a limit: past it, a process is killed and does not go on in swap, unless `--swap` gives the container some. The kernel then ends the whole container, not only the one process, and the next `start`, `stop` or `rm` clears it away. Processes that `exec` starts have the container's `--oom-score`, as its init does.
+
+`start` enables the `memory`, `pids`, `cpu` and `io` cgroup controllers one by one. One that the host does not give the container's cgroup stops the start only when the container has a limit that needs it: `cpu` always, `memory` for `--mem` or `--swap`, `pids` for `--pids` and `io` for `--io-max`. Otherwise `start` says it once and the container runs without it.
 
 ### Exec options
 

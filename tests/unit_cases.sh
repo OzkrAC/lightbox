@@ -1649,6 +1649,56 @@ privileged=1'; do
     expect oom -1000 'score -1000'
     expect oom 1000 'score 1000'
     for text in '' abc 12abc 1001 -1001 1.5 ' 5'; do expect oom "$text" refused; done
+    # swap: what mem takes, or none
+    for text in 0 1 64M 1g max 8388607T; do expect swap "$text" ok; done
+    for text in '' 00 0100M -1 lots MAX '0 ' '64M
+mem=1G'; do expect swap "$text" refused; done
+    # a line of io.max for one disk, with numbers the kernel cannot read in another base
+    for text in '8:0 rbps=1048576' '8:0 wbps=max' '259:0 rbps=1 wbps=2 riops=3 wiops=4' '8:16 wiops=max riops=10' \
+                '4095:1048575 rbps=9223372036854775807'; do
+        expect io "$text" ok
+    done
+    for text in '' 8:0 '8:0 ' '8:0 rbps' '8:0 rbps=' '8:0 rbps=0' '8:0 rbps=01' '8:0 rbps=0x10' '8:0 xbps=1' \
+                '8:0 rbps=1 rbps=2' '8:0  rbps=1' '8:0 rbps=1 ' ' 8:0 rbps=1' '08:0 rbps=1' '8:00 rbps=1' \
+                '0:0 rbps=1' '4096:0 rbps=1' '8:1048576 rbps=1' '8 rbps=1' '8:0,rbps=1' '8:0 rbps=maximum' \
+                '8:0 rbps=9223372036854775808' '8:0 rbps=1
+privileged=1' 'a:b rbps=1'; do
+        expect io "$text" refused
+    done
+    return $bad
+}
+
+# The controllers a container's cgroup has: one that a limit needs is there
+# or the start is refused; one that is missing and not needed is said once.
+t_controllers() {
+    bad=0
+    expect() { # listed, mem, pids, swap, io, expected (with what was said before it)
+        got=$("$UNIT" controllers "$1" "$2" "$3" "$4" "$5" 2>&1 | paste -sd'|' -)
+        [ "$got" = "$6" ] || { echo "'$1' for mem $2 pids $3 swap $4 io '$5': $got"; echo "  expected $6"; bad=1; }
+    }
+    all='cpuset cpu io memory hugetlb pids rdma misc'
+    expect "$all" 256M 128 - - 'have memory pids cpu io'
+    expect "$all" 256M 128 64M '8:0 rbps=1' 'have memory pids cpu io'
+    # without io: a container without an I/O limit is told once, one with one is refused
+    expect 'cpuset cpu memory pids' 256M 128 - - "Warning: the container's cgroup has no io controller; the container has no I/O limit that needs it|have memory pids cpu"
+    expect 'cpuset cpu memory pids' 256M 128 - '8:0 rbps=1' "refused: the container's cgroup has no io controller, and the container has an I/O limit"
+    # cpuset is not cpu, nor is a name with more to it
+    expect 'cpuset memory pids io' 256M 128 - - "refused: the container's cgroup has no cpu controller, and every container has a CPU limit"
+    expect 'cpuacct memory pids io' 256M 128 - - "refused: the container's cgroup has no cpu controller, and every container has a CPU limit"
+    # memory, for a memory limit or a swap limit that was given; not for the 0 of no --swap
+    expect 'cpu io pids' 256M 128 - - "refused: the container's cgroup has no memory controller, and the container has a memory or a swap limit"
+    expect 'cpu io pids' max 128 1G - "refused: the container's cgroup has no memory controller, and the container has a memory or a swap limit"
+    expect 'cpu io pids' max 128 0 - "refused: the container's cgroup has no memory controller, and the container has a memory or a swap limit"
+    expect 'cpu io pids' max 128 - - "Warning: the container's cgroup has no memory controller: nothing keeps the container from swapping|have pids cpu io"
+    expect 'cpu io pids' max 128 max - "Warning: the container's cgroup has no memory controller: nothing keeps the container from swapping|have pids cpu io"
+    # pids, for a process limit
+    expect 'cpu io memory' 256M 128 - - "refused: the container's cgroup has no pids controller, and the container has a process limit"
+    expect 'cpu io memory' 256M max - - "Warning: the container's cgroup has no pids controller; the container has no process limit that needs it|have memory cpu io"
+    # a refusal says nothing of what else is missing, not before it either
+    expect 'cpu memory' 256M max - '8:0 rbps=1' "refused: the container's cgroup has no io controller, and the container has an I/O limit"
+    # two missing, two warnings, and a list with a newline at its end as the kernel writes it
+    expect 'cpu memory
+' max max - - "Warning: the container's cgroup has no pids controller; the container has no process limit that needs it|Warning: the container's cgroup has no io controller; the container has no I/O limit that needs it|have memory cpu"
     return $bad
 }
 
@@ -1676,6 +1726,7 @@ config_as_written() {
         echo 'privileged=1'
         echo 'readonly=1'
         echo 'io=8:0 rbps=1048576'
+        echo 'swap=1G'
         echo 'vol=/srv/data:/data'
         echo 'vol=/etc/app.conf:/etc/app.conf:ro'
         echo 'link=db'
@@ -1692,6 +1743,7 @@ readonly 1
 userns 0
 uid_start 0
 io 8:0 rbps=1048576
+swap 1G
 vol /srv/data -> /data rw
 vol /etc/app.conf -> /etc/app.conf ro
 link db
@@ -1716,7 +1768,8 @@ privileged 0
 readonly 0
 userns 0
 uid_start 0
-io -' ] || return 1
+io -
+swap -' ] || return 1
     # a default that cannot be used is no default: the file must have the limit
     got=$(config nodefaults)
     printf '%s\n' "$got"
@@ -1767,6 +1820,12 @@ config_strict() {
     refuses 'line 2: pids is not *'                     version=1 pids=123456789
     refuses 'line 2: cpu is not *'                      version=1 cpu=1024
     refuses 'line 2: oom_score is not *'                version=1 oom_score=12abc
+    refuses 'line 2: swap is not *'                     version=1 swap=lots
+    refuses 'line 2: swap is not *'                     version=1 swap=064M
+    refuses 'line 3: a key the file already has'        version=1 swap=1G swap=2G
+    refuses 'line 2: io is not *'                       version=1 io=8:0
+    refuses 'line 2: io is not *'                       version=1 'io=8:0 rbps=010'
+    refuses 'line 2: io is not *'                       version=1 'io=8:0 rbps=1 rbps=2'
     refuses 'line 2: privileged is not 0 or 1'          version=1 privileged=yes
     refuses 'line 2: readonly is not 0 or 1'            version=1 readonly=2
     refuses 'line 2: the link is not the name of a container' version=1 'link=a b'
@@ -1839,6 +1898,7 @@ readonly 0
 userns 0
 uid_start 0
 io -
+swap -
 vol /srv/data -> /data rw
 vol /srv/other -> /data rw
 link db' ] || return 1
@@ -1858,11 +1918,12 @@ t_config_from_before_the_version_line() { in_config_dir config_from_before; }
 # this is the writer's own refusal, for the day one does.
 config_written() {
     bad=0
-    got=$(written mem=1G pids=max cpu=0.25 'io=8:0 wbps=1024' src=/srv/data dst=/data link=db)
+    got=$(written mem=1G swap=64M pids=max cpu=0.25 'io=8:0 wbps=1024' src=/srv/data dst=/data link=db)
     [ "$got" = written ] || { echo "a good configuration: $got"; bad=1; }
     cat "$D/web/.conf"
     [ "$(cat "$D/web/.conf")" = 'version=1
 mem=1G
+swap=64M
 pids=max
 cpu=0.25
 oom_score=500
@@ -1871,7 +1932,7 @@ vol=/srv/data:/data
 link=db' ] || { echo "the file is not what was put in"; bad=1; }
     [ "$(stat -c %a "$D/web/.conf")" = 600 ] || { echo "the file's mode is $(stat -c %a "$D/web/.conf")"; bad=1; }
     got=$(config | tr '\n' ' ')
-    case $got in 'version 1 mem 1G pids max cpu 0.25 oom_score 500 '*'io 8:0 wbps=1024 vol /srv/data -> /data rw link db ') ;;
+    case $got in 'version 1 mem 1G pids max cpu 0.25 oom_score 500 '*'io 8:0 wbps=1024 swap 64M vol /srv/data -> /data rw link db ') ;;
         *) echo "read back: $got"; bad=1 ;; esac
 
     before=$(cat "$D/web/.conf")
@@ -1887,10 +1948,14 @@ link=db' ] || { echo "the file is not what was put in"; bad=1; }
     case $got in 'refused: '*) ;; *) echo "written with a destination of two lines: $got"; bad=1 ;; esac
     got=$(written src=/srv dst=/data:ro)
     case $got in 'refused: '*) ;; *) echo "written with a colon in a destination: $got"; bad=1 ;; esac
+    # a value that the reader takes back shorter, which only the comparison sees
+    got=$(written "swap=64M${nl}")
+    case $got in 'refused: '*) ;; *) echo "written with a swap that ends in a newline: $got"; bad=1 ;; esac
     got=$(written "mem=1G$(printf '\r')")
     case $got in 'refused: '*) ;; *) echo "written with a carriage return: $got"; bad=1 ;; esac
     # values that are one line and still not what a reader takes, or takes as they are
-    for value in mem=lots mem=0100M mem= pids=0 pids= cpu=1024 cpu= 'link=a b' link= \
+    for value in mem=lots mem=0100M mem= pids=0 pids= cpu=1024 cpu= 'link=a b' link= swap=lots swap=00 \
+                 io=8:0 'io=8:0 rbps=01' 'io=8:0 xbps=1' \
                  src=/srv/ src=/srv/../etc src=srv src=/proc/1; do
         case $value in src=*) got=$(written "$value" dst=/data) ;; *) got=$(written "$value") ;; esac
         case $got in 'refused: '*) ;; *) echo "written with $value: $got"; bad=1 ;; esac
@@ -1903,7 +1968,7 @@ link=db' ] || { echo "the file is not what was put in"; bad=1; }
     # container from before can have them, and its file is written all the same
     got=$(written src=/srv dst=/data src=/other dst=/data)
     [ "$got" = written ] || { echo "two volumes at one place: $got"; bad=1; }
-    got=$(written mem=1G pids=max cpu=0.25 'io=8:0 wbps=1024' src=/srv/data dst=/data link=db)
+    got=$(written mem=1G swap=64M pids=max cpu=0.25 'io=8:0 wbps=1024' src=/srv/data dst=/data link=db)
     [ "$got" = written ] || { echo "the good configuration again: $got"; bad=1; }
     [ "$(cat "$D/web/.conf")" = "$before" ] || { echo "a refused configuration changed the file"; bad=1; }
     for left in "$D/web"/.[!.]* "$D/web"/*; do
@@ -2215,6 +2280,7 @@ check 'cmd_start has one way out once it has changed the host'   t_start_has_one
 check 'text is put into a buffer whole or not at all'            t_text_is_whole_or_refused
 check 'a number is digits in its range, and never wraps'         t_numbers_are_strict
 check 'memory, process, CPU and OOM limits are what they say'    t_limits
+check 'a cgroup without a controller: refused when a limit needs it, said when not' t_controllers
 check 'an address is four numbers and three dots, and no zero in front' t_addresses_are_strict
 check 'subnet and gw are one network, and an address on it is one a container can have' t_network_settings
 check 'no prefix is written into the source: subnet gives it'      t_no_prefix_of_its_own

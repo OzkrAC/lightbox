@@ -229,41 +229,144 @@ static bool readable_within(int32_t fd, int64_t ms) {
     return write_file(path, value);
 }
 
-static int cgroup_create(const char *name, int pid, const container_config *config) {
-    char cg[MAX_PATH];
-    if (!cgroup_path(cg, name))
-        return -1;
+/* The controllers a container's cgroup can have, in the order they are enabled. */
+enum { CTL_MEMORY, CTL_PIDS, CTL_CPU, CTL_IO, CTL_COUNT };
+static const char *const CONTROLLER_NAMES[CTL_COUNT] = { "memory", "pids", "cpu", "io" };
 
-    /* ensure parent exists and has controllers */
-    lc_kernel_mkdirat(AT_FDCWD, cfg_global.cgroup_base, 0755);
-    if (cgroup_write(cfg_global.cgroup_root, "cgroup.subtree_control", "+memory +pids +cpu +io") < 0)
-        return -1;
-    if (cgroup_write(cfg_global.cgroup_base, "cgroup.subtree_control", "+memory +pids +cpu +io") < 0)
-        return -1;
+/* Is a controller in the text of a cgroup.controllers, names and spaces? */
+static bool controller_listed(const char *list, const char *name) {
+    size_t len = lc_string_length(name);
+    for (const char *p = list; *p; ) {
+        while (*p == ' ' || *p == '\n')
+            p++;
+        size_t n = 0;
+        while (p[n] && p[n] != ' ' && p[n] != '\n')
+            n++;
+        if (n > 0 && lc_string_compare(p, n, name, len) == 0)
+            return true;
+        p += n;
+    }
+    return false;
+}
 
-    lc_kernel_mkdirat(AT_FDCWD, cg, 0755);
+/*
+ * The controllers a container's limits need: memory for a memory limit, and
+ * for a swap limit it was given; pids for a process limit; cpu always, since
+ * every container has a CPU limit; io for an I/O limit. The swap limit of 0
+ * that a container has without --swap needs none: without the controller
+ * there is no limit to set, and that is said.
+ */
+static void controllers_needed(const container_config *c, bool need[CTL_COUNT]) {
+    need[CTL_MEMORY] = !streq(c->mem, "max") || (c->swap[0] && !streq(c->swap, "max"));
+    need[CTL_PIDS] = !streq(c->pids, "max");
+    need[CTL_CPU] = true;
+    need[CTL_IO] = c->io[0] != '\0';
+}
 
-    if (cgroup_write(cg, "memory.max", config->mem) < 0) return -1;
-    if (cgroup_write(cg, "pids.max", config->pids) < 0) return -1;
+/*
+ * What a container's cgroup has of the controllers, from the text of its
+ * cgroup.controllers: NULL, or why the container cannot have its limits. A
+ * controller that it lacks and does not need is a warning, once, and the
+ * container runs without it.
+ */
+static const char *controllers_check(const char *listed, const container_config *config, bool have[CTL_COUNT]) {
+    static const char *const lacking[CTL_COUNT] = {
+        "the container's cgroup has no memory controller, and the container has a memory or a swap limit",
+        "the container's cgroup has no pids controller, and the container has a process limit",
+        "the container's cgroup has no cpu controller, and every container has a CPU limit",
+        "the container's cgroup has no io controller, and the container has an I/O limit",
+    };
+    static const char *const without[CTL_COUNT] = {
+        "Warning: the container's cgroup has no memory controller: nothing keeps the container from swapping\n",
+        "Warning: the container's cgroup has no pids controller; the container has no process limit that needs it\n",
+        "",
+        "Warning: the container's cgroup has no io controller; the container has no I/O limit that needs it\n",
+    };
+    bool need[CTL_COUNT];
+    controllers_needed(config, need);
+    for (int i = 0; i < CTL_COUNT; i++) {
+        have[i] = controller_listed(listed, CONTROLLER_NAMES[i]);
+        if (!have[i] && need[i])
+            return lacking[i];
+    }
+    for (int i = 0; i < CTL_COUNT; i++) {
+        if (!have[i])
+            print_str(STDERR, without[i]);
+    }
+    return NULL;
+}
+
+/*
+ * Make a container's cgroup, give it the container's limits and put init in
+ * it. NULL, or what failed.
+ */
+static const char *cgroup_create(const char *name, int pid, const container_config *config) {
+    char cg[MAX_PATH], path[MAX_PATH];
+    if (!cgroup_path(cg, name) || !path_join(path, sizeof(path), cg, "cgroup.controllers"))
+        return "the path of the container's cgroup is too long";
+
+    /* The controllers one at a time, at the root and below it: one that a
+     * level cannot have does not keep the others from it. What the
+     * container's cgroup then lists is what it has. */
+    (void)lc_kernel_mkdirat(AT_FDCWD, cfg_global.cgroup_base, 0755);
+    for (int i = 0; i < CTL_COUNT; i++) {
+        char plus[16] = "+";
+        lc_bytes_copy(plus + 1, CONTROLLER_NAMES[i], lc_string_length(CONTROLLER_NAMES[i]) + 1);
+        (void)cgroup_write(cfg_global.cgroup_root, "cgroup.subtree_control", plus);
+        (void)cgroup_write(cfg_global.cgroup_base, "cgroup.subtree_control", plus);
+    }
+    (void)lc_kernel_mkdirat(AT_FDCWD, cg, 0755);
+    char listed[256];
+    if (read_file(path, listed, sizeof(listed)) < 0)
+        return "failed to create the container's cgroup";
+
+    bool have[CTL_COUNT];
+    const char *lacking = controllers_check(listed, config, have);
+    if (lacking)
+        return lacking;
+
+    if (have[CTL_MEMORY]) {
+        if (cgroup_write(cg, "memory.max", config->mem) < 0)
+            return "failed to set the memory limit";
+        /* No swap unless the container was given some: past its memory
+         * limit a process is killed, and does not go on in swap. */
+        if (cgroup_write(cg, "memory.swap.max", config->swap[0] ? config->swap : "0") < 0) {
+            char swap_path[MAX_PATH];
+            if (!path_join(swap_path, sizeof(swap_path), cg, "memory.swap.max") || path_exists(swap_path))
+                return "failed to set the swap limit";
+            if (config->swap[0] && !streq(config->swap, "max"))
+                return "this kernel does not count swap for cgroups, and the container has a swap limit";
+            if (!config->swap[0])
+                print_str(STDERR, "Warning: this kernel does not count swap for cgroups: nothing keeps the container from swapping\n");
+        }
+        /* and what the kernel kills for it is the whole container, not some
+         * part of it that the rest goes on without */
+        if (cgroup_write(cg, "memory.oom.group", "1") < 0)
+            return "failed to set memory.oom.group";
+    }
+    if (have[CTL_PIDS] && cgroup_write(cg, "pids.max", config->pids) < 0)
+        return "failed to set the process limit";
 
     /* cpu: so much of every period, on all CPUs together */
     int quota;
     char cpu_max[32];
     bool cut = false;
     if (!parse_cpu_limit(config->cpu, &quota))
-        return -1;
+        return "the container's CPU limit is not one";
     size_t len = (size_t)fmt_int(cpu_max, quota);
     str_append(cpu_max, len, " " STRINGIFY(CPU_PERIOD_US), sizeof(cpu_max), &cut);
     if (cut || cgroup_write(cg, "cpu.max", cpu_max) < 0)
-        return -1;
+        return "failed to set the CPU limit";
 
     if (config->io[0] && cgroup_write(cg, "io.max", config->io) < 0)
-        return -1;
+        return "failed to set the I/O limit; the kernel takes one for a disk that is there, and not for a partition";
 
     /* move container process into this cgroup */
     char pidbuf[16];
     fmt_int(pidbuf, pid);
-    return cgroup_write(cg, "cgroup.procs", pidbuf);
+    if (cgroup_write(cg, "cgroup.procs", pidbuf) < 0)
+        return "failed to move init into the container's cgroup";
+    return NULL;
 }
 
 /*
@@ -549,6 +652,22 @@ static const char *option_value(int argc, char **argv, int *i) {
 
 /* ─── cmd_create ────────────────────────────────────────────────────────── */
 
+/* NULL when the disk an I/O limit names is one on this host, or why the
+ * kernel will not take a limit for it: io.max is for whole disks. */
+static const char *io_disk_problem(const char *limit) {
+    char path[64] = "/sys/dev/block/";
+    size_t pos = lc_string_length(path), i = 0;
+    while (limit[i] && limit[i] != ' ' && pos + 1 < sizeof(path))
+        path[pos++] = limit[i++];
+    path[pos] = '\0';
+    if (!path_exists(path))
+        return "there is no block device with that number on this host";
+    char partition[80];
+    if (!path_join(partition, sizeof(partition), path, "partition") || path_exists(partition))
+        return "that is a partition, and the kernel limits only whole disks";
+    return NULL;
+}
+
 [[noreturn]] static void die_about_address(const char *address, const char *why) {
     print_str(STDERR, "Error: a container cannot have the address ");
     print_str(STDERR, address);
@@ -644,6 +763,20 @@ static void cmd_create(int argc, char **argv) {
             const char *value = option_value(argc, argv, &i);
             if (!mem_limit_ok(value) || !str_copy(cfg.mem, value, sizeof(cfg.mem)))
                 die2("Error: --mem takes <number>[K|M|G|T] or max, not: ", value);
+        } else if (streq(opt, "--swap")) {
+            const char *value = option_value(argc, argv, &i);
+            if (!swap_limit_ok(value) || !str_copy(cfg.swap, value, sizeof(cfg.swap)))
+                die2("Error: --swap takes 0, <number>[K|M|G|T] or max, not: ", value);
+        } else if (streq(opt, "--io-max")) {
+            const char *value = option_value(argc, argv, &i);
+            if (cfg.io[0])
+                die("Error: --io-max is given once: a container has an I/O limit for one disk");
+            if (!io_limit_ok(value) || !str_copy(cfg.io, value, sizeof(cfg.io)))
+                die2("Error: --io-max takes \"<major>:<minor> <key>=<value> ...\", each key one of rbps, wbps, "
+                     "riops and wiops and each value a number or max, not: ", value);
+            const char *why = io_disk_problem(value);
+            if (why)
+                die_about("Error: --io-max: ", why, value);
         } else if (streq(opt, "--pids")) {
             const char *value = option_value(argc, argv, &i);
             if (!pids_limit_ok(value) || !str_copy(cfg.pids, value, sizeof(cfg.pids)))
@@ -2372,7 +2505,7 @@ static int finish_exec(int32_t worker, int32_t signal_fd, const struct lb_termio
 /* ─── exec: entering the container ──────────────────────────────────────── */
 
 static int exec_inside_container(const char *name, int target_pid, int userns,
-                                 int privileged, const struct exec_request *req) {
+                                 int privileged, int oom_score, const struct exec_request *req) {
     /* From here to the command's execve this process, and the child it
      * forks, are lightbox inside a container. Not dumpable, their memory and
      * their descriptors are closed to the container's processes, whatever
@@ -2404,6 +2537,14 @@ static int exec_inside_container(const char *name, int target_pid, int userns,
 
     /* Join the host-side container cgroup before switching mount namespaces. */
     cgroup_join_self(name);
+    /* and when memory runs short, be what the container's processes are to
+     * the kernel, not what the caller of exec was */
+    {
+        char score[16];
+        fmt_int(score, oom_score);
+        if (write_file("/proc/self/oom_score_adj", score) < 0)
+            die("Error: failed to give the command the container's OOM score");
+    }
 
     require_setns_fd(mntfd, CLONE_NEWNS, "mount");
     require_setns_fd(utsfd, CLONE_NEWUTS, "uts");
@@ -3277,10 +3418,9 @@ static void cmd_start(int argc, char **argv) {
      */
 
     /* set up cgroup */
-    if (cgroup_create(name, child_pid, &config) != 0) {
-        start_err = "failed to create cgroup";
+    start_err = cgroup_create(name, child_pid, &config);
+    if (start_err)
         goto fail_start;
-    }
 
     /* before the namespace has an interface that could come up with it */
     if (netns_disable_ipv6(child_pid) != 0) {
@@ -3710,7 +3850,7 @@ static void cmd_exec(int argc, char **argv) {
 
     if (worker == 0) {
         lc_kernel_close_file(signal_fd);
-        int status = exec_inside_container(name, pid, userns, privileged, &req);
+        int status = exec_inside_container(name, pid, userns, privileged, config.oom_score, &req);
         lc_kernel_exit(exit_code_from_status(status));
     }
 
@@ -3729,8 +3869,11 @@ static void cmd_exec(int argc, char **argv) {
         "  create <name> [<ip>] [options]\n"
         "                                Create a new container; without <ip>, the lowest free address\n"
         "         --mem  <limit>         Memory limit: <number>[K|M|G|T] or max (default: 256M)\n"
+        "         --swap <limit>         Swap it may use: 0, <number>[K|M|G|T] or max (default: 0)\n"
         "         --pids <limit>         Max processes, or max (default: 128)\n"
         "         --cpu  <num>           CPUs, such as 2 or 0.5 (default: 1)\n"
+        "         --io-max <limit>       I/O limit for one disk: \"8:0 wbps=10485760\", with rbps, wbps,\n"
+        "                                riops or wiops (default: none)\n"
         "         --vol  <src:dst[:ro]>  Bind mount (repeatable)\n"
         "         --rootfs <path>         Base rootfs to copy (default: $LIGHTBOX_ROOTFS or lightbox.conf)\n"
         "         --userns               Future improvement; not supported yet\n"

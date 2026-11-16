@@ -10,6 +10,7 @@
  *
  *   version=1
  *   mem=256M
+ *   swap=64M                only when given; without it the container has none
  *   pids=128
  *   cpu=0.5
  *   oom_score=500
@@ -17,7 +18,8 @@
  *   readonly=1
  *   userns=1
  *   uid_start=100000
- *   io=8:0 rbps=1048576
+ *   io=8:0 rbps=1048576     only when given: <major>:<minor>, and rbps, wbps,
+ *                           riops or wiops, each at most once
  *   vol=/src:/dst[:ro]      once for each volume, in the order they are mounted
  *   link=name               once for each link
  */
@@ -56,6 +58,64 @@ bool mem_limit_ok(const char *text) {
         default:            return false;
     }
     return text[i + 1] == '\0' && value <= ((uint64_t)INT64_MAX >> shift);
+}
+
+/* What memory.swap.max takes: what memory.max does, or none at all. */
+bool swap_limit_ok(const char *text) {
+    return streq(text, "0") || mem_limit_ok(text);
+}
+
+/* A number at *p from min to max, without a zero in front unless it is 0;
+ * *p then stands after it. */
+static bool number_at(const char **p, int64_t min, int64_t max, int64_t *out) {
+    const char *s = *p;
+    if (*s < '0' || *s > '9' || (s[0] == '0' && s[1] >= '0' && s[1] <= '9'))
+        return false;
+    uint64_t value = 0;
+    for (; *s >= '0' && *s <= '9'; s++) {
+        uint64_t digit = (uint64_t)(*s - '0');
+        if (value > ((uint64_t)INT64_MAX - digit) / 10)
+            return false;
+        value = value * 10 + digit;
+    }
+    if ((int64_t)value < min || (int64_t)value > max)
+        return false;
+    *p = s;
+    *out = (int64_t)value;
+    return true;
+}
+
+/*
+ * A line of io.max for one disk: "8:0 rbps=1048576 wiops=max". The kernel
+ * reads its numbers in any base, so 010 would be 8 to it: a zero in front
+ * is refused here, as it is for the other limits.
+ */
+bool io_limit_ok(const char *text) {
+    static const char *const keys[] = { "rbps", "wbps", "riops", "wiops" };
+    const char *p = text;
+    int64_t major, minor, value;
+    if (!number_at(&p, 1, 4095, &major) || *p++ != ':' || !number_at(&p, 0, 1048575, &minor))
+        return false;
+    unsigned seen = 0;
+    while (*p == ' ') {
+        p++;
+        size_t len = 0;
+        while (p[len] && p[len] != '=' && p[len] != ' ')
+            len++;
+        size_t k = 0;
+        while (k < 4 && !(lc_string_length(keys[k]) == len &&
+                          lc_string_starts_with(p, len, keys[k], len)))
+            k++;
+        if (k == 4 || (seen & (1u << k)) || p[len] != '=')
+            return false;
+        seen |= 1u << k;
+        p += len + 1;
+        if (p[0] == 'm' && p[1] == 'a' && p[2] == 'x' && (p[3] == ' ' || p[3] == '\0'))
+            p += 3;
+        else if (!number_at(&p, 1, INT64_MAX, &value))
+            return false;
+    }
+    return seen != 0 && *p == '\0';
 }
 
 /* A count for pids.max, or "max". The same about a leading 0. */
@@ -318,14 +378,14 @@ static const char *config_problem(const char *path, int line, const char *what, 
 enum {
     KEY_MEM = 1 << 0, KEY_PIDS = 1 << 1, KEY_CPU = 1 << 2, KEY_OOM = 1 << 3,
     KEY_PRIVILEGED = 1 << 4, KEY_READONLY = 1 << 5, KEY_USERNS = 1 << 6,
-    KEY_UID_START = 1 << 7, KEY_IO = 1 << 8,
+    KEY_UID_START = 1 << 7, KEY_IO = 1 << 8, KEY_SWAP = 1 << 9,
 };
 
 static unsigned key_bit(const char *key) {
     static const struct { const char *name; unsigned bit; } keys[] = {
         { "mem", KEY_MEM }, { "pids", KEY_PIDS }, { "cpu", KEY_CPU }, { "oom_score", KEY_OOM },
         { "privileged", KEY_PRIVILEGED }, { "readonly", KEY_READONLY }, { "userns", KEY_USERNS },
-        { "uid_start", KEY_UID_START }, { "io", KEY_IO },
+        { "uid_start", KEY_UID_START }, { "io", KEY_IO }, { "swap", KEY_SWAP },
     };
     for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
         if (streq(key, keys[i].name))
@@ -399,6 +459,10 @@ static const char *config_line(container_config *config, char *line, unsigned *s
             if (!mem_limit_ok(value) || !str_copy(config->mem, value, sizeof(config->mem)))
                 return "mem is not <number>[K|M|G|T] or max";
             return NULL;
+        case KEY_SWAP:
+            if (!swap_limit_ok(value) || !str_copy(config->swap, value, sizeof(config->swap)))
+                return "swap is not 0, <number>[K|M|G|T] or max";
+            return NULL;
         case KEY_PIDS:
             if (!pids_limit_ok(value) || !str_copy(config->pids, value, sizeof(config->pids)))
                 return "pids is not a number from 1 to " STRINGIFY(PIDS_LIMIT_MAX) " or max";
@@ -423,7 +487,8 @@ static const char *config_line(container_config *config, char *line, unsigned *s
             return parse_int_in(value, 0, INT32_MAX, &config->uid_start) ? NULL
                                                                          : "uid_start is not a number";
         default:    /* KEY_IO */
-            return str_copy(config->io, value, sizeof(config->io)) ? NULL : "io is too long";
+            return io_limit_ok(value) && str_copy(config->io, value, sizeof(config->io))
+                   ? NULL : "io is not <major>:<minor> with rbps, wbps, riops or wiops =<number> or =max";
     }
 }
 
@@ -511,7 +576,8 @@ static void put_number(struct config_text *out, const char *key, int value) {
 
 /* Do two configurations say the same about a container? */
 static bool same_config(const container_config *a, const container_config *b) {
-    if (!streq(a->mem, b->mem) || !streq(a->pids, b->pids) || !streq(a->cpu, b->cpu) ||
+    if (!streq(a->mem, b->mem) || !streq(a->swap, b->swap) || !streq(a->pids, b->pids) ||
+        !streq(a->cpu, b->cpu) ||
         !streq(a->io, b->io) || a->oom_score != b->oom_score ||
         a->privileged != b->privileged || a->read_only != b->read_only ||
         a->userns != b->userns || (a->userns && a->uid_start != b->uid_start) ||
@@ -536,6 +602,8 @@ const char *container_config_save(const char *name, const container_config *conf
 
     put_number(&out, "version", CONTAINER_CONFIG_VERSION);
     put_line(&out, "mem", config->mem);
+    if (config->swap[0])
+        put_line(&out, "swap", config->swap);
     put_line(&out, "pids", config->pids);
     put_line(&out, "cpu", config->cpu);
     put_number(&out, "oom_score", config->oom_score);
