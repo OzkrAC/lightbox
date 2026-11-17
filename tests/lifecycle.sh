@@ -920,7 +920,8 @@ t_rmvol_applies_at_next_start() {
 t_conf_from_before_starts() {
     mkdir -p "$T/vol/old"
     echo old > "$T/vol/old/in"
-    box before || return 1
+    # a copy, as every container from before 0.7 is: the .conf of then names no snapshot
+    box before --copy || return 1
     printf 'mem=32M\npids=40\ncpu=2\noom_score=200\nnote=by hand\nvol=%s:/old:ro\n' "$T/vol/old" > "$C/before/.conf"
     start before || return 1
     pid=$(pid_of before)

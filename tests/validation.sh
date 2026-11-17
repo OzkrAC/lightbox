@@ -979,6 +979,7 @@ t_create_killed_half_way() {
         echo 'for last; do :; done'                             # the destination: <container>/rootfs, or a snapshot
         echo "case \"\$last\" in $C/*) if [ -e \"\${last%/rootfs}/.creating\" ]; then echo marked; else echo unmarked; fi >> $W/seen ;; esac"
         echo "if [ -e $W/end-it ]; then kill -KILL \$PPID; exit 1; fi"
+        echo "case \"\$last\" in */bases/.*.new/rootfs) if [ -e $W/end-snapshot ]; then kill -KILL \$PPID; exit 1; fi ;; esac"
         echo "exec $W/cp.real \"\$@\""
     } > "$W/cp.shim"
     chmod +x "$W/cp.shim"
@@ -987,27 +988,52 @@ t_create_killed_half_way() {
         for cp in /bin/cp /usr/bin/cp; do
             [ -e "$cp" ] && { mount --bind "$1/cp.shim" "$(readlink -f "$cp")" || exit 77; }
         done
-        "$2" create whole 10.0.0.2 || exit 1
+        "$2" create whole 10.0.0.2 --copy || exit 1
         : > "$1/end-it"
-        "$2" create half 10.0.0.3
+        "$2" create half 10.0.0.3 --copy
         echo "the create that was killed: status $?"
         "$2" ls
         "$2" start half
         echo "start of the half-made container: status $?"
         "$2" rm half
+        rm -f "$1/end-it"
+        cp "$1/seen" "$1/seen.copies"
+        # killed while it takes a snapshot of a base, where an overlay mounts here
+        cp -a "$1/base" "$1/base2" && : > "$1/end-snapshot"
+        "$2" create snapped 10.0.0.4 --rootfs "$1/base2"
+        echo "the create killed in its snapshot: status $?"
+        "$2" ls
+        "$2" base ls
+        "$2" start snapped
+        echo "start of the container whose snapshot was cut: status $?"
+        "$2" rm snapped
+        rm -f "$1/end-snapshot"
+        "$2" create again 10.0.0.4 --rootfs "$1/base2" || exit 1
+        "$2" base ls
     ' _ "$W" "$LB" > "$W/ns.out" 2>&1
     rc=$?
     cat "$W/ns.out"
     [ $rc -ne 77 ] || { echo "a stand-in could not be mounted over cp here"; return 77; }
     [ $rc -eq 0 ] || return 1
-    echo "the mark, when each copy began: $(paste -sd' ' "$W/seen")"
-    [ "$(paste -sd' ' "$W/seen")" = 'marked marked' ] || { echo "a container was being copied into without being marked"; return 1; }
+    echo "the mark, when each copy began: $(paste -sd' ' "$W/seen.copies")"
+    [ "$(paste -sd' ' "$W/seen.copies")" = 'marked marked' ] || { echo "a container was being copied into without being marked"; return 1; }
     [ ! -e "$C/whole/.creating" ] || { echo "a finished container is still marked"; return 1; }
     grep -Eq '^whole +10\.0\.0\.2 +stopped' "$W/ns.out" && grep -Eq '^half +- +creating' "$W/ns.out" ||
         { echo "ls does not tell the finished container from the half-made one"; return 1; }
     grep -q 'was not created completely' "$W/ns.out" && grep -qx 'start of the half-made container: status 1' "$W/ns.out" ||
         { echo "the half-made container was not refused by start as one"; return 1; }
     [ ! -e "$C/half" ] || { echo "rm did not remove the half-made container"; return 1; }
+    if ! grep -qx 'the create killed in its snapshot: status 137' "$W/ns.out"; then
+        echo "no overlay mounts in this user namespace, so no snapshot was taken to cut short"
+        return 0
+    fi
+    grep -Eq '^snapped +- +creating' "$W/ns.out" && grep -qx 'start of the container whose snapshot was cut: status 1' "$W/ns.out" ||
+        { echo "the container whose snapshot was cut short was not shown and refused as half made"; return 1; }
+    # the snapshot cut short is no snapshot, and the next create takes a whole one
+    [ "$(grep -c "  $W/base2  " "$W/ns.out")" = 1 ] && grep -Eq "  $W/base2  again\$" "$W/ns.out" ||
+        { echo "a snapshot cut short was listed, or the next create did not take a whole one"; return 1; }
+    id=$(sed -n 's/^base=//p' "$C/again/.conf")
+    [ -n "$id" ] && [ -f "$W/data/bases/$id/rootfs/bin/placeholder" ] || { echo "the container made after does not overlay a whole snapshot"; return 1; }
 }
 
 # rm clears away what a container that ended without a stop still had, and
