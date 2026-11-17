@@ -1898,6 +1898,28 @@ ip filter FORWARD, inet firewall fwd, bridge other forward' ] || { printf '%s\n'
     [ "$got" = 'chains 0' ] || { printf '%s\n' "$got"; return 1; }
 }
 
+# Where lightbox's settings come from: --config, then LIGHTBOX_CONFIG unless
+# it is empty, then /etc/lightbox/lightbox.conf, then $HOME's, then none.
+t_config_sources() {
+    bad=0
+    expect() { # given env etc home -> source
+        got=$("$UNIT" config-source "$1" "$2" "$3" "$4")
+        [ "$got" = "$5" ] || { echo "config-source $1 '$2' $3 $4: $got, expected $5"; bad=1; }
+    }
+    for etc in 0 1; do for home in 0 1; do
+        expect /x.conf /y.conf "$etc" "$home" given
+        expect /x.conf -       "$etc" "$home" given
+        expect -       /y.conf "$etc" "$home" env
+    done; done
+    expect - '' 1 1 etc
+    expect - -  1 0 etc
+    expect - '' 0 1 home
+    expect - -  0 1 home
+    expect - -  0 0 none
+    expect - '' 0 0 none
+    return $bad
+}
+
 # What setup puts in its chains: between two ports of the bridge what a link
 # allows and nothing else; out by any interface but the bridge, and back what
 # belongs to that; masquerading of the subnet, as the network spells it, when
@@ -2599,6 +2621,7 @@ check 'nftables: a container'"'"'s links are elements of the set, each once, tak
 check 'nftables: a record that is not lightbox'"'"'s is not given to nft'  t_nft_records_refused
 check 'bridge_accept_fwmark: a mark nft reads as written, and none that matches all' t_fwmarks
 check 'the forward chains that drop what nothing accepts are named'      t_forward_drop_chains
+check 'the settings come from --config, LIGHTBOX_CONFIG, /etc, HOME or nowhere' t_config_sources
 check 'an address is four numbers and three dots, and no zero in front' t_addresses_are_strict
 check 'subnet and gw are one network, and an address on it is one a container can have' t_network_settings
 check 'no prefix is written into the source: subnet gives it'      t_no_prefix_of_its_own

@@ -84,6 +84,8 @@ settings() { # after LIFECYCLE_T is known
     OUT="$T/out"
     CG=$(cat "$T/cgroup_base")
     export HOME="$T/home"
+    # named, so that neither /etc/lightbox nor $HOME is looked at
+    export LIGHTBOX_CONFIG="$HOME/.config/lightbox/lightbox.conf"
 }
 
 # ─── Helpers for cases ──────────────────────────────────────────────────────
@@ -283,11 +285,12 @@ firewall_rules() { iptables-save | grep -v '^#' | sed 's/\[[0-9]*:[0-9]*\]//'; }
 # A lightbox.conf of the suite's with more settings, for a case: sets $ALT.
 alt_conf() { # directory name, settings...
     ALT=$T/$1/home
+    ALT_CONF=$ALT/.config/lightbox/lightbox.conf
     shift
     mkdir -p "$ALT/.config/lightbox" || return 1
     { cat "$HOME/.config/lightbox/lightbox.conf"; printf '%s\n' "$@"; } > "$ALT/.config/lightbox/lightbox.conf"
 }
-alt_lb() { HOME="$ALT" timeout -k 5 60 "$LB" "$@"; }
+alt_lb() { LIGHTBOX_CONFIG="$ALT_CONF" timeout -k 5 60 "$LB" "$@"; }
 
 # What lightbox 0.4 put straight into FORWARD and POSTROUTING, taken out by
 # setup; a rule of the host's that looks like one stays.
@@ -377,7 +380,7 @@ t_setup_refuses_a_gateway_outside() {
     sed -e 's#^bridge = .*#bridge = lbt9#' -e 's#^gw = .*#gw = 10.198.0.1#' "$HOME/.config/lightbox/lightbox.conf" \
         > "$T/gwout/home/.config/lightbox/lightbox.conf"
     rules=$(firewall_rules)
-    said=$(HOME="$T/gwout/home" timeout -k 5 60 "$LB" setup 2>&1) && { echo "setup succeeded"; return 1; }
+    said=$(LIGHTBOX_CONFIG="$T/gwout/home/.config/lightbox/lightbox.conf" timeout -k 5 60 "$LB" setup 2>&1) && { echo "setup succeeded"; return 1; }
     printf '%s\n' "$said"
     no_link lbt9 || { echo "a bridge was made before the refusal"; return 1; }
     [ "$rules" = "$(firewall_rules)" ] || { echo "the firewall rules changed:"; firewall_rules; return 1; }
@@ -402,7 +405,7 @@ t_setup_refuses_other_cgroup_root() {
         -e 's#^bridge = .*#bridge = lbt9#' "$HOME/.config/lightbox/lightbox.conf" \
         > "$T/alt/home/.config/lightbox/lightbox.conf"
     mounts=$(cat /proc/self/mountinfo)
-    said=$(HOME="$T/alt/home" timeout -k 5 60 "$LB" setup 2>&1) && { echo "setup succeeded"; return 1; }
+    said=$(LIGHTBOX_CONFIG="$T/alt/home/.config/lightbox/lightbox.conf" timeout -k 5 60 "$LB" setup 2>&1) && { echo "setup succeeded"; return 1; }
     printf '%s\n' "$said"
     [ "$mounts" = "$(cat /proc/self/mountinfo)" ] || { echo "the mount table changed"; return 1; }
     no_link lbt9 || { echo "a bridge was made before the refusal"; return 1; }
@@ -1269,7 +1272,7 @@ t_without_io_controller() {
     sed -e "s#^cgroup_root = .*#cgroup_root = $sub#" -e "s#^cgroup_base = .*#cgroup_base = $sub/base#" \
         "$HOME/.config/lightbox/lightbox.conf" > "$T/noio/home/.config/lightbox/lightbox.conf"
     echo "controllers below the suite's cgroup: $(cat "$sub/cgroup.controllers")"
-    export HOME="$T/noio/home"
+    export LIGHTBOX_CONFIG="$T/noio/home/.config/lightbox/lightbox.conf"
     box plain || return 1
     lb start plain >"$OUT/plain.start" 2>&1 </dev/null || { cat "$OUT/plain.start"; return 1; }
     cat "$OUT/plain.start"
@@ -1857,8 +1860,8 @@ t_wide_subnet() {
     mkdir -p "$T/wide/home/.config/lightbox"
     sed -e "s#^bridge = .*#bridge = $WIDE_BR#" -e 's#^subnet = .*#subnet = 10.9.0.0/16#' -e 's#^gw = .*#gw = 10.9.0.1#' \
         "$HOME/.config/lightbox/lightbox.conf" > "$T/wide/home/.config/lightbox/lightbox.conf"
-    suite_home=$HOME
-    export HOME="$T/wide/home"
+    suite_conf=$LIGHTBOX_CONFIG
+    export LIGHTBOX_CONFIG="$T/wide/home/.config/lightbox/lightbox.conf"
     lb setup >"$OUT/wide.setup" 2>&1 || { cat "$OUT/wide.setup"; return 1; }
     ip -o -4 addr show dev "$WIDE_BR"
     ip -o -4 addr show dev "$WIDE_BR" | grep -q ' 10\.9\.0\.1/16 ' || { echo "the bridge does not have 10.9.0.1/16"; return 1; }
@@ -1876,7 +1879,7 @@ t_wide_subnet() {
     fi
     lb stop wide >/dev/null || return 1
     # on the suite's network that address is no container's, and start says so
-    export HOME="$suite_home"
+    export LIGHTBOX_CONFIG="$suite_conf"
     said=$(lb start wide 2>&1) && { echo "a container outside the subnet was started"; return 1; }
     printf '%s\n' "$said"
     case $said in *'it is outside the subnet of lightbox.conf'*) ;; *) return 1 ;; esac
@@ -2061,6 +2064,28 @@ t_several_names() {
     nothing_left many1 && nothing_left many2
 }
 
+# ─── Cases: where the settings are ──────────────────────────────────────────
+
+# Named by neither --config nor LIGHTBOX_CONFIG, the settings are those of
+# /etc/lightbox/lightbox.conf, and a file at the old place in $HOME is said
+# not to be read. /etc is an overlay in this mount namespace: nothing is
+# written to the host's.
+t_config_in_etc() {
+    mkdir -p "$T/etc-up" "$T/etc-work" || return 1
+    mount -t overlay overlay -o "lowerdir=/etc,upperdir=$T/etc-up,workdir=$T/etc-work" /etc 2>/dev/null ||
+        { echo "no overlay can be put over /etc here"; return 77; }
+    echo /etc >> "$T/shims"         # teardown takes it away
+    mkdir -p /etc/lightbox &&
+        sed 's#^bridge = .*#bridge = lbt-etc#' "$LIGHTBOX_CONFIG" > /etc/lightbox/lightbox.conf || return 1
+    said=$(env -u LIGHTBOX_CONFIG "$LB" doctor 2>&1)
+    printf '%s\n' "$said" | grep -E '^(Note|Warning|bridge):'
+    printf '%s\n' "$said" | grep -qx 'bridge: lbt-etc' || { echo "/etc/lightbox/lightbox.conf was not read"; return 1; }
+    printf '%s\n' "$said" | grep -qx "Note: $HOME/.config/lightbox/lightbox.conf is not read; /etc/lightbox/lightbox.conf is" ||
+        { echo "the file in HOME was not said to be left"; return 1; }
+    [ "$(lb doctor 2>/dev/null | grep '^bridge: ')" = "bridge: $BR" ] || { echo "LIGHTBOX_CONFIG did not come first"; return 1; }
+    [ -f "$T/etc-up/lightbox/lightbox.conf" ] || { echo "the file is not in the overlay, but in the host's /etc"; return 1; }
+}
+
 # ─── Cases: after a reboot, and teardown ────────────────────────────────────
 
 # What a reboot takes: the bridge, every firewall rule and chain, forwarding
@@ -2099,11 +2124,11 @@ t_nft_start_after_the_tables_went() {
     nft_setup nftre; rc=$?; [ $rc = 0 ] || return $rc
     box nrepeer && box nrelinked --link nrepeer || return 1
     ip link delete "$BR" && nft delete table ip lightbox && nft delete table bridge lightbox || return 1
-    HOME="$ALT" start nrepeer || return 1
+    LIGHTBOX_CONFIG="$ALT_CONF" start nrepeer || return 1
     grep -q 'making it again' "$OUT/nrepeer.start" || { echo "start did not say that it made the network again"; return 1; }
     nft list table ip lightbox >/dev/null && nft list table bridge lightbox >/dev/null && ip link show dev "$BR" >/dev/null ||
         { echo "the tables or the bridge are not there"; return 1; }
-    HOME="$ALT" start nrelinked || return 1
+    LIGHTBOX_CONFIG="$ALT_CONF" start nrelinked || return 1
     reaches nrelinked "$(addr_of nrepeer)" && reaches nrelinked "$OUTSIDE"
 }
 
@@ -2202,7 +2227,7 @@ t_nft_links_without_brnf() {
     if [ -e "$BRNF" ]; then brnf 0 || return 1; fi
     nft_setup nftlinks; rc=$?; [ $rc = 0 ] || return $rc
     box npeer && box nlinked --link npeer && box nthird || return 1
-    HOME="$ALT" start npeer && HOME="$ALT" start nlinked && HOME="$ALT" start nthird || return 1
+    LIGHTBOX_CONFIG="$ALT_CONF" start npeer && LIGHTBOX_CONFIG="$ALT_CONF" start nlinked && LIGHTBOX_CONFIG="$ALT_CONF" start nthird || return 1
     nft list set bridge lightbox links
     reaches nlinked "$(addr_of npeer)" && reaches npeer "$(addr_of nlinked)" || return 1
     reaches nthird "$(addr_of nlinked)" && { echo "a container without the link reached nlinked"; return 1; }
@@ -2217,7 +2242,7 @@ t_nft_one_process() {
     nft_setup nftone; rc=$?; [ $rc = 0 ] || return $rc
     box nonepeer && box nonelinked --link nonepeer || return 1
     is_up() { [ "$(state_of nonelinked 2>/dev/null)" = running ]; }
-    HOME="$ALT" timeout -k 5 80 strace -f -qq -e trace=execve -o "$T/nftlinks.strace" \
+    LIGHTBOX_CONFIG="$ALT_CONF" timeout -k 5 80 strace -f -qq -e trace=execve -o "$T/nftlinks.strace" \
         "$LB" start nonelinked >"$OUT/nonelinked.start" 2>&1 </dev/null &
     tracer=$!
     wait_until 60 is_up || { echo "the container did not start under strace:"; cat "$OUT/nonelinked.start"; kill "$tracer" 2>/dev/null; return 1; }
@@ -2236,7 +2261,7 @@ t_nft_one_process() {
 t_nft_rm_leaves_nothing() {
     nft_setup nftrm; rc=$?; [ $rc = 0 ] || return $rc
     box nrpeer --link nrmain && box nrmain --link nrpeer && box nrother --link nrpeer || return 1
-    HOME="$ALT" start nrpeer && HOME="$ALT" start nrmain && HOME="$ALT" start nrother || return 1
+    LIGHTBOX_CONFIG="$ALT_CONF" start nrpeer && LIGHTBOX_CONFIG="$ALT_CONF" start nrmain && LIGHTBOX_CONFIG="$ALT_CONF" start nrother || return 1
     port=$(port_of nrmain) other=$(port_of nrother)
     nft list set bridge lightbox links
     nft list set bridge lightbox links | grep -qF "\"$port\"" || { echo "the link is not in the set"; return 1; }
@@ -2279,7 +2304,7 @@ t_nft_forwarding() {
 t_nft_accept_fwmark() {
     command -v ping >/dev/null 2>&1 || { echo "no ping to try the way in with"; return 77; }
     nft_setup nftmark 'bridge_accept_fwmark = 0x10/0xf0'; rc=$?; [ $rc = 0 ] || return $rc
-    box nmarked && HOME="$ALT" start nmarked || return 1
+    box nmarked && LIGHTBOX_CONFIG="$ALT_CONF" start nmarked || return 1
     ip=$(addr_of nmarked) outside=$(cat "$T/outside")
     nsenter -t "$outside" -n ip route add "$SUBNET" via 192.0.2.2 || return 1
     nsenter -t "$outside" -n ping -c 1 -W 2 "$ip" && { echo "a new connection from outside was not dropped"; return 1; }
@@ -2608,6 +2633,7 @@ if [ "$MODE" = inside ]; then
     check 'a start where the network is there makes nothing'              t_start_with_the_network_there
     check 'nftables: after the tables went, start makes them again'       t_nft_start_after_the_tables_went
     check 'setup --teardown leaves the host as before the first setup'    t_setup_teardown
+    check 'without --config or LIGHTBOX_CONFIG, /etc/lightbox/lightbox.conf is read' t_config_in_etc
 
     # last: it may leave a kernel setting changed for the rest of this suite's life
     check 'exec works where a memfd may not be executed'                  t_exec_where_memfds_may_not_be_executed

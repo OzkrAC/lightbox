@@ -4038,7 +4038,7 @@ static bool asks_for_help(const char *arg) {
 
 /* The usage: of one command, or of all of them. */
 static void print_usage(int32_t fd, const char *command) {
-    print_str(fd, "Usage: lightbox <command> [args]\n\n");
+    print_str(fd, "Usage: lightbox [--config <path>] <command> [args]\n\n");
     if (command) {
         print_str(fd, help_of(command));
         return;
@@ -4048,6 +4048,8 @@ static void print_usage(int32_t fd, const char *command) {
         print_str(fd, command_help[i].text);
     print_str(fd,
         "\n"
+        "  --config <path>                              The lightbox.conf to read (default:\n"
+        "                                               $LIGHTBOX_CONFIG, else " CONFIG_ETC_FILE ")\n"
         "  --help, help [<command>], <command> --help   This text, or a command's part of it\n"
         "  --version                                    The version of lightbox, and of lightc\n");
 }
@@ -4103,31 +4105,43 @@ int main(int argc, char **argv, char **envp) {
     reserve_standard_streams();
     caller_argv = argv;
     caller_env = envp;
-    if (argc < 2) usage();
+
+    /* lightbox [--config <path>] <command> [args] */
+    const char *config = NULL;
+    int first = 1;
+    if (argc > 1 && streq(argv[1], "--config")) {
+        if (argc < 3 || !argv[2][0])
+            die("Error: --config needs the path of a lightbox.conf");
+        config = argv[2];
+        first = 3;
+    }
+    if (argc <= first) usage();
+    char **args = argv + first;
+    int nargs = argc - first;
 
     /* help and the version need no configuration, and get none of its warnings */
-    if (asks_for_help(argv[1]) || streq(argv[1], "help")) {
-        if (argc == 2)
+    if (asks_for_help(args[0]) || streq(args[0], "help")) {
+        if (nargs == 1)
             help(NULL);
-        if (argc == 3 && help_of(argv[2]))
-            help(argv[2]);
-        die2(argc == 3 ? "Error: there is no such command: " : "Error: unexpected argument: ", argv[argc == 3 ? 2 : 3]);
+        if (nargs == 2 && help_of(args[1]))
+            help(args[1]);
+        die2(nargs == 2 ? "Error: there is no such command: " : "Error: unexpected argument: ", args[nargs == 2 ? 1 : 2]);
     }
-    if (streq(argv[1], "--version")) {
-        if (argc > 2)
-            die2("Error: unexpected argument: ", argv[2]);
+    if (streq(args[0], "--version")) {
+        if (nargs > 1)
+            die2("Error: unexpected argument: ", args[1]);
         version();
     }
-    if (argc > 2 && asks_for_help(argv[2]) && help_of(argv[1]))
-        help(argv[1]);
+    if (nargs > 1 && asks_for_help(args[1]) && help_of(args[0]))
+        help(args[0]);
 
     /* load configuration: built-in defaults → lightbox.conf → env vars */
     cfg_global_init();
-    cfg_global_load(envp);
+    cfg_global_load(envp, config);
 
-    const char *cmd = argv[1];
-    int sub_argc = argc - 2;
-    char **sub_argv = argv + 2;
+    const char *cmd = args[0];
+    int sub_argc = nargs - 1;
+    char **sub_argv = args + 1;
 
     if (streq(cmd, "setup")) {
         if (sub_argc == 0)

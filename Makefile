@@ -27,10 +27,11 @@ LIGHTC_LIB := $(LIGHTC)/build/liblightc.a
 
 PREFIX     ?= /usr/local
 BINDIR     ?= $(PREFIX)/bin
+# lightbox reads /etc/lightbox/lightbox.conf without --config or
+# LIGHTBOX_CONFIG; a CONFDIR elsewhere has to be named with one of them.
 CONFDIR    ?= /etc/lightbox
 DATADIR    ?= /var/lib/lightbox
 RUNDIR     ?= /run/lightbox
-HOME_CONF  ?= $(HOME)/.config/lightbox
 
 # ─── Toolchain ──────────────────────────────────────────────────────────────
 # make CC=aarch64-linux-gnu-gcc cross-builds; AR and STRIP follow the prefix.
@@ -220,12 +221,11 @@ install: lightbox
 	install -d -m 755 $(DESTDIR)$(DATADIR)/rootfs
 	install -d -m 700 $(DESTDIR)$(DATADIR)/containers
 	install -d -m 755 $(DESTDIR)$(RUNDIR)
-	install -d -m 755 $(HOME_CONF)
-	@if [ ! -f $(HOME_CONF)/lightbox.conf ]; then \
-		install -m 644 lightbox.conf.example $(HOME_CONF)/lightbox.conf; \
-		echo "Installed config: $(HOME_CONF)/lightbox.conf"; \
+	@if [ ! -f $(DESTDIR)$(CONFDIR)/lightbox.conf ]; then \
+		install -m 644 lightbox.conf.example $(DESTDIR)$(CONFDIR)/lightbox.conf; \
+		echo "Installed config: $(DESTDIR)$(CONFDIR)/lightbox.conf"; \
 	else \
-		echo "Config already exists: $(HOME_CONF)/lightbox.conf (skipped)"; \
+		echo "Config already exists: $(DESTDIR)$(CONFDIR)/lightbox.conf (skipped)"; \
 	fi
 	@echo ""
 	@echo "lightbox installed to $(DESTDIR)$(BINDIR)/lightbox"
@@ -233,7 +233,7 @@ install: lightbox
 	@echo "Next steps:"
 	@echo "  1. Place a rootfs in $(DATADIR)/rootfs/"
 	@echo "     e.g.: wget -qO- https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.3-x86_64.tar.gz | tar -xz -C $(DATADIR)/rootfs/"
-	@echo "  2. Edit $(HOME_CONF)/lightbox.conf if needed"
+	@echo "  2. Edit $(CONFDIR)/lightbox.conf if needed"
 	@echo "  3. Run: lightbox setup"
 
 uninstall:

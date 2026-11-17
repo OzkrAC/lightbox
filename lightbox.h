@@ -84,6 +84,14 @@ typedef struct {
 
 extern global_config cfg_global;
 
+/* Where the settings come from: --config, then $LIGHTBOX_CONFIG, then
+ * /etc/lightbox/lightbox.conf, then, for one release more and with a
+ * warning, $HOME/.config/lightbox/lightbox.conf; or the built-in values. */
+#define CONFIG_ETC_FILE  "/etc/lightbox/lightbox.conf"
+#define CONFIG_HOME_FILE ".config/lightbox/lightbox.conf"
+typedef enum { CONFIG_GIVEN, CONFIG_ENV, CONFIG_ETC, CONFIG_HOME, CONFIG_NONE } config_source;
+config_source config_source_of(const char *given, const char *from_env, bool etc_there, bool home_there);
+
 /*
  * What a container is configured with: the content of its .conf.
  *
@@ -248,7 +256,8 @@ void require_write_file(const char *path, const char *data);
 void cfg_global_init(void);
 /* the value of a variable in an environment, or NULL */
 const char *env_get(char **envp, const char *name);
-void cfg_global_load(char **envp);
+/* given: the path --config names, or NULL */
+void cfg_global_load(char **envp, const char *given);
 
 int read_file(const char *path, char *buf, size_t bufsz);
 bool path_exists(const char *path);

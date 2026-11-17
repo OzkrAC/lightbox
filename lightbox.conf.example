@@ -1,7 +1,9 @@
 # lightbox configuration
 #
-# Place this file at ~/.config/lightbox/lightbox.conf
-# All values are optional — built-in defaults are shown below.
+# lightbox reads /etc/lightbox/lightbox.conf, which make install puts here, or
+# the file that --config <path> or LIGHTBOX_CONFIG names.
+# All values are optional — built-in defaults are shown below. A # after a
+# space begins a comment, and a key lightbox does not know is warned about.
 #
 # No value is cut to fit: a directory of more than 448 characters, or a
 # bridge name or address that is too long, ends every command with the

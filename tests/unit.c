@@ -26,6 +26,10 @@
  *   unit fwmark <text>                        parse_fwmark: lines "mark <m>", "mask <k>", "as <text>",
  *                                             or "refused"
  *   unit portname <text>                      host_port_ok: ok or refused
+ *   unit config-source <given> <env> <etc> <home>
+ *                                             config_source_of, "-" for no --config or no
+ *                                             variable, 1 or 0 for a file in /etc or $HOME:
+ *                                             given, env, etc, home or none
  *   unit dropping <listing>                   forward_drop_chains of what "nft list chains"
  *                                             printed: how many, and their names
  *   unit status  <wait status>                exit_code_from_status
@@ -731,6 +735,14 @@ int main(int argc, char **argv, char **envp) {
         put_line("mark ", m);
         put_line("mask ", k);
         put_line("as ", text);
+        return 0;
+    }
+    if (argc == 6 && streq(argv[1], "config-source")) {
+        static const char *const names[] = { "given", "env", "etc", "home", "none" };
+        config_source source = config_source_of(streq(argv[2], "-") ? NULL : argv[2],
+                                                streq(argv[3], "-") ? NULL : argv[3],
+                                                streq(argv[4], "1"), streq(argv[5], "1"));
+        put_line("", names[source]);
         return 0;
     }
     if (argc == 3 && streq(argv[1], "portname")) {

@@ -9,12 +9,16 @@ Not tagged yet, and not complete: the part of Phase 6 that is written so far.
 ### Changes you may have to act on
 
 - **Help goes to standard output and exits 0**: `lightbox --help`, `-h`, `help`, `help <command>` and `<command> --help`. It used to go to standard error, with status 1. A command line that is not one, such as an unknown command, still prints the usage on standard error and exits 1, and now says first what was wrong.
+- **The configuration is `/etc/lightbox/lightbox.conf`**, or the file that `--config <path>` or `LIGHTBOX_CONFIG` names. `~/.config/lightbox/lightbox.conf`, where lightbox looked before, is still read when none of those is there, with a warning on every command: move the file to `/etc/lightbox/lightbox.conf`. lightbox 0.7 will not look in `~`. Under `sudo`, which `~` was meant depended on how `sudo` was set up.
+- **`make install` puts the example configuration in `$(DESTDIR)/etc/lightbox/lightbox.conf`**, unless one is there, and writes nothing in the home of whoever runs it. It used to write `~/.config/lightbox/lightbox.conf` there, outside `DESTDIR`, which under `sudo` could be root's or the user's.
+- **A key in `lightbox.conf` that lightbox does not know, and a line that is no setting, are warned about** with the file and the line; a misspelt `defualt_mem` was ignored without a word. A `#` after a space begins a comment, and a carriage return at the end of a line is dropped: `bridge = br0 # main` used to be the bridge `br0 # main`.
 - **A word that a command will not use is an error that names it.** `inspect`, `doctor`, `ls`, `add-vol` and `rm-vol` ignored what came after the words they read: `inspect a b` showed `a`, and `rm a b` removed `a` and said nothing of `b`.
 
 ### Added
 
 - **`start`, `stop` and `rm` take several names**, as Docker's do, and do one container after the other. One that cannot be done ends nothing for the others; the command names those it did not do, and exits with the first status that was not 0. `-t` for `start` and `stop` may come anywhere among the names.
 - **`lightbox --version`** prints the version of lightbox and of lightc.
+- **`lightbox --config <path> <command>`** reads that configuration, as `LIGHTBOX_CONFIG=<path>` does.
 
 ## 0.5.1
 

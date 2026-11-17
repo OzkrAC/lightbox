@@ -56,7 +56,7 @@ sandbox() {
     } > "$CONF"
 }
 
-lb() { HOME="$W/home" "$LB" "$@"; }
+lb() { HOME="$W/home" LIGHTBOX_CONFIG="$CONF" "$LB" "$@"; }
 
 # Succeeds when the command fails. Output is kept for the report.
 refused() { ! "$@"; }
@@ -406,7 +406,7 @@ t_creates_at_once_get_two_addresses() {
     printf '#!/bin/sh\nsleep 1\nexec %s "$@"\n' "$W/cp.real" > "$W/cp.shim"
     chmod +x "$W/cp.shim"
     # shellcheck disable=SC2016     # the script is for the shell in the namespace
-    HOME="$W/home" unshare -r --mount -- sh -c '
+    HOME="$W/home" LIGHTBOX_CONFIG="$CONF" unshare -r --mount -- sh -c '
         for cp in /bin/cp /usr/bin/cp; do
             [ -e "$cp" ] && { mount --bind "$1/cp.shim" "$(readlink -f "$cp")" || exit 77; }
         done
@@ -782,18 +782,19 @@ t_rootfs_from_the_environment() {
     echo base > "$BASE/etc/which"
     built_in=/var/lib/lightbox/rootfs
 
-    # without a lightbox.conf: the variable, and without it what is built in
-    said=$(HOME="$W/nohome" LIGHTBOX_ROOTFS="$W/other" "$LB" doctor 2>/dev/null | grep '^rootfs: ')
+    # without a lightbox.conf, which an empty one is, so that this host's
+    # /etc/lightbox counts for nothing: the variable, and without it what is built in
+    said=$(HOME="$W/nohome" LIGHTBOX_CONFIG=/dev/null LIGHTBOX_ROOTFS="$W/other" "$LB" doctor 2>/dev/null | grep '^rootfs: ')
     echo "no lightbox.conf, with the variable: $said"
     [ "$said" = "rootfs: $W/other" ] || return 1
-    said=$(HOME="$W/nohome" "$LB" doctor 2>/dev/null | grep '^rootfs: ')
+    said=$(HOME="$W/nohome" LIGHTBOX_CONFIG=/dev/null "$LB" doctor 2>/dev/null | grep '^rootfs: ')
     echo "no lightbox.conf, without it: $said"
     [ "$said" = "rootfs: $built_in" ] || return 1
     # an empty variable is no variable, and neither is another that begins like it
-    said=$(HOME="$W/nohome" LIGHTBOX_ROOTFS='' LIGHTBOX_ROOTFS_OLD="$W/other" "$LB" doctor 2>/dev/null | grep '^rootfs: ')
+    said=$(HOME="$W/nohome" LIGHTBOX_CONFIG=/dev/null LIGHTBOX_ROOTFS='' LIGHTBOX_ROOTFS_OLD="$W/other" "$LB" doctor 2>/dev/null | grep '^rootfs: ')
     [ "$said" = "rootfs: $built_in" ] || { echo "an empty variable: $said"; return 1; }
     # no HOME at all, as under some service managers
-    said=$(env -u HOME LIGHTBOX_ROOTFS="$W/other" "$LB" doctor 2>/dev/null | grep '^rootfs: ')
+    said=$(env -u HOME LIGHTBOX_CONFIG=/dev/null LIGHTBOX_ROOTFS="$W/other" "$LB" doctor 2>/dev/null | grep '^rootfs: ')
     [ "$said" = "rootfs: $W/other" ] || { echo "without HOME: $said"; return 1; }
 
     # with a lightbox.conf: the variable comes before the setting, and --rootfs before both
@@ -806,7 +807,7 @@ t_rootfs_from_the_environment() {
     [ "$(cat "$C/fromflag/rootfs/etc/which")" = other ] || return 1
 
     # the variable is held to what the setting is held to
-    msg=$(HOME="$W/nohome" LIGHTBOX_ROOTFS="$(pad_path "$W/other" 460)" "$LB" doctor 2>&1) && { echo "a variable of 460 characters was accepted"; return 1; }
+    msg=$(HOME="$W/nohome" LIGHTBOX_CONFIG=/dev/null LIGHTBOX_ROOTFS="$(pad_path "$W/other" 460)" "$LB" doctor 2>&1) && { echo "a variable of 460 characters was accepted"; return 1; }
     printf '%s\n' "$msg" | cut -c1-80
     case $msg in 'Error: LIGHTBOX_ROOTFS is too long: '*) ;; *) return 1 ;; esac
 }
@@ -982,7 +983,7 @@ t_create_killed_half_way() {
     } > "$W/cp.shim"
     chmod +x "$W/cp.shim"
     # shellcheck disable=SC2016     # the script is for the shell in the namespace
-    HOME="$W/home" unshare -r --mount -- sh -c '
+    HOME="$W/home" LIGHTBOX_CONFIG="$CONF" unshare -r --mount -- sh -c '
         for cp in /bin/cp /usr/bin/cp; do
             [ -e "$cp" ] && { mount --bind "$1/cp.shim" "$(readlink -f "$cp")" || exit 77; }
         done
@@ -1227,17 +1228,88 @@ t_inspect_shows_volumes_and_links() {
     printf '%s\n' "$report" | grep -q '/data' && printf '%s\n' "$report" | grep -Eq 'link.*db'
 }
 
+# A carriage return at the end of a line is no part of the value, as a file
+# written on Windows has it, and neither is a # after a space: the rest of
+# the line is a comment. A # with no space before it is part of the value.
 t_config_strips_carriage_returns() {
     printf 'bridge = br9\r\n' >> "$CONF"
-    lb doctor 2>/dev/null | grep -x 'bridge: br9'
+    lb doctor 2>/dev/null | grep -x 'bridge: br9' || return 1
+    printf 'bridge = br8 # the test bridge\r\n\r\n# a comment\r\n' >> "$CONF"
+    lb doctor 2>/dev/null | grep -x 'bridge: br8' || return 1
+    [ -z "$(lb doctor 2>&1 >/dev/null)" ] || { echo "CRLF lines were warned about:"; { lb doctor >/dev/null; } 2>&1; return 1; }
 }
 t_config_strips_inline_comments() {
     printf 'bridge = br9 # the test bridge\n' >> "$CONF"
-    lb doctor 2>/dev/null | grep -x 'bridge: br9'
+    lb doctor 2>/dev/null | grep -x 'bridge: br9' || return 1
+    printf 'bridge = br#7\ndns = 9.9.9.9\t# tab before\n' >> "$CONF"
+    lb doctor 2>/dev/null | grep -x 'bridge: br#7'
 }
+# A key that lightbox does not know, and a line that is no setting, are said
+# with the file and the line, and change nothing; the command goes on.
 t_config_reports_unknown_keys() {
-    printf 'defualt_mem = 1G\n' >> "$CONF"
-    lb doctor 2>&1 >/dev/null | grep -q 'defualt_mem'
+    lines=$(wc -l < "$CONF")
+    printf 'defualt_mem = 1G\nthis is not a setting\n' >> "$CONF"
+    said=$(lb doctor 2>&1 >/dev/null)
+    printf '%s\n' "$said"
+    [ "$said" = "Warning: $CONF: line $((lines + 1)): a key lightbox does not know: defualt_mem
+Warning: $CONF: line $((lines + 2)): not a setting, which is <key> = <value>: this is not a setting" ] || return 1
+    lb create web 10.0.0.2 >/dev/null 2>&1 && grep -qx 'mem=256M' "$C/web/.conf" ||
+        { echo "the misspelt key changed default_mem: $(grep '^mem=' "$C/web/.conf")"; return 1; }
+}
+
+# Where the settings come from: --config, then LIGHTBOX_CONFIG, then
+# /etc/lightbox/lightbox.conf, then the place in $HOME that lightbox read
+# before, which it says it will stop reading. A file that is named and not
+# there is an error. (No case here writes /etc: the lifecycle suite has that.)
+t_config_lookup_order() {
+    first=$W/first.conf second=$W/second.conf
+    { cat "$CONF"; echo 'bridge = brfirst'; } > "$first"
+    { cat "$CONF"; echo 'bridge = brsecond'; } > "$second"
+    { cat "$CONF"; echo 'bridge = brhome'; } > "$CONF.home" && mv "$CONF.home" "$CONF"
+    bridge() { grep '^bridge: ' | cut -d' ' -f2; }
+    bad=0
+    got=$(LIGHTBOX_CONFIG="$second" HOME="$W/home" "$LB" --config "$first" doctor 2>/dev/null | bridge)
+    [ "$got" = brfirst ] || { echo "--config and LIGHTBOX_CONFIG: $got"; bad=1; }
+    got=$(LIGHTBOX_CONFIG="$second" HOME="$W/home" "$LB" doctor 2>/dev/null | bridge)
+    [ "$got" = brsecond ] || { echo "LIGHTBOX_CONFIG and HOME: $got"; bad=1; }
+    if [ ! -e /etc/lightbox/lightbox.conf ]; then
+        said=$(LIGHTBOX_CONFIG='' HOME="$W/home" "$LB" doctor 2>&1)
+        [ "$(printf '%s\n' "$said" | bridge)" = brhome ] || { echo "an empty LIGHTBOX_CONFIG, and HOME: $(printf '%s\n' "$said" | bridge)"; bad=1; }
+        printf '%s\n' "$said" | grep -F "Warning: the configuration is read from $CONF, where lightbox 0.7 will" ||
+            { echo "the place in HOME was not said to be going"; bad=1; }
+    else
+        echo "this host has /etc/lightbox/lightbox.conf: HOME is not looked at, and that is not tried"
+    fi
+    for words in "--config $W/none.conf ls" "--config $W ls"; do
+        # shellcheck disable=SC2086
+        said=$(env -u LIGHTBOX_CONFIG "$LB" $words 2>&1) && { echo "lightbox $words succeeded"; bad=1; }
+        path=${words#--config }
+        [ "$said" = "Error: cannot read the configuration: ${path% ls}" ] || { echo "lightbox $words: $said"; bad=1; }
+    done
+    said=$(LIGHTBOX_CONFIG="$W/none.conf" "$LB" ls 2>&1) && { echo "a LIGHTBOX_CONFIG that is not there was taken"; bad=1; }
+    [ "$said" = "Error: cannot read the configuration: $W/none.conf" ] || { echo "LIGHTBOX_CONFIG not there: $said"; bad=1; }
+    said=$("$LB" --config 2>&1) && bad=1
+    [ "$said" = 'Error: --config needs the path of a lightbox.conf' ] || { echo "--config alone: $said"; bad=1; }
+    "$LB" --config "$first" --help | grep -q '^Usage: lightbox \[--config <path>\]' || { echo "help after --config"; bad=1; }
+    return $bad
+}
+
+# make install puts everything under DESTDIR, the configuration in
+# DESTDIR/etc/lightbox, and writes nothing in the home of whoever runs it. A
+# configuration that is there already is kept.
+t_make_install_stays_in_destdir() {
+    src=$(dirname "$LB")
+    [ -f "$src/Makefile" ] && [ -f "$src/lightbox.conf.example" ] || { echo "no source tree beside $LB"; return 77; }
+    mkdir -p "$W/installer"
+    inst() { env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS HOME="$W/installer" make -s -C "$src" install DESTDIR="$W/dest" >"$W/install.out" 2>&1; }
+    inst || { cat "$W/install.out"; return 1; }
+    find "$W/dest" -type f | sed "s#^$W/dest##" | sort
+    [ -x "$W/dest/usr/local/bin/lightbox" ] && cmp -s "$W/dest/etc/lightbox/lightbox.conf" "$src/lightbox.conf.example" ||
+        { echo "the binary or the configuration is not under DESTDIR"; return 1; }
+    [ -z "$(ls -A "$W/installer")" ] || { echo "written in the home of whoever ran it: $(find "$W/installer")"; return 1; }
+    echo 'bridge = brkept' >> "$W/dest/etc/lightbox/lightbox.conf"
+    inst || { cat "$W/install.out"; return 1; }
+    grep -qx 'bridge = brkept' "$W/dest/etc/lightbox/lightbox.conf" || { echo "a second install replaced the configuration"; return 1; }
 }
 
 # Help that is asked for goes to standard output and is no error: the whole
@@ -1376,7 +1448,7 @@ t_logs_prints_the_log() {
     [ "$(lb logs web)" = "one
 two" ] || return 1
     # a container that is not running has nothing to follow
-    followed=$(HOME="$W/home" timeout 5 "$LB" logs web -f) || { echo "logs -f of a stopped container did not end by itself"; return 1; }
+    followed=$(HOME="$W/home" LIGHTBOX_CONFIG="$CONF" timeout 5 "$LB" logs web -f) || { echo "logs -f of a stopped container did not end by itself"; return 1; }
     [ "$followed" = "one
 two" ] || return 1
     refused lb logs missing || return 1
@@ -1423,7 +1495,7 @@ last" ]
 # A command that is run with its standard streams closed must not take a file
 # of its own for one of them: its messages would be written into the file.
 t_closed_streams_are_harmless() {
-    HOME="$W/home" "$LB" create web 10.0.0.2 <&- >&- 2>&- || { echo "create failed with status $?"; return 1; }
+    HOME="$W/home" LIGHTBOX_CONFIG="$CONF" "$LB" create web 10.0.0.2 <&- >&- 2>&- || { echo "create failed with status $?"; return 1; }
     echo "$(lb inspect web | grep '^state: '), ip: $(cat "$C/web/.ip")"
     lb inspect web | grep -qx 'state: stopped' && [ ! -e "$C/web/.creating" ] &&
     [ "$(cat "$C/web/.ip")" = 10.0.0.2 ] && conf_has web 'mem=256M' || return 1
@@ -1600,9 +1672,11 @@ check 'ls --json gives pid as null for a stopped container'   t_ls_json_pid_is_n
 check 'ls is sorted by name'                                  t_ls_is_sorted
 check 'ls lists only directories with a container name'       t_ls_lists_only_containers
 xfail CLI-inspect          'inspect shows volumes and links'                 t_inspect_shows_volumes_and_links
-xfail CFG-parse            'configuration: carriage returns are stripped'    t_config_strips_carriage_returns
-xfail CFG-parse            'configuration: inline comments are stripped'     t_config_strips_inline_comments
-xfail CFG-parse            'configuration: unknown keys are reported'        t_config_reports_unknown_keys
+check 'configuration: carriage returns are stripped'                   t_config_strips_carriage_returns
+check 'configuration: inline comments are stripped'                    t_config_strips_inline_comments
+check 'configuration: unknown keys and lines that are no setting are said, with the line' t_config_reports_unknown_keys
+check 'configuration: --config, LIGHTBOX_CONFIG, /etc, then HOME with a warning' t_config_lookup_order
+check 'make install writes under DESTDIR only, and keeps a configuration' t_make_install_stays_in_destdir
 check 'help goes to standard output with status 0, and --version names the release' t_help_exits_zero
 check 'rm takes several names, and names those it did not remove'      t_rm_handles_every_argument
 check 'a surplus argument is an error that names it'                    t_surplus_arguments_are_errors

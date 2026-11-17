@@ -194,10 +194,12 @@ If the image has an `/init.sh`, the container's init runs it with `/bin/sh` once
 
 ## Configuration
 
-lightbox reads `~/.config/lightbox/lightbox.conf` at startup. All values have built-in defaults — the config file is optional.
+lightbox reads `/etc/lightbox/lightbox.conf` at startup, or the file that `--config <path>` or the variable `LIGHTBOX_CONFIG` names, in that order; `make install` puts the example there. All values have built-in defaults — the config file is optional. A file that `--config` or `LIGHTBOX_CONFIG` names has to be there. Without any of the three, lightbox 0.6 still reads `~/.config/lightbox/lightbox.conf`, where earlier versions looked, and warns that 0.7 will not; with `/etc/lightbox/lightbox.conf` there as well, it says that the file in `~` is not read.
+
+A line is `<key> = <value>`, blank, or a comment that begins with `#`. A `#` after a space or a tab begins a comment too, and a carriage return at the end of a line is no part of it, as files written on Windows have one. A key lightbox does not know and a line that is no setting are reported as warnings, with the file and the line, and change nothing.
 
 ```ini
-# ~/.config/lightbox/lightbox.conf
+# /etc/lightbox/lightbox.conf
 
 # Base directory for lightbox data (base rootfs and container directories)
 lightbox_dir = /var/lib/lightbox
@@ -421,7 +423,7 @@ The sandbox covers everything in a container: init, the `/init.sh` hook and all 
 - **Starting**: `start` and init talk over two pipes. Init builds the container when `start` has set up its cgroup and network, and reports back when it is built and again when the hook has ended. If either side goes away the other notices: an init whose `start` was killed exits before it runs anything
 - **External tools**: on the host, `ip` and `nsenter` set up a container's network, `iptables` and `iptables-restore` the firewall (a start with links runs `iptables-restore` once), and `cp` and `rm` create and remove a container. Everything else is direct syscalls, and nothing from the image is run before `/init.sh`
 - **One command at a time**: `start`, `stop`, `rm`, `add-vol` and `rm-vol` take a lock on the container they change, and `create` and `setup` one on the whole store, so two commands on one container do their work one after the other. A command that has to wait says so. `ls` and `inspect` never wait. `setup`, `start`, `stop` and `exec` need root and say so before they touch anything
-- **Configuration**: optional `~/.config/lightbox/lightbox.conf` for all paths and defaults
+- **Configuration**: optional `/etc/lightbox/lightbox.conf`, or the file `--config` or `LIGHTBOX_CONFIG` names, for all paths and defaults
 
 ## Volume Notes
 
