@@ -328,7 +328,9 @@ lightbox <command> [args]
   stop   <name>... [-t <seconds>]  Stop running containers, one after the other
   add-vol <name> <src>:<dst>[:ro]  Add a volume to an existing container
   rm-vol <name> <dst>           Remove the volume at a destination
-  rm     <name>...              Remove containers
+  restart <name>... [-t <seconds>]  Stop containers that run, as stop does, and start them
+  update <name> [--mem <limit>] [--pids <limit>] [--cpu <num>]  Change a container's limits
+  rm     [-f] <name>...         Remove containers; -f kills one that runs first
   exec   <name> [options] [--] [cmd [args...]]   Run a command in a container
   logs   <name> [-f]            Show what a container has printed; -f follows it
   inspect <name> [--json]       Show a container's configuration and state; --json as JSON
@@ -339,7 +341,7 @@ lightbox <command> [args]
   --version                                    The version of lightbox, and of lightc
 ```
 
-Help that is asked for goes to standard output, and the command exits 0. A word that a command will not use is an error that names it, and the command does nothing. `start`, `stop` and `rm` take several names, as Docker's do, and do one container after the other: one that cannot be done ends nothing for the others, the command names those it did not do at the end, and its exit status is the first that was not 0.
+Help that is asked for goes to standard output, and the command exits 0. A word that a command will not use is an error that names it, and the command does nothing. `start`, `stop`, `restart` and `rm` take several names, as Docker's do, and do one container after the other: one that cannot be done ends nothing for the others, the command names those it did not do at the end, and its exit status is the first that was not 0.
 
 ### Create options
 

@@ -2125,6 +2125,54 @@ t_doctor_names_what_is_missing() {
     echo "no setpriv to run doctor as another user with"
 }
 
+# ─── Cases: restart, update, rm -f ──────────────────────────────────────────
+
+limits_of() { echo "memory.max $(cat "$CG/$1/memory.max"), pids.max $(cat "$CG/$1/pids.max"), cpu.max $(cat "$CG/$1/cpu.max")"; }
+
+# update of a running container changes its cgroup's limits at once, and its
+# .conf, so that it has them after a restart too.
+t_update_live() {
+    up upd || return 1
+    before=$(limits_of upd)
+    echo "before: $before"
+    lb update upd --mem 64M --pids 50 --cpu 0.5 || return 1
+    echo "after:  $(limits_of upd)"
+    want='memory.max 67108864, pids.max 50, cpu.max 50000 100000'
+    [ "$(limits_of upd)" = "$want" ] || { echo "the running container did not take the limits"; return 1; }
+    old=$(pid_of upd)
+    lb restart upd || return 1
+    settled upd || return 1
+    [ "$(pid_of upd)" != "$old" ] || { echo "restart left the same init"; return 1; }
+    echo "after a restart: $(limits_of upd)"
+    [ "$(limits_of upd)" = "$want" ] || { echo "the limits did not outlast a restart"; return 1; }
+}
+
+# restart stops a container that runs and starts it, and starts one that is
+# stopped.
+t_restart() {
+    up rst || return 1
+    old=$(pid_of rst)
+    lb restart -t 5 rst || return 1
+    settled rst && [ "$(pid_of rst)" != "$old" ] || { echo "the container was not started again"; return 1; }
+    wait_until 5 gone "$old" || { echo "the old init is still there"; return 1; }
+    lb stop rst >/dev/null || return 1
+    lb restart rst || return 1
+    settled rst
+}
+
+# rm of a running container is refused; rm -f kills it first, as docker rm -f
+# does, and removes it, leaving nothing.
+t_rm_force() {
+    up rmf || return 1
+    pid=$(pid_of rmf)
+    port_of rmf >/dev/null
+    refused lb rm rmf || { echo "rm removed a running container"; return 1; }
+    lb rm -f rmf || return 1
+    wait_until 5 gone "$pid" || { echo "init is still there"; return 1; }
+    [ ! -e "$C/rmf" ] || { echo "the container's directory is left"; return 1; }
+    nothing_left rmf
+}
+
 # ─── Cases: where the settings are ──────────────────────────────────────────
 
 # Named by neither --config nor LIGHTBOX_CONFIG, the settings are those of
@@ -2578,6 +2626,9 @@ if [ "$MODE" = inside ]; then
 
     check 'create, start, exec, stop and rm'                              t_lifecycle
     check 'start and stop take several names, and name those they could not do' t_several_names
+    check 'update changes the limits of a running container, and they outlast a restart' t_update_live
+    check 'restart stops a running container and starts it, and starts a stopped one' t_restart
+    check 'rm -f kills a running container and removes it'                t_rm_force
     check 'ls and inspect show a running container'                       t_queries_show_running
     check 'inspect --json of a running container has its init, as numbers'  t_inspect_json_running
     check 'exec returns the exit status of the command'                   t_exec_status

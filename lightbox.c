@@ -262,6 +262,17 @@ static const char *controllers_check(const char *listed, const container_config 
  * Make a container's cgroup, give it the container's limits and put init in
  * it. NULL, or what failed.
  */
+/* What cpu.max is given for a CPU limit: "<quota> <period>". */
+static bool cpu_max_text(const char *cpu, char *out, size_t max) {
+    int quota;
+    bool cut = false;
+    if (!parse_cpu_limit(cpu, &quota))
+        return false;
+    size_t len = (size_t)fmt_int(out, quota);
+    str_append(out, len, " " STRINGIFY(CPU_PERIOD_US), max, &cut);
+    return !cut;
+}
+
 static const char *cgroup_create(const char *name, int pid, const container_config *config) {
     char cg[MAX_PATH], path[MAX_PATH];
     if (!cgroup_path(cg, name) || !path_join(path, sizeof(path), cg, "cgroup.controllers"))
@@ -310,14 +321,10 @@ static const char *cgroup_create(const char *name, int pid, const container_conf
         return "failed to set the process limit";
 
     /* cpu: so much of every period, on all CPUs together */
-    int quota;
     char cpu_max[32];
-    bool cut = false;
-    if (!parse_cpu_limit(config->cpu, &quota))
+    if (!cpu_max_text(config->cpu, cpu_max, sizeof(cpu_max)))
         return "the container's CPU limit is not one";
-    size_t len = (size_t)fmt_int(cpu_max, quota);
-    str_append(cpu_max, len, " " STRINGIFY(CPU_PERIOD_US), sizeof(cpu_max), &cut);
-    if (cut || cgroup_write(cg, "cpu.max", cpu_max) < 0)
+    if (cgroup_write(cg, "cpu.max", cpu_max) < 0)
         return "failed to set the CPU limit";
 
     if (config->io[0] && cgroup_write(cg, "io.max", config->io) < 0)
@@ -690,6 +697,33 @@ static void choose_address(const container_network *net, const uint32_t *asked, 
     die2("Error: every address of the subnet has a container: ", cfg_global.subnet);
 }
 
+/*
+ * --mem, --pids and --cpu, as create and update take them: the value checked
+ * and put in the configuration, or the option named with what it takes.
+ * False for any other option.
+ */
+static bool limit_option(int argc, char **argv, int *i, container_config *cfg) {
+    const char *opt = argv[*i];
+    if (streq(opt, "--mem")) {
+        const char *value = option_value(argc, argv, i);
+        if (!mem_limit_ok(value) || !str_copy(cfg->mem, value, sizeof(cfg->mem)))
+            die2("Error: --mem takes <number>[K|M|G|T] or max, not: ", value);
+    } else if (streq(opt, "--pids")) {
+        const char *value = option_value(argc, argv, i);
+        if (!pids_limit_ok(value) || !str_copy(cfg->pids, value, sizeof(cfg->pids)))
+            die2("Error: --pids takes a number from 1 to " STRINGIFY(PIDS_LIMIT_MAX) " or max, not: ", value);
+    } else if (streq(opt, "--cpu")) {
+        const char *value = option_value(argc, argv, i);
+        int quota;
+        if (!parse_cpu_limit(value, &quota) || !str_copy(cfg->cpu, value, sizeof(cfg->cpu)))
+            die2("Error: --cpu takes a number of CPUs from 0.01 to " STRINGIFY(CPU_LIMIT_MAX)
+                 ", such as 2 or 0.5, not: ", value);
+    } else {
+        return false;
+    }
+    return true;
+}
+
 static void cmd_create(int argc, char **argv) {
     require_tool("cp", tool_path_cp());
     if (argc < 1) die("Usage: lightbox create <name> [<ip>] [options]");
@@ -721,10 +755,8 @@ static void cmd_create(int argc, char **argv) {
 
     for (int i = address_given ? 2 : 1; i < argc; i++) {
         const char *opt = argv[i];
-        if (streq(opt, "--mem")) {
-            const char *value = option_value(argc, argv, &i);
-            if (!mem_limit_ok(value) || !str_copy(cfg.mem, value, sizeof(cfg.mem)))
-                die2("Error: --mem takes <number>[K|M|G|T] or max, not: ", value);
+        if (limit_option(argc, argv, &i, &cfg)) {
+            /* --mem, --pids or --cpu */
         } else if (streq(opt, "--swap")) {
             const char *value = option_value(argc, argv, &i);
             if (!swap_limit_ok(value) || !str_copy(cfg.swap, value, sizeof(cfg.swap)))
@@ -739,16 +771,6 @@ static void cmd_create(int argc, char **argv) {
             const char *why = io_disk_problem(value);
             if (why)
                 die_about("Error: --io-max: ", why, value);
-        } else if (streq(opt, "--pids")) {
-            const char *value = option_value(argc, argv, &i);
-            if (!pids_limit_ok(value) || !str_copy(cfg.pids, value, sizeof(cfg.pids)))
-                die2("Error: --pids takes a number from 1 to " STRINGIFY(PIDS_LIMIT_MAX) " or max, not: ", value);
-        } else if (streq(opt, "--cpu")) {
-            const char *value = option_value(argc, argv, &i);
-            int quota;
-            if (!parse_cpu_limit(value, &quota) || !str_copy(cfg.cpu, value, sizeof(cfg.cpu)))
-                die2("Error: --cpu takes a number of CPUs from 0.01 to " STRINGIFY(CPU_LIMIT_MAX)
-                     ", such as 2 or 0.5, not: ", value);
         } else if (streq(opt, "--userns")) {
             die("Error: --userns is not supported yet");
         } else if (streq(opt, "--uid-start")) {
@@ -3063,10 +3085,12 @@ static const char *text_with_number(char *buf, size_t bufsz, const char *before,
  * --timeout with its seconds wherever it is, when the command takes one.
  * Anything else is an error, named. How many names there are.
  */
-static int names_and_seconds(int argc, char **argv, int *seconds) {
+static int names_and_seconds(int argc, char **argv, int *seconds, bool *force) {
     int count = 0;
     for (int i = 0; i < argc; i++) {
-        if (seconds && (streq(argv[i], "-t") || streq(argv[i], "--timeout"))) {
+        if (force && (streq(argv[i], "-f") || streq(argv[i], "--force"))) {
+            *force = true;
+        } else if (seconds && (streq(argv[i], "-t") || streq(argv[i], "--timeout"))) {
             if (i + 1 >= argc)
                 die2("Error: option needs a number of seconds: ", argv[i]);
             if (!parse_seconds(argv[++i], seconds))
@@ -3497,7 +3521,7 @@ fail_start:
 static void cmd_start(int argc, char **argv) {
     /* how long each waits for the init hook */
     int hook_wait = cfg_global.start_timeout;
-    int count = names_and_seconds(argc, argv, &hook_wait);
+    int count = names_and_seconds(argc, argv, &hook_wait, NULL);
     if (count == 0)
         die("Usage: lightbox start <name>... [-t <seconds>]");
     require_root("start");
@@ -3590,11 +3614,117 @@ static void stop_one(const char *name, int seconds) {
 static void cmd_stop(int argc, char **argv) {
     /* how long each container gets to end by itself */
     int seconds = cfg_global.stop_timeout;
-    int count = names_and_seconds(argc, argv, &seconds);
+    int count = names_and_seconds(argc, argv, &seconds, NULL);
     if (count == 0)
         die("Usage: lightbox stop <name>... [-t <seconds>]");
     require_root("stop");
     each_container("not stopped", count, argv, stop_one, seconds);
+}
+
+/* A container that runs, stopped in a process of its own, as stop does it:
+ * true when it does not run afterwards. */
+static bool stop_if_running(const char *name, int seconds) {
+    if (!is_running(name))
+        return true;
+    lc_sysret pid = lc_kernel_fork();
+    if (pid < 0)
+        die("Error: cannot make a process to stop the container in");
+    if (pid == 0) {
+        stop_one(name, seconds);
+        lc_kernel_exit(0);
+    }
+    int32_t status = 0;
+    lc_sysret got;
+    do {
+        got = lc_kernel_wait_for_child((int32_t)pid, &status, 0);
+    } while (got == -LB_EINTR);
+    return got == pid && exit_code_from_status(status) == 0;
+}
+
+/* restart: stopped, with -t as stop has it, if it runs, and started. */
+static void restart_one(const char *name, int seconds) {
+    require_root("restart");
+    if (!stop_if_running(name, seconds))
+        lc_kernel_exit(1);
+    start_one(name, cfg_global.start_timeout);
+}
+
+static void cmd_restart(int argc, char **argv) {
+    int seconds = cfg_global.stop_timeout;
+    int count = names_and_seconds(argc, argv, &seconds, NULL);
+    if (count == 0)
+        die("Usage: lightbox restart <name>... [-t <seconds>]");
+    require_root("restart");
+    each_container("not restarted", count, argv, restart_one, seconds);
+}
+
+/* ─── cmd_update ────────────────────────────────────────────────────────── */
+
+/*
+ * update <name> --mem/--pids/--cpu: the limits in the container's
+ * configuration, which every start reads, and in the cgroup of a container
+ * that runs. The configuration is changed first; a running container that
+ * does not take a limit has it from its next start, and that is said.
+ */
+static void cmd_update(int argc, char **argv) {
+    static container_config given;
+    container_config_init(&given);
+    given.mem[0] = given.pids[0] = given.cpu[0] = '\0';
+    const char *name = NULL;
+    for (int i = 0; i < argc; i++) {
+        if (limit_option(argc, argv, &i, &given))
+            continue;
+        if (argv[i][0] == '-')
+            die2("Error: unknown option: ", argv[i]);
+        if (name)
+            die2("Error: unexpected argument: ", argv[i]);
+        name = argv[i];
+    }
+    if (!name || (!given.mem[0] && !given.pids[0] && !given.cpu[0]))
+        die("Usage: lightbox update <name> [--mem <limit>] [--pids <limit>] [--cpu <num>]");
+    validate_name(name);
+    require_root("update");
+    container_lock(name);
+
+    static container_config config;
+    container_config_load_or_die(name, &config);
+    if (given.mem[0])  lc_bytes_copy(config.mem, given.mem, sizeof(config.mem));
+    if (given.pids[0]) lc_bytes_copy(config.pids, given.pids, sizeof(config.pids));
+    if (given.cpu[0])  lc_bytes_copy(config.cpu, given.cpu, sizeof(config.cpu));
+    const char *wrong = container_config_save(name, &config);
+    if (wrong)
+        die_about("Error: container ", wrong, name);
+    print_str(STDOUT, "Container '");
+    print_str(STDOUT, name);
+    print_str(STDOUT, "' updated\n");
+    if (!is_running(name)) {
+        print_str(STDOUT, "It is not running: it has them from its next start\n");
+        return;
+    }
+
+    char cg[MAX_PATH], cpu_max[32];
+    if (!cgroup_path(cg, name))
+        die("Error: the path of the container's cgroup is too long");
+    const struct { const char *file, *value, *what; } live[] = {
+        { "memory.max", given.mem, "memory limit" },
+        { "pids.max", given.pids, "process limit" },
+        { "cpu.max", given.cpu[0] && cpu_max_text(given.cpu, cpu_max, sizeof(cpu_max)) ? cpu_max : "", "CPU limit" },
+    };
+    int failed = 0;
+    for (size_t i = 0; i < sizeof(live) / sizeof(live[0]); i++) {
+        if (!live[i].value[0])
+            continue;
+        if (cgroup_write(cg, live[i].file, live[i].value) < 0) {
+            print_str(STDERR, "Error: the running container did not take the new ");
+            print_str(STDERR, live[i].what);
+            print_str(STDERR, " (");
+            print_str(STDERR, live[i].file);
+            print_str(STDERR, "); it has it from its next start\n");
+            failed++;
+        }
+    }
+    if (failed)
+        lc_kernel_exit(1);
 }
 
 static void cmd_add_vol(int argc, char **argv) {
@@ -3684,8 +3814,10 @@ static void cmd_rm_vol(int argc, char **argv) {
 
 /* ─── cmd_rm ────────────────────────────────────────────────────────────── */
 
-static void rm_one(const char *name, int unused) {
-    (void)unused;
+static void rm_one(const char *name, int force) {
+    /* with --force, one that runs is killed first, as docker rm -f does */
+    if (force && !stop_if_running(name, 0))
+        lc_kernel_exit(1);
     container_lock(name);
 
     if (is_running(name)) die2("Error: container is running (stop it first): ", name);
@@ -3716,10 +3848,11 @@ static void rm_one(const char *name, int unused) {
 
 static void cmd_rm(int argc, char **argv) {
     require_tool("rm", tool_path_rm());
-    int count = names_and_seconds(argc, argv, NULL);
+    bool force = false;
+    int count = names_and_seconds(argc, argv, NULL, &force);
     if (count == 0)
-        die("Usage: lightbox rm <name>...");
-    each_container("not removed", count, argv, rm_one, 0);
+        die("Usage: lightbox rm [-f] <name>...");
+    each_container("not removed", count, argv, rm_one, force);
 }
 
 /* ─── cmd_exec ──────────────────────────────────────────────────────────── */
@@ -3857,8 +3990,14 @@ static const struct { const char *name; const char *text; } command_help[] = {
         "  add-vol <name> <src:dst[:ro]> Add a volume to an existing container\n" },
     { "rm-vol",
         "  rm-vol <name> <dst>           Remove the volume at a destination\n" },
+    { "restart",
+        "  restart <name>... [-t <seconds>]  Stop containers that run, as stop does, and start them\n" },
+    { "update",
+        "  update <name> [--mem <limit>] [--pids <limit>] [--cpu <num>]\n"
+        "                                Change a container's limits, live if it runs and from its next\n"
+        "                                start in any case\n" },
     { "rm",
-        "  rm     <name>...              Remove containers (they must be stopped)\n" },
+        "  rm     [-f] <name>...         Remove containers; -f kills one that runs first\n" },
     { "exec",
         "  exec   <name> [options] [--] [cmd [args...]]  Run a command in a running container\n"
         "         --user <name|uid[:gid]> Who to run it as (default: root)\n"
@@ -4008,6 +4147,8 @@ int main(int argc, char **argv, char **envp) {
     else if (streq(cmd, "create")) cmd_create(sub_argc, sub_argv);
     else if (streq(cmd, "start"))  cmd_start(sub_argc, sub_argv);
     else if (streq(cmd, "stop"))   cmd_stop(sub_argc, sub_argv);
+    else if (streq(cmd, "restart")) cmd_restart(sub_argc, sub_argv);
+    else if (streq(cmd, "update")) cmd_update(sub_argc, sub_argv);
     else if (streq(cmd, "add-vol")) cmd_add_vol(sub_argc, sub_argv);
     else if (streq(cmd, "rm-vol")) cmd_rm_vol(sub_argc, sub_argv);
     else if (streq(cmd, "rm"))     cmd_rm(sub_argc, sub_argv);

@@ -1408,7 +1408,7 @@ t_surplus_arguments_are_errors() {
     expect 'Error: unexpected argument: /mnt' add-vol web /tmp:/srv /mnt
     expect 'Error: unexpected argument: /var' rm-vol web /srv /var
     expect 'Error: unexpected argument: again' create web2 10.0.0.3 again
-    expect 'Error: unknown option: --force' rm web --force
+    expect 'Error: unknown option: --all' rm web --all
     expect 'Error: unknown option: --now' stop web --now
     expect 'Error: not a number of seconds from 0 to 86400: soon' start web other -t soon
     expect 'Usage: lightbox start <name>... [-t <seconds>]' start -t 5
@@ -1505,6 +1505,68 @@ sys.exit(0 if d["overall"] == "ok" else 1)
     [ $verdict = "$rc" ] || { echo "the exit status $rc is not that of the overall verdict, $verdict"; return 1; }
     said=$(lb doctor --json --bogus 2>&1) && return 1
     [ "$said" = 'Error: unknown option: --bogus' ]
+}
+
+# update takes --mem, --pids and --cpu, held to what create holds them to,
+# and refuses anything else before it looks at the container; restart takes
+# -t, and rm -f; each needs root as the command it is made of does.
+t_update_restart_rm_options() {
+    lb create web 10.0.0.2 || return 1
+    before=$(cat "$C/web/.conf")
+    bad=0
+    expect() { # message, words...
+        local want=$1
+        shift
+        msg=$(lb "$@" 2>&1) && { echo "lightbox $*: succeeded"; bad=1; return; }
+        echo "lightbox $*: $msg"
+        [ "$msg" = "$want" ] || bad=1
+    }
+    usage='Usage: lightbox update <name> [--mem <limit>] [--pids <limit>] [--cpu <num>]'
+    expect "$usage" update
+    expect "$usage" update web
+    expect 'Error: --mem takes <number>[K|M|G|T] or max, not: 1x' update web --mem 1x
+    expect 'Error: --cpu takes a number of CPUs from 0.01 to 512, such as 2 or 0.5, not: 0' update web --cpu 0
+    expect 'Error: --pids takes a number from 1 to 4194304 or max, not: 0' update web --pids 0
+    expect 'Error: unknown option: --swap' update web --swap 1G
+    expect 'Error: unexpected argument: db' update web db --mem 64M
+    expect 'Error: not a number of seconds from 0 to 86400: soon' restart web -t soon
+    expect 'Usage: lightbox restart <name>... [-t <seconds>]' restart
+    expect 'Usage: lightbox rm [-f] <name>...' rm -f
+    expect 'Error: unknown option: --forcefully' rm --forcefully web
+    if [ "$(id -u)" -ne 0 ]; then
+        expect 'Error: lightbox update must be run as root' update web --mem 64M
+        expect 'Error: lightbox restart must be run as root' restart web
+    fi
+    [ "$before" = "$(cat "$C/web/.conf")" ] || { echo "a refused command changed the .conf"; bad=1; }
+    for words in 'update --help' 'restart --help' 'rm --help'; do
+        # shellcheck disable=SC2086
+        lb $words | grep -q '^  [a-z]' || { echo "no help for $words"; bad=1; }
+    done
+    return $bad
+}
+
+# update of a container that is not running writes its .conf, the limits
+# given and nothing else changed, and says that it has them from its next
+# start. rm -f of one that is not running removes it as rm does.
+t_update_rewrites_the_conf() {
+    unshare -r --mount true 2>/dev/null || { echo "user namespaces are not available to this user"; return 77; }
+    lb create web 10.0.0.2 --vol "$W/vol:/data:ro" --swap 32M || return 1
+    lb create gone 10.0.0.3 || return 1
+    # shellcheck disable=SC2016     # the script is for the shell in the namespace
+    HOME="$W/home" LIGHTBOX_CONFIG="$CONF" unshare -r --mount -- sh -c '
+        "$1" update web --mem 64M --cpu 0.5 || exit 1
+        "$1" update web --pids 50 || exit 1
+        "$1" rm -f gone || exit 1
+    ' _ "$LB" > "$W/ns.out" 2>&1
+    rc=$?
+    cat "$W/ns.out"
+    cat "$C/web/.conf"
+    [ $rc -eq 0 ] || return 1
+    grep -qx 'It is not running: it has them from its next start' "$W/ns.out" || return 1
+    for line in mem=64M cpu=0.5 pids=50 swap=32M "vol=$W/vol:/data:ro" oom_score=500 version=1; do
+        grep -qx "$line" "$C/web/.conf" || { echo "the .conf has no $line"; return 1; }
+    done
+    [ ! -e "$C/gone" ] || { echo "rm -f left the container"; return 1; }
 }
 
 # A start_timeout or stop_timeout that cannot be read is said so, and stops
@@ -1782,6 +1844,8 @@ check 'rm takes several names, and names those it did not remove'      t_rm_hand
 check 'a surplus argument is an error that names it'                    t_surplus_arguments_are_errors
 check 'doctor says how to fix each thing it finds missing'              t_doctor_says_how_to_fix
 check 'doctor --json: settings and checks, typed'                       t_doctor_json
+check 'update, restart and rm -f check their options before anything'  t_update_restart_rm_options
+check 'update writes the limits into a stopped container'"'"'s .conf'       t_update_rewrites_the_conf
 check 'start without root is a clean error'                   t_start_without_root_is_a_clean_error
 
 summary validation
