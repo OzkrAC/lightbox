@@ -94,7 +94,7 @@ What an image has to contain:
 - The programs that `exec` runs, found on `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, with their libraries where they are linked dynamically: nothing of the host is in a container.
 - `/etc/passwd` and `/etc/group`, for `exec --user <name>` and for the groups of the user a command runs as.
 
-`create` copies the whole image; an empty one is refused.
+An empty image is refused. A container does not copy its image: see [Storage](#storage).
 
 ### 2. Set up host networking
 
@@ -165,8 +165,8 @@ mkdir -p /srv/www
 mkdir -p /srv/config && echo 'debug = 1' > /srv/config/app.conf
 ./lightbox create conf --vol /srv/config/app.conf:/etc/app.conf:ro
 
-# Copy another image than LIGHTBOX_ROOTFS for this container
-./lightbox create other --rootfs /opt/rootfs/alpine
+# Another base than LIGHTBOX_ROOTFS for this container, and a full copy of it
+./lightbox create other --rootfs /opt/rootfs/alpine --copy
 
 # Choose the name servers the container asks
 ./lightbox create resolver --dns 9.9.9.9 --dns 149.112.112.112
@@ -357,6 +357,7 @@ Commands:
          --userns               Future improvement; not supported yet
          --uid-start <n>        Future improvement; not supported yet
          --read-only            Read-only root filesystem
+         --copy                 A copy of the base, and not an overlay of its snapshot
          --privileged           Disable security sandbox
          --oom-score <n>        OOM score adjustment (default: 500)
          --link <name>          Allow network to another container
@@ -381,6 +382,9 @@ Commands:
   doctor [--json]               Check what lightbox needs of this host, and say how to fix what
                                 is missing; --json as JSON
   ls [--json]                   List all containers
+  base ls                       List the snapshots of bases that containers overlay
+  base add <dir>                Take a new snapshot of a base, for the containers made after it
+  base rm <id>...               Remove snapshots that no container uses
   setup                         Setup host networking
   setup --teardown              Take lightbox's host network away, when no container runs
 
@@ -408,6 +412,7 @@ A container's name is 1 to 30 characters of `a-z`, `A-Z`, `0-9`, `_` and `-`.
 | `--userns` | — | Future improvement; not supported yet |
 | `--uid-start <n>` | — | Future improvement; not supported yet |
 | `--read-only` | off | Read-only root filesystem |
+| `--copy` | off | A full copy of the base, as before 0.7, and not an overlay of its snapshot |
 | `--privileged` | off | Disable security sandbox |
 | `--oom-score <n>` | `500` | OOM score adjustment, -1000 to 1000 |
 | `--link <name>` | — | Allow network to another container (repeatable) |
@@ -479,7 +484,7 @@ What it does not keep out, and what to do about it:
 ## How it works
 
 - **Namespaces**: `clone()` with PID, mount, UTS, IPC and network namespace flags
-- **Filesystem**: each container lives under `<container_dir>/<name>/` with `rootfs/` for the filesystem, `.conf` and `.ip` for what it is configured with and `console.log` for its output. `pivot_root` into the rootfs copy
+- **Filesystem**: each container lives under `<container_dir>/<name>/` with `rootfs/` for its own files, `.conf` and `.ip` for what it is configured with and `console.log` for its output. Init mounts an overlay of the base's snapshot and `rootfs/` in the container's mount namespace, or takes `rootfs/` as it is for a copy, and `pivot_root`s into it (see [Storage](#storage))
 - **Runtime records**: what is known about a container while it runs is in `<run_dir>/<name>/`: `pid` and `pid_start` for its init, `state`, and `exit`, where init writes its exit status as the last thing it does. These are written without waiting for a disk, and a reboot takes them away with everything else in `/run`; a container without them is stopped. `start` makes the directory again when it is missing, for root alone
 - **States**: `ls` and `inspect` show `stopped`, `running`, `starting` and `stopping` while a command is at work, `exited` for a container that ended by itself, `failed` for one that was killed or whose start or hook failed, and `creating` for one that `create` did not finish. A half-made container is not started: remove it and create it again
 - **A container that ended without a stop**: when init is killed, or is told to stop by a signal from somewhere other than `lightbox stop`, from inside the container too, nobody is there to clear up. `ls` shows such a container as `exited` and changes nothing. The next `start`, `stop` or `rm` clears away what it left, its cgroup, its interface and the firewall rules of its links, says that it did, and records `exited` if init had ended with status 0 and `failed` otherwise
@@ -494,6 +499,16 @@ What it does not keep out, and what to do about it:
 - **External tools**: on the host, `ip` and `nsenter` set up a container's network, `iptables` and `iptables-restore`, or `nft`, the firewall (a start with links runs one of them once, and every start looks at the firewall with one), and `cp` and `rm` create and remove a container. Everything else lightbox does with system calls of its own, and nothing from the image is run before `/init.sh`
 - **One command at a time**: `start`, `stop`, `restart`, `update`, `rm`, `add-vol` and `rm-vol` take a lock on the container they change, and `create` and `setup` one on the whole store, so two commands on one container do their work one after the other. A command that has to wait says so. `ls` and `inspect` never wait. `setup`, `start`, `stop`, `restart`, `update` and `exec` need root and say so before they touch anything
 - **Configuration**: optional `/etc/lightbox/lightbox.conf`, or the file `--config` or `LIGHTBOX_CONFIG` names, for all paths and defaults
+
+## Storage
+
+A container's root is an overlay: a snapshot of its base, which containers of that base share and nothing writes to, and the container's own files on top. As Docker keeps its images, lightbox keeps the snapshots itself, in `<lightbox_dir>/bases/<id>/`:
+
+- The first `create` from a base takes a snapshot of it, a reflink where the filesystem has them and a copy where it has not; every `create` from that base after it uses the snapshot, and takes no time and no room of the base's size. Changing or removing the base directory afterwards changes no container.
+- `<container_dir>/<name>/rootfs/` holds the container's own files: what `create` wrote in `/etc`, and what the container writes. What it takes out of the base is marked there, the way overlayfs marks it. The overlay is mounted in the container's mount namespace only; on the host, `rootfs/` shows the container's own files and nothing of the base.
+- A file of the base that you change from the host has to be in `rootfs/` first: appending to `rootfs/etc/passwd` while the container has the base's makes a file of only what you appended. Change it inside the container, with `exec`, or copy it into `rootfs/` and change the copy.
+- `lightbox base ls` lists the snapshots, with their base and the containers on them. `lightbox base add <dir>` takes a new snapshot of a base, for the containers made after it, as after an update of the base; the containers made before keep theirs. `lightbox base rm <id>` removes a snapshot that no container uses.
+- `--copy` makes the container a full copy of its base in `rootfs/`, as every container was before 0.7. So does every `create` where an overlay cannot be mounted, without overlayfs in the kernel or without the right to mount, and it says so; `doctor` says whether the kernel has overlayfs. Containers made before 0.7 are copies, and stay as they are.
 
 ## Volume Notes
 

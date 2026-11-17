@@ -2095,6 +2095,7 @@ privileged 1
 readonly 1
 io 8:0 rbps=1048576
 swap 1G
+base -
 vol /srv/data -> /data rw
 vol /etc/app.conf -> /etc/app.conf ro
 link db
@@ -2119,6 +2120,21 @@ config_old_userns_keys() {
 }
 t_config_old_userns_keys() { in_config_dir config_old_userns_keys; }
 
+# base=, the snapshot a container overlays: twelve hex digits, read and
+# written back as they are; anything else is refused with its line.
+config_base_key() {
+    printf 'version=1\nmem=64M\npids=32\ncpu=1\noom_score=0\nbase=5ea0e1194872\n' > "$D/web/.conf"
+    got=$(config)
+    printf '%s\n' "$got" | grep -qx 'base 5ea0e1194872' || { printf '%s\n' "$got"; return 1; }
+    for wrong in 5ea0e119487 5ea0e11948720 5EA0E1194872 ../../etc/x ''; do
+        printf 'version=1\nmem=64M\npids=32\ncpu=1\noom_score=0\nbase=%s\n' "$wrong" > "$D/web/.conf"
+        got=$(config)
+        [ "$got" = "refused: $D/web/.conf: line 6: base is not the id of a base snapshot" ] ||
+            { echo "base=$wrong: $got"; return 1; }
+    done
+}
+t_config_base_key() { in_config_dir config_base_key; }
+
 # What a file does not say is what lightbox.conf says, and a file may say
 # nothing at all.
 config_defaults() {
@@ -2133,7 +2149,8 @@ oom_score 500
 privileged 0
 readonly 0
 io -
-swap -' ] || return 1
+swap -
+base -' ] || return 1
     # a default that cannot be used is no default: the file must have the limit
     got=$(config nodefaults)
     printf '%s\n' "$got"
@@ -2261,6 +2278,7 @@ privileged 1
 readonly 0
 io -
 swap -
+base -
 vol /srv/data -> /data rw
 vol /srv/other -> /data rw
 link db' ] || return 1
@@ -2294,7 +2312,7 @@ vol=/srv/data:/data
 link=db' ] || { echo "the file is not what was put in"; bad=1; }
     [ "$(stat -c %a "$D/web/.conf")" = 600 ] || { echo "the file's mode is $(stat -c %a "$D/web/.conf")"; bad=1; }
     got=$(config | tr '\n' ' ')
-    case $got in 'version 1 mem 1G pids max cpu 0.25 oom_score 500 '*'io 8:0 wbps=1024 swap 64M vol /srv/data -> /data rw link db ') ;;
+    case $got in 'version 1 mem 1G pids max cpu 0.25 oom_score 500 '*'io 8:0 wbps=1024 swap 64M base - vol /srv/data -> /data rw link db ') ;;
         *) echo "read back: $got"; bad=1 ;; esac
 
     before=$(cat "$D/web/.conf")
@@ -2662,6 +2680,7 @@ check 'no prefix is written into the source: subnet gives it'      t_no_prefix_o
 check 'a .conf is read into one structure, whole'                t_config_is_read_whole
 check 'what a .conf leaves out is the default, if that is usable' t_config_defaults
 check 'userns=0 and uid_start of 0.5 are read, and userns=1 is refused' t_config_old_userns_keys
+check 'base= is a snapshot'"'"'s id, read as it is, or refused'          t_config_base_key
 check 'a .conf with a version is read strictly, by line'         t_config_is_read_strictly
 check 'a .conf from before the version line is still read'       t_config_from_before_the_version_line
 check 'a .conf is written as it will be read, or not written'    t_config_is_written_as_it_will_be_read

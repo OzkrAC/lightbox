@@ -240,6 +240,7 @@ static void put_config(const container_config *config) {
     put_number("readonly", config->read_only);
     put_line("io ", config->io[0] ? config->io : "-");
     put_line("swap ", config->swap[0] ? config->swap : "-");
+    put_line("base ", config->base[0] ? config->base : "-");
     for (int i = 0; i < config->nvols; i++) {
         put("vol ");
         put(config->vols[i].src);

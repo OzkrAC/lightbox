@@ -768,8 +768,8 @@ t_default_settings_are_checked() {
         [ ! -e "$C/x$n" ] || { echo "the refused container is there"; return 1; }
         sed -i '$d' "$CONF"
     done
-    # and with nothing wrong any more, nothing is said
-    msg=$(lb create y 10.0.0.5 2>&1 >/dev/null) || return 1
+    # and with nothing wrong any more, nothing is said but that this user can mount no overlay
+    msg=$(lb create y 10.0.0.5 2>&1 >/dev/null | grep -v '^Note: an overlay cannot be mounted here') || true
     [ -z "$msg" ] && conf_has y 'mem=64M' && conf_has y 'oom_score=-200'
 }
 
@@ -976,8 +976,8 @@ t_create_killed_half_way() {
     real=$(readlink -f "$(type -P cp)") && cp "$real" "$W/cp.real" || return 1
     {
         echo '#!/bin/sh'
-        echo 'for last; do :; done'                             # the destination: <container>/rootfs
-        echo "if [ -e \"\${last%/rootfs}/.creating\" ]; then echo marked; else echo unmarked; fi >> $W/seen"
+        echo 'for last; do :; done'                             # the destination: <container>/rootfs, or a snapshot
+        echo "case \"\$last\" in $C/*) if [ -e \"\${last%/rootfs}/.creating\" ]; then echo marked; else echo unmarked; fi >> $W/seen ;; esac"
         echo "if [ -e $W/end-it ]; then kill -KILL \$PPID; exit 1; fi"
         echo "exec $W/cp.real \"\$@\""
     } > "$W/cp.shim"
@@ -1585,6 +1585,34 @@ t_readme_matches_the_binary() {
     [ -n "$said" ] && [ $((size * 4)) -ge $((said * 3)) ] && [ $((size * 4)) -le $((said * 5)) ]
 }
 
+# base ls, add and rm, as an ordinary user can have them: a snapshot of a
+# base is taken and listed with its source; one that a container's .conf
+# names is not removed, and one that none names is.
+t_base_snapshots() {
+    lb create web 10.0.0.2 || return 1
+    listing=$(lb base ls) || return 1
+    # web is a copy, as this user can mount no overlay, and took no snapshot
+    [ "$listing" = 'ID            TAKEN (UTC)          SOURCE  CONTAINERS' ] || { printf '%s\n' "$listing"; return 1; }
+    said=$(lb base add "$BASE") || { printf '%s\n' "$said"; return 1; }
+    printf '%s\n' "$said"
+    id=$(printf '%s\n' "$said" | sed -n 's/^Base \([0-9a-f]\{12\}\) taken of .*/\1/p')
+    [ -n "$id" ] && [ -f "$W/data/bases/$id/rootfs/bin/placeholder" ] || { echo "no snapshot of the base"; return 1; }
+    lb base ls | grep -E "^$id  [0-9-]{10} [0-9:]{8}  $BASE  -$" || { lb base ls; echo "base ls does not show it"; return 1; }
+    # a container on it, as its .conf says
+    echo "base=$id" >> "$C/web/.conf"
+    lb base ls | grep -E "^$id .* web$" || { lb base ls; return 1; }
+    said=$(lb base rm "$id" 2>&1) && { echo "a snapshot that a container names was removed"; return 1; }
+    [ "$said" = "Error: base $id is used by: web" ] || { echo "$said"; return 1; }
+    sed -i '$d' "$C/web/.conf"
+    lb base rm "$id" && [ ! -e "$W/data/bases/$id" ] || { echo "an unused snapshot was not removed"; return 1; }
+    bad=0
+    for words in "base rm not-an-id" "base rm 000000000000" "base add $W/nothing" "base" "base list" "base ls x"; do
+        # shellcheck disable=SC2086
+        lb $words >/dev/null 2>&1 && { echo "lightbox $words succeeded"; bad=1; }
+    done
+    return $bad
+}
+
 # A start_timeout or stop_timeout that cannot be read is said so, and stops
 # no command.
 t_start_timeout_setting() {
@@ -1863,6 +1891,7 @@ check 'doctor --json: settings and checks, typed'                       t_doctor
 check 'update, restart and rm -f check their options before anything'  t_update_restart_rm_options
 check 'update writes the limits into a stopped container'"'"'s .conf'       t_update_rewrites_the_conf
 check 'README.md'"'"'s command reference is the usage, and its size the binary'"'"'s' t_readme_matches_the_binary
+check 'base add, ls and rm manage the snapshots of bases'              t_base_snapshots
 check 'start without root is a clean error'                   t_start_without_root_is_a_clean_error
 
 summary validation

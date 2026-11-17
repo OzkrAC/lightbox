@@ -18,7 +18,7 @@
 
 /* What --version says: the release, set when it is tagged, and "-dev" after
  * it on the way to the next one. */
-#define LIGHTBOX_VERSION "0.6.0"
+#define LIGHTBOX_VERSION "0.7.0-dev"
 
 #define MAX_PATH         512
 #define NAME_MAX_LEN     30
@@ -116,6 +116,7 @@ typedef struct {
     int  oom_score;
     bool privileged;
     bool read_only;
+    char base[13];              /* the snapshot it overlays; empty: a copy of its base */
     int  nvols;
     volume_spec vols[MAX_VOLS];
     int  nlinks;
@@ -331,6 +332,27 @@ bool name_is_valid(const char *name);
  * left out. Stores at most max names and returns how many; *more, if given,
  * says whether some did not fit. */
 int list_containers(char names[][NAME_MAX_LEN + 1], int max, bool *more);
+/* The entries of a directory that valid takes, directories only, sorted. */
+int list_entries(const char *dir, bool (*valid)(const char *), char names[][NAME_MAX_LEN + 1], int max, bool *more);
+
+/* ─── Base snapshots (lightbox_base.c) ──────────────────────────────────── */
+
+#define BASE_ID_LEN  12
+#define BASE_ID_TEXT (BASE_ID_LEN + 1)
+bool base_id_ok(const char *id);
+void bases_dir_path(char out[MAX_PATH]);
+/* <bases>/<id>/rootfs: false for an id that is not one */
+bool base_rootfs_path(char out[MAX_PATH], const char *id);
+/* A snapshot of a base directory taken now: 0, or -1 once said. */
+int base_take(const char *source, char id[BASE_ID_TEXT]);
+/* The newest snapshot of a base directory, or one taken now, which took
+ * says: 0, or -1 once said. */
+int base_snapshot_for(const char *source, char id[BASE_ID_TEXT], bool *took);
+int list_bases(char ids[][NAME_MAX_LEN + 1], int max);
+/* The mount options of an overlay of a snapshot with this upper and work
+ * directory, or false where a path cannot go into them. */
+bool overlay_options(char *out, size_t max, const char *id, const char *upper, const char *work);
+void cmd_base(int argc, char **argv);
 
 /*
  * What a container is made of is in <container_dir>/<name>/ and is written

@@ -713,7 +713,8 @@ t_exec_user_is_strict() {
 # An account is found wherever it is in the container's passwd, and is the
 # container's: the file is read inside it, to its end.
 t_exec_finds_a_late_account() {
-    up late || return 1
+    # a copy: the accounts are added from the host to a file of the base
+    up late --copy || return 1
     {
         for i in $(seq 1 200); do echo "filler$i:x:$((20000 + i)):$((20000 + i)):an account to fill the file:/home/filler$i:/bin/sh"; done
         echo 'a-late-user-with-a-long-name:x:4800:4800::/home/late:/bin/sh'
@@ -1147,7 +1148,7 @@ EOF
 # lightbox mounts by itself. With the host's mount turned into something that
 # only records being run, and none in the image, a container starts and stops.
 t_start_needs_no_mount_tool() {
-    box nomount || return 1
+    box nomount --copy || return 1      # a copy, as files of the base are taken out of it
     rm -f "$C/nomount/rootfs/bin/mount" "$C/nomount/rootfs/usr/bin/mount"
     tool=$(type -P mount) || { echo "this host has no mount to stand in for"; return 77; }
     shim "$tool" "echo \"\$*\" >> '$T/mount.ran'; exit 97" || return 1
@@ -1162,7 +1163,7 @@ t_start_needs_no_mount_tool() {
 }
 
 t_image_without_mount_points() {
-    box bare || return 1
+    box bare --copy || return 1         # a copy, as directories of the base are taken out of it
     for d in dev proc sys tmp run var; do rm -rf -- "$C/bare/rootfs/$d"; done
     start bare || return 1
     [ "$(sh_in bare 'echo x > /dev/null && cat /proc/1/comm > /dev/null && ls /sys > /dev/null && echo x > /tmp/a && echo fine')" = fine ]
@@ -2173,6 +2174,72 @@ t_rm_force() {
     nothing_left rmf
 }
 
+# ─── Cases: the root as an overlay of a snapshot ────────────────────────────
+
+base_of() { sed -n 's/^base=//p' "$C/$1/.conf"; }
+
+# Two containers of one base overlay one snapshot of it, and each has only
+# its own files in its rootfs/: what create wrote, and what it writes. The
+# base's files are there in the container, what it changes and takes out is
+# changed in rootfs/ only, and a change of the base afterwards reaches no
+# container.
+t_overlay_root() {
+    box ov1 && box ov2 || return 1
+    id=$(base_of ov1)
+    echo "base snapshot: $id; of ov2: $(base_of ov2)"
+    [ -n "$id" ] && [ "$(base_of ov2)" = "$id" ] || { echo "the two do not overlay one snapshot"; return 1; }
+    snap=$T/lb/bases/$id/rootfs
+    [ -x "$snap/bin/busybox" ] || { echo "the snapshot has no busybox"; return 1; }
+    lb inspect ov1 | grep -x 'storage: overlay' && lb inspect ov1 | grep -x "base: $id" || return 1
+    own=$(cd "$C/ov1/rootfs" && find . -type f | sort | paste -sd' ' -)
+    echo "ov1's own files: $own"
+    [ "$own" = './etc/hostname ./etc/hosts ./etc/resolv.conf' ] || { echo "rootfs/ has more than create wrote"; return 1; }
+    start ov1 || return 1
+    [ "$(sh_in ov1 'test -x /bin/busybox && cat /etc/hostname')" = ov1 ] || { echo "the base or the hostname is not there"; return 1; }
+    sh_in ov1 'echo mine > /made-here && rm /etc/group' || return 1
+    [ "$(cat "$C/ov1/rootfs/made-here")" = mine ] || { echo "what the container wrote is not in its rootfs/"; return 1; }
+    [ ! -e "$snap/made-here" ] && [ -e "$snap/etc/group" ] || { echo "the snapshot was changed"; return 1; }
+    sh_in ov1 'test ! -e /etc/group' || { echo "a file taken out in the container is still there"; return 1; }
+    echo later > "$BASE/added-later"
+    sh_in ov1 'test ! -e /added-later' || { rm -f "$BASE/added-later"; echo "a change of the base reached the container"; return 1; }
+    rm -f "$BASE/added-later"
+    lb stop ov1 >/dev/null && start ov1 || return 1
+    [ "$(sh_in ov1 'cat /made-here')" = mine ] || { echo "what the container wrote did not outlast a restart"; return 1; }
+}
+
+# --copy: a copy of the base, as before 0.7, with no snapshot of its own.
+t_copy_root() {
+    box cp1 --copy || return 1
+    [ -z "$(base_of cp1)" ] || { echo "a copy has a base snapshot: $(base_of cp1)"; return 1; }
+    [ -x "$C/cp1/rootfs/bin/busybox" ] || { echo "rootfs/ is not a copy of the base"; return 1; }
+    lb inspect cp1 | grep -x 'storage: copy' && lb inspect cp1 | grep -x 'base: -' || return 1
+    start cp1 && [ "$(sh_in cp1 'cat /etc/hostname')" = cp1 ]
+}
+
+# base ls names each snapshot, its base and the containers on it; base rm
+# refuses one that a container uses and removes one that none does; base add
+# takes a new snapshot, which the containers made after it overlay.
+t_base_commands() {
+    box bu1 || return 1
+    old=$(base_of bu1)
+    listing=$(lb base ls) || return 1
+    printf '%s\n' "$listing"
+    printf '%s\n' "$listing" | grep -E "^$old  [0-9-]{10} [0-9:]{8}  $BASE  .*bu1" || { echo "base ls does not show bu1 on $old"; return 1; }
+    said=$(lb base rm "$old" 2>&1) && { echo "a snapshot in use was removed"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *"is used by: "*bu1*) ;; *) return 1 ;; esac
+    said=$(lb base add "$BASE") || return 1
+    printf '%s\n' "$said"
+    new=$(printf '%s\n' "$said" | sed -n 's/^Base \([0-9a-f]\{12\}\) taken of .*/\1/p')
+    [ -n "$new" ] && [ "$new" != "$old" ] || { echo "base add took no new snapshot"; return 1; }
+    box bu2 || return 1
+    [ "$(base_of bu2)" = "$new" ] || { echo "a container made after base add does not overlay the new snapshot"; return 1; }
+    [ "$(base_of bu1)" = "$old" ] || return 1
+    lb rm bu1 >/dev/null && lb base rm "$old" || { echo "a snapshot that nothing uses was not removed"; return 1; }
+    [ ! -e "$T/lb/bases/$old" ] || return 1
+    refused lb base rm 000000000000 && refused lb base rm not-an-id
+}
+
 # ─── Cases: the README ──────────────────────────────────────────────────────
 
 # The quick start of README.md: every command of its fenced blocks, as it is
@@ -2807,6 +2874,9 @@ if [ "$MODE" = inside ]; then
     check 'nftables: after the tables went, start makes them again'       t_nft_start_after_the_tables_went
     check 'setup --teardown leaves the host as before the first setup'    t_setup_teardown
     check 'without --config or LIGHTBOX_CONFIG, /etc/lightbox/lightbox.conf is read' t_config_in_etc
+    check 'a container overlays a snapshot of its base, and keeps its own files apart' t_overlay_root
+    check '--copy makes a container a copy of its base'                   t_copy_root
+    check 'base ls, base rm and base add manage the snapshots'            t_base_commands
     check 'the quick start of README.md runs as it is written'             t_readme_quick_start
 
     # last: it may leave a kernel setting changed for the rest of this suite's life

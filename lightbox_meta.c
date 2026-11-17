@@ -354,6 +354,8 @@ void cmd_inspect(int argc, char **argv) {
         report_text(&r, "pids", config.pids);
         report_text(&r, "cpu", config.cpu);
         report_text(&r, "io", config.io[0] ? config.io : NULL);
+        report_text(&r, "storage", config.base[0] ? "overlay" : "copy");
+        report_text(&r, "base", config.base[0] ? config.base : NULL);
         report_number(&r, "oom_score", config.oom_score);
         report_flag(&r, "privileged", config.privileged, "1", "0");
         report_flag(&r, "readonly", config.read_only, "1", "0");
@@ -669,6 +671,14 @@ void cmd_doctor(int argc, char **argv) {
             forward_drops_on_host(drops, sizeof(drops));
             doc_setting(d, "forward_drops", drops[0] ? drops : "none", NULL);
         }
+    }
+    /* told, not counted: without it a new container is a copy of its base */
+    {
+        static char filesystems[8192];
+        bool overlay = read_file("/proc/filesystems", filesystems, sizeof(filesystems)) > 0 &&
+                       lc_string_contains(filesystems, lc_string_length(filesystems), "\toverlay\n", 9);
+        doc_setting(d, "overlayfs", overlay ? "yes" : "no (a new container is a copy of its base, not an overlay)",
+                    overlay ? "true" : "false");
     }
     /* told, not counted: start makes what is missing, as setup does */
     {

@@ -2,9 +2,24 @@
 
 What changed for someone who uses lightbox, newest first. `ROADMAP.md` has the reasons and the finding each change closes.
 
+## 0.7.0
+
+Not tagged yet, and not complete: the part of Phase 7 that is written so far.
+
+### Changes you may have to act on
+
+- **A new container is an overlay of a snapshot of its base, not a copy of it.** The first `create` from a base takes a snapshot of it into `<lightbox_dir>/bases/`, and every container of that base shares it; `create` after the first takes no time or room of the base's size, and a change of the base directory afterwards changes no container. `<container_dir>/<name>/rootfs/` holds only the container's own files, and the base's are not there on the host: a script that reads or changes a file of the base there has to use `--copy`, or work in the container. A file of the base that is changed from the host has to be copied into `rootfs/` first. Containers made before 0.7 are copies, and stay so.
+- **Where an overlay cannot be mounted**, without overlayfs or without the right to mount, `create` makes a copy, as before, and says so.
+
+### Added
+
+- **`create --copy`** makes a container a full copy of its base, as before 0.7, a reflink first where the filesystem has them.
+- **`lightbox base ls`, `base add <dir>` and `base rm <id>`** list the snapshots with their bases and containers, take a new snapshot of a base for the containers made after it, and remove snapshots that no container uses.
+- `inspect` shows `storage`, overlay or copy, and the `base` snapshot; `doctor` says whether the kernel has overlayfs.
+
 ## 0.6.0
 
-Not tagged yet. Phase 6 of the roadmap: a command line that gives help when it is asked for and refuses what it will not use, the configuration in `/etc/lightbox`, a `doctor` that checks what `start` needs and says how to fix it, `inspect` and `doctor` in JSON, `restart`, `update` and `rm -f`, and a README whose command reference and quick start the suites check.
+Tagged `v0.6.0`, at `fd702e8`, the merge of pull request 6. Phase 6 of the roadmap: a command line that gives help when it is asked for and refuses what it will not use, the configuration in `/etc/lightbox`, a `doctor` that checks what `start` needs and says how to fix it, `inspect` and `doctor` in JSON, `restart`, `update` and `rm -f`, and a README whose command reference and quick start the suites check.
 
 ### Changes you may have to act on
 
