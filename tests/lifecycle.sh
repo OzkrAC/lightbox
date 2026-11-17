@@ -2214,13 +2214,22 @@ t_readme_quick_start() {
     export qs LIGHTBOX_CONFIG="$qs/lightbox.conf"
     ( cd "$qs/dir" && PS4='+ ' bash -e -x "$qs/script.sh" ) > "$OUT/quickstart" 2>&1 </dev/null
     rc=$?
-    grep '^+ ' "$OUT/quickstart"
-    [ $rc = 0 ] || { echo "the quick start stopped at its last command above:"; tail -n 15 "$OUT/quickstart"; return 1; }
+    if [ $rc != 0 ]; then
+        # what stopped it first, for a report that shows only the first lines
+        echo "the quick start stopped at: $(grep '^+ ' "$OUT/quickstart" | tail -n 1)"
+        tail -n 12 "$OUT/quickstart"
+        echo "--- the commands that ran:"
+        grep '^+ ' "$OUT/quickstart"
+        return 1
+    fi
     ran=$(grep -c '^+ ' "$OUT/quickstart")
-    [ "$ran" -ge "$commands" ] || { echo "$ran commands ran of $commands"; return 1; }
-    ( cd "$qs/dir" && ./lightbox create hooked >/dev/null &&
-      cp "$qs/init.sh" "$qs/data/containers/hooked/rootfs/init.sh" && ./lightbox start hooked && ./lightbox stop hooked ) ||
-        { echo "a container with step 5's /init.sh did not start and stop"; return 1; }
+    [ "$ran" -ge "$commands" ] || { echo "$ran commands ran of $commands"; grep '^+ ' "$OUT/quickstart"; return 1; }
+    # step 5: its block as the /init.sh of a container from the quick start's image
+    said=$(cd "$qs/dir" && ./lightbox create hooked --rootfs /opt/rootfs/alpine 2>&1 &&
+           cp "$qs/init.sh" "$qs/data/containers/hooked/rootfs/init.sh" &&
+           ./lightbox start hooked 2>&1 && ./lightbox stop hooked 2>&1) ||
+        { echo "a container with step 5's /init.sh did not start and stop:"; printf '%s\n' "$said"; return 1; }
+    echo "$ran commands of the quick start ran, and step 5's hook started a container"
 }
 
 # ─── Cases: where the settings are ──────────────────────────────────────────
