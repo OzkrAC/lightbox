@@ -99,19 +99,7 @@ This creates:
 - IPv4 forwarding, if it was off, with the `FORWARD` policy set to DROP as Docker does
 - cgroup v2 mount at `/sys/fs/cgroup`
 
-The bridge, the firewall rules and forwarding live in the kernel only, and a reboot takes them. `start` looks for them, with one process, and makes them again as `setup` does when they are not all there, saying so: after a reboot, or after a firewall service loaded its own rules over lightbox's. To have them before the first start, run `setup` at boot. `contrib/` has a service for that, for systemd and for runit as Void Linux has it; both run after the services that load a firewall:
-
-```sh
-# systemd
-cp contrib/systemd/lightbox-setup.service /etc/systemd/system/
-systemctl enable --now lightbox-setup
-
-# runit (Void Linux)
-cp -r contrib/runit/lightbox-setup /etc/sv/
-ln -s /etc/sv/lightbox-setup /var/service/
-```
-
-Both run `/usr/local/bin/lightbox` with root's `lightbox.conf`; change the path in the file if lightbox is elsewhere.
+The bridge, the firewall rules and forwarding live in the kernel only, and a reboot takes them. `start` looks for them, with one process, and makes them again as `setup` does when they are not all there, saying so: after a reboot, or after a firewall service loaded its own rules over lightbox's.
 
 To take lightbox off the host's network again, once no container runs:
 

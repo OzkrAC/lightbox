@@ -4,7 +4,7 @@ What changed for someone who uses lightbox, newest first. `ROADMAP.md` has the r
 
 ## 0.5.0
 
-Not tagged yet, and not complete: the part of Phase 5 that is written so far.
+Not tagged yet. Phase 5 of the roadmap: one reader and writer for a container's configuration, strict values, locks, the clearing away of containers that died, records in `run_dir`, addresses and limits that are checked, firewall rules in chains and tables of lightbox's own with nftables as a backend to choose, interfaces that lightbox owns, and a host network that comes back after a reboot.
 
 ### Changes you may have to act on
 
@@ -49,7 +49,6 @@ Not tagged yet, and not complete: the part of Phase 5 that is written so far.
 - **`firewall_backend = nftables`**, Docker's `firewall-backend`: lightbox's rules go in two nftables tables of its own, `ip lightbox` and `bridge lightbox`, and a container's links are elements of a set there. A table of the bridge family sees what the bridge switches, so a container with links starts without `br_netfilter`, and a start runs one `nft`. As with Docker's nftables backend, `setup` does not turn IPv4 forwarding on, and stops if it is off and `ip_forward` is true; there is no `LIGHTBOX-USER`; and `setup` and `doctor` name the chains of other tables, iptables' `FORWARD` among them, whose drop policy drops the containers' traffic as well. Moving from one backend to the other, `setup` takes out what the other made. `iptables` stays the default.
 - **`start` makes the host's network again when it is not all there**: the bridge, lightbox's firewall rules and, with iptables, forwarding, as `setup` makes them, after a reboot or after a firewall service loaded its own rules over lightbox's. It used to fail with "failed to attach the container's interface to the bridge" until someone ran `setup`. A start looks with one process more than before.
 - **`lightbox setup --teardown`** takes lightbox's firewall rules, in either backend, the bridge and `cgroup_base` away once no container runs, and refuses while one does. Forwarding and the `FORWARD` policy stay, and it says what `setup` had changed of them.
-- **Boot services in `contrib/`**, for systemd and for runit as Void Linux has it, that run `setup` at boot, after the services that load a firewall.
 - **`bridge_accept_fwmark`**, Docker's `bridge-accept-fwmark`: with nftables, packets that a chain of the host's gave this mark, or mark and mask, are accepted by lightbox's rules before they drop anything.
 - **`lightbox rm-vol <name> <dst>`** takes the volume at a destination out of a container's configuration. Like `add-vol`, it takes effect at the next start.
 - A container's `.conf` begins with `version=1`. Containers made by earlier versions keep working as they are, and get the line the next time `add-vol` or `rm-vol` writes the file.
