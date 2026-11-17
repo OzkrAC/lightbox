@@ -949,7 +949,7 @@ static void firewall_setup(const container_network *net) {
  * host's LIGHTBOX-USER stays, and the jump to it. The chain of a running
  * container's links is taken out when the container stops.
  */
-static void forget_iptables_chains(const container_network *net) {
+static void forget_iptables_chains(const container_network *net, bool teardown) {
     if (!path_exists(tool_path_iptables()))
         return;
     int old = forget_old_rules(net);
@@ -971,8 +971,9 @@ static void forget_iptables_chains(const container_network *net) {
                 (void)run_cmd_quiet(tool_path_iptables(), step);
             }
         }
-        print_str(STDOUT, "Removed the iptables chains that lightbox made with firewall_backend = iptables.\n"
-                          "LIGHTBOX-USER is this host's and stays; its rules still run in FORWARD\n");
+        print_str(STDOUT, teardown ? "Removed lightbox's iptables chains\n"
+                                   : "Removed the iptables chains that lightbox made with firewall_backend = iptables.\n"
+                                     "LIGHTBOX-USER is this host's and stays; its rules still run in FORWARD\n");
     }
     if (old > 0)
         print_str(STDOUT, "Removed the firewall rules that an earlier lightbox put straight into FORWARD and POSTROUTING\n");
@@ -1038,7 +1039,7 @@ static void nft_firewall_setup(const container_network *net) {
     if (run_cmd_input(tool_path_nft(), nft, text, false) != 0)
         die("Error: setup's nftables rules could not be put in. They need nf_tables with NAT,\n"
             "masquerading, connection tracking and the bridge family (CONFIG_NF_TABLES_BRIDGE)");
-    forget_iptables_chains(net);
+    forget_iptables_chains(net, false);
     print_str(STDOUT, "Firewall rules are in the nftables tables ip lightbox and bridge lightbox. To accept\n"
                       "what they drop, give it the mark of bridge_accept_fwmark in a chain of this host's\n"
                       "that comes before theirs\n");
@@ -1135,38 +1136,29 @@ static bool forwarding_on(void) {
     return read_file("/proc/sys/net/ipv4/ip_forward", forwarding, sizeof(forwarding)) > 0 && forwarding[0] == '1';
 }
 
-void cmd_setup(void) {
-    require_root("setup");
-    require_tool("ip", tool_path_ip());
-    bool nftables = cfg_global.firewall_backend == FIREWALL_NFTABLES;
-    if (cfg_global.firewall)
-        require_tool(nftables ? "nft" : "iptables", nftables ? tool_path_nft() : tool_path_iptables());
-
-    /* Before anything on the host changes: the bridge gets an address of a
-     * network that the settings do describe, */
-    container_network net;
-    container_network_load_or_die(&net);
-    /* with nftables, forwarding that is needed is on already, as Docker has
-     * it: lightbox would have no DROP policy to turn it on with, */
-    if (nftables && cfg_global.ip_forward && !forwarding_on())
+/* With nftables, forwarding that is needed is on already, as Docker has it:
+ * lightbox would have no DROP policy to turn it on with. */
+static void require_forwarding_for_nftables(void) {
+    if (cfg_global.firewall_backend == FIREWALL_NFTABLES && cfg_global.ip_forward && !forwarding_on())
         die("Error: IPv4 forwarding is off. With firewall_backend = nftables lightbox does not turn it\n"
             "on, as Docker does not: turn it on with rules of this host's against forwarding between\n"
             "its other interfaces (sysctl -w net.ipv4.ip_forward=1), or set ip_forward = false in\n"
             "lightbox.conf, and containers reach this host and nothing beyond it");
-    /* and a host without cgroup v2 cannot run containers, so setup stops
-     * here and leaves no bridge behind. */
-    ensure_cgroup2_root();
+}
 
-    print_str(STDOUT, "Setting up host networking...\n");
+/* <run_dir>/.forwarding: what setup changed of forwarding, for teardown to
+ * say. No container is called that: a name has no dot. */
+static void forwarding_record_path(char out[MAX_PATH]) {
+    path_join_or_die(out, MAX_PATH, cfg_global.run_dir, ".forwarding");
+}
 
-    ensure_private_dir(cfg_global.lightbox_dir);
-    ensure_private_dir(cfg_global.container_dir);
-    /* gone again after a reboot, when start makes it anew */
-    ensure_private_dir(cfg_global.run_dir);
-
-    /* one setup at a time, and no create while the bridge is being made */
-    store_lock();
-
+/*
+ * The bridge, the firewall rules and forwarding, which setup makes and start
+ * makes again when a reboot took them. Under the store's lock.
+ */
+static void host_network_setup(const container_network *net) {
+    bool nftables = cfg_global.firewall_backend == FIREWALL_NFTABLES;
+    require_forwarding_for_nftables();
     {
         const char *show[] = { "ip", "link", "show", cfg_global.bridge, NULL };
         if (run_cmd_quiet(tool_path_ip(), show) != 0) {
@@ -1176,7 +1168,7 @@ void cmd_setup(void) {
             const char *add[] = { "ip", "link", "add", "name", cfg_global.bridge, "type", "bridge", NULL };
             require_cmd(tool_path_ip(), add);
             char gw_cidr[CIDR_TEXT_MAX];
-            address_with_prefix(gw_cidr, net.gateway, &net);
+            address_with_prefix(gw_cidr, net->gateway, net);
             const char *addr[] = { "ip", "addr", "add", gw_cidr, "dev", cfg_global.bridge, NULL };
             require_cmd(tool_path_ip(), addr);
             const char *up[] = { "ip", "link", "set", cfg_global.bridge, "up", NULL };
@@ -1191,9 +1183,9 @@ void cmd_setup(void) {
     if (!cfg_global.firewall) {
         print_str(STDOUT, "firewall = false in lightbox.conf: no firewall rules were made\n");
     } else if (nftables) {
-        nft_firewall_setup(&net);
+        nft_firewall_setup(net);
     } else {
-        firewall_setup(&net);
+        firewall_setup(net);
         forget_nft_tables();
     }
 
@@ -1201,13 +1193,15 @@ void cmd_setup(void) {
      * Forwarding, as Docker does it: when setup is the one that turns it on,
      * the FORWARD policy becomes DROP first, so that the host forwards what a
      * rule accepts and nothing else. A host that had forwarding on already
-     * keeps its policy, and ip_forward_no_drop keeps it in any case.
+     * keeps its policy, and ip_forward_no_drop keeps it in any case. What
+     * was changed goes on record, for teardown to say.
      */
     bool was_on = forwarding_on();
     if (!was_on && cfg_global.ip_forward && !nftables) {
-        if (cfg_global.firewall && !cfg_global.ip_forward_no_drop) {
-            const char *drop[] = { "iptables", "-P", "FORWARD", "DROP", NULL };
-            require_cmd(tool_path_iptables(), drop);
+        bool drop = cfg_global.firewall && !cfg_global.ip_forward_no_drop;
+        if (drop) {
+            const char *policy[] = { "iptables", "-P", "FORWARD", "DROP", NULL };
+            require_cmd(tool_path_iptables(), policy);
             print_str(STDOUT, "IPv4 forwarding was off. It is on, and the FORWARD policy is DROP: this host\n"
                               "forwards what a rule accepts and nothing else (ip_forward_no_drop = true\n"
                               "in lightbox.conf leaves the policy as it is)\n");
@@ -1215,10 +1209,44 @@ void cmd_setup(void) {
             print_str(STDOUT, "IPv4 forwarding was off, and is on\n");
         }
         require_write_file("/proc/sys/net/ipv4/ip_forward", "1");
+        char record[MAX_PATH];
+        forwarding_record_path(record);
+        ensure_private_dir(cfg_global.run_dir);
+        if (write_file_volatile(record, drop ? "on drop\n" : "on\n") != 0)
+            print_str(STDERR, "Warning: what setup changed of forwarding could not be recorded\n");
     } else if (!was_on) {
         print_str(STDOUT, "Warning: IPv4 forwarding is off, and ip_forward = false in lightbox.conf:\n"
                           "containers reach this host and nothing beyond it\n");
     }
+}
+
+void cmd_setup(void) {
+    require_root("setup");
+    require_tool("ip", tool_path_ip());
+    bool nftables = cfg_global.firewall_backend == FIREWALL_NFTABLES;
+    if (cfg_global.firewall)
+        require_tool(nftables ? "nft" : "iptables", nftables ? tool_path_nft() : tool_path_iptables());
+
+    /* Before anything on the host changes: the bridge gets an address of a
+     * network that the settings do describe, forwarding is on where it has
+     * to be, */
+    container_network net;
+    container_network_load_or_die(&net);
+    require_forwarding_for_nftables();
+    /* and a host without cgroup v2 cannot run containers, so setup stops
+     * here and leaves no bridge behind. */
+    ensure_cgroup2_root();
+
+    print_str(STDOUT, "Setting up host networking...\n");
+
+    ensure_private_dir(cfg_global.lightbox_dir);
+    ensure_private_dir(cfg_global.container_dir);
+    /* gone again after a reboot, when start makes it anew */
+    ensure_private_dir(cfg_global.run_dir);
+
+    /* one setup at a time, and no create while the bridge is being made */
+    (void)store_lock();
+    host_network_setup(&net);
 
     if (!nftables && !bridge_traffic_is_filtered())
         print_str(STDOUT,
@@ -1228,4 +1256,142 @@ void cmd_setup(void) {
             "  modprobe br_netfilter && sysctl -w net.bridge.bridge-nf-call-iptables=1\n");
 
     print_str(STDOUT, "Host networking ready\n");
+}
+
+/* ─── After a reboot, and teardown ──────────────────────────────────────── */
+
+/* The bridge, as /proc/net/dev lists the interfaces of this network
+ * namespace: no process, and not the namespace that sysfs was mounted in. */
+static bool bridge_present(void) {
+    static char dev[65536];
+    if (read_file("/proc/net/dev", dev, sizeof(dev)) <= 0)
+        return false;
+    size_t blen = lc_string_length(cfg_global.bridge);
+    for (const char *line = dev; *line; ) {
+        while (*line == ' ')
+            line++;
+        if (lc_string_starts_with(line, lc_string_length(line), cfg_global.bridge, blen) && line[blen] == ':')
+            return true;
+        while (*line && *line != '\n')
+            line++;
+        if (*line)
+            line++;
+    }
+    return false;
+}
+
+/* lightbox's firewall rules, looked at with one process: the jump to
+ * LIGHTBOX-FORWARD with iptables, both tables with nftables. A flush by a
+ * firewall service that loads its own rules takes those as well. */
+static bool firewall_present(void) {
+    if (!cfg_global.firewall)
+        return true;
+    if (cfg_global.firewall_backend == FIREWALL_NFTABLES) {
+        static char tables[4096];
+        const char *list[] = { "nft", "list", "tables", NULL };
+        if (run_cmd_capture_quiet(tool_path_nft(), list, tables, sizeof(tables)) != 0)
+            return false;
+        bool ip = false, bridge = false;
+        for (char *line = tables; *line; ) {
+            char *end = line;
+            while (*end && *end != '\n') end++;
+            bool last = *end == '\0';
+            *end = '\0';
+            ip = ip || streq(line, "table ip lightbox");
+            bridge = bridge || streq(line, "table bridge lightbox");
+            line = last ? end : end + 1;
+        }
+        return ip && bridge;
+    }
+    const char *jump[] = { "iptables", "-C", "FORWARD", "-j", "LIGHTBOX-FORWARD", NULL };
+    return iptables_check(jump) == 0;
+}
+
+static bool host_network_ready(void) {
+    return bridge_present() && (!cfg_global.ip_forward || forwarding_on()) && firewall_present();
+}
+
+void ensure_host_network(void) {
+    if (host_network_ready())
+        return;
+    container_network net;
+    container_network_load_or_die(&net);
+    /* as setup, one at a time; and whoever waited finds it made */
+    int32_t lock = store_lock();
+    if (!host_network_ready()) {
+        print_str(STDOUT, "lightbox's host network is not all there, as after a reboot: making it again\n");
+        host_network_setup(&net);
+    }
+    if (lock >= 0)
+        lc_kernel_close_file(lock);
+}
+
+/* LIGHTBOX-USER is the host's, made by lightbox: taken away with its jump
+ * when it has no rule, and left with them when it has. */
+static void forget_user_chain(void) {
+    if (!path_exists(tool_path_iptables()) || !iptables_chain_exists("filter", "LIGHTBOX-USER"))
+        return;
+    static char rules[4096];
+    const char *list[] = { "iptables", "-S", "LIGHTBOX-USER", NULL };
+    if (run_cmd_capture_quiet(tool_path_iptables(), list, rules, sizeof(rules)) != 0 ||
+        !streq(rules, "-N LIGHTBOX-USER\n")) {
+        print_str(STDOUT, "LIGHTBOX-USER has rules of this host's, and stays, with the jump to it from FORWARD\n");
+        return;
+    }
+    const char *jump[] = { "iptables", "-D", "FORWARD", "-j", "LIGHTBOX-USER", NULL };
+    const char *drop[] = { "iptables", "-X", "LIGHTBOX-USER", NULL };
+    (void)iptables_delete_all(jump);
+    if (run_cmd_quiet(tool_path_iptables(), drop) == 0)
+        print_str(STDOUT, "Removed LIGHTBOX-USER, which had no rule\n");
+}
+
+void teardown_host(void) {
+    container_network net;
+    container_network_load_or_die(&net);
+    print_str(STDOUT, "Taking lightbox's host network away...\n");
+
+    /* the firewall, whichever backend made it */
+    forget_iptables_chains(&net, true);
+    forget_user_chain();
+    forget_nft_tables();
+
+    if (bridge_present()) {
+        const char *del[] = { "ip", "link", "delete", cfg_global.bridge, NULL };
+        require_cmd(tool_path_ip(), del);
+        print_str(STDOUT, "Removed bridge ");
+        print_str(STDOUT, cfg_global.bridge);
+        lc_print_char(STDOUT, '\n');
+    }
+
+    /* cgroup_base, which start made; never the hierarchy itself */
+    if (!streq(cfg_global.cgroup_base, cfg_global.cgroup_root) && path_exists(cfg_global.cgroup_base)) {
+        if (lc_kernel_unlinkat(AT_FDCWD, cfg_global.cgroup_base, AT_REMOVEDIR) == 0) {
+            print_str(STDOUT, "Removed ");
+            print_str(STDOUT, cfg_global.cgroup_base);
+            lc_print_char(STDOUT, '\n');
+        } else {
+            print_str(STDERR, "Warning: cannot remove ");
+            print_str(STDERR, cfg_global.cgroup_base);
+            print_str(STDERR, "; a cgroup is left in it\n");
+        }
+    }
+
+    /* Forwarding and the FORWARD policy stay as they are: something else on
+     * this host may forward by now, and turning it off would cut that off,
+     * as an ACCEPT policy with forwarding on would open it. */
+    char record[MAX_PATH], changed[16];
+    forwarding_record_path(record);
+    if (read_file(record, changed, sizeof(changed)) > 0) {
+        bool drop = streq(changed, "on drop\n");
+        print_str(STDOUT, drop ? "setup turned IPv4 forwarding on and set the FORWARD policy to DROP. Both stay,\n"
+                               : "setup turned IPv4 forwarding on. It stays on,\n");
+        print_str(STDOUT, "as something else on this host may forward by now. If nothing does:\n");
+        print_str(STDOUT, drop ? "  sysctl -w net.ipv4.ip_forward=0 && iptables -P FORWARD ACCEPT\n"
+                               : "  sysctl -w net.ipv4.ip_forward=0\n");
+        lc_kernel_unlinkat(AT_FDCWD, record, 0);
+    }
+    /* run_dir, which setup made, when nothing is left in it */
+    (void)lc_kernel_unlinkat(AT_FDCWD, cfg_global.run_dir, AT_REMOVEDIR);
+
+    print_str(STDOUT, "lightbox's host network is taken away; setup, or a start, makes it again\n");
 }

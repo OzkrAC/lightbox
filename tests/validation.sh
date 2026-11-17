@@ -1051,14 +1051,27 @@ t_root_is_asked_for_first() {
     chmod 755 "$W/data" "$C"
     before=$(kept_sum)
     bad=0
-    for words in setup 'start web' 'stop web' 'exec web /bin/true'; do
+    for words in setup 'setup --teardown' 'start web' 'stop web' 'exec web /bin/true'; do
         # shellcheck disable=SC2086
         msg=$(lb $words 2>&1) && { echo "lightbox $words succeeded"; bad=1; }
         echo "lightbox $words: $msg"
-        [ "$msg" = "Error: lightbox ${words%% *} must be run as root" ] || bad=1
+        [ "$msg" = "Error: lightbox ${words%% web*} must be run as root" ] || bad=1
     done
     [ "$before" = "$(kept_sum)" ] || { echo "something under $W/data or $R changed"; bad=1; }
     [ "$(mode_of "$C")" = 755 ] || { echo "setup changed the mode of container_dir"; bad=1; }
+    return $bad
+}
+
+# setup takes --teardown and nothing else, and says so before it asks for root.
+t_setup_arguments() {
+    bad=0
+    for words in 'setup --teardown now' 'setup --tear-down' 'setup br0'; do
+        # shellcheck disable=SC2086
+        msg=$(lb $words 2>&1) && { echo "lightbox $words succeeded"; bad=1; }
+        echo "lightbox $words: $msg"
+        [ "$msg" = 'Usage: lightbox setup [--teardown]' ] || bad=1
+    done
+    lb 2>&1 | grep -F 'setup --teardown' || { echo "the usage does not name setup --teardown"; bad=1; }
     return $bad
 }
 
@@ -1522,6 +1535,7 @@ check '--swap takes what --mem does and 0, and is none unless given' t_swap_opti
 check '--io-max is a line of io.max for a whole disk that is there' t_io_max_option
 check 'the firewall settings are Docker'"'"'s, and a wrong one keeps the built-in' t_firewall_settings
 check 'firewall_backend and bridge_accept_fwmark: Docker'"'"'s, and a wrong one is not taken' t_firewall_backend_settings
+check 'setup takes --teardown and no other argument'                    t_setup_arguments
 check 'ls --json stays JSON next to an odd directory name'    t_ls_json_escapes_names
 check 'ls --json escapes whatever a record holds'             t_ls_json_escapes_values
 check 'ls --json gives pid as null for a stopped container'   t_ls_json_pid_is_null_when_stopped

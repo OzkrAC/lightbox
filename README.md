@@ -99,6 +99,28 @@ This creates:
 - IPv4 forwarding, if it was off, with the `FORWARD` policy set to DROP as Docker does
 - cgroup v2 mount at `/sys/fs/cgroup`
 
+The bridge, the firewall rules and forwarding live in the kernel only, and a reboot takes them. `start` looks for them, with one process, and makes them again as `setup` does when they are not all there, saying so: after a reboot, or after a firewall service loaded its own rules over lightbox's. To have them before the first start, run `setup` at boot. `contrib/` has a service for that, for systemd and for runit as Void Linux has it; both run after the services that load a firewall:
+
+```sh
+# systemd
+cp contrib/systemd/lightbox-setup.service /etc/systemd/system/
+systemctl enable --now lightbox-setup
+
+# runit (Void Linux)
+cp -r contrib/runit/lightbox-setup /etc/sv/
+ln -s /etc/sv/lightbox-setup /var/service/
+```
+
+Both run `/usr/local/bin/lightbox` with root's `lightbox.conf`; change the path in the file if lightbox is elsewhere.
+
+To take lightbox off the host's network again, once no container runs:
+
+```sh
+./lightbox setup --teardown
+```
+
+It refuses while a container runs, and names it. Otherwise it removes lightbox's firewall rules, in iptables and in nftables, the bridge and `cgroup_base`, and clears away what containers that ended without a stop left. `LIGHTBOX-USER` goes too, unless it holds rules of the host's. Containers and their files stay, and a `setup` or a `start` makes the network again. IPv4 forwarding and the `FORWARD` policy stay as they are, as something else on the host may forward by then: when `setup` was the one that changed them, `--teardown` says so and gives the commands that put them back.
+
 ### 3. Create, start, and use containers
 
 ```sh
@@ -293,7 +315,7 @@ What changes with the backend, as it does for Docker:
 - `setup` does not turn IPv4 forwarding on. When it is off and `ip_forward` is true, `setup` stops before it changes anything and says so: turn it on yourself, with rules of this host's against forwarding between its other interfaces, or set `ip_forward = false`. `ip_forward_no_drop` has no use, as no policy is set.
 - There is no `LIGHTBOX-USER`. An nftables `accept` does not get a packet past another table, so the host's rules go in tables of its own: one that drops decides whatever lightbox's accept. To accept what lightbox's rules drop, mark it in a chain of the host's on the same hook with a lower priority (`filter - 1` or below), and set `bridge_accept_fwmark` to that mark, or mark and mask: `0x10`, or `0x10/0xf0`. Mark 0 is every unmarked packet's and is refused.
 - A chain of another table whose policy drops forwarded packets drops the containers' traffic too: iptables' `FORWARD` with policy DROP, which Docker, ufw, firewalld and lightbox's own `setup` with iptables leave, among them. `setup` names every such chain it finds, and so does `doctor`, as `forward_drops`. Change their policy, with `iptables -P FORWARD ACCEPT` for iptables', or accept the bridge's traffic in them.
-- A host firewall that flushes the whole ruleset when it loads, as `/etc/nftables.conf` files that begin with `flush ruleset` do, takes lightbox's tables with it: run `lightbox setup` after it.
+- A host firewall that flushes the whole ruleset when it loads, as `/etc/nftables.conf` files that begin with `flush ruleset` do, takes lightbox's tables with it. The next `start` makes them again; to have them back at once, run `lightbox setup`.
 
 ### Rootfs resolution order
 

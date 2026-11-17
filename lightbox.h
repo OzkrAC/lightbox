@@ -388,7 +388,12 @@ void container_shown_state(const char *name, container_liveness live, char *buf,
  */
 void container_lock(const char *name);          /* ends the process when there is no such container */
 void container_lock_if_free(const char *name);
-void store_lock(void);
+/* The store's lock: the descriptor that holds it, to close when it may go,
+ * or -1 when there is no store yet to lock. */
+int32_t store_lock(void);
+/* A container's lock if no command holds it, without waiting: the
+ * descriptor that holds it, or -1. */
+int32_t container_lock_try(const char *name);
 
 /* Ends the process, saying which command it was, unless it runs as root. */
 void require_root(const char *command);
@@ -475,6 +480,16 @@ int firewall_add_links(const char *name, const container_config *config);
 int firewall_remove_links(const char *name);
 /* does iptables see what the bridge switches between containers? */
 bool bridge_traffic_is_filtered(void);
+
+/*
+ * The host's side of lightbox's network, which lives in the kernel only and
+ * is gone after a reboot: the bridge, the firewall rules and forwarding.
+ * start makes it again when it is not all there, as setup makes it.
+ */
+void ensure_host_network(void);
+/* setup --teardown, once no container runs: lightbox's firewall rules, in
+ * either backend, the bridge, cgroup_base and the record of forwarding. */
+void teardown_host(void);
 
 /*
  * firewall_backend = nftables: two tables of lightbox's own, made whole by

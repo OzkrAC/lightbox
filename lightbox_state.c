@@ -405,11 +405,19 @@ void container_lock_if_free(const char *name) {
     (void)lock_directory(dir, true, false, "");
 }
 
-void store_lock(void) {
+int32_t store_lock(void) {
     lc_sysret fd = lock_directory(cfg_global.container_dir, false, true, "the container store");
     /* a store that is not there yet is locked by nobody; what needs it says so itself */
     if (fd < 0 && fd != -LB_ENOENT)
         die2("Error: cannot lock ", cfg_global.container_dir);
+    return fd < 0 ? -1 : (int32_t)fd;
+}
+
+int32_t container_lock_try(const char *name) {
+    char dir[MAX_PATH];
+    container_dir_path(dir, name);
+    lc_sysret fd = lock_directory(dir, false, false, "");
+    return fd < 0 ? -1 : (int32_t)fd;
 }
 
 void require_root(const char *command) {

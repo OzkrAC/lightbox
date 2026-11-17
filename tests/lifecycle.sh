@@ -110,6 +110,8 @@ status_field() { # pid field : a value from /proc/<pid>/status
 alive()   { kill -0 "$1" 2>/dev/null && [ "$(status_field "$1" State)" != Z ]; }
 gone()    { ! kill -0 "$1" 2>/dev/null; }          # exited and reaped
 no_link() { ! ip link show "$1" >/dev/null 2>&1; }
+# the interfaces of this network namespace, by name
+links_now() { ip -o link show | awk -F': ' '{ sub(/@.*/, "", $2); print $2 }' | sort; }
 
 pid_of()   { cat "$RUN/$1/pid"; }
 # what is on record; a container without a record of its state is stopped
@@ -1941,10 +1943,12 @@ t_link_rules_in_one_process() {
     settled onelinked || return 1
     lb stop onelinked >/dev/null 2>&1 || { echo "stop failed"; return 1; }
     wait "$tracer"
-    grep -E 'execve\("[^"]*/(ip6?tables[^"]*|nft)"' "$T/links.strace" | grep -v ' = -1 '
-    count=$(grep -E 'execve\("[^"]*/(ip6?tables[^"]*|nft)"' "$T/links.strace" | grep -vc ' = -1 ')
-    echo "firewall tools the start ran: $count"
-    [ "$count" = 1 ] && grep -E 'execve\("[^"]*/(ip6?tables[^"]*|nft)"' "$T/links.strace" | grep -v ' = -1 ' | grep -q 'restore'
+    # but for the look at whether setup's rules are there, which every start has
+    tools=$(grep -E 'execve\("[^"]*/(ip6?tables[^"]*|nft)"' "$T/links.strace" | grep -v ' = -1 ')
+    printf '%s\n' "$tools"
+    count=$(printf '%s\n' "$tools" | grep -v '"-C", "FORWARD", "-j", "LIGHTBOX-FORWARD"' | grep -c .)
+    echo "firewall tools the start ran to put rules in: $count"
+    [ "$count" = 1 ] && printf '%s\n' "$tools" | grep -v '"-C", "FORWARD"' | grep -q 'restore'
 }
 
 t_link_to_later_container() {
@@ -1994,11 +1998,13 @@ t_start_spares_foreign_interface() {
 
 # A start that fails after it made the container's interface takes it away,
 # though the interface has no alias yet: it gets one as it joins the bridge,
-# and the bridge it is to join is not there.
+# and here the ip that would do that refuses, before it changes anything.
 t_start_fails_at_the_bridge() {
-    alt_conf nobridge 'bridge = lbt-none' || return 1
+    ip_path=$(first_existing /sbin/ip /usr/sbin/ip /bin/ip /usr/bin/ip)
+    shim "$ip_path" 'case " $* " in *" alias lightbox:"*" master "*) echo "refused here" >&2; exit 2 ;; esac
+exec "$REAL" "$@"' || return 1
     box nobridge || return 1
-    said=$(alt_lb start nobridge 2>&1 </dev/null) && { echo "start went ahead without its bridge"; return 1; }
+    said=$(lb start nobridge 2>&1 </dev/null) && { echo "start went ahead without its bridge"; return 1; }
     printf '%s\n' "$said"
     case $said in *"failed to attach the container's interface to the bridge"*) ;; *) return 1 ;; esac
     nothing_left nobridge
@@ -2039,6 +2045,82 @@ t_no_ipv6_in_container() {
     said=$(sh_in six 'cat /proc/net/if_inet6 2>/dev/null')
     printf 'IPv6 addresses in the container:\n%s\n' "${said:-none}"
     [ -z "$said" ]
+}
+
+# ─── Cases: after a reboot, and teardown ────────────────────────────────────
+
+# What a reboot takes: the bridge, every firewall rule and chain, forwarding
+# and run_dir. A start makes the host's side of the network again, as setup
+# makes it, and says so; the container reaches the gateway and the outside.
+t_start_after_a_reboot_of_the_network() {
+    box rebuilt || return 1
+    ip link delete "$BR" &&
+    iptables -F && iptables -X && iptables -t nat -F && iptables -t nat -X && iptables -P FORWARD ACCEPT &&
+    echo 0 > /proc/sys/net/ipv4/ip_forward || return 1
+    rm -rf -- "$RUN"
+    start rebuilt || return 1
+    grep -q 'making it again' "$OUT/rebuilt.start" || { echo "start did not say that it made the network again"; return 1; }
+    ip -o -4 addr show dev "$BR" | grep -q " $GW/24 " || { echo "the bridge is not there with $GW/24"; return 1; }
+    iptables -C FORWARD -j LIGHTBOX-USER && iptables -C FORWARD -j LIGHTBOX-FORWARD &&
+    iptables -t nat -C POSTROUTING -j LIGHTBOX-POSTROUTING || { echo "lightbox's jumps are not there"; return 1; }
+    [ "$(cat /proc/sys/net/ipv4/ip_forward)" = 1 ] && [ "$(iptables -S FORWARD | head -n 1)" = '-P FORWARD DROP' ] ||
+        { echo "forwarding is not on with the FORWARD policy at DROP"; return 1; }
+    if [ -e "$T/have_nc" ]; then
+        reaches rebuilt "$GW" && reaches rebuilt "$OUTSIDE"
+    else
+        echo "this image has no nc: whether the container reaches anything is not tried"
+    fi
+}
+
+# A start where everything is there looks once, and makes nothing.
+t_start_with_the_network_there() {
+    up steady || return 1
+    ! grep -q 'making it again' "$OUT/steady.start" || { echo "start made the network again, which was there"; return 1; }
+}
+
+# With nftables: a firewall service that flushes the ruleset, and the bridge
+# gone. A start makes the tables and the bridge again, and links hold.
+t_nft_start_after_the_tables_went() {
+    need_nc || return 77
+    nft_setup nftre; rc=$?; [ $rc = 0 ] || return $rc
+    box nrepeer && box nrelinked --link nrepeer || return 1
+    ip link delete "$BR" && nft delete table ip lightbox && nft delete table bridge lightbox || return 1
+    HOME="$ALT" start nrepeer || return 1
+    grep -q 'making it again' "$OUT/nrepeer.start" || { echo "start did not say that it made the network again"; return 1; }
+    nft list table ip lightbox >/dev/null && nft list table bridge lightbox >/dev/null && ip link show dev "$BR" >/dev/null ||
+        { echo "the tables or the bridge are not there"; return 1; }
+    HOME="$ALT" start nrelinked || return 1
+    reaches nrelinked "$(addr_of nrepeer)" && reaches nrelinked "$OUTSIDE"
+}
+
+# setup --teardown does nothing while a container runs, and says which. With
+# none running it takes away all that setup and the containers made: the
+# interfaces are those there were before the first setup, no rule or chain of
+# lightbox's is left, in iptables or nftables, and cgroup_base is gone. What
+# setup changed of forwarding stays, and is said. A container that is only
+# stopped stays as it is, and starts again, which makes the network again.
+t_setup_teardown() {
+    box kept && up busy || return 1
+    said=$(lb setup --teardown 2>&1) && { printf '%s\n' "$said"; echo "teardown went ahead with a container running"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *"container 'busy' is running"*) ;; *) return 1 ;; esac
+    ip link show dev "$BR" >/dev/null || { echo "a teardown that was refused took the bridge away"; return 1; }
+    lb stop busy >/dev/null || return 1
+    # forwarding as before the first setup, so that setup turns it on and says so
+    echo 0 > /proc/sys/net/ipv4/ip_forward && iptables -P FORWARD ACCEPT && lb setup >/dev/null || return 1
+    nft_ok >/dev/null 2>&1 && { nft add table ip lightbox && nft add table bridge lightbox || return 1; }
+    said=$(lb setup --teardown 2>&1) || { printf '%s\n' "$said"; return 1; }
+    printf '%s\n' "$said"
+    links_now | diff "$T/links.before" - || { echo "the interfaces are not those there were before the first setup"; return 1; }
+    left=$(iptables-save | grep -E '^(-A |:LIGHTBOX|:LB-)')
+    [ -z "$left" ] || { echo "left in iptables:"; printf '%s\n' "$left"; return 1; }
+    ! nft list tables 2>/dev/null | grep -q ' lightbox$' || { echo "left in nftables: $(nft list tables)"; return 1; }
+    [ ! -d "$CG" ] || { echo "cgroup_base $CG is left"; return 1; }
+    case $said in *'sysctl -w net.ipv4.ip_forward=0 && iptables -P FORWARD ACCEPT'*) ;; *)
+        echo "teardown did not say what setup changed of forwarding"; return 1 ;; esac
+    [ "$(cat /proc/sys/net/ipv4/ip_forward)" = 1 ] || { echo "teardown turned forwarding off"; return 1; }
+    [ -e "$C/kept/.conf" ] || { echo "the stopped container was taken away"; return 1; }
+    start kept
 }
 
 # ─── Cases: firewall_backend = nftables ─────────────────────────────────────
@@ -2128,7 +2210,9 @@ t_nft_one_process() {
     settled nonelinked || return 1
     alt_lb stop nonelinked >/dev/null 2>&1 || { echo "stop failed"; return 1; }
     wait "$tracer"
-    tools=$(grep -E 'execve\("[^"]*/(ip6?tables[^"]*|nft)"' "$T/nftlinks.strace" | grep -v ' = -1 ')
+    # but for the look at whether setup's tables are there, which every start has
+    tools=$(grep -E 'execve\("[^"]*/(ip6?tables[^"]*|nft)"' "$T/nftlinks.strace" | grep -v ' = -1 ' |
+            grep -v '"list", "tables"')
     printf '%s\n' "$tools"
     [ "$(printf '%s\n' "$tools" | grep -c .)" = 1 ] && printf '%s\n' "$tools" | grep -q '/nft"'
 }
@@ -2269,7 +2353,7 @@ EOF
     echo 1 > "$T/next_ip"
     : > "$T/shims"
     : > "$T/background"
-    build_rootfs && network
+    build_rootfs && network && links_now > "$T/links.before"
 }
 
 kill_cgroup() { # directory, after every cgroup below it
@@ -2320,7 +2404,7 @@ teardown() {
     [ -w "$BRNF" ] && echo 1 > "$BRNF"
     find "$C" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
     # and the records of the ones that ran; a case may have taken run_dir away
-    [ -d "$RUN" ] && find "$RUN" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+    [ -d "$RUN" ] && find "$RUN" -mindepth 1 -maxdepth 1 ! -name .forwarding -exec rm -rf -- {} +
     rm -f "$T/nsenter.reached" "$T/mount.ran"
 } 2>/dev/null
 
@@ -2505,6 +2589,10 @@ if [ "$MODE" = inside ]; then
     check 'nftables: rm of a dead container takes its links out of the set' t_nft_rm_leaves_nothing
     check 'nftables: setup does not turn forwarding on, as Docker does not' t_nft_forwarding
     check 'nftables: what comes in is dropped, and bridge_accept_fwmark accepts it' t_nft_accept_fwmark
+    check 'after a reboot took the network, start makes it again'         t_start_after_a_reboot_of_the_network
+    check 'a start where the network is there makes nothing'              t_start_with_the_network_there
+    check 'nftables: after the tables went, start makes them again'       t_nft_start_after_the_tables_went
+    check 'setup --teardown leaves the host as before the first setup'    t_setup_teardown
 
     # last: it may leave a kernel setting changed for the rest of this suite's life
     check 'exec works where a memfd may not be executed'                  t_exec_where_memfds_may_not_be_executed

@@ -3210,6 +3210,11 @@ static void cmd_start(int argc, char **argv) {
     (void)reconcile(name);          /* an earlier run that ended without a stop */
     container_forget_pid(name);     /* and whatever else one left on record */
 
+    /* The bridge, the firewall rules and forwarding, made again when a
+     * reboot took them. What makes them takes the store's lock; teardown,
+     * which holds that, never waits for a container's. */
+    ensure_host_network();
+
     /* The container's address, which has to be one of the network as it is
      * set now: with another subnet since the container was created, it would
      * start and reach nothing. */
@@ -3859,6 +3864,44 @@ static void cmd_exec(int argc, char **argv) {
 
 /* ─── Usage ─────────────────────────────────────────────────────────────── */
 
+/*
+ * setup --teardown: what setup made taken away, once no container runs.
+ * With the store's lock nothing is created, set up or made again by a start
+ * meanwhile; a container that a command is working on, or that runs, ends
+ * it. What a container that ended without a stop left is cleared away first.
+ */
+static void cmd_teardown(void) {
+    require_root("setup --teardown");
+    require_tool("ip", tool_path_ip());
+    (void)store_lock();
+
+    static char names[MAX_LISTED][NAME_MAX_LEN + 1];
+    bool more = false;
+    int count = list_containers(names, MAX_LISTED, &more);
+    if (more)
+        die("Error: there are more containers than setup --teardown can look at");
+    int busy = 0;
+    for (int i = 0; i < count; i++) {
+        int32_t lock = container_lock_try(names[i]);
+        bool running = lock < 0 || is_running(names[i]);
+        if (running) {
+            print_str(STDERR, lock < 0 ? "Error: a lightbox command is working on container '"
+                                       : "Error: container '");
+            print_str(STDERR, names[i]);
+            print_str(STDERR, lock < 0 ? "'\n" : "' is running\n");
+            busy++;
+        } else {
+            (void)reconcile(names[i]);
+        }
+        if (lock >= 0)
+            lc_kernel_close_file(lock);
+    }
+    if (busy)
+        die("Error: setup --teardown takes lightbox's host network away only when no container runs");
+    teardown_host();
+    lc_kernel_exit(0);
+}
+
 [[noreturn]] static void usage(void) {
     print_str(STDERR,
         "Usage: lightbox <command> [args]\n"
@@ -3897,6 +3940,7 @@ static void cmd_exec(int argc, char **argv) {
         "  doctor                        Show host/runtime dependency status\n"
         "  ls                            List all containers\n"
         "  setup                         Setup host networking\n"
+        "  setup --teardown              Take lightbox's host network away, when no container runs\n"
     );
     lc_kernel_exit(1);
 }
@@ -3935,7 +3979,14 @@ int main(int argc, char **argv, char **envp) {
     int sub_argc = argc - 2;
     char **sub_argv = argv + 2;
 
-    if (streq(cmd, "setup"))       cmd_setup();
+    if (streq(cmd, "setup")) {
+        if (sub_argc == 0)
+            cmd_setup();
+        else if (sub_argc == 1 && streq(sub_argv[0], "--teardown"))
+            cmd_teardown();
+        else
+            die("Usage: lightbox setup [--teardown]");
+    }
     else if (streq(cmd, "create")) cmd_create(sub_argc, sub_argv);
     else if (streq(cmd, "start"))  cmd_start(sub_argc, sub_argv);
     else if (streq(cmd, "stop"))   cmd_stop(sub_argc, sub_argv);
