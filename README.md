@@ -329,7 +329,7 @@ lightbox <command> [args]
   rm     <name>...              Remove containers
   exec   <name> [options] [--] [cmd [args...]]   Run a command in a container
   logs   <name> [-f]            Show what a container has printed; -f follows it
-  inspect <name>                Show a container's configuration and state
+  inspect <name> [--json]       Show a container's configuration and state; --json as JSON
   doctor                        Show what the host has of what lightbox needs
   ls [--json]                   List all containers
 

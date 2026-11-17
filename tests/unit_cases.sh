@@ -2317,7 +2317,7 @@ t_conf_has_one_reader() {
     echo "container_conf_path is called in: $users"
     [ "$users" = 'lightbox_container.c lightbox_meta.c lightbox_state.c ' ] || { echo "expected the reader and writer, inspect (which prints the path) and the definition"; bad=1; }
     # inspect names the file and does not read it
-    grep -n 'conf_path' "$src/lightbox_meta.c" | grep -v 'container_conf_path(conf_path, name)\|print_kv("config_path", conf_path)\|char cdir' && { echo "lightbox_meta.c does more with the path than print it"; bad=1; }
+    grep -n 'conf_path' "$src/lightbox_meta.c" | grep -v 'container_conf_path(conf_path, name)\|report_text(&r, "config_path", conf_path)\|char cdir' && { echo "lightbox_meta.c does more with the path than print it"; bad=1; }
     for file in "$src"/lightbox.c "$src"/lightbox_meta.c "$src"/lightbox_state.c "$src"/lightbox_net.c \
                 "$src"/lightbox_config.c "$src"/lightbox_util.c; do
         if grep -nE '"(vol|link|mem|pids|cpu|oom_score|privileged|readonly|userns|uid_start|version)="|conf_get|container_conf_read' "$file" /dev/null; then

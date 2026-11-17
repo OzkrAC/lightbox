@@ -2064,6 +2064,23 @@ t_several_names() {
     nothing_left many1 && nothing_left many2
 }
 
+# inspect --json of a running container: running, its init's number as a
+# number, and the start time beside it, as text inspect shows them.
+t_inspect_json_running() {
+    command -v python3 >/dev/null 2>&1 || { echo "no python3 to decode JSON with"; return 77; }
+    up seen || return 1
+    json=$(lb inspect seen --json) || return 1
+    printf '%s\n' "$json"
+    printf '%s' "$json" | python3 -I -c '
+import json, sys
+c = json.load(sys.stdin)[0]
+assert c["running"] is True and c["state"] == "running", "not running"
+assert c["pid"] == int(sys.argv[1]), "pid %r" % c["pid"]
+assert isinstance(c["pid_starttime"], str) and c["pid_starttime"].isdigit(), "pid_starttime %r" % c["pid_starttime"]
+' "$(pid_of seen)" || return 1
+    [ "$(lb inspect seen | sed -n 's/^pid_starttime: //p')" = "$(printf '%s' "$json" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)[0]["pid_starttime"])')" ]
+}
+
 # ─── Cases: where the settings are ──────────────────────────────────────────
 
 # Named by neither --config nor LIGHTBOX_CONFIG, the settings are those of
@@ -2517,6 +2534,7 @@ if [ "$MODE" = inside ]; then
     check 'create, start, exec, stop and rm'                              t_lifecycle
     check 'start and stop take several names, and name those they could not do' t_several_names
     check 'ls and inspect show a running container'                       t_queries_show_running
+    check 'inspect --json of a running container has its init, as numbers'  t_inspect_json_running
     check 'exec returns the exit status of the command'                   t_exec_status
     check 'exec without a command runs a shell on standard input'         t_exec_default_shell
     check 'a container has its own hostname, processes and root'          t_own_world

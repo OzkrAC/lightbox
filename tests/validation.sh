@@ -1221,11 +1221,46 @@ t_unusable_base_refused() {
     [ -z "$(ls -A "$C")" ]
 }
 
+# inspect shows what a container is configured with, its volumes and links
+# among it, a line each, and its log; "-" where there is none.
 t_inspect_shows_volumes_and_links() {
     lb create db 10.0.0.3 && lb create web 10.0.0.2 --vol "$W/vol:/data:ro" --link db || return 1
     report=$(lb inspect web)
     printf '%s\n' "$report"
-    printf '%s\n' "$report" | grep -q '/data' && printf '%s\n' "$report" | grep -Eq 'link.*db'
+    printf '%s\n' "$report" | grep -qx "volume: $W/vol:/data:ro" && printf '%s\n' "$report" | grep -qx 'link: db' &&
+    printf '%s\n' "$report" | grep -qx "log_path: $C/web/console.log" || return 1
+    report=$(lb inspect db)
+    printf '%s\n' "$report" | grep -qx 'volume: -' && printf '%s\n' "$report" | grep -qx 'link: -'
+}
+
+# inspect --json: the same, as a JSON array of one object, with numbers,
+# true and false, null for what is not there, and arrays of volumes and
+# links. A configuration that cannot be used is an error before anything is
+# printed: a JSON document is whole or not there.
+t_inspect_json() {
+    command -v python3 >/dev/null 2>&1 || { echo "no python3 to decode JSON with"; return 77; }
+    lb create db 10.0.0.3 && lb create web 10.0.0.2 --vol "$W/vol:/data:ro" --vol "$W/vol:/rw" --link db --swap 32M || return 1
+    json=$(lb inspect web --json) || return 1
+    printf '%s\n' "$json"
+    [ "$json" = "$(lb inspect --json web)" ] || { echo "--json before the name gives another answer"; return 1; }
+    printf '%s' "$json" | python3 -I -c '
+import json, sys
+doc = json.load(sys.stdin)
+assert isinstance(doc, list) and len(doc) == 1, "not an array of one"
+c = doc[0]
+want = {"name": "web", "ip": "10.0.0.2", "state": "stopped", "running": False, "pid": None,
+        "pid_starttime": None, "mem": "256M", "swap": "32M", "io": None, "oom_score": 500,
+        "privileged": False, "readonly": False, "userns": False, "links": ["db"],
+        "volumes": [{"src": sys.argv[1], "dst": "/data", "ro": True}, {"src": sys.argv[1], "dst": "/rw", "ro": False}]}
+bad = [k for k in want if c.get(k) != want[k]]
+assert not bad, "differ: " + ", ".join("%s=%r" % (k, c.get(k)) for k in bad)
+assert c["log_path"].endswith("/web/console.log") and c["host_interface"].startswith("vb-"), "paths"
+' "$W/vol" || return 1
+    echo 'colour=blue' >> "$C/web/.conf"
+    out=$(lb inspect web --json 2>"$W/err") && { echo "inspect --json of a configuration that cannot be used succeeded"; return 1; }
+    cat "$W/err"
+    [ -z "$out" ] || { echo "it printed: $out"; return 1; }
+    grep -q "^Error: the container's configuration cannot be used: " "$W/err"
 }
 
 # A carriage return at the end of a line is no part of the value, as a file
@@ -1671,7 +1706,8 @@ check 'ls --json escapes whatever a record holds'             t_ls_json_escapes_
 check 'ls --json gives pid as null for a stopped container'   t_ls_json_pid_is_null_when_stopped
 check 'ls is sorted by name'                                  t_ls_is_sorted
 check 'ls lists only directories with a container name'       t_ls_lists_only_containers
-xfail CLI-inspect          'inspect shows volumes and links'                 t_inspect_shows_volumes_and_links
+check 'inspect shows volumes, links and the log'                       t_inspect_shows_volumes_and_links
+check 'inspect --json is one JSON object, typed, or nothing'             t_inspect_json
 check 'configuration: carriage returns are stripped'                   t_config_strips_carriage_returns
 check 'configuration: inline comments are stripped'                    t_config_strips_inline_comments
 check 'configuration: unknown keys and lines that are no setting are said, with the line' t_config_reports_unknown_keys

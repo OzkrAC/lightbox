@@ -195,14 +195,116 @@ void cmd_logs(int argc, char **argv) {
         lc_kernel_close_file((int32_t)fd);
 }
 
+/*
+ * What inspect prints, one value at a time: "key: value" lines, or the
+ * members of one JSON object. Text shows what has no value as "-", and JSON
+ * as null; a flag is yes and no, or 1 and 0, in text, as it always was, and
+ * true and false in JSON.
+ */
+struct report {
+    bool json;
+    bool first;
+};
+
+static void report_text(struct report *r, const char *key, const char *value) {
+    if (!r->json) {
+        print_kv(key, value ? value : "-");
+        return;
+    }
+    json_key(key, r->first);
+    r->first = false;
+    if (value)
+        json_string(value);
+    else
+        print_str(STDOUT, "null");
+}
+
+static void report_number(struct report *r, const char *key, int value) {
+    if (!r->json) {
+        print_kv_int(key, value);
+        return;
+    }
+    char digits[16];
+    fmt_int(digits, value);
+    json_key(key, r->first);
+    r->first = false;
+    print_str(STDOUT, digits);
+}
+
+static void report_flag(struct report *r, const char *key, bool value, const char *yes, const char *no) {
+    if (!r->json) {
+        print_kv(key, value ? yes : no);
+        return;
+    }
+    json_key(key, r->first);
+    r->first = false;
+    print_str(STDOUT, value ? "true" : "false");
+}
+
+/* The volumes: a line each, "<src>:<dst>[:ro]", or an array of objects. */
+static void report_volumes(struct report *r, const container_config *config) {
+    if (!r->json) {
+        if (config->nvols == 0)
+            print_kv("volume", "-");
+        for (int i = 0; i < config->nvols; i++) {
+            print_str(STDOUT, "volume: ");
+            print_str(STDOUT, config->vols[i].src);
+            lc_print_char(STDOUT, ':');
+            print_str(STDOUT, config->vols[i].dst);
+            print_str(STDOUT, config->vols[i].ro ? ":ro\n" : "\n");
+        }
+        return;
+    }
+    json_key("volumes", r->first);
+    r->first = false;
+    lc_print_char(STDOUT, '[');
+    for (int i = 0; i < config->nvols; i++) {
+        if (i) lc_print_char(STDOUT, ',');
+        lc_print_char(STDOUT, '{');
+        json_key("src", true);  json_string(config->vols[i].src);
+        json_key("dst", false); json_string(config->vols[i].dst);
+        json_key("ro", false);  print_str(STDOUT, config->vols[i].ro ? "true" : "false");
+        lc_print_char(STDOUT, '}');
+    }
+    lc_print_char(STDOUT, ']');
+}
+
+/* The containers it is linked to: a line each, or an array of names. */
+static void report_links(struct report *r, const container_config *config) {
+    if (!r->json) {
+        if (config->nlinks == 0)
+            print_kv("link", "-");
+        for (int i = 0; i < config->nlinks; i++)
+            print_kv("link", config->links[i]);
+        return;
+    }
+    json_key("links", r->first);
+    r->first = false;
+    lc_print_char(STDOUT, '[');
+    for (int i = 0; i < config->nlinks; i++) {
+        if (i) lc_print_char(STDOUT, ',');
+        json_string(config->links[i]);
+    }
+    lc_print_char(STDOUT, ']');
+}
+
 void cmd_inspect(int argc, char **argv) {
-    if (argc < 1) die("Usage: lightbox inspect <name>");
-    if (argc > 1)
-        die2(argv[1][0] == '-' ? "Error: unknown option: " : "Error: unexpected argument: ", argv[1]);
-    const char *name = argv[0];
+    bool json = false;
+    const char *name = NULL;
+    for (int i = 0; i < argc; i++) {
+        if (streq(argv[i], "--json"))
+            json = true;
+        else if (argv[i][0] == '-')
+            die2("Error: unknown option: ", argv[i]);
+        else if (!name)
+            name = argv[i];
+        else
+            die2("Error: unexpected argument: ", argv[i]);
+    }
+    if (!name) die("Usage: lightbox inspect <name> [--json]");
     validate_name(name);
 
-    char cdir[MAX_PATH], root[MAX_PATH], conf_path[MAX_PATH], ip_path[MAX_PATH];
+    char cdir[MAX_PATH], root[MAX_PATH], conf_path[MAX_PATH], ip_path[MAX_PATH], log_path[MAX_PATH];
     char pid_path[MAX_PATH], pid_start_path[MAX_PATH], state_path[MAX_PATH], state[32], ip[16], pid_start[32];
     container_dir_path(cdir, name);
     if (!path_exists(cdir)) die2("Error: container does not exist: ", name);
@@ -210,62 +312,71 @@ void cmd_inspect(int argc, char **argv) {
     container_root(root, name);
     container_conf_path(conf_path, name);
     container_ip_path(ip_path, name);
+    container_log_path(log_path, name);
     container_pid_path(pid_path, name);
     container_pid_start_path(pid_start_path, name);
     container_state_path(state_path, name);
 
     container_lock_if_free(name);
-    if (read_container_ip(name, ip, sizeof(ip)) < 0) {
-        ip[0] = '-';
-        ip[1] = '\0';
-    }
+    bool have_ip = read_container_ip(name, ip, sizeof(ip)) >= 0;
     container_liveness live = container_probe(name);
     container_shown_state(name, live, state, sizeof(state));
+    /* a record that is not the number of a process is no record */
+    int pid = get_container_pid(name);
+    bool have_start = get_container_pid_starttime(name, pid_start, sizeof(pid_start)) == 0;
 
-    print_kv("name", name);
-    print_kv("state", state);
-    print_kv("running", live == CONTAINER_RUNNING ? "yes" : "no");
-    print_kv("ip", ip);
+    /* What it is configured with. In text, a configuration that cannot be
+     * used is said to be so after everything that could be shown; JSON is
+     * a whole document or none. */
+    static container_config config;
+    const char *wrong = container_config_load(name, &config);
+    if (wrong && json)
+        die2("Error: the container's configuration cannot be used: ", wrong);
+
+    struct report r = { .json = json, .first = true };
+    if (json)
+        print_str(STDOUT, "[{");
+    report_text(&r, "name", name);
+    report_text(&r, "state", state);
+    report_flag(&r, "running", live == CONTAINER_RUNNING, "yes", "no");
+    report_text(&r, "ip", have_ip ? ip : NULL);
     {
         char port[IFNAME_TEXT_MAX];
         host_port_name(name, port);
-        print_kv("host_interface", port);
+        report_text(&r, "host_interface", port);
     }
-    print_kv("dir", cdir);
-    print_kv("rootfs", root);
-    print_kv("config_path", conf_path);
-    print_kv("ip_path", ip_path);
-    print_kv("pid_path", pid_path);
-    print_kv("pid_start_path", pid_start_path);
-    print_kv("state_path", state_path);
-
-    /* a record that is not the number of a process is no record */
-    int pid = get_container_pid(name);
+    report_text(&r, "dir", cdir);
+    report_text(&r, "rootfs", root);
+    report_text(&r, "config_path", conf_path);
+    report_text(&r, "ip_path", ip_path);
+    report_text(&r, "log_path", log_path);
+    report_text(&r, "pid_path", pid_path);
+    report_text(&r, "pid_start_path", pid_start_path);
+    report_text(&r, "state_path", state_path);
     if (pid > 0)
-        print_kv_int("pid", pid);
+        report_number(&r, "pid", pid);
     else
-        print_kv("pid", "-");
-    if (get_container_pid_starttime(name, pid_start, sizeof(pid_start)) == 0)
-        print_kv("pid_starttime", pid_start);
-    else
-        print_kv("pid_starttime", "-");
+        report_text(&r, "pid", NULL);
+    report_text(&r, "pid_starttime", have_start ? pid_start : NULL);
 
-    /* What it is configured with. A configuration that cannot be used is
-     * said to be so, after everything that could be shown. */
-    static container_config config;
-    const char *wrong = container_config_load(name, &config);
+    if (!wrong) {
+        report_text(&r, "mem", config.mem);
+        report_text(&r, "swap", config.swap[0] ? config.swap : "0");
+        report_text(&r, "pids", config.pids);
+        report_text(&r, "cpu", config.cpu);
+        report_text(&r, "io", config.io[0] ? config.io : NULL);
+        report_number(&r, "oom_score", config.oom_score);
+        report_flag(&r, "userns", config.userns, "1", "0");
+        report_number(&r, "uid_start", config.uid_start);
+        report_flag(&r, "privileged", config.privileged, "1", "0");
+        report_flag(&r, "readonly", config.read_only, "1", "0");
+        report_volumes(&r, &config);
+        report_links(&r, &config);
+    }
+    if (json)
+        print_str(STDOUT, "}]\n");
     if (wrong)
         die2("Error: the container's configuration cannot be used: ", wrong);
-    print_kv("mem", config.mem);
-    print_kv("swap", config.swap[0] ? config.swap : "0");
-    print_kv("pids", config.pids);
-    print_kv("cpu", config.cpu);
-    print_kv("io", config.io[0] ? config.io : "-");
-    print_kv_int("oom_score", config.oom_score);
-    print_kv_int("userns", config.userns);
-    print_kv_int("uid_start", config.uid_start);
-    print_kv_int("privileged", config.privileged);
-    print_kv_int("readonly", config.read_only);
 }
 
 /* doctor: can exec run from a copy of the binary that cannot be written to? */

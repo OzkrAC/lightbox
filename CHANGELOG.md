@@ -19,6 +19,7 @@ Not tagged yet, and not complete: the part of Phase 6 that is written so far.
 - **`start`, `stop` and `rm` take several names**, as Docker's do, and do one container after the other. One that cannot be done ends nothing for the others; the command names those it did not do, and exits with the first status that was not 0. `-t` for `start` and `stop` may come anywhere among the names.
 - **`lightbox --version`** prints the version of lightbox and of lightc.
 - **`lightbox --config <path> <command>`** reads that configuration, as `LIGHTBOX_CONFIG=<path>` does.
+- **`inspect` shows all of a container's configuration**: a `volume:` line for each volume, as `<src>:<dst>[:ro]`, a `link:` line for each link, `-` for none, and `log_path`. **`inspect --json`** gives the same as an array of one JSON object, as `docker inspect` does, with numbers, `true` and `false`, `null` for what is not there, and arrays of volumes and links; a configuration that cannot be used is an error and prints no JSON.
 
 ## 0.5.1
 

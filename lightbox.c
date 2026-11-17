@@ -4014,7 +4014,7 @@ static const struct { const char *name; const char *text; } command_help[] = {
     { "logs",
         "  logs   <name> [-f]            Show what the container has printed; -f follows it\n" },
     { "inspect",
-        "  inspect <name>                Show container metadata and runtime state\n" },
+        "  inspect <name> [--json]       Show a container's configuration and state; --json as JSON\n" },
     { "doctor",
         "  doctor                        Show host/runtime dependency status\n" },
     { "ls",
