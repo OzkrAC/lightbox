@@ -4016,7 +4016,8 @@ static const struct { const char *name; const char *text; } command_help[] = {
     { "inspect",
         "  inspect <name> [--json]       Show a container's configuration and state; --json as JSON\n" },
     { "doctor",
-        "  doctor                        Show host/runtime dependency status\n" },
+        "  doctor [--json]               Check what lightbox needs of this host, and say how to fix what\n"
+        "                                is missing; --json as JSON\n" },
     { "ls",
         "  ls [--json]                   List all containers\n" },
     { "setup",
@@ -4160,11 +4161,7 @@ int main(int argc, char **argv, char **envp) {
     else if (streq(cmd, "exec"))   cmd_exec(sub_argc, sub_argv);
     else if (streq(cmd, "logs"))   cmd_logs(sub_argc, sub_argv);
     else if (streq(cmd, "inspect")) cmd_inspect(sub_argc, sub_argv);
-    else if (streq(cmd, "doctor")) {
-        if (sub_argc > 0)
-            die2(sub_argv[0][0] == '-' ? "Error: unknown option: " : "Error: unexpected argument: ", sub_argv[0]);
-        cmd_doctor();
-    }
+    else if (streq(cmd, "doctor")) cmd_doctor(sub_argc, sub_argv);
     else if (streq(cmd, "ls"))     cmd_ls(sub_argc, sub_argv);
     else {
         print_str(STDERR, "Error: unknown command: ");

@@ -2081,6 +2081,50 @@ assert isinstance(c["pid_starttime"], str) and c["pid_starttime"].isdigit(), "pi
     [ "$(lb inspect seen | sed -n 's/^pid_starttime: //p')" = "$(printf '%s' "$json" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)[0]["pid_starttime"])')" ]
 }
 
+# doctor as root on a host set up for lightbox finds nothing missing (see
+# t_doctor). Each precondition of start broken in turn makes it exit 1, with
+# the check that names it and, on the line after, what fixes it.
+t_doctor_names_what_is_missing() {
+    breaks() { # check, fix, doctor's words... : doctor fails that check and says the fix
+        local check=$1 fix=$2
+        shift 2
+        said=$("$@" 2>&1) && { printf '%s\n' "$said"; echo "doctor exited 0 with $check broken"; return 1; }
+        printf '%s\n' "$said" | grep -A1 "^$check: "
+        printf '%s\n' "$said" | grep -A1 -E "^$check: (no|missing)" | tail -n 1 | grep -qF "  to fix: $fix" ||
+            { echo "$check is not said to fail, with: $fix"; return 1; }
+    }
+    lb doctor >/dev/null || { lb doctor; echo "doctor finds something missing before anything is broken"; return 1; }
+    nsenter_path=$(first_existing /usr/bin/nsenter /bin/nsenter /usr/sbin/nsenter /sbin/nsenter)
+    mount --bind /dev/null "$nsenter_path" || return 1
+    breaks bin.nsenter 'install util-linux' lb doctor; rc=$?
+    umount "$nsenter_path" || return 1
+    [ $rc = 0 ] || return 1
+    ip_path=$(first_existing /sbin/ip /usr/sbin/ip /bin/ip /usr/bin/ip)
+    shim "$ip_path" 'case "$1" in -V) echo "ip: invalid option -- '"'"'V'"'"'"; echo "BusyBox v1.36.1 multi-call binary." ;; *) exec "$REAL" "$@" ;; esac' || return 1
+    breaks bin.ip 'install iproute2' lb doctor || return 1
+    umount -l "$ip_path" && : > "$T/shims"
+    mkdir -p "$T/emptyroot" "$T/notcg"
+    alt_conf docrootfs "rootfs = $T/emptyroot" || return 1
+    breaks path.rootfs 'put a root filesystem there' alt_lb doctor || return 1
+    alt_conf doccg "cgroup_root = $T/notcg" || return 1
+    breaks cgroup2 'boot with cgroup_no_v1=all' alt_lb doctor || return 1
+    alt_conf docfwd 'firewall_backend = nftables' || return 1
+    echo 0 > /proc/sys/net/ipv4/ip_forward || return 1
+    breaks ip_forwarding 'sysctl -w net.ipv4.ip_forward=1' alt_lb doctor || return 1
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+    if command -v setpriv >/dev/null 2>&1; then
+        # a copy that another user can reach, which the checkout may not be
+        pub=$(mktemp -d /tmp/lbt-pub.XXXXXX) && chmod 755 "$pub" && cp "$LB" "$pub/lightbox" && chmod 755 "$pub/lightbox" ||
+            return 1
+        breaks root 'run lightbox as root' setpriv --reuid=65534 --regid=65534 --clear-groups \
+            env LIGHTBOX_CONFIG=/dev/null "$pub/lightbox" doctor
+        rc=$?
+        rm -rf -- "$pub"
+        return $rc
+    fi
+    echo "no setpriv to run doctor as another user with"
+}
+
 # ─── Cases: where the settings are ──────────────────────────────────────────
 
 # Named by neither --config nor LIGHTBOX_CONFIG, the settings are those of
@@ -2530,6 +2574,7 @@ if [ "$MODE" = inside ]; then
     check 'ip_forward_no_drop = true leaves the FORWARD policy'           t_ip_forward_no_drop
     check 'firewall = false: no rule is made, and a container with links is refused' t_firewall_false
     check 'doctor finds nothing missing'                                  t_doctor
+    check 'doctor names each precondition of start that is broken, and its fix' t_doctor_names_what_is_missing
 
     check 'create, start, exec, stop and rm'                              t_lifecycle
     check 'start and stop take several names, and name those they could not do' t_several_names

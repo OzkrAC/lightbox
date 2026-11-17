@@ -521,8 +521,43 @@ int dir_is_empty(const char *path) {
     return empty;
 }
 
+/* access(2) as faccessat2 has it, and as faccessat on a kernel before 5.8,
+ * where faccessat2 is not, so that doctor can say which kernel it is on. */
+static lc_sysret access_path(const char *path, int32_t mode) {
+    lc_sysret rc = lc_kernel_faccessat2(AT_FDCWD, path, mode, 0);
+    if (rc == -LB_ENOSYS)
+        rc = lb_sys_faccessat(AT_FDCWD, path, mode);
+    return rc;
+}
+
 bool path_exists(const char *path) {
-    return lc_kernel_faccessat2(AT_FDCWD, path, F_OK, 0) == 0;
+    return access_path(path, F_OK) == 0;
+}
+
+bool path_executable(const char *path) {
+    return access_path(path, X_OK) == 0;
+}
+
+bool kernel_release_at_least(const char *release, int want_major, int want_minor, int *major, int *minor) {
+    *major = *minor = -1;
+    int parts[2] = { 0, 0 };
+    const char *p = release;
+    for (int i = 0; i < 2; i++) {
+        if (*p < '0' || *p > '9')
+            return false;
+        int n = 0;
+        while (*p >= '0' && *p <= '9' && n < 100000)
+            n = n * 10 + (*p++ - '0');
+        parts[i] = n;
+        if (i == 0) {
+            if (*p != '.')
+                return false;
+            p++;
+        }
+    }
+    *major = parts[0];
+    *minor = parts[1];
+    return parts[0] > want_major || (parts[0] == want_major && parts[1] >= want_minor);
 }
 
 bool path_is_directory(const char *path) {

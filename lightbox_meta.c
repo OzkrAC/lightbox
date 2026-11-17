@@ -116,17 +116,6 @@ static void print_kv_int(const char *key, int val) {
     print_kv(key, buf);
 }
 
-static void print_check(const char *key, bool ok, const char *detail) {
-    print_str(STDOUT, key);
-    print_str(STDOUT, ": ");
-    print_str(STDOUT, ok ? "ok" : "missing");
-    if (detail && detail[0]) {
-        print_str(STDOUT, " (");
-        print_str(STDOUT, detail);
-        print_str(STDOUT, ")");
-    }
-    lc_print_char(STDOUT, '\n');
-}
 
 /*
  * logs <name> [-f]: what the container's init, its hook and its services
@@ -379,129 +368,389 @@ void cmd_inspect(int argc, char **argv) {
         die2("Error: the container's configuration cannot be used: ", wrong);
 }
 
+/* ─── doctor ────────────────────────────────────────────────────────────── */
+
+/*
+ * doctor's report: the settings, then the checks of what start and the
+ * other commands need. In text a check is "<name>: <what it found>", and one
+ * that fails is followed by "  to fix: <what to do>". --json gives the same
+ * as {"settings": {...}, "checks": [{"check", "ok", "text", "fix"}, ...],
+ * "overall"}, the text being what the line says after the name.
+ */
+struct doctor {
+    bool json;
+    bool first;
+    int failed;
+};
+
+/* a setting: its text, and in JSON that text or the literal given */
+static void doc_setting(struct doctor *d, const char *key, const char *text, const char *literal) {
+    if (!d->json) {
+        print_kv(key, text);
+        return;
+    }
+    json_key(key, d->first);
+    d->first = false;
+    if (literal)
+        print_str(STDOUT, literal);
+    else
+        json_string(text);
+}
+
+static void doc_flag(struct doctor *d, const char *key, bool value, const char *text_true, const char *text_false) {
+    doc_setting(d, key, value ? text_true : text_false, value ? "true" : "false");
+}
+
+static void doc_begin_checks(struct doctor *d) {
+    if (d->json)
+        print_str(STDOUT, "},\"checks\":[");
+    d->first = true;
+}
+
+static void doc_check(struct doctor *d, const char *name, bool ok, const char *text, const char *fix) {
+    if (!ok)
+        d->failed++;
+    if (!d->json) {
+        print_kv(name, text);
+        if (!ok && fix) {
+            print_str(STDOUT, "  to fix: ");
+            print_str(STDOUT, fix);
+            lc_print_char(STDOUT, '\n');
+        }
+        return;
+    }
+    if (!d->first)
+        lc_print_char(STDOUT, ',');
+    d->first = false;
+    lc_print_char(STDOUT, '{');
+    json_key("check", true);
+    json_string(name);
+    json_key("ok", false);
+    print_str(STDOUT, ok ? "true" : "false");
+    json_key("text", false);
+    json_string(text);
+    json_key("fix", false);
+    if (!ok && fix)
+        json_string(fix);
+    else
+        print_str(STDOUT, "null");
+    lc_print_char(STDOUT, '}');
+}
+
+/* "<word> (<detail>)", or the word alone */
+static const char *worded(char *buf, size_t max, const char *word, const char *detail) {
+    bool cut = false;
+    size_t pos = str_append(buf, 0, word, max, &cut);
+    if (detail && detail[0]) {
+        pos = str_append(buf, pos, " (", max, &cut);
+        pos = str_append(buf, pos, detail, max, &cut);
+        str_append(buf, pos, ")", max, &cut);
+    }
+    return buf;
+}
+
+/* A file a check names, and what to do when it is not right: ok or missing. */
+static void doc_file(struct doctor *d, const char *name, bool ok, const char *detail, const char *fix) {
+    char text[MAX_PATH + 64];
+    doc_check(d, name, ok, worded(text, sizeof(text), ok ? "ok" : "missing", detail), fix);
+}
+
+/* Anything else: yes or no. */
+static void doc_yes_no(struct doctor *d, const char *name, bool ok, const char *detail, const char *fix) {
+    char text[MAX_PATH + 128];
+    doc_check(d, name, ok, worded(text, sizeof(text), ok ? "yes" : "no", detail), fix);
+}
+
+static void check_root(struct doctor *d) {
+    char detail[32];
+    uint32_t uid = (uint32_t)lb_sys_geteuid();
+    bool cut = false;
+    fmt_int(detail + str_append(detail, 0, "uid ", sizeof(detail), &cut), (int)uid);
+    doc_yes_no(d, "root", uid == 0, detail,
+               "run lightbox as root, as setup, start, stop and exec need: sudo lightbox doctor");
+}
+
+static void check_kernel(struct doctor *d) {
+    char release[128] = "";
+    int n = read_file("/proc/sys/kernel/osrelease", release, sizeof(release));
+    while (n > 0 && (release[n - 1] == '\n' || release[n - 1] == ' '))
+        release[--n] = '\0';
+    int major, minor;
+    bool ok = kernel_release_at_least(release, KERNEL_FLOOR_MAJOR, KERNEL_FLOOR_MINOR, &major, &minor);
+    char detail[192];
+    bool cut = false;
+    size_t pos = str_append(detail, 0, n > 0 ? release : "the release cannot be read", sizeof(detail), &cut);
+    str_append(detail, pos, "; lightbox needs Linux " STRINGIFY(KERNEL_FLOOR_MAJOR) "." STRINGIFY(KERNEL_FLOOR_MINOR)
+               " or later", sizeof(detail), &cut);
+    doc_yes_no(d, "kernel", ok, detail, "boot Linux " STRINGIFY(KERNEL_FLOOR_MAJOR) "." STRINGIFY(KERNEL_FLOOR_MINOR) " or later");
+}
+
+/*
+ * The system calls of the kernels after 5.0 that start, stop and exec make,
+ * each called so that it fails at once without doing anything: a kernel that
+ * has it says what is wrong with the arguments, one that does not says
+ * ENOSYS.
+ */
+static void check_syscalls(struct doctor *d) {
+    const struct { const char *name; int64_t nr, a, b, c, e, f; } probes[] = {
+        { "pidfd_open",        LB_SYS_pidfd_open,        0, 0, 0, 0, 0 },                  /* pid 0 */
+        { "pidfd_send_signal", LB_SYS_pidfd_send_signal, -1, 0, 0, 0, 0 },                 /* no descriptor */
+        { "open_tree",         LB_SYS_open_tree,         -1, (int64_t)(uintptr_t)"", 0, 0, 0 },
+        { "move_mount",        LB_SYS_move_mount,        -1, (int64_t)(uintptr_t)"", -1, (int64_t)(uintptr_t)"", 0 },
+        { "openat2",           LB_SYS_openat2,           -1, 0, 0, 0, 0 },                 /* no how */
+        { "close_range",       LB_SYS_close_range,       1, 0, 0, 0, 0 },                  /* first after last */
+        { "faccessat2",        SYS_faccessat2,           AT_FDCWD, (int64_t)(uintptr_t)"/", F_OK, 0, 0 },
+    };
+    char missing[256] = "";
+    size_t pos = 0;
+    bool cut = false;
+    for (size_t i = 0; i < sizeof(probes) / sizeof(probes[0]); i++) {
+        lc_sysret rc = lc_syscall5(probes[i].nr, probes[i].a, probes[i].b, probes[i].c, probes[i].e, probes[i].f);
+        if (rc != -LB_ENOSYS)
+            continue;
+        pos = str_append(missing, pos, pos ? ", " : "missing: ", sizeof(missing), &cut);
+        pos = str_append(missing, pos, probes[i].name, sizeof(missing), &cut);
+    }
+    doc_yes_no(d, "syscalls", !missing[0], missing[0] ? missing : "the ones of Linux 5.10 that lightbox makes",
+               "boot Linux " STRINGIFY(KERNEL_FLOOR_MAJOR) "." STRINGIFY(KERNEL_FLOOR_MINOR) " or later");
+}
+
+/* cgroup_root a cgroup v2 hierarchy, and the controllers a container's
+ * limits need in it: cpu, memory and pids for every container, io only
+ * for one with --io-max, which is said and not counted. */
+static void check_cgroups(struct doctor *d) {
+    const char *root = cfg_global.cgroup_root;
+    struct lb_statfs sfs;
+    bool v2 = lb_sys_statfs(root, &sfs) == 0 && sfs.f_type == LB_CGROUP2_SUPER_MAGIC;
+    doc_yes_no(d, "cgroup2", v2, root,
+               "boot with cgroup_no_v1=all, or set cgroup_root to an empty directory, which lightbox setup mounts cgroup2 on");
+    if (!v2)
+        return;
+    char path[MAX_PATH], list[256];
+    if (!path_join(path, sizeof(path), root, "cgroup.controllers") || read_file(path, list, sizeof(list)) < 0)
+        list[0] = '\0';
+    static const char *const needed[] = { "cpu", "memory", "pids", "io" };
+    char missing[64] = "", found[64] = "";
+    size_t mpos = 0, fpos = 0;
+    bool cut = false, io = true;
+    for (size_t i = 0; i < sizeof(needed) / sizeof(needed[0]); i++) {
+        bool there = false;
+        size_t len = lc_string_length(needed[i]);
+        for (const char *p = list; *p && !there; ) {
+            while (*p == ' ' || *p == '\n') p++;
+            const char *w = p;
+            while (*p && *p != ' ' && *p != '\n') p++;
+            there = (size_t)(p - w) == len && lc_string_starts_with(w, len, needed[i], len);
+        }
+        if (there) {
+            fpos = str_append(found, fpos, fpos ? " " : "", sizeof(found), &cut);
+            fpos = str_append(found, fpos, needed[i], sizeof(found), &cut);
+        } else if (i == 3) {
+            io = false;
+        } else {
+            mpos = str_append(missing, mpos, mpos ? " " : "missing: ", sizeof(missing), &cut);
+            mpos = str_append(missing, mpos, needed[i], sizeof(missing), &cut);
+        }
+    }
+    char detail[160];
+    size_t pos = str_append(detail, 0, missing[0] ? missing : found, sizeof(detail), &cut);
+    if (!io)
+        str_append(detail, pos, missing[0] ? "; no io either" : "; no io, so --io-max cannot be used", sizeof(detail), &cut);
+    doc_yes_no(d, "cgroup_controllers", !missing[0], detail,
+               "the kernel offers them in cgroup.controllers of cgroup_root unless its command line has cgroup_disable= for one");
+}
+
+/* The base root filesystem: a directory with something in it to copy. */
+static void check_rootfs(struct doctor *d) {
+    const char *rootfs = cfg_global.rootfs;
+    bool dir = path_is_directory(rootfs);
+    int empty = dir ? dir_is_empty(rootfs) : -1;
+    char detail[MAX_PATH + 32];
+    bool cut = false;
+    size_t pos = str_append(detail, 0, rootfs, sizeof(detail), &cut);
+    if (!path_exists(rootfs))
+        str_append(detail, pos, " is not there", sizeof(detail), &cut);
+    else if (!dir)
+        str_append(detail, pos, " is not a directory", sizeof(detail), &cut);
+    else if (empty != 0)
+        str_append(detail, pos, empty > 0 ? " is empty" : " cannot be read", sizeof(detail), &cut);
+    doc_file(d, "path.rootfs", dir && empty == 0, detail,
+             "put a root filesystem there, such as Alpine's minirootfs: tar -xzf alpine-minirootfs-*.tar.gz -C <rootfs>");
+}
+
+/* The full ip of iproute2: BusyBox's has none of veth, netns or bridge_slave. */
+static bool ip_is_iproute2(const char *path) {
+    char said[256];
+    const char *version[] = { "ip", "-V", NULL };
+    return run_cmd_capture_quiet(path, version, said, sizeof(said)) == 0 &&
+           lc_string_contains(said, lc_string_length(said), "iproute2", 8);
+}
+
 /* doctor: can exec run from a copy of the binary that cannot be written to? */
-static bool report_exec_sealing(void) {
+static void check_exec_sealing(struct doctor *d) {
     switch (exec_seal_method()) {
         case SEAL_MEMFD:
-            print_kv("exec_sealing", "yes (a sealed copy in memory)");
-            return true;
+            doc_check(d, "exec_sealing", true, "yes (a sealed copy in memory)", NULL);
+            return;
         case SEAL_READONLY:
-            print_kv("exec_sealing", "yes (a read-only mount of the binary; executable memfds are refused here)");
-            return true;
+            doc_check(d, "exec_sealing", true,
+                      "yes (a read-only mount of the binary; executable memfds are refused here)", NULL);
+            return;
         case SEAL_NONE:
         default:
-            print_kv("exec_sealing", "no (exec will not run: it needs memfd_create, or root and Linux 5.12)");
-            return false;
+            doc_check(d, "exec_sealing", false, "no (exec will not run: it needs memfd_create, or root and Linux 5.12)",
+                      "boot Linux 5.12 or later and run exec as root, or let memfds be executed (vm.memfd_noexec = 0)");
+            return;
     }
 }
 
-void cmd_doctor(void) {
+void cmd_doctor(int argc, char **argv) {
+    struct doctor doc = { .json = false, .first = true, .failed = 0 };
+    for (int i = 0; i < argc; i++) {
+        if (streq(argv[i], "--json"))
+            doc.json = true;
+        else
+            die2(argv[i][0] == '-' ? "Error: unknown option: " : "Error: unexpected argument: ", argv[i]);
+    }
+    struct doctor *d = &doc;
     static const struct {
         const char *key;
         const char *(*resolve)(void);
         bool nftables;      /* the firewall tools of one backend: the other's are not looked for */
         bool iptables;
+        const char *fix;
     } bins[] = {
-        { "bin.ip", tool_path_ip, true, true },
-        { "bin.iptables", tool_path_iptables, false, true },
-        { "bin.iptables-restore", tool_path_iptables_restore, false, true },
-        { "bin.nft", tool_path_nft, true, false },
-        { "bin.cp", tool_path_cp, true, true },
-        { "bin.chown", tool_path_chown, true, true },
-        { "bin.rm", tool_path_rm, true, true },
+        { "bin.ip", tool_path_ip, true, true, "install iproute2" },
+        { "bin.nsenter", tool_path_nsenter, true, true, "install util-linux" },
+        { "bin.iptables", tool_path_iptables, false, true, "install iptables" },
+        { "bin.iptables-restore", tool_path_iptables_restore, false, true, "install iptables" },
+        { "bin.nft", tool_path_nft, true, false, "install nftables" },
+        { "bin.cp", tool_path_cp, true, true, "install coreutils" },
+        { "bin.chown", tool_path_chown, true, true, "install coreutils" },
+        { "bin.rm", tool_path_rm, true, true, "install coreutils" },
     };
     bool nftables = cfg_global.firewall_backend == FIREWALL_NFTABLES;
 
-    int missing = 0;
-    bool ok;
+    if (d->json)
+        print_str(STDOUT, "{\"settings\":{");
+    doc_setting(d, "lightbox_dir", cfg_global.lightbox_dir, NULL);
+    doc_setting(d, "rootfs", cfg_global.rootfs, NULL);
+    doc_setting(d, "container_dir", cfg_global.container_dir, NULL);
+    doc_setting(d, "run_dir", cfg_global.run_dir, NULL);
+    doc_setting(d, "cgroup_root", cfg_global.cgroup_root, NULL);
+    doc_setting(d, "cgroup_base", cfg_global.cgroup_base, NULL);
+    doc_setting(d, "bridge", cfg_global.bridge, NULL);
+    doc_setting(d, "subnet", cfg_global.subnet, NULL);
+    doc_setting(d, "gw", cfg_global.gw, NULL);
+    doc_flag(d, "firewall", cfg_global.firewall, "true", "false (lightbox makes no firewall rules)");
+    doc_flag(d, "ip_forward", cfg_global.ip_forward, "true", "false");
+    doc_flag(d, "ip_forward_no_drop", cfg_global.ip_forward_no_drop, "true", "false");
+    doc_flag(d, "ip_masq", cfg_global.ip_masq, "true", "false");
+    doc_setting(d, "firewall_backend", nftables ? "nftables" : "iptables", NULL);
+    if (cfg_global.accept_fwmark_set) {
+        char mark[24], text[96];
+        fwmark_text(mark, cfg_global.accept_fwmark, cfg_global.accept_fwmask);
+        bool cut = false;
+        str_append(text, str_append(text, 0, mark, sizeof(text), &cut),
+                   nftables ? "" : " (not used: with iptables, rules in LIGHTBOX-USER decide first)", sizeof(text), &cut);
+        doc_setting(d, "bridge_accept_fwmark", text, NULL);
+    } else {
+        doc_setting(d, "bridge_accept_fwmark", "none", "null");
+    }
+    /* told, not counted as missing: only a container with links depends on it */
+    if (nftables)
+        doc_setting(d, "bridge_filtering", "not needed (firewall_backend = nftables filters at the bridge)", NULL);
+    else
+        doc_setting(d, "bridge_filtering", bridge_traffic_is_filtered()
+                    ? "yes" : "no (a container with --link will not start; it needs br_netfilter)", NULL);
+    if (nftables && cfg_global.firewall) {
+        /* told, not counted: it is the host's to change */
+        static char drops[1024];
+        if (lb_sys_geteuid() != 0) {
+            doc_setting(d, "forward_drops", "unknown (doctor is not run as root)", NULL);
+        } else {
+            forward_drops_on_host(drops, sizeof(drops));
+            doc_setting(d, "forward_drops", drops[0] ? drops : "none", NULL);
+        }
+    }
+    /* told, not counted: start makes what is missing, as setup does */
+    {
+        const char *missing = host_network_missing();
+        char text[160];
+        bool cut = false;
+        if (missing)
+            str_append(text, str_append(text, str_append(text, 0, "not all there (missing: ", sizeof(text), &cut),
+                                        missing, sizeof(text), &cut),
+                       "; start makes it, as lightbox setup does)", sizeof(text), &cut);
+        doc_setting(d, "host_network", missing ? text : "ready", NULL);
+    }
 
-    print_kv("lightbox_dir", cfg_global.lightbox_dir);
-    print_kv("rootfs", cfg_global.rootfs);
-    print_kv("container_dir", cfg_global.container_dir);
-    print_kv("run_dir", cfg_global.run_dir);
-    print_kv("cgroup_root", cfg_global.cgroup_root);
-    print_kv("cgroup_base", cfg_global.cgroup_base);
-    print_kv("bridge", cfg_global.bridge);
-    print_kv("subnet", cfg_global.subnet);
-    print_kv("gw", cfg_global.gw);
+    doc_begin_checks(d);
+    check_root(d);
+    check_kernel(d);
+    check_syscalls(d);
     {
         /* the two as one network: what setup, create and start go by */
         container_network net;
         const char *setting;
         const char *wrong = container_network_parse(cfg_global.subnet, cfg_global.gw, &net, &setting);
+        char text[128], subnet[CIDR_TEXT_MAX];
         if (wrong) {
-            print_str(STDOUT, "network: unusable (");
-            print_str(STDOUT, setting);
-            print_str(STDOUT, " ");
-            print_str(STDOUT, wrong);
-            print_str(STDOUT, ")\n");
-            missing++;
+            char detail[96];
+            bool cut = false;
+            str_append(detail, str_append(detail, str_append(detail, 0, setting, sizeof(detail), &cut),
+                                          " ", sizeof(detail), &cut), wrong, sizeof(detail), &cut);
+            doc_check(d, "network", false, worded(text, sizeof(text), "unusable", detail),
+                      "set subnet to <address>/<8 to 30> and gw to an address in it in lightbox.conf");
         } else {
-            char subnet[CIDR_TEXT_MAX];
             subnet_text(subnet, &net);
-            print_kv("network", subnet);
+            doc_check(d, "network", true, subnet, NULL);
         }
     }
-    print_kv("firewall", cfg_global.firewall ? "true" : "false (lightbox makes no firewall rules)");
-    print_kv("ip_forward", cfg_global.ip_forward ? "true" : "false");
-    print_kv("ip_forward_no_drop", cfg_global.ip_forward_no_drop ? "true" : "false");
-    print_kv("ip_masq", cfg_global.ip_masq ? "true" : "false");
-    print_kv("firewall_backend", nftables ? "nftables" : "iptables");
-    if (cfg_global.accept_fwmark_set) {
-        char mark[24];
-        fwmark_text(mark, cfg_global.accept_fwmark, cfg_global.accept_fwmask);
-        print_str(STDOUT, "bridge_accept_fwmark: ");
-        print_str(STDOUT, mark);
-        print_str(STDOUT, nftables ? "\n" : " (not used: with iptables, rules in LIGHTBOX-USER decide first)\n");
-    } else {
-        print_kv("bridge_accept_fwmark", "none");
-    }
-    /* told, not counted as missing: only a container with links depends on it */
-    if (nftables)
-        print_kv("bridge_filtering", "not needed (firewall_backend = nftables filters at the bridge)");
-    else
-        print_kv("bridge_filtering", bridge_traffic_is_filtered()
-                 ? "yes" : "no (a container with --link will not start; it needs br_netfilter)");
-    if (nftables && cfg_global.firewall) {
-        /* told, not counted: it is the host's to change */
-        static char drops[1024];
-        if (lb_sys_geteuid() != 0) {
-            print_kv("forward_drops", "unknown (doctor is not run as root)");
-        } else {
-            forward_drops_on_host(drops, sizeof(drops));
-            print_kv("forward_drops", drops[0] ? drops : "none");
-        }
+    check_cgroups(d);
+    if (nftables && cfg_global.ip_forward) {
+        char forwarding[8];
+        bool on = read_file("/proc/sys/net/ipv4/ip_forward", forwarding, sizeof(forwarding)) > 0 && forwarding[0] == '1';
+        doc_yes_no(d, "ip_forwarding", on,
+                   on ? "on" : "off, and with firewall_backend = nftables lightbox does not turn it on",
+                   "sysctl -w net.ipv4.ip_forward=1, with rules of this host's against forwarding between its other "
+                   "interfaces; or ip_forward = false in lightbox.conf");
     }
 
-    ok = path_exists(cfg_global.lightbox_dir);
-    print_check("path.lightbox_dir", ok, cfg_global.lightbox_dir);
-    if (!ok) missing++;
-    ok = path_exists(cfg_global.rootfs);
-    print_check("path.rootfs", ok, cfg_global.rootfs);
-    if (!ok) missing++;
-    ok = path_exists(cfg_global.container_dir);
-    print_check("path.container_dir", ok, cfg_global.container_dir);
-    if (!ok) missing++;
-    ok = path_exists(cfg_global.cgroup_root);
-    print_check("path.cgroup_root", ok, cfg_global.cgroup_root);
-    if (!ok) missing++;
-    ok = path_exists("/proc/sys/net/ipv4/ip_forward");
-    print_check("path.proc_ip_forward", ok, "/proc/sys/net/ipv4/ip_forward");
-    if (!ok) missing++;
+    doc_file(d, "path.lightbox_dir", path_exists(cfg_global.lightbox_dir), cfg_global.lightbox_dir,
+             "lightbox setup makes it");
+    check_rootfs(d);
+    doc_file(d, "path.container_dir", path_exists(cfg_global.container_dir), cfg_global.container_dir,
+             "lightbox setup makes it");
+    doc_file(d, "path.cgroup_root", path_exists(cfg_global.cgroup_root), cfg_global.cgroup_root,
+             "lightbox setup mounts cgroup2 at an empty directory there");
+    doc_file(d, "path.proc_ip_forward", path_exists("/proc/sys/net/ipv4/ip_forward"), "/proc/sys/net/ipv4/ip_forward",
+             "mount /proc: mount -t proc proc /proc");
 
     for (size_t i = 0; i < sizeof(bins) / sizeof(bins[0]); i++) {
         if (nftables ? !bins[i].nftables : !bins[i].iptables)
             continue;
         const char *path = bins[i].resolve();
-        ok = path_exists(path);
-        print_check(bins[i].key, ok, path);
-        if (!ok) missing++;
+        bool ok = path_executable(path);
+        if (ok && streq(bins[i].key, "bin.ip") && !ip_is_iproute2(path)) {
+            char detail[MAX_PATH + 32];
+            bool cut = false;
+            str_append(detail, str_append(detail, 0, path, sizeof(detail), &cut), " is not iproute2's", sizeof(detail), &cut);
+            doc_file(d, bins[i].key, false, detail, "install iproute2: BusyBox's ip cannot make what start needs");
+            continue;
+        }
+        doc_file(d, bins[i].key, ok, path, bins[i].fix);
     }
 
-    if (!report_exec_sealing())
-        missing++;
+    check_exec_sealing(d);
 
-    print_kv("overall", missing == 0 ? "ok" : "degraded");
-    if (missing != 0)
+    if (d->json) {
+        print_str(STDOUT, "],\"overall\":");
+        json_string(d->failed == 0 ? "ok" : "degraded");
+        print_str(STDOUT, "}\n");
+    } else {
+        print_kv("overall", d->failed == 0 ? "ok" : "degraded");
+    }
+    if (d->failed != 0)
         lc_kernel_exit(1);
 }

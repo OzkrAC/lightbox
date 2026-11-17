@@ -1920,6 +1920,30 @@ t_config_sources() {
     return $bad
 }
 
+# The kernel doctor asks for: 5.10, the floor lightc sets, or later, read from
+# the release as the kernel gives it.
+t_kernel_floor() {
+    bad=0
+    expect() { # release, verdict
+        got=$("$UNIT" kernel "$1")
+        [ "$got" = "$2" ] || { echo "kernel '$1': $got, expected $2"; bad=1; }
+    }
+    expect 5.10.0 'yes 5.10'
+    expect 5.10 'yes 5.10'
+    expect 6.12.117-t480fast3 'yes 6.12'
+    expect 7.0.0-1017-azure 'yes 7.0'
+    expect 5.15.0-91-generic 'yes 5.15'
+    expect 5.9.16 'no 5.9'
+    expect 4.19.0-25-amd64 'no 4.19'
+    expect 5.4.0 'no 5.4'
+    expect 3.10.0-1160.el7.x86_64 'no 3.10'
+    expect 10.1 'yes 10.1'
+    for text in '' 5 5. .10 x5.10 'v6.1' ' 6.1'; do
+        expect "$text" unreadable
+    done
+    return $bad
+}
+
 # What setup puts in its chains: between two ports of the bridge what a link
 # allows and nothing else; out by any interface but the bridge, and back what
 # belongs to that; masquerading of the subnet, as the network spells it, when
@@ -2622,6 +2646,7 @@ check 'nftables: a record that is not lightbox'"'"'s is not given to nft'  t_nft
 check 'bridge_accept_fwmark: a mark nft reads as written, and none that matches all' t_fwmarks
 check 'the forward chains that drop what nothing accepts are named'      t_forward_drop_chains
 check 'the settings come from --config, LIGHTBOX_CONFIG, /etc, HOME or nowhere' t_config_sources
+check 'doctor asks for Linux 5.10 or later, read from the release'     t_kernel_floor
 check 'an address is four numbers and three dots, and no zero in front' t_addresses_are_strict
 check 'subnet and gw are one network, and an address on it is one a container can have' t_network_settings
 check 'no prefix is written into the source: subnet gives it'      t_no_prefix_of_its_own

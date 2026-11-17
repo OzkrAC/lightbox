@@ -4,12 +4,14 @@ A minimal, secure Linux container runtime. Single static binary, ~33KB, no libc 
 
 ## Prerequisites
 
-- Linux with namespace and cgroup v2 support
+- Linux 5.10 or later, the floor lightc sets, with namespaces and cgroup v2 offering the `cpu`, `memory` and `pids` controllers, and `io` for `--io-max`
 - GCC and ninja (build time)
 - `iproute2`, `util-linux` (`nsenter`) and `iptables` at runtime, or `nft` with `firewall_backend = nftables`
 - BusyBox `ip` is not sufficient; `lightbox start` requires the full `iproute2` `ip` binary for veth creation and bridge attachment
 - For containers created with `--link`, with iptables: the `br_netfilter` kernel module, with `net.bridge.bridge-nf-call-iptables=1`. With nftables: nf_tables with the bridge family (`CONFIG_NF_TABLES_BRIDGE`, `nft_meta_bridge`), NAT and masquerading, and no `br_netfilter`
 - Root privileges
+
+`lightbox doctor` checks all of this on the host it runs on: root, the kernel and the system calls lightbox makes, cgroup v2 and its controllers, the tools, the base root filesystem, and with nftables that forwarding is on. Each check that fails is followed by what fixes it, and `doctor` then exits 1; `doctor --json` gives the same to scripts.
 
 ## Building
 

@@ -26,6 +26,8 @@
  *   unit fwmark <text>                        parse_fwmark: lines "mark <m>", "mask <k>", "as <text>",
  *                                             or "refused"
  *   unit portname <text>                      host_port_ok: ok or refused
+ *   unit kernel <release>                     kernel_release_at_least the floor: "yes <major>.<minor>",
+ *                                             "no <major>.<minor>", or "unreadable"
  *   unit config-source <given> <env> <etc> <home>
  *                                             config_source_of, "-" for no --config or no
  *                                             variable, 1 or 0 for a file in /etc or $HOME:
@@ -743,6 +745,22 @@ int main(int argc, char **argv, char **envp) {
                                                 streq(argv[3], "-") ? NULL : argv[3],
                                                 streq(argv[4], "1"), streq(argv[5], "1"));
         put_line("", names[source]);
+        return 0;
+    }
+    if (argc == 3 && streq(argv[1], "kernel")) {
+        int major, minor;
+        bool ok = kernel_release_at_least(argv[2], KERNEL_FLOOR_MAJOR, KERNEL_FLOOR_MINOR, &major, &minor);
+        if (major < 0) {
+            put("unreadable\n");
+            return 0;
+        }
+        char a[16], b[16];
+        fmt_int(a, major);
+        fmt_int(b, minor);
+        put(ok ? "yes " : "no ");
+        put(a);
+        put(".");
+        put_line("", b);
         return 0;
     }
     if (argc == 3 && streq(argv[1], "portname")) {

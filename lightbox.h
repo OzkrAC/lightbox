@@ -262,6 +262,13 @@ void cfg_global_load(char **envp, const char *given);
 int read_file(const char *path, char *buf, size_t bufsz);
 bool path_exists(const char *path);
 bool path_is_directory(const char *path);
+bool path_executable(const char *path);
+/* A release as uname gives it, "6.12.117-x": at least want_major.want_minor?
+ * What it reads goes in major and minor, -1 each when it reads nothing. */
+bool kernel_release_at_least(const char *release, int want_major, int want_minor, int *major, int *minor);
+/* The kernel lightc and lightbox need. */
+#define KERNEL_FLOOR_MAJOR 5
+#define KERNEL_FLOOR_MINOR 10
 /* mkdir -p, in this process: 0, or -1 with the failure reported */
 [[nodiscard]] int make_dirs(const char *path);
 /* ip link set lo up, in this process: 0, or -1 with the failure reported */
@@ -500,6 +507,9 @@ bool bridge_traffic_is_filtered(void);
  * start makes it again when it is not all there, as setup makes it.
  */
 void ensure_host_network(void);
+/* What of it is not there, as "the bridge, the firewall rules", or NULL
+ * when all of it is. The firewall is looked at only by root. */
+const char *host_network_missing(void);
 /* setup --teardown, once no container runs: lightbox's firewall rules, in
  * either backend, the bridge, cgroup_base and the record of forwarding. */
 void teardown_host(void);
@@ -550,7 +560,7 @@ typedef enum {
 seal_method exec_seal_method(void);
 
 void cmd_setup(void);
-void cmd_doctor(void);
+void cmd_doctor(int argc, char **argv);
 void cmd_ls(int argc, char **argv);
 void cmd_inspect(int argc, char **argv);
 void cmd_logs(int argc, char **argv);

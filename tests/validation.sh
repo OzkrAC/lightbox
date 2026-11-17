@@ -1443,6 +1443,69 @@ t_start_options_are_checked() {
     [ "$before" = "$(kept_sum)" ] || { echo "the container's records changed"; return 1; }
 }
 
+# doctor run by an ordinary user says that lightbox needs root, and how to
+# run it, and exits 1. Each check that fails is followed by what fixes it.
+# A rootfs with nothing in it is one create cannot copy.
+t_doctor_says_how_to_fix() {
+    [ "$(id -u)" -ne 0 ] || { echo "run as root: root is no failure to show"; return 77; }
+    report=$(lb doctor 2>&1) && { printf '%s\n' "$report"; echo "doctor exited 0 for an ordinary user"; return 1; }
+    printf '%s\n' "$report" | sed -n '/^root: /,$p'
+    printf '%s\n' "$report" | grep -qx "root: no (uid $(id -u))" || return 1
+    printf '%s\n' "$report" | grep -Eqx 'kernel: (yes|no) \(.+; lightbox needs Linux 5\.10 or later\)' || return 1
+    printf '%s\n' "$report" | grep -q '^syscalls: ' && printf '%s\n' "$report" | grep -q '^bin.nsenter: ' || return 1
+    # from root on the lines are checks, and one that fails has its fix next
+    printf '%s\n' "$report" | awk '/^root: / { on = 1 }
+        on && want { if ($0 !~ /^  to fix: ./) { print "no fix after " name; bad = 1 } want = 0; next }
+        on && /^[a-z_.0-9-]+: (no|missing|unusable)( |$)/ { want = 1; name = $1 }
+        END { if (want) { print "no fix after " name; bad = 1 } exit bad }' || return 1
+    mkdir "$W/emptyroot" && echo "rootfs = $W/emptyroot" >> "$CONF"
+    report=$(lb doctor 2>&1)
+    printf '%s\n' "$report" | grep -A1 '^path.rootfs: '
+    printf '%s\n' "$report" | grep -qx "path.rootfs: missing ($W/emptyroot is empty)" &&
+    printf '%s\n' "$report" | grep -A1 '^path.rootfs: ' | grep -q '^  to fix: put a root filesystem there'
+}
+
+# doctor --json: the settings, and every check as an object with ok as true
+# or false, the text of its line, and the fix of one that fails.
+t_doctor_json() {
+    command -v python3 >/dev/null 2>&1 || { echo "no python3 to decode JSON with"; return 77; }
+    json=$(lb doctor --json)
+    rc=$?
+    printf '%s\n' "$json" | cut -c1-300
+    # 0 or 1 as the overall verdict says, 3 when the document is not as it should be
+    printf '%s' "$json" | python3 -I -c '
+import json, sys
+def wrong(why):
+    print("not as it should be:", why)
+    sys.exit(3)
+try:
+    d = json.load(sys.stdin)
+except ValueError as e:
+    wrong(e)
+checks = {c["check"]: c for c in d["checks"]}
+for name in ("root", "kernel", "syscalls", "network", "cgroup2", "path.rootfs", "bin.ip", "bin.nsenter", "exec_sealing"):
+    if name not in checks:
+        wrong("no check " + name)
+for c in d["checks"]:
+    if not isinstance(c["ok"], bool):
+        wrong(c)
+    if (c["fix"] is None) != c["ok"]:
+        wrong(c)
+    if not (c["text"].startswith(("yes", "no", "ok", "missing", "unusable")) or c["check"] == "network"):
+        wrong(c)
+if d["overall"] != ("ok" if all(c["ok"] is True for c in d["checks"]) else "degraded"):
+    wrong("overall " + repr(d["overall"]))
+if d["settings"]["firewall"] is not True or d["settings"]["bridge_accept_fwmark"] is not None:
+    wrong("settings")
+sys.exit(0 if d["overall"] == "ok" else 1)
+'
+    verdict=$?
+    [ $verdict != 3 ] || return 1
+    [ $verdict = "$rc" ] || { echo "the exit status $rc is not that of the overall verdict, $verdict"; return 1; }
+    said=$(lb doctor --json --bogus 2>&1) && return 1
+    [ "$said" = 'Error: unknown option: --bogus' ]
+}
+
 # A start_timeout or stop_timeout that cannot be read is said so, and stops
 # no command.
 t_start_timeout_setting() {
@@ -1716,6 +1779,8 @@ check 'make install writes under DESTDIR only, and keeps a configuration' t_make
 check 'help goes to standard output with status 0, and --version names the release' t_help_exits_zero
 check 'rm takes several names, and names those it did not remove'      t_rm_handles_every_argument
 check 'a surplus argument is an error that names it'                    t_surplus_arguments_are_errors
+check 'doctor says how to fix each thing it finds missing'              t_doctor_says_how_to_fix
+check 'doctor --json: settings and checks, typed'                       t_doctor_json
 check 'start without root is a clean error'                   t_start_without_root_is_a_clean_error
 
 summary validation
