@@ -4,7 +4,7 @@ What changed for someone who uses lightbox, newest first. `ROADMAP.md` has the r
 
 ## 0.6.0
 
-Not tagged yet, and not complete: the part of Phase 6 that is written so far.
+Not tagged yet. Phase 6 of the roadmap: a command line that gives help when it is asked for and refuses what it will not use, the configuration in `/etc/lightbox`, a `doctor` that checks what `start` needs and says how to fix it, `inspect` and `doctor` in JSON, `restart`, `update` and `rm -f`, and a README whose command reference and quick start the suites check.
 
 ### Changes you may have to act on
 
@@ -13,6 +13,8 @@ Not tagged yet, and not complete: the part of Phase 6 that is written so far.
 - **`make install` puts the example configuration in `$(DESTDIR)/etc/lightbox/lightbox.conf`**, unless one is there, and writes nothing in the home of whoever runs it. It used to write `~/.config/lightbox/lightbox.conf` there, outside `DESTDIR`, which under `sudo` could be root's or the user's.
 - **A key in `lightbox.conf` that lightbox does not know, and a line that is no setting, are warned about** with the file and the line; a misspelt `defualt_mem` was ignored without a word. A `#` after a space begins a comment, and a carriage return at the end of a line is dropped: `bridge = br0 # main` used to be the bridge `br0 # main`.
 - **A word that a command will not use is an error that names it.** `inspect`, `doctor`, `ls`, `add-vol` and `rm-vol` ignored what came after the words they read: `inspect a b` showed `a`, and `rm a b` removed `a` and said nothing of `b`.
+- **`doctor` exits 1 when an ordinary user runs it**, as `start` needs root, and on every other check that fails: it now checks the kernel, cgroup v2, `nsenter`, the base root filesystem and more. A script that ran `doctor` as a user for its exit status has to run it as root, or read its checks, as `doctor --json` gives them.
+- **A container's `.conf` with `userns=1` is refused**, with its line, as user namespaces are not supported; `start` and `exec` refused such a container already. `userns=0` and `uid_start`, which earlier versions could write, are read and mean nothing. `inspect` no longer shows `userns` and `uid_start`, and `doctor` no longer looks for `chown`, which only the unsupported user namespaces used. About 190 lines of code that could not run are gone.
 
 ### Added
 
@@ -20,8 +22,6 @@ Not tagged yet, and not complete: the part of Phase 6 that is written so far.
 - **`lightbox --version`** prints the version of lightbox and of lightc.
 - **`lightbox --config <path> <command>`** reads that configuration, as `LIGHTBOX_CONFIG=<path>` does.
 - **`doctor` checks what `start` needs**: that it runs as root, Linux 5.10 or later and the system calls lightbox makes, cgroup v2 at `cgroup_root` with the `cpu`, `memory` and `pids` controllers, `nsenter`, which it did not look for, an `ip` that is iproute2's and not BusyBox's, a base root filesystem with something in it, and with nftables that forwarding is on. Each check that fails is followed by a `  to fix:` line, and `doctor` exits 1, as it did for what it checked before; run as an ordinary user it now always does, since `start` needs root. It also says whether the bridge, the firewall rules and forwarding are there, which `start` makes when they are not. **`doctor --json`** gives the settings and the checks as JSON.
-- **A container's `.conf` with `userns=1` is refused**, with its line, as user namespaces are not supported; `start` and `exec` refused such a container already. `userns=0` and `uid_start`, which earlier versions could write, are read and mean nothing. `inspect` no longer shows `userns` and `uid_start`, and `doctor` no longer looks for `chown`, which only the unsupported user namespaces used. About 190 lines of code that could not run are gone.
-- On a kernel before 5.8, which has no `faccessat2`, lightbox could not tell that any file was there; it asks with `faccessat` then. Such a kernel is below lightbox's floor, and `doctor` now says so.
 - **`lightbox update <name> --mem/--pids/--cpu`** changes a container's limits: in its `.conf`, so that every start has them, and at once in the cgroup of a container that runs. A limit that the running container does not take is said, and it has it from its next start. The values are held to what `create` holds them to.
 - **`lightbox restart <name>... [-t <seconds>]`** stops a container that runs, as `stop` does, and starts it, and starts one that is stopped.
 - **`lightbox rm -f <name>`** kills a container that runs first, as `docker rm -f` does, and removes it.
@@ -29,6 +29,7 @@ Not tagged yet, and not complete: the part of Phase 6 that is written so far.
 
 ### Fixed
 
+- On a kernel before 5.8, which has no `faccessat2`, lightbox could not tell that any file was there; it asks with `faccessat` then. Such a kernel is below lightbox's floor, and `doctor` now says so.
 - **The README says what the code does.** Its command reference is the usage `lightbox --help` prints, which the validation suite compares with it, and its quick start is run by the lifecycle suite as it is written. It gave the binary as about 33 KB, which is about 150; it said everything but a few tools was direct syscalls without naming `nft`, and that containers could have a user namespace. It now says what an image must contain, what the `/init.sh` hook gets and with which privileges, and what lightbox does and does not keep out, in a threat model.
 
 ## 0.5.1
