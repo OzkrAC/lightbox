@@ -15,7 +15,7 @@ Not tagged yet, and not complete: the part of Phase 7 that is written so far.
 
 ### Changed
 
-- **`start`, `stop`, `rm`, `setup` and `setup --teardown` make and take away the bridge, the veth pair and the bridge's port with rtnetlink requests of their own**, and the container's init gives `eth0` its address and its default route from inside the container: nothing enters the container's network namespace from the host.
+- **`start`, `stop`, `rm`, `setup` and `setup --teardown` make and take away the bridge, the veth pair and the bridge's port with rtnetlink requests of their own**, and the container's init gives `eth0` its address and its default route from inside the container: nothing enters the container's network namespace from the host. A start makes 4 processes instead of 12, and the only tool it runs on the host is the firewall's: one `iptables` or `nft` to look whether lightbox's rules are there, and with links the transaction that adds theirs. On GitHub's runners it takes a median of 9.0 ms on x86_64 and 11.5 ms on aarch64, where it took 22.7 and 28.5.
 
 ### Added
 

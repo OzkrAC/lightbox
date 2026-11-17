@@ -40,7 +40,8 @@ timed() { # label command...
     "$@" >/dev/null 2>"$BENCH_DIR/stderr" </dev/null
     rc=$?
     t1=${EPOCHREALTIME/[.,]/}
-    echo $((t1 - t0)) >> "$BENCH_DIR/$label"
+    echo $((t1 - t0)) >> "$BENCH_DIR/$label" ||
+        { echo "bench: the time of '$label' could not be recorded" >&2; return 1; }
     if [ $rc -ne 0 ]; then
         echo "bench: '$*' failed with status $rc:" >&2
         cat "$BENCH_DIR/stderr" >&2
@@ -81,17 +82,18 @@ bench_spawns() { # -> sets spawned
 # The first create from a base of 1 GB, which takes its snapshot, and
 # BENCH_RUNS after it, which overlay that: each one's time, and the most room
 # one of those took. The base is the suite's with a file of 1 GB of zeros,
-# written out and not sparse, so that a copy of it is a copy of 1 GB.
+# written out and not sparse, so that a copy of it is a copy of 1 GB. It is
+# not called by a label: timed appends a label's times to $BENCH_DIR/<label>.
 bench_big_base() { # -> sets big_kb
     local i ip kb
     big_kb=0
-    mkdir -p "$BENCH_DIR/big" && cp -a "$BASE/." "$BENCH_DIR/big/" &&
-        dd if=/dev/zero of="$BENCH_DIR/big/gigabyte" bs=1M count=1024 status=none || return 1
+    mkdir -p "$BENCH_DIR/base-1g" && cp -a "$BASE/." "$BENCH_DIR/base-1g/" &&
+        dd if=/dev/zero of="$BENCH_DIR/base-1g/gigabyte" bs=1M count=1024 status=none || return 1
     ip=$(next_ip) || return 1
-    timed snapshot "$LB" create bigfirst "$ip" --rootfs "$BENCH_DIR/big" || return 1
+    timed snapshot "$LB" create bigfirst "$ip" --rootfs "$BENCH_DIR/base-1g" || return 1
     for i in $(seq 1 "$BENCH_RUNS"); do
         ip=$(next_ip) || return 1
-        timed big "$LB" create "big$i" "$ip" --rootfs "$BENCH_DIR/big" || return 1
+        timed big "$LB" create "big$i" "$ip" --rootfs "$BENCH_DIR/base-1g" || return 1
         kb=$(du -sk "$C/big$i" | cut -f1)
         [ "$kb" -gt "$big_kb" ] && big_kb=$kb
     done
