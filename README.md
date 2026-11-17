@@ -1,15 +1,15 @@
 # lightbox
 
-A minimal, secure Linux container runtime. Single static binary, ~33KB, no libc — built on [lightc](https://github.com/OscarAC/lightc) using raw Linux syscalls.
+A minimal, secure Linux container runtime: one static binary of about 150 KB, with no libc, built on [lightc](https://github.com/OscarAC/lightc). It makes the Linux system calls it needs itself, and runs a few host tools for the rest: `ip` and `nsenter` for a container's network, `iptables` or `nft` for the firewall, and `cp` and `rm` for a container's files (see [How it works](#how-it-works)).
 
 ## Prerequisites
 
-- Linux with namespace and cgroup v2 support
-- GCC and ninja (build time)
-- `iproute2`, `util-linux` (`nsenter`) and `iptables` at runtime, or `nft` with `firewall_backend = nftables`
-- BusyBox `ip` is not sufficient; `lightbox start` requires the full `iproute2` `ip` binary for veth creation and bridge attachment
-- For containers created with `--link`, with iptables: the `br_netfilter` kernel module, with `net.bridge.bridge-nf-call-iptables=1`. With nftables: nf_tables with the bridge family (`CONFIG_NF_TABLES_BRIDGE`, `nft_meta_bridge`), NAT and masquerading, and no `br_netfilter`
-- Root privileges
+- **Kernel:** Linux 5.10 or later, the floor lightc sets, with namespaces and cgroup v2 offering the `cpu`, `memory` and `pids` controllers, and `io` for `--io-max`. For the network: bridge and veth; with iptables, `iptables` with the conntrack, physdev and MASQUERADE matches and targets, and `br_netfilter` with `net.bridge.bridge-nf-call-iptables=1` for containers created with `--link`; with nftables, nf_tables with NAT, masquerading, conntrack and the bridge family (`CONFIG_NF_TABLES_BRIDGE`, `nft_meta_bridge`), and no `br_netfilter`
+- **Building:** GCC 13 or later, which CI builds with, make and ninja, which builds lightc
+- **Host tools:** iproute2's `ip` (BusyBox's cannot make veth pairs or set bridge ports), util-linux's `nsenter`, `iptables` and `iptables-restore`, or with `firewall_backend = nftables` `nft`, and `cp` and `rm`
+- **Root:** `setup`, `start`, `stop`, `restart`, `update` and `exec` run as root. A container's root is the host's root, as lightbox has no user namespaces yet (see [Threat model](#threat-model))
+
+`lightbox doctor` checks all of this on the host it runs on: root, the kernel and the system calls lightbox makes, cgroup v2 and its controllers, the tools, the base root filesystem, and with nftables that forwarding is on. Each check that fails is followed by what fixes it, and `doctor` then exits 1; `doctor --json` gives the same to scripts.
 
 ## Building
 
@@ -69,9 +69,11 @@ sudo drops the environment, so options go on make's command line: `sudo make tes
 
 ## Quick start
 
+The commands below run as root, from the directory `make` built `./lightbox` in. The lifecycle suite runs every one of them as it is written here, in a mount namespace of its own with `/opt` and `/srv` on a tmpfs; the download is the one thing it does otherwise, as its network namespace reaches no internet, and it unpacks a root filesystem of its own under that name.
+
 ### 1. Get a rootfs
 
-lightbox needs a Linux root filesystem to use as a base image. Any distro works — Alpine minirootfs is a good starting point (~3MB). The image needs no tools of its own: lightbox mounts and configures everything itself, so a single static binary is an image too.
+lightbox needs a Linux root filesystem to use as a base image. Any distro works — Alpine's minirootfs is a good starting point (about 3 MB); on aarch64 take its `aarch64` tarball.
 
 ```sh
 mkdir -p /opt/rootfs/alpine
@@ -85,9 +87,18 @@ Tell lightbox where to find it — either export the environment variable or pas
 export LIGHTBOX_ROOTFS=/opt/rootfs/alpine
 ```
 
+What an image has to contain:
+
+- Nothing, for a container to run: lightbox makes `/dev`, `/proc`, `/sys`, `/tmp` and `/run` and the container's network itself, and `create` writes `/etc/resolv.conf`, `/etc/hostname` and a line of `/etc/hosts`, making `/etc` where there is none. A single static binary is an image too.
+- `/bin/sh`, for an `/init.sh` hook and for `exec` without a command.
+- The programs that `exec` runs, found on `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, with their libraries where they are linked dynamically: nothing of the host is in a container.
+- `/etc/passwd` and `/etc/group`, for `exec --user <name>` and for the groups of the user a command runs as.
+
+`create` copies the whole image; an empty one is refused.
+
 ### 2. Set up host networking
 
-Run once to create the bridge, enable NAT, and mount cgroups. Safe to re-run (idempotent).
+Run once to create the bridge and the firewall rules and to turn on forwarding. Safe to re-run (idempotent).
 
 ```sh
 ./lightbox setup
@@ -97,7 +108,7 @@ This creates:
 - A `br0` bridge with the address `gw` and the prefix of `subnet`, `10.0.0.1/24` unless `lightbox.conf` sets them
 - lightbox's firewall chains, reached from the top of `FORWARD` and `POSTROUTING` (see [Firewall](#firewall))
 - IPv4 forwarding, if it was off, with the `FORWARD` policy set to DROP as Docker does
-- cgroup v2 mount at `/sys/fs/cgroup`
+- cgroup v2 mounted at `cgroup_root`, if it is an empty directory
 
 The bridge, the firewall rules and forwarding live in the kernel only, and a reboot takes them. `start` looks for them, with one process, and makes them again as `setup` does when they are not all there, saying so: after a reboot, or after a firewall service loaded its own rules over lightbox's.
 
@@ -116,7 +127,7 @@ It refuses while a container runs, and names it. Otherwise it removes lightbox's
 ./lightbox create mybox
 # or give it one: ./lightbox create mybox 10.0.0.20
 
-# Start it
+# Start it; after the teardown above this makes the host network again
 ./lightbox start mybox
 
 # Get a shell inside
@@ -128,8 +139,9 @@ It refuses while a container runs, and names it. Otherwise it removes lightbox's
 # See what the container's services have printed; -f keeps following
 ./lightbox logs mybox
 
-# List all containers
+# List all containers, and look at one
 ./lightbox ls
+./lightbox inspect mybox
 
 # Stop and remove
 ./lightbox stop mybox
@@ -145,17 +157,16 @@ It refuses while a container runs, and names it. Otherwise it removes lightbox's
 # Half a CPU, and no limit on memory, at an address of your choosing
 ./lightbox create small 10.0.0.8 --cpu 0.5 --mem max
 
-# User namespaces are planned but not supported yet
-# ./lightbox create sandbox --userns
-
 # Read-only rootfs with a data volume
-./lightbox create web --read-only --vol /data/www:/var/www:ro
+mkdir -p /srv/www
+./lightbox create web --read-only --vol /srv/www:/var/www:ro
 
 # Mount a host file into the container
+mkdir -p /srv/config && echo 'debug = 1' > /srv/config/app.conf
 ./lightbox create conf --vol /srv/config/app.conf:/etc/app.conf:ro
 
-# Use a different rootfs image
-./lightbox create deb --rootfs /opt/rootfs/debian
+# Copy another image than LIGHTBOX_ROOTFS for this container
+./lightbox create other --rootfs /opt/rootfs/alpine
 
 # Choose the name servers the container asks
 ./lightbox create resolver --dns 9.9.9.9 --dns 149.112.112.112
@@ -168,36 +179,49 @@ It refuses while a container runs, and names it. Otherwise it removes lightbox's
 ./lightbox create api --link db
 
 # Run a command as one of the container's users, with a variable set, in a directory
-./lightbox exec app --user www-data --env MODE=debug --workdir /var/www -- ls -la
+./lightbox start web
+./lightbox exec web --user nobody --env MODE=debug --workdir /var/www -- ls -la
 
-# Add a volume to an existing container configuration
+# Change the limits of a container, at once if it runs
+./lightbox update web --mem 128M --cpu 0.5
+
+# Add a volume to an existing container configuration, and take it out again;
+# a container that runs has the change from its next start
 ./lightbox add-vol app /srv/config/app.conf:/etc/app.conf:ro
-# Take the volume at a destination out again
 ./lightbox rm-vol app /etc/app.conf
-# Restart if the container is already running
+
+# Stop and start, and remove a container that runs
+./lightbox restart web
+./lightbox rm -f web
 ```
 
 ### 5. Start services with an init hook
 
-If the image has an `/init.sh`, the container's init runs it with `/bin/sh` once the container is built, and `start` returns when the script has ended:
+If the image has an `/init.sh`, the container's init runs it once the container is built, and `start` returns when the script has ended:
 
 ```sh
 # /init.sh in the image: start the service in the background and return
 /usr/sbin/nginx &
 ```
 
+What the hook gets:
+
+- It runs as `/bin/sh /init.sh`, as root, in `/`, with `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, `HOME=/root` and `TERM=xterm` and nothing else of the environment `start` was given. The container is complete by then: its mounts, its `/dev`, its address and default route, its cgroup and limits, and the container is on record, so `stop` and `ls` find it.
+- It has the container's sandbox: 12 capabilities, the seccomp filter and no_new_privs, the masked and read-only parts of `/proc`. A hook that mounts filesystems or configures the network needs `--privileged`. Its root is the host's root (see [Threat model](#threat-model)).
 - The hook and everything it starts read from `/dev/null` and write to the container's log, not to the terminal `start` was typed on. `lightbox logs <name>` shows the log, and `logs -f` follows it until the container stops.
 - A hook that exits with a status other than 0 fails the start: `start` says which status it was, and the container is stopped and cleaned up. A hook that fails after `start` has returned stops the container as well.
 - `start` waits 30 seconds for the hook. If the hook is still running then, for instance because it runs its service in the foreground, `start` says so and returns; the container stays up. `start <name> -t <seconds>` or `start_timeout` in `lightbox.conf` sets the wait, and 0 does not wait at all.
-- `lightbox stop` sends SIGTERM to every process in the container and waits until they have ended, for 10 seconds; what is left then is killed. A service that should shut down cleanly has to handle SIGTERM. `stop <name> -t <seconds>` or `stop_timeout` in `lightbox.conf` sets the time, and `-t 0` kills at once.
+- What the hook starts stays when the hook ends, as children of init, which reaps them. `lightbox stop` sends SIGTERM to every process in the container and waits until they have ended, for 10 seconds; what is left then is killed. A service that should shut down cleanly has to handle SIGTERM. `stop <name> -t <seconds>` or `stop_timeout` in `lightbox.conf` sets the time, and `-t 0` kills at once.
 - Ctrl-C, or a `kill`, while `start` is working undoes the start: nothing of the container is left running, and the exit status is 128 plus the signal's number.
 
 ## Configuration
 
-lightbox reads `~/.config/lightbox/lightbox.conf` at startup. All values have built-in defaults — the config file is optional.
+lightbox reads `/etc/lightbox/lightbox.conf` at startup, or the file that `--config <path>` or the variable `LIGHTBOX_CONFIG` names, in that order; `make install` puts the example there. All values have built-in defaults — the config file is optional. A file that `--config` or `LIGHTBOX_CONFIG` names has to be there. Without any of the three, lightbox 0.6 still reads `~/.config/lightbox/lightbox.conf`, where earlier versions looked, and warns that 0.7 will not; with `/etc/lightbox/lightbox.conf` there as well, it says that the file in `~` is not read.
+
+A line is `<key> = <value>`, blank, or a comment that begins with `#`. A `#` after a space or a tab begins a comment too, and a carriage return at the end of a line is no part of it, as files written on Windows have one. A key lightbox does not know and a line that is no setting are reported as warnings, with the file and the line, and change nothing.
 
 ```ini
-# ~/.config/lightbox/lightbox.conf
+# /etc/lightbox/lightbox.conf
 
 # Base directory for lightbox data (base rootfs and container directories)
 lightbox_dir = /var/lib/lightbox
@@ -314,20 +338,59 @@ What changes with the backend, as it does for Docker:
 
 ## Command reference
 
-```
-lightbox <command> [args]
+`lightbox --help` prints this; the validation suite checks that it is what this README says.
 
-  setup                         Initialize host networking
-  create <name> [<ip>] [options]  Create a new container; without <ip>, the lowest free address
-  start  <name> [-t <seconds>]  Start a stopped container
-  stop   <name> [-t <seconds>]  Stop a running container
-  add-vol <name> <src>:<dst>[:ro]  Add a volume to an existing container
-  rm-vol <name> <dst>           Remove the volume at a destination
-  rm     <name>                 Remove a container
-  exec   <name> [options] [--] [cmd [args...]]   Run a command in a container
-  logs   <name> [-f]            Show what a container has printed; -f follows it
-  ls                            List all containers
 ```
+Usage: lightbox [--config <path>] <command> [args]
+
+Commands:
+  create <name> [<ip>] [options]
+                                Create a new container; without <ip>, the lowest free address
+         --mem  <limit>         Memory limit: <number>[K|M|G|T] or max (default: 256M)
+         --swap <limit>         Swap it may use: 0, <number>[K|M|G|T] or max (default: 0)
+         --pids <limit>         Max processes, or max (default: 128)
+         --cpu  <num>           CPUs, such as 2 or 0.5 (default: 1)
+         --io-max <limit>       I/O limit for one disk: "8:0 wbps=10485760", with rbps, wbps,
+                                riops or wiops (default: none)
+         --vol  <src:dst[:ro]>  Bind mount (repeatable)
+         --rootfs <path>         Base rootfs to copy (default: $LIGHTBOX_ROOTFS or lightbox.conf)
+         --userns               Future improvement; not supported yet
+         --uid-start <n>        Future improvement; not supported yet
+         --read-only            Read-only root filesystem
+         --privileged           Disable security sandbox
+         --oom-score <n>        OOM score adjustment (default: 500)
+         --link <name>          Allow network to another container
+         --dns <address>        A name server for the container (up to 3; default: the host's)
+  start  <name>... [-t <seconds>]  Start stopped containers, one after the other
+         -t <seconds>            How long to wait for /init.sh (default: 30, 0: do not wait)
+  stop   <name>... [-t <seconds>]  Stop running containers, one after the other
+         -t <seconds>            How long their processes get to end (default: 10)
+  add-vol <name> <src:dst[:ro]> Add a volume to an existing container
+  rm-vol <name> <dst>           Remove the volume at a destination
+  restart <name>... [-t <seconds>]  Stop containers that run, as stop does, and start them
+  update <name> [--mem <limit>] [--pids <limit>] [--cpu <num>]
+                                Change a container's limits, live if it runs and from its next
+                                start in any case
+  rm     [-f] <name>...         Remove containers; -f kills one that runs first
+  exec   <name> [options] [--] [cmd [args...]]  Run a command in a running container
+         --user <name|uid[:gid]> Who to run it as (default: root)
+         --env <KEY=VALUE>       Set a variable in its environment (repeatable)
+         --workdir <dir>         The directory to run it in (default: /)
+  logs   <name> [-f]            Show what the container has printed; -f follows it
+  inspect <name> [--json]       Show a container's configuration and state; --json as JSON
+  doctor [--json]               Check what lightbox needs of this host, and say how to fix what
+                                is missing; --json as JSON
+  ls [--json]                   List all containers
+  setup                         Setup host networking
+  setup --teardown              Take lightbox's host network away, when no container runs
+
+  --config <path>                              The lightbox.conf to read (default:
+                                               $LIGHTBOX_CONFIG, else /etc/lightbox/lightbox.conf)
+  --help, help [<command>], <command> --help   This text, or a command's part of it
+  --version                                    The version of lightbox, and of lightc
+```
+
+Help that is asked for goes to standard output, and the command exits 0. A word that a command will not use is an error that names it, and the command does nothing. `start`, `stop`, `restart` and `rm` take several names, as Docker's do, and do one container after the other: one that cannot be done ends nothing for the others, the command names those it did not do at the end, and its exit status is the first that was not 0.
 
 ### Create options
 
@@ -393,12 +456,29 @@ The sandbox covers everything in a container: init, the `/init.sh` hook and all 
 | Container isolation | A container without `--link` has an isolated port on the bridge: it reaches the host and the outside, and no other container. IPv6 is off inside containers. A container with `--link` shares the bridge, and is kept to its links by firewall rules that name the two ports of each link: with iptables it does not start unless `br_netfilter` lets iptables see bridged traffic, and with nftables a table of the bridge family sees it without. A link holds whichever of the two starts first, and a container's link rules go with it when it stops, is removed or is found dead |
 | The terminal of whoever runs `exec` | A command never holds it. Typed at a terminal, `exec` gives the command a pseudo-terminal of the container and carries the bytes; where only one of its streams is a terminal, a pipe stands in for it |
 | The binary `exec` enters with | `exec` executes itself again from a sealed copy in memory before it enters a container, so the processes it puts there are never the installed binary. Where the kernel refuses executable memfds (`vm.memfd_noexec=2`) it takes the binary through a read-only mount of its own instead. Its worker is not dumpable. `lightbox doctor` says which of the two is in use |
-| User namespaces | Planned future improvement |
+| User namespaces | Not yet: a container's root is the host's root |
 | OOM priority | Containers scored higher for OOM killer |
+
+### Threat model
+
+lightbox keeps what runs in a container away from the host and from the other containers, as far as the kernel's namespaces, the sandbox and the firewall can:
+
+- **The host from a container's processes:** their own PID, mount, UTS, IPC and network namespaces; 12 capabilities and a seccomp filter of Docker's kind, with no_new_privs; the paths of `/proc` and `/sys` that Docker masks, masked, and the rest of `/proc`'s system trees read-only; a root filesystem that is `nodev` and `nosuid`; and limits on memory, swap, processes, CPU and, with `--io-max`, I/O.
+- **Containers from each other:** each on an isolated port of the bridge, and with `--link` kept to its links by firewall rules that lightbox owns and takes away with the container.
+- **The host's terminal and the installed binary from a container:** `exec` gives a command a terminal of the container's, not yours, and enters from a sealed copy of itself.
+
+What it does not keep out, and what to do about it:
+
+- **A container's root is the host's root.** There are no user namespaces yet. What keeps a container's root in is the namespaces and the sandbox; a flaw in the kernel past them would be a flaw on the host. Run as root in a container only what you would run as root on the host, and run the rest with `exec --user`.
+- **`--privileged` turns the sandbox off.** Such a container has all capabilities and no seccomp filter; give it only to what needs that, such as a hook that mounts filesystems.
+- **The host itself is in reach.** The firewall rules decide what the bridge forwards, not what a container sends to the host: services of the host that listen on the bridge's address, or on all addresses, answer containers. Keep them to the addresses they are for, or filter `INPUT` on the bridge in the host's firewall.
+- **Disk is not limited.** A container's copy of its image and its `console.log`, which is not rotated, take what the disk has.
+- **Whoever runs lightbox is root.** lightbox does not decide who may use it: giving someone `sudo lightbox` is giving them root.
+- **Images are trusted as files.** `create` copies an image as it is; what it contains runs in the sandbox, with the container's root.
 
 ## How it works
 
-- **Namespaces**: `clone()` with PID, mount, UTS, IPC, net (and optionally user) namespace flags
+- **Namespaces**: `clone()` with PID, mount, UTS, IPC and network namespace flags
 - **Filesystem**: each container lives under `<container_dir>/<name>/` with `rootfs/` for the filesystem, `.conf` and `.ip` for what it is configured with and `console.log` for its output. `pivot_root` into the rootfs copy
 - **Runtime records**: what is known about a container while it runs is in `<run_dir>/<name>/`: `pid` and `pid_start` for its init, `state`, and `exit`, where init writes its exit status as the last thing it does. These are written without waiting for a disk, and a reboot takes them away with everything else in `/run`; a container without them is stopped. `start` makes the directory again when it is missing, for root alone
 - **States**: `ls` and `inspect` show `stopped`, `running`, `starting` and `stopping` while a command is at work, `exited` for a container that ended by itself, `failed` for one that was killed or whose start or hook failed, and `creating` for one that `create` did not finish. A half-made container is not started: remove it and create it again
@@ -411,9 +491,9 @@ The sandbox covers everything in a container: init, the `/init.sh` hook and all 
 - **Stopping**: `stop` sends init a SIGTERM that carries the number of seconds the container may take. Init passes SIGTERM on to every process in the container, the ones `exec` put there included, reaps them, and exits when none is left or the time is over; the kernel kills whatever remains with it. `stop` waits for init through a pidfd, so it returns as soon as the container has ended. It then kills anything still in the cgroup, waits until the kernel reports the cgroup empty, and removes it. A SIGTERM sent to init by other means has the same effect, with the `stop_timeout` that was set when the container started
 - **Output**: init leads a session of its own and keeps nothing that was open in the command that started it. Its standard output and error, and those of the hook and every service, are appended to `<container_dir>/<name>/console.log`, which only root can read. The log is kept from one start to the next and is not rotated or limited yet, so a container that prints without end fills the disk it is on
 - **Starting**: `start` and init talk over two pipes. Init builds the container when `start` has set up its cgroup and network, and reports back when it is built and again when the hook has ended. If either side goes away the other notices: an init whose `start` was killed exits before it runs anything
-- **External tools**: on the host, `ip` and `nsenter` set up a container's network, `iptables` and `iptables-restore` the firewall (a start with links runs `iptables-restore` once), and `cp` and `rm` create and remove a container. Everything else is direct syscalls, and nothing from the image is run before `/init.sh`
-- **One command at a time**: `start`, `stop`, `rm`, `add-vol` and `rm-vol` take a lock on the container they change, and `create` and `setup` one on the whole store, so two commands on one container do their work one after the other. A command that has to wait says so. `ls` and `inspect` never wait. `setup`, `start`, `stop` and `exec` need root and say so before they touch anything
-- **Configuration**: optional `~/.config/lightbox/lightbox.conf` for all paths and defaults
+- **External tools**: on the host, `ip` and `nsenter` set up a container's network, `iptables` and `iptables-restore`, or `nft`, the firewall (a start with links runs one of them once, and every start looks at the firewall with one), and `cp` and `rm` create and remove a container. Everything else lightbox does with system calls of its own, and nothing from the image is run before `/init.sh`
+- **One command at a time**: `start`, `stop`, `restart`, `update`, `rm`, `add-vol` and `rm-vol` take a lock on the container they change, and `create` and `setup` one on the whole store, so two commands on one container do their work one after the other. A command that has to wait says so. `ls` and `inspect` never wait. `setup`, `start`, `stop`, `restart`, `update` and `exec` need root and say so before they touch anything
+- **Configuration**: optional `/etc/lightbox/lightbox.conf`, or the file `--config` or `LIGHTBOX_CONFIG` names, for all paths and defaults
 
 ## Volume Notes
 

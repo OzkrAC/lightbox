@@ -50,7 +50,9 @@ annotate() { # title: the case's output as a GitHub Actions error annotation
     local title text
     # a workflow command is one line: %, newlines, and in a property : and , are escaped
     title=$(printf '%s' "$1" | sed -e 's/%/%25/g' -e 's/:/%3A/g' -e 's/,/%2C/g')
-    text=$(printf '%s\n' "$out" | sed -e "${SHOW_FILTER:-s/^//}" | head -n 20 |
+    # a long output's first lines and its last, where what went wrong usually is
+    text=$(printf '%s\n' "$out" | sed -e "${SHOW_FILTER:-s/^//}" |
+           awk '{ line[NR] = $0 } END { for (i = 1; i <= NR; i++) if (NR <= 20 || i <= 6 || i > NR - 14) print line[i]; else if (i == 7) print "..." }' |
            sed -e 's/%/%25/g' | awk '{ printf "%s%%0A", $0 }')
     printf '::error title=%s::%s\n' "$title" "${text:-no output}"
 }

@@ -1311,6 +1311,20 @@ static bool host_network_ready(void) {
     return bridge_present() && (!cfg_global.ip_forward || forwarding_on()) && firewall_present();
 }
 
+const char *host_network_missing(void) {
+    static char missing[96];
+    size_t pos = 0;
+    bool cut = false;
+    missing[0] = '\0';
+    if (!bridge_present())
+        pos = str_append(missing, pos, "the bridge", sizeof(missing), &cut);
+    if (lb_sys_geteuid() == 0 && !firewall_present())
+        pos = str_append(missing, pos, pos ? ", the firewall rules" : "the firewall rules", sizeof(missing), &cut);
+    if (cfg_global.ip_forward && !forwarding_on())
+        str_append(missing, pos, pos ? ", forwarding" : "forwarding", sizeof(missing), &cut);
+    return missing[0] ? missing : NULL;
+}
+
 void ensure_host_network(void) {
     if (host_network_ready())
         return;

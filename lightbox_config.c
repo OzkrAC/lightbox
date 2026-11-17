@@ -125,7 +125,7 @@ static void cfg_set_default(const char *key, const char *val, char *setting, siz
     print_str(STDERR, "; a container that needs it will be refused\n");
 }
 
-static void cfg_set(const char *key, const char *val, bool derived[3]) {
+static bool cfg_set(const char *key, const char *val, bool derived[3]) {
     int number;
     if (streq(key, "lightbox_dir")) {
         cfg_set_text(key, val, cfg_global.lightbox_dir, MAX_PATH);
@@ -209,7 +209,10 @@ static void cfg_set(const char *key, const char *val, bool derived[3]) {
     } else if (streq(key, "dns")) {
         /* create reads it, and says so if it is not a list of addresses */
         cfg_set_text(key, val, cfg_global.dns, sizeof(cfg_global.dns));
+    } else {
+        return false;
     }
+    return true;
 }
 
 /* Every directory short enough that the paths built below it fit. */
@@ -232,33 +235,60 @@ static void require_short_directories(void) {
     }
 }
 
-/* The settings of lightbox.conf, if there is one. */
-static void cfg_read_file(const char *home, bool derived[3]) {
-    /* a home so long that the file's path does not fit has no such file */
-    char conf_path[MAX_PATH];
-    if (!path_join(conf_path, MAX_PATH, home, ".config/lightbox/lightbox.conf"))
-        return;
+static void cfg_warn_line(const char *path, int line, const char *what, const char *text) {
+    char number[16];
+    fmt_int(number, line);
+    print_str(STDERR, "Warning: ");
+    print_str(STDERR, path);
+    print_str(STDERR, ": line ");
+    print_str(STDERR, number);
+    print_str(STDERR, ": ");
+    print_str(STDERR, what);
+    print_str(STDERR, text);
+    lc_print_char(STDERR, '\n');
+}
 
+/*
+ * The settings of a lightbox.conf, line by line: "<key> = <value>", blank
+ * lines and lines that begin with #. A carriage return at the end of a line
+ * is no part of it, and a # after a space or a tab begins a comment. A line
+ * that is not a setting, and a key lightbox does not know, are said with
+ * the line they are on, and change nothing. A file that is not there is no
+ * error unless it was named.
+ */
+static void cfg_read_file(const char *conf_path, bool named, bool derived[3]) {
     static char buf[CONF_BUF_SIZE];
     int n = read_file(conf_path, buf, sizeof(buf));
-    if (n <= 0) return;
+    if (n < 0) {
+        if (named)
+            die2("Error: cannot read the configuration: ", conf_path);
+        print_str(STDERR, "Warning: cannot read ");
+        print_str(STDERR, conf_path);
+        print_str(STDERR, "; the built-in settings are used\n");
+        return;
+    }
     if (n >= CONF_BUF_SIZE - 1)
         die2("Error: the configuration is larger than lightbox reads: ", conf_path);
 
-    char *p = buf;
-    while (*p) {
+    int line = 0;
+    for (char *p = buf; *p; ) {
+        line++;
+        char *end = p;
+        while (*end && *end != '\n') end++;
+        char *next = *end ? end + 1 : end;
+        while (end > p && (end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t')) end--;
+        *end = '\0';
         while (*p == ' ' || *p == '\t') p++;
-        if (*p == '#' || *p == '\n') {
-            while (*p && *p != '\n') p++;
-            if (*p == '\n') p++;
+        if (!*p || *p == '#') {
+            p = next;
             continue;
         }
 
         char *eq = p;
-        while (*eq && *eq != '=' && *eq != '\n') eq++;
-        if (*eq != '=') {
-            while (*p && *p != '\n') p++;
-            if (*p == '\n') p++;
+        while (*eq && *eq != '=') eq++;
+        if (!*eq) {
+            cfg_warn_line(conf_path, line, "not a setting, which is <key> = <value>: ", p);
+            p = next;
             continue;
         }
 
@@ -266,30 +296,44 @@ static void cfg_read_file(const char *home, bool derived[3]) {
         char key[64];
         size_t klen = (size_t)(eq - p);
         while (klen > 0 && (p[klen - 1] == ' ' || p[klen - 1] == '\t')) klen--;
-        if (klen >= sizeof(key)) klen = 0;
+        bool long_key = klen >= sizeof(key);
+        if (long_key)
+            klen = sizeof(key) - 4;
         lc_bytes_copy(key, p, klen);
+        if (long_key) {
+            lc_bytes_copy(key + klen, "...", 3);
+            klen += 3;
+        }
         key[klen] = '\0';
 
         char *vs = eq + 1;
         while (*vs == ' ' || *vs == '\t') vs++;
         char *ve = vs;
-        while (*ve && *ve != '\n') ve++;
-        char *vt = ve;
-        while (vt > vs && (vt[-1] == ' ' || vt[-1] == '\t')) vt--;
+        while (*ve && !(*ve == '#' && (ve == eq + 1 || ve[-1] == ' ' || ve[-1] == '\t'))) ve++;
+        while (ve > vs && (ve[-1] == ' ' || ve[-1] == '\t')) ve--;
 
         /* no setting takes a value this long, and none is cut to fit */
         char val[MAX_PATH];
-        size_t vlen = (size_t)(vt - vs);
+        size_t vlen = (size_t)(ve - vs);
         if (vlen >= sizeof(val))
             die2("Error: lightbox.conf has a value that is too long, for ", key);
         lc_bytes_copy(val, vs, vlen);
         val[vlen] = '\0';
 
-        cfg_set(key, val, derived);
-
-        p = ve;
-        if (*p == '\n') p++;
+        if (long_key || !cfg_set(key, val, derived))
+            cfg_warn_line(conf_path, line, "a key lightbox does not know: ", key);
+        p = next;
     }
+}
+
+config_source config_source_of(const char *given, const char *from_env, bool etc_there, bool home_there) {
+    if (given)
+        return CONFIG_GIVEN;
+    if (from_env && from_env[0])
+        return CONFIG_ENV;
+    if (etc_there)
+        return CONFIG_ETC;
+    return home_there ? CONFIG_HOME : CONFIG_NONE;
 }
 
 /*
@@ -297,12 +341,33 @@ static void cfg_read_file(const char *home, bool derived[3]) {
  * the environment says. The last two steps do not depend on each other:
  * LIGHTBOX_ROOTFS counts whether there is a lightbox.conf or not.
  */
-void cfg_global_load(char **envp) {
+void cfg_global_load(char **envp, const char *given) {
     const char *home = env_get(envp, "HOME");
     if (!home) home = "/root";
 
+    /* --config, then $LIGHTBOX_CONFIG, then /etc, then where lightbox looked
+     * before 0.6, which it says; a home so long that the path does not fit
+     * has no file there */
+    char home_conf[MAX_PATH];
+    bool home_there = path_join(home_conf, MAX_PATH, home, CONFIG_HOME_FILE) && path_exists(home_conf);
+    const char *from_env = env_get(envp, "LIGHTBOX_CONFIG");
+    config_source source = config_source_of(given, from_env, path_exists(CONFIG_ETC_FILE), home_there);
+    const char *path = source == CONFIG_GIVEN ? given : source == CONFIG_ENV ? from_env
+                     : source == CONFIG_ETC ? CONFIG_ETC_FILE : source == CONFIG_HOME ? home_conf : NULL;
+    if (source == CONFIG_HOME) {
+        print_str(STDERR, "Warning: the configuration is read from ");
+        print_str(STDERR, home_conf);
+        print_str(STDERR, ", where lightbox 0.7 will\nnot look. Move it to " CONFIG_ETC_FILE
+                          ", or name it with --config or LIGHTBOX_CONFIG\n");
+    } else if (source == CONFIG_ETC && home_there) {
+        print_str(STDERR, "Note: ");
+        print_str(STDERR, home_conf);
+        print_str(STDERR, " is not read; " CONFIG_ETC_FILE " is\n");
+    }
+
     bool derived[3] = { false, false, false };
-    cfg_read_file(home, derived);
+    if (path)
+        cfg_read_file(path, source == CONFIG_GIVEN || source == CONFIG_ENV, derived);
 
     if (!derived[2])
         path_join_or_die(cfg_global.cgroup_base, MAX_PATH, cfg_global.cgroup_root, "lightbox");

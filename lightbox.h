@@ -16,6 +16,10 @@
 #error "lightbox needs lightc 0.1.1 or later"
 #endif
 
+/* What --version says: the release, set when it is tagged, and "-dev" after
+ * it on the way to the next one. */
+#define LIGHTBOX_VERSION "0.6.0"
+
 #define MAX_PATH         512
 #define NAME_MAX_LEN     30
 #define MAX_VOLS         16
@@ -80,6 +84,14 @@ typedef struct {
 
 extern global_config cfg_global;
 
+/* Where the settings come from: --config, then $LIGHTBOX_CONFIG, then
+ * /etc/lightbox/lightbox.conf, then, for one release more and with a
+ * warning, $HOME/.config/lightbox/lightbox.conf; or the built-in values. */
+#define CONFIG_ETC_FILE  "/etc/lightbox/lightbox.conf"
+#define CONFIG_HOME_FILE ".config/lightbox/lightbox.conf"
+typedef enum { CONFIG_GIVEN, CONFIG_ENV, CONFIG_ETC, CONFIG_HOME, CONFIG_NONE } config_source;
+config_source config_source_of(const char *given, const char *from_env, bool etc_there, bool home_there);
+
 /*
  * What a container is configured with: the content of its .conf.
  *
@@ -104,8 +116,6 @@ typedef struct {
     int  oom_score;
     bool privileged;
     bool read_only;
-    bool userns;
-    int  uid_start;
     int  nvols;
     volume_spec vols[MAX_VOLS];
     int  nlinks;
@@ -244,11 +254,19 @@ void require_write_file(const char *path, const char *data);
 void cfg_global_init(void);
 /* the value of a variable in an environment, or NULL */
 const char *env_get(char **envp, const char *name);
-void cfg_global_load(char **envp);
+/* given: the path --config names, or NULL */
+void cfg_global_load(char **envp, const char *given);
 
 int read_file(const char *path, char *buf, size_t bufsz);
 bool path_exists(const char *path);
 bool path_is_directory(const char *path);
+bool path_executable(const char *path);
+/* A release as uname gives it, "6.12.117-x": at least want_major.want_minor?
+ * What it reads goes in major and minor, -1 each when it reads nothing. */
+bool kernel_release_at_least(const char *release, int want_major, int want_minor, int *major, int *minor);
+/* The kernel lightc and lightbox need. */
+#define KERNEL_FLOOR_MAJOR 5
+#define KERNEL_FLOOR_MINOR 10
 /* mkdir -p, in this process: 0, or -1 with the failure reported */
 [[nodiscard]] int make_dirs(const char *path);
 /* ip link set lo up, in this process: 0, or -1 with the failure reported */
@@ -294,7 +312,6 @@ const char *tool_path_iptables(void);
 const char *tool_path_iptables_restore(void);
 const char *tool_path_nft(void);
 const char *tool_path_cp(void);
-const char *tool_path_chown(void);
 const char *tool_path_rm(void);
 const char *tool_path_nsenter(void);
 bool tool_available(const char *path);
@@ -487,6 +504,9 @@ bool bridge_traffic_is_filtered(void);
  * start makes it again when it is not all there, as setup makes it.
  */
 void ensure_host_network(void);
+/* What of it is not there, as "the bridge, the firewall rules", or NULL
+ * when all of it is. The firewall is looked at only by root. */
+const char *host_network_missing(void);
 /* setup --teardown, once no container runs: lightbox's firewall rules, in
  * either backend, the bridge, cgroup_base and the record of forwarding. */
 void teardown_host(void);
@@ -537,7 +557,7 @@ typedef enum {
 seal_method exec_seal_method(void);
 
 void cmd_setup(void);
-void cmd_doctor(void);
+void cmd_doctor(int argc, char **argv);
 void cmd_ls(int argc, char **argv);
 void cmd_inspect(int argc, char **argv);
 void cmd_logs(int argc, char **argv);

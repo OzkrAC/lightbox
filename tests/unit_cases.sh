@@ -1455,16 +1455,16 @@ t_standard_streams_are_reserved() {
     return $rc
 }
 
-# From its first change to the host on, cmd_start has one way out, which undoes
+# From its first change to the host on, a start has one way out, which undoes
 # what was done. A call that ends the process where it stands would leave an
 # interface, a cgroup or an init behind.
 t_start_has_one_way_out() {
     src=$HERE/../lightbox.c
-    region=$(awk '/^static void cmd_start\(/ { inside = 1 }
+    region=$(awk '/^static void start_one\(/ { inside = 1 }
                   inside && /const char \*start_err = NULL;/ { on = 1 }
                   on { print }
                   inside && /^}/ { exit }' "$src")
-    [ -n "$region" ] || { echo "cmd_start, or the start of its guarded part, was not found in $src"; return 1; }
+    [ -n "$region" ] || { echo "start_one, or the start of its guarded part, was not found in $src"; return 1; }
     echo "lines looked at: $(printf '%s\n' "$region" | wc -l)"
     bad=0
     if printf '%s\n' "$region" | grep -nE '\b(die|die2|[a-z_]+_or_die|require_[a-z_]+|set_container_state|usage)\(' ; then
@@ -1898,6 +1898,52 @@ ip filter FORWARD, inet firewall fwd, bridge other forward' ] || { printf '%s\n'
     [ "$got" = 'chains 0' ] || { printf '%s\n' "$got"; return 1; }
 }
 
+# Where lightbox's settings come from: --config, then LIGHTBOX_CONFIG unless
+# it is empty, then /etc/lightbox/lightbox.conf, then $HOME's, then none.
+t_config_sources() {
+    bad=0
+    expect() { # given env etc home -> source
+        got=$("$UNIT" config-source "$1" "$2" "$3" "$4")
+        [ "$got" = "$5" ] || { echo "config-source $1 '$2' $3 $4: $got, expected $5"; bad=1; }
+    }
+    for etc in 0 1; do for home in 0 1; do
+        expect /x.conf /y.conf "$etc" "$home" given
+        expect /x.conf -       "$etc" "$home" given
+        expect -       /y.conf "$etc" "$home" env
+    done; done
+    expect - '' 1 1 etc
+    expect - -  1 0 etc
+    expect - '' 0 1 home
+    expect - -  0 1 home
+    expect - -  0 0 none
+    expect - '' 0 0 none
+    return $bad
+}
+
+# The kernel doctor asks for: 5.10, the floor lightc sets, or later, read from
+# the release as the kernel gives it.
+t_kernel_floor() {
+    bad=0
+    expect() { # release, verdict
+        got=$("$UNIT" kernel "$1")
+        [ "$got" = "$2" ] || { echo "kernel '$1': $got, expected $2"; bad=1; }
+    }
+    expect 5.10.0 'yes 5.10'
+    expect 5.10 'yes 5.10'
+    expect 6.12.117-t480fast3 'yes 6.12'
+    expect 7.0.0-1017-azure 'yes 7.0'
+    expect 5.15.0-91-generic 'yes 5.15'
+    expect 5.9.16 'no 5.9'
+    expect 4.19.0-25-amd64 'no 4.19'
+    expect 5.4.0 'no 5.4'
+    expect 3.10.0-1160.el7.x86_64 'no 3.10'
+    expect 10.1 'yes 10.1'
+    for text in '' 5 5. .10 x5.10 'v6.1' ' 6.1'; do
+        expect "$text" unreadable
+    done
+    return $bad
+}
+
 # What setup puts in its chains: between two ports of the bridge what a link
 # allows and nothing else; out by any interface but the bridge, and back what
 # belongs to that; masquerading of the subnet, as the network spells it, when
@@ -2047,8 +2093,6 @@ cpu 0.5
 oom_score -300
 privileged 1
 readonly 1
-userns 0
-uid_start 0
 io 8:0 rbps=1048576
 swap 1G
 vol /srv/data -> /data rw
@@ -2059,6 +2103,21 @@ link cache'
     [ "$got" = "$want" ]
 }
 t_config_is_read_whole() { in_config_dir config_as_written; }
+
+# userns=0 and uid_start, which lightbox up to 0.5 could write, still read and
+# change nothing; userns=1 is refused with its line, as user namespaces are
+# not supported.
+config_old_userns_keys() {
+    printf 'version=1\nmem=64M\npids=32\ncpu=1\noom_score=0\nuserns=0\nuid_start=100000\n' > "$D/web/.conf"
+    got=$(config)
+    printf '%s\n' "$got"
+    printf '%s\n' "$got" | grep -qx 'mem 64M' || return 1
+    printf 'version=1\nmem=64M\npids=32\ncpu=1\noom_score=0\nuserns=1\nuid_start=100000\n' > "$D/web/.conf"
+    got=$(config)
+    printf '%s\n' "$got"
+    [ "$got" = "refused: $D/web/.conf: line 6: userns=1: user namespaces are not supported yet" ]
+}
+t_config_old_userns_keys() { in_config_dir config_old_userns_keys; }
 
 # What a file does not say is what lightbox.conf says, and a file may say
 # nothing at all.
@@ -2073,8 +2132,6 @@ cpu 1
 oom_score 500
 privileged 0
 readonly 0
-userns 0
-uid_start 0
 io -
 swap -' ] || return 1
     # a default that cannot be used is no default: the file must have the limit
@@ -2202,8 +2259,6 @@ cpu 2
 oom_score 100
 privileged 1
 readonly 0
-userns 0
-uid_start 0
 io -
 swap -
 vol /srv/data -> /data rw
@@ -2295,7 +2350,7 @@ t_conf_has_one_reader() {
     echo "container_conf_path is called in: $users"
     [ "$users" = 'lightbox_container.c lightbox_meta.c lightbox_state.c ' ] || { echo "expected the reader and writer, inspect (which prints the path) and the definition"; bad=1; }
     # inspect names the file and does not read it
-    grep -n 'conf_path' "$src/lightbox_meta.c" | grep -v 'container_conf_path(conf_path, name)\|print_kv("config_path", conf_path)\|char cdir' && { echo "lightbox_meta.c does more with the path than print it"; bad=1; }
+    grep -n 'conf_path' "$src/lightbox_meta.c" | grep -v 'container_conf_path(conf_path, name)\|report_text(&r, "config_path", conf_path)\|char cdir' && { echo "lightbox_meta.c does more with the path than print it"; bad=1; }
     for file in "$src"/lightbox.c "$src"/lightbox_meta.c "$src"/lightbox_state.c "$src"/lightbox_net.c \
                 "$src"/lightbox_config.c "$src"/lightbox_util.c; do
         if grep -nE '"(vol|link|mem|pids|cpu|oom_score|privileged|readonly|userns|uid_start|version)="|conf_get|container_conf_read' "$file" /dev/null; then
@@ -2582,7 +2637,7 @@ check 'exec'"'"'s options are checked, and a missing value names its option' t_c
 
 check 'a number of seconds is digits within the limit'           t_seconds
 check 'a file never gets the number of a closed standard stream' t_standard_streams_are_reserved
-check 'cmd_start has one way out once it has changed the host'   t_start_has_one_way_out
+check 'a start has one way out once it has changed the host'      t_start_has_one_way_out
 
 check 'text is put into a buffer whole or not at all'            t_text_is_whole_or_refused
 check 'a number is digits in its range, and never wraps'         t_numbers_are_strict
@@ -2599,11 +2654,14 @@ check 'nftables: a container'"'"'s links are elements of the set, each once, tak
 check 'nftables: a record that is not lightbox'"'"'s is not given to nft'  t_nft_records_refused
 check 'bridge_accept_fwmark: a mark nft reads as written, and none that matches all' t_fwmarks
 check 'the forward chains that drop what nothing accepts are named'      t_forward_drop_chains
+check 'the settings come from --config, LIGHTBOX_CONFIG, /etc, HOME or nowhere' t_config_sources
+check 'doctor asks for Linux 5.10 or later, read from the release'     t_kernel_floor
 check 'an address is four numbers and three dots, and no zero in front' t_addresses_are_strict
 check 'subnet and gw are one network, and an address on it is one a container can have' t_network_settings
 check 'no prefix is written into the source: subnet gives it'      t_no_prefix_of_its_own
 check 'a .conf is read into one structure, whole'                t_config_is_read_whole
 check 'what a .conf leaves out is the default, if that is usable' t_config_defaults
+check 'userns=0 and uid_start of 0.5 are read, and userns=1 is refused' t_config_old_userns_keys
 check 'a .conf with a version is read strictly, by line'         t_config_is_read_strictly
 check 'a .conf from before the version line is still read'       t_config_from_before_the_version_line
 check 'a .conf is written as it will be read, or not written'    t_config_is_written_as_it_will_be_read

@@ -28,8 +28,6 @@
 /* ─── Compile-time limits ───────────────────────────────────────────────── */
 
 #define MAX_PATH         512
-#define USERNS_RANGE_SIZE 65536
-#define USERNS_MIN_START 100000
 #define MAX_DNS          3       /* as many as a resolver reads from resolv.conf */
 #define CHILD_STACK_SIZE (1024 * 1024) /* 1 MiB */
 
@@ -40,9 +38,6 @@
 global_config cfg_global;
 
 /* cfg_global_init() and cfg_global_load() defined after utility functions */
-
-/* device numbers: makedev(major, minor) */
-#define MAKEDEV(ma, mi) (((uint64_t)(ma) << 8) | (mi))
 
 /* ─── Structs ───────────────────────────────────────────────────────────── */
 
@@ -151,38 +146,6 @@ bool name_is_valid(const char *name) {
             return false;
     }
     return true;
-}
-
-static bool uid_ranges_overlap(int start_a, int start_b) {
-    int end_a = start_a + USERNS_RANGE_SIZE;
-    int end_b = start_b + USERNS_RANGE_SIZE;
-    return !(end_a <= start_b || end_b <= start_a);
-}
-
-static bool userns_range_in_use(const char *exclude_name, int uid_start) {
-    static char names[MAX_LISTED][NAME_MAX_LEN + 1];
-    int count = list_containers(names, MAX_LISTED, NULL);
-
-    for (int i = 0; i < count; i++) {
-        if (exclude_name && streq(names[i], exclude_name))
-            continue;
-        /* one whose configuration cannot be read has no range to keep clear of */
-        static container_config other;
-        if (container_config_load(names[i], &other) != NULL)
-            continue;
-        if (other.userns && other.uid_start > 0 && uid_ranges_overlap(other.uid_start, uid_start))
-            return true;
-    }
-    return false;
-}
-
-static int allocate_uid_start(const char *exclude_name) {
-    int candidate = USERNS_MIN_START;
-    for (int i = 0; i < 4096; i++, candidate += USERNS_RANGE_SIZE) {
-        if (!userns_range_in_use(exclude_name, candidate))
-            return candidate;
-    }
-    return -1;
 }
 
 /* ─── Time ──────────────────────────────────────────────────────────────── */
@@ -299,6 +262,17 @@ static const char *controllers_check(const char *listed, const container_config 
  * Make a container's cgroup, give it the container's limits and put init in
  * it. NULL, or what failed.
  */
+/* What cpu.max is given for a CPU limit: "<quota> <period>". */
+static bool cpu_max_text(const char *cpu, char *out, size_t max) {
+    int quota;
+    bool cut = false;
+    if (!parse_cpu_limit(cpu, &quota))
+        return false;
+    size_t len = (size_t)fmt_int(out, quota);
+    str_append(out, len, " " STRINGIFY(CPU_PERIOD_US), max, &cut);
+    return !cut;
+}
+
 static const char *cgroup_create(const char *name, int pid, const container_config *config) {
     char cg[MAX_PATH], path[MAX_PATH];
     if (!cgroup_path(cg, name) || !path_join(path, sizeof(path), cg, "cgroup.controllers"))
@@ -347,14 +321,10 @@ static const char *cgroup_create(const char *name, int pid, const container_conf
         return "failed to set the process limit";
 
     /* cpu: so much of every period, on all CPUs together */
-    int quota;
     char cpu_max[32];
-    bool cut = false;
-    if (!parse_cpu_limit(config->cpu, &quota))
+    if (!cpu_max_text(config->cpu, cpu_max, sizeof(cpu_max)))
         return "the container's CPU limit is not one";
-    size_t len = (size_t)fmt_int(cpu_max, quota);
-    str_append(cpu_max, len, " " STRINGIFY(CPU_PERIOD_US), sizeof(cpu_max), &cut);
-    if (cut || cgroup_write(cg, "cpu.max", cpu_max) < 0)
+    if (cgroup_write(cg, "cpu.max", cpu_max) < 0)
         return "failed to set the CPU limit";
 
     if (config->io[0] && cgroup_write(cg, "io.max", config->io) < 0)
@@ -727,6 +697,33 @@ static void choose_address(const container_network *net, const uint32_t *asked, 
     die2("Error: every address of the subnet has a container: ", cfg_global.subnet);
 }
 
+/*
+ * --mem, --pids and --cpu, as create and update take them: the value checked
+ * and put in the configuration, or the option named with what it takes.
+ * False for any other option.
+ */
+static bool limit_option(int argc, char **argv, int *i, container_config *cfg) {
+    const char *opt = argv[*i];
+    if (streq(opt, "--mem")) {
+        const char *value = option_value(argc, argv, i);
+        if (!mem_limit_ok(value) || !str_copy(cfg->mem, value, sizeof(cfg->mem)))
+            die2("Error: --mem takes <number>[K|M|G|T] or max, not: ", value);
+    } else if (streq(opt, "--pids")) {
+        const char *value = option_value(argc, argv, i);
+        if (!pids_limit_ok(value) || !str_copy(cfg->pids, value, sizeof(cfg->pids)))
+            die2("Error: --pids takes a number from 1 to " STRINGIFY(PIDS_LIMIT_MAX) " or max, not: ", value);
+    } else if (streq(opt, "--cpu")) {
+        const char *value = option_value(argc, argv, i);
+        int quota;
+        if (!parse_cpu_limit(value, &quota) || !str_copy(cfg->cpu, value, sizeof(cfg->cpu)))
+            die2("Error: --cpu takes a number of CPUs from 0.01 to " STRINGIFY(CPU_LIMIT_MAX)
+                 ", such as 2 or 0.5, not: ", value);
+    } else {
+        return false;
+    }
+    return true;
+}
+
 static void cmd_create(int argc, char **argv) {
     require_tool("cp", tool_path_cp());
     if (argc < 1) die("Usage: lightbox create <name> [<ip>] [options]");
@@ -758,10 +755,8 @@ static void cmd_create(int argc, char **argv) {
 
     for (int i = address_given ? 2 : 1; i < argc; i++) {
         const char *opt = argv[i];
-        if (streq(opt, "--mem")) {
-            const char *value = option_value(argc, argv, &i);
-            if (!mem_limit_ok(value) || !str_copy(cfg.mem, value, sizeof(cfg.mem)))
-                die2("Error: --mem takes <number>[K|M|G|T] or max, not: ", value);
+        if (limit_option(argc, argv, &i, &cfg)) {
+            /* --mem, --pids or --cpu */
         } else if (streq(opt, "--swap")) {
             const char *value = option_value(argc, argv, &i);
             if (!swap_limit_ok(value) || !str_copy(cfg.swap, value, sizeof(cfg.swap)))
@@ -776,16 +771,6 @@ static void cmd_create(int argc, char **argv) {
             const char *why = io_disk_problem(value);
             if (why)
                 die_about("Error: --io-max: ", why, value);
-        } else if (streq(opt, "--pids")) {
-            const char *value = option_value(argc, argv, &i);
-            if (!pids_limit_ok(value) || !str_copy(cfg.pids, value, sizeof(cfg.pids)))
-                die2("Error: --pids takes a number from 1 to " STRINGIFY(PIDS_LIMIT_MAX) " or max, not: ", value);
-        } else if (streq(opt, "--cpu")) {
-            const char *value = option_value(argc, argv, &i);
-            int quota;
-            if (!parse_cpu_limit(value, &quota) || !str_copy(cfg.cpu, value, sizeof(cfg.cpu)))
-                die2("Error: --cpu takes a number of CPUs from 0.01 to " STRINGIFY(CPU_LIMIT_MAX)
-                     ", such as 2 or 0.5, not: ", value);
         } else if (streq(opt, "--userns")) {
             die("Error: --userns is not supported yet");
         } else if (streq(opt, "--uid-start")) {
@@ -820,7 +805,7 @@ static void cmd_create(int argc, char **argv) {
             validate_name(value);
             str_copy_or_die(cfg.links[cfg.nlinks++], value, sizeof(cfg.links[0]), "--link");
         } else {
-            die2("Error: unknown option: ", opt);
+            die2(opt[0] == '-' ? "Error: unknown option: " : "Error: unexpected argument: ", opt);
         }
     }
 
@@ -909,23 +894,6 @@ static void cmd_create(int argc, char **argv) {
     }
 
     /* write config */
-    if (cfg.userns) {
-        if (cfg.uid_start == 0) {
-            cfg.uid_start = allocate_uid_start(name);
-            if (cfg.uid_start <= 0) {
-                create_err = "failed to allocate uid_start";
-                goto fail_create;
-            }
-        }
-        if (cfg.uid_start < USERNS_MIN_START) {
-            create_err = "uid_start is below the managed userns range";
-            goto fail_create;
-        }
-        if (userns_range_in_use(name, cfg.uid_start)) {
-            create_err = "uid_start overlaps an existing container userns range";
-            goto fail_create;
-        }
-    }
     create_err = container_config_save(name, &cfg);
     if (create_err)
         goto fail_create;
@@ -997,26 +965,6 @@ static void cmd_create(int argc, char **argv) {
         }
     }
 
-    /* shift rootfs ownership for user namespace */
-    if (cfg.userns && cfg.uid_start > 0) {
-        if (!tool_available(tool_path_chown())) {
-            create_err = "chown is needed to shift the rootfs ownership and was not found";
-            goto fail_create;
-        }
-        print_str(STDOUT,"Shifting rootfs ownership...\n");
-        /* use chown -R via fork+exec for simplicity */
-        char uid_str[32];
-        size_t pos = (size_t)fmt_int(uid_str, cfg.uid_start);
-        uid_str[pos++] = ':';
-        fmt_int(uid_str + pos, cfg.uid_start);
-
-        const char *chown_argv[] = { "chown", "-R", "-h", uid_str, root, NULL };
-        if (run_cmd(tool_path_chown(), chown_argv) != 0) {
-            create_err = "failed to shift rootfs ownership";
-            goto fail_create;
-        }
-    }
-
     /* made: and with no runtime record, stopped */
     if (remove_file_durably(creating) != 0) {
         create_err = "failed to mark the container as created";
@@ -1076,7 +1024,6 @@ struct child_args {
     const char  *root;
     const char  *hook;                      /* the script init runs when it is ready */
     int          stop_grace;                /* seconds the container gets to end, unless a stop says otherwise */
-    int          userns;
     int          privileged;
     int          read_only;
 };
@@ -2503,7 +2450,7 @@ static int finish_exec(int32_t worker, int32_t signal_fd, const struct lb_termio
 
 /* ─── exec: entering the container ──────────────────────────────────────── */
 
-static int exec_inside_container(const char *name, int target_pid, int userns,
+static int exec_inside_container(const char *name, int target_pid,
                                  int privileged, int oom_score, const struct exec_request *req) {
     /* From here to the command's execve this process, and the child it
      * forks, are lightbox inside a container. Not dumpable, their memory and
@@ -2516,13 +2463,6 @@ static int exec_inside_container(const char *name, int target_pid, int userns,
     if (rootfd < 0)
         die("Error: failed to open target root");
 
-    int userfd = -1;
-    if (userns) {
-        userfd = open_target_path(target_pid, "/ns/user");
-        if (userfd < 0)
-            die("Error: failed to open target user namespace");
-    }
-
     int mntfd = open_target_path(target_pid, "/ns/mnt");
     int utsfd = open_target_path(target_pid, "/ns/uts");
     int ipcfd = open_target_path(target_pid, "/ns/ipc");
@@ -2530,9 +2470,6 @@ static int exec_inside_container(const char *name, int target_pid, int userns,
     int pidfd = open_target_path(target_pid, "/ns/pid");
     if (mntfd < 0 || utsfd < 0 || ipcfd < 0 || netfd < 0 || pidfd < 0)
         die("Error: failed to open target namespace fd");
-
-    if (userns)
-        require_setns_fd(userfd, CLONE_NEWUSER, "user");
 
     /* Join the host-side container cgroup before switching mount namespaces. */
     cgroup_join_self(name);
@@ -2888,27 +2825,6 @@ static bool reconcile(const char *name) {
     return true;
 }
 
-static void enter_user_namespace_root(void) {
-    struct lb_cap_header hdr = { LB_CAPABILITY_VERSION_3, 0 };
-    struct lb_cap_data data[LB_CAPABILITY_WORDS];
-
-    if (lc_kernel_prctl(LB_PR_SET_KEEPCAPS, 1, 0, 0, 0) < 0)
-        die("Error: failed to enable keepcaps for userns");
-    if (lc_kernel_setgid(0) < 0)
-        die("Error: failed to setgid(0) in userns");
-    if (lc_kernel_setuid(0) < 0)
-        die("Error: failed to setuid(0) in userns");
-
-    if (lb_sys_capget(&hdr, data) < 0)
-        die("Error: capget failed in userns");
-
-    data[0].effective = data[0].permitted;
-    data[1].effective = data[1].permitted;
-
-    if (lb_sys_capset(&hdr, data) < 0)
-        die("Error: capset failed in userns");
-}
-
 /* A volume on its way into a container. */
 struct volume_mount {
     int32_t tree;               /* a clone of the source's mount, attached nowhere yet */
@@ -3000,9 +2916,6 @@ static void attach_volumes(const struct volume_mount *vols, int count) {
  * with the reason on stderr; the command then sees init's pipe close.
  */
 static void build_container(const struct child_args *ca) {
-    if (ca->userns)
-        enter_user_namespace_root();
-
     /* make all mounts private — prevents host mount events (including
      * the host's /proc) from propagating into the container */
     require_mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
@@ -3016,20 +2929,20 @@ static void build_container(const struct child_args *ca) {
     struct volume_mount volumes[MAX_VOLS];
     int nvolumes = open_volumes(ca->config, volumes);
 
-    /* set up /dev via bind mounts (works in both userns and non-userns) */
+    /* /dev: the host's devices, bound one by one onto empty files */
     {
         char dev_path[MAX_PATH];
         path_join_or_die(dev_path, MAX_PATH, ca->root, "dev");
         lc_kernel_mkdirat(AT_FDCWD, dev_path, 0755);   /* a minimal image may not have it */
         require_mount("tmpfs", dev_path, "tmpfs", MS_NOSUID | MS_NOEXEC, "mode=755");
 
-        struct { const char *name; uint64_t dev; int mode; } devs[] = {
-            { "null",    MAKEDEV(1, 3), 0666 },
-            { "zero",    MAKEDEV(1, 5), 0666 },
-            { "full",    MAKEDEV(1, 7), 0666 },
-            { "random",  MAKEDEV(1, 8), 0444 },
-            { "urandom", MAKEDEV(1, 9), 0444 },
-            { "tty",     MAKEDEV(5, 0), 0666 },
+        static const struct { const char *name; int mode; } devs[] = {
+            { "null",    0666 },
+            { "zero",    0666 },
+            { "full",    0666 },
+            { "random",  0444 },
+            { "urandom", 0444 },
+            { "tty",     0666 },
         };
 
         for (size_t i = 0; i < sizeof(devs) / sizeof(devs[0]); i++) {
@@ -3083,12 +2996,7 @@ static void build_container(const struct child_args *ca) {
     /* mount proc, sys */
     require_mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL);
 
-    /*
-     * sysfs mounting is typically not permitted inside an unprivileged user
-     * namespace. Leave /sys as the rootfs directory in that mode.
-     */
-    if (!ca->userns)
-        require_mount("sysfs", "/sys", "sysfs", MS_RDONLY, NULL);
+    require_mount("sysfs", "/sys", "sysfs", MS_RDONLY, NULL);
 
     /* devpts and shm inside container */
     require_mount("devpts", "/dev/pts", "devpts",
@@ -3170,22 +3078,83 @@ static const char *text_with_number(char *buf, size_t bufsz, const char *before,
     return buf;
 }
 
-static void cmd_start(int argc, char **argv) {
-    if (argc < 1) die("Usage: lightbox start <name> [-t <seconds>]");
-    const char *name = argv[0];
-    validate_name(name);
+/* ─── Several containers at once ────────────────────────────────────────── */
 
-    /* how long to wait for the init hook */
-    int hook_wait = cfg_global.start_timeout;
-    for (int i = 1; i < argc; i++) {
-        if (!streq(argv[i], "-t") && !streq(argv[i], "--timeout"))
-            die2(argv[i][0] == '-' ? "Error: unknown option: " : "Error: unexpected argument: ", argv[i]);
-        if (i + 1 >= argc)
-            die2("Error: option needs a number of seconds: ", argv[i]);
-        if (!parse_seconds(argv[++i], &hook_wait))
-            die2("Error: not a number of seconds from 0 to " STRINGIFY(SECONDS_MAX) ": ", argv[i]);
+/*
+ * The names among a command's arguments, moved to its front, and -t or
+ * --timeout with its seconds wherever it is, when the command takes one.
+ * Anything else is an error, named. How many names there are.
+ */
+static int names_and_seconds(int argc, char **argv, int *seconds, bool *force) {
+    int count = 0;
+    for (int i = 0; i < argc; i++) {
+        if (force && (streq(argv[i], "-f") || streq(argv[i], "--force"))) {
+            *force = true;
+        } else if (seconds && (streq(argv[i], "-t") || streq(argv[i], "--timeout"))) {
+            if (i + 1 >= argc)
+                die2("Error: option needs a number of seconds: ", argv[i]);
+            if (!parse_seconds(argv[++i], seconds))
+                die2("Error: not a number of seconds from 0 to " STRINGIFY(SECONDS_MAX) ": ", argv[i]);
+        } else if (argv[i][0] == '-') {
+            die2("Error: unknown option: ", argv[i]);
+        } else {
+            argv[count++] = argv[i];
+        }
     }
+    for (int i = 0; i < count; i++)
+        validate_name(argv[i]);
+    return count;
+}
 
+typedef void (*per_container)(const char *name, int seconds);
+
+/*
+ * start, stop and rm of several containers, as Docker's: each in a process
+ * of its own, one after the other, so that what ends the command for one
+ * ends it for that one only. The exit status is the first that was not 0,
+ * and the ones that were not done are named at the end.
+ */
+[[noreturn]] static void each_container(const char *not_done, int count, char **names, per_container one, int seconds) {
+    if (count == 1) {
+        one(names[0], seconds);
+        lc_kernel_exit(0);
+    }
+    int first = 0;
+    static char failed[4096];
+    size_t pos = 0;
+    bool cut = false;
+    for (int i = 0; i < count; i++) {
+        lc_sysret pid = lc_kernel_fork();
+        if (pid < 0)
+            die("Error: cannot make a process for the next container");
+        if (pid == 0) {
+            one(names[i], seconds);
+            lc_kernel_exit(0);
+        }
+        int32_t status = 0;
+        lc_sysret got;
+        do {
+            got = lc_kernel_wait_for_child((int32_t)pid, &status, 0);
+        } while (got == -LB_EINTR);
+        int code = got == pid ? exit_code_from_status(status) : 1;
+        if (code != 0) {
+            if (!first)
+                first = code;
+            pos = str_append(failed, pos, pos ? ", " : "", sizeof(failed), &cut);
+            pos = str_append(failed, pos, names[i], sizeof(failed), &cut);
+        }
+    }
+    if (first) {
+        print_str(STDERR, "Error: ");
+        print_str(STDERR, not_done);
+        print_str(STDERR, ": ");
+        print_str(STDERR, failed);
+        print_str(STDERR, cut ? " and more\n" : "\n");
+    }
+    lc_kernel_exit(first);
+}
+
+static void start_one(const char *name, int hook_wait) {
     require_root("start");
     require_tool("ip", tool_path_ip());
     require_tool("nsenter", tool_path_nsenter());
@@ -3235,14 +3204,9 @@ static void cmd_start(int argc, char **argv) {
      * start. Init gets it with the memory it is cloned with. */
     static container_config config;
     container_config_load_or_die(name, &config);
-    bool userns = config.userns;
-    int uid_start = config.uid_start;
     bool privileged = config.privileged;
     bool read_only = config.read_only;
     int oom_score = config.oom_score;
-
-    if (userns)
-        die("Error: containers configured with user namespaces are not supported yet");
 
     /* A container without links gets an isolated port on the bridge: it
      * reaches the host and, through it, the outside, and no other container.
@@ -3354,12 +3318,10 @@ static void cmd_start(int argc, char **argv) {
         .root = root,
         .hook = "/init.sh",
         .stop_grace = cfg_global.stop_timeout,
-        .userns = userns,
         .privileged = privileged,
         .read_only = read_only,
     };
     int clone_flags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET;
-    if (userns) clone_flags |= CLONE_NEWUSER;
 
     start_err = init_spawn(&init, &ca, clone_flags, container_child);
     close_container_streams(&null_fd, &log_fd);     /* init has its own copies */
@@ -3368,28 +3330,6 @@ static void cmd_start(int argc, char **argv) {
     if (start_err)
         goto fail_start;
     int child_pid = (int)init.pid;
-
-    /* write uid/gid maps if userns */
-    if (userns) {
-        char proc_path[64], map_buf[32];
-        bool cut = false;
-
-        /* deny setgroups */
-        if (!proc_pid_path(proc_path, sizeof(proc_path), child_pid, "/setgroups") ||
-            write_file(proc_path, "deny") < 0) { start_err = "failed to write setgroups"; goto fail_start; }
-
-        /* uid_map and gid_map: the same range for both */
-        {
-            char first[16]; fmt_int(first, uid_start);
-            size_t mp = str_append(map_buf, 0, "0 ", sizeof(map_buf), &cut);
-            mp = str_append(map_buf, mp, first, sizeof(map_buf), &cut);
-            str_append(map_buf, mp, " 65536", sizeof(map_buf), &cut);
-        }
-        if (cut || !proc_pid_path(proc_path, sizeof(proc_path), child_pid, "/uid_map") ||
-            write_file(proc_path, map_buf) < 0) { start_err = "failed to write uid_map"; goto fail_start; }
-        if (!proc_pid_path(proc_path, sizeof(proc_path), child_pid, "/gid_map") ||
-            write_file(proc_path, map_buf) < 0) { start_err = "failed to write gid_map"; goto fail_start; }
-    }
 
     /*
      * Set up cgroup, networking, and OOM score before init gets its first
@@ -3578,6 +3518,16 @@ fail_start:
     lc_kernel_exit(exit_code);
 }
 
+static void cmd_start(int argc, char **argv) {
+    /* how long each waits for the init hook */
+    int hook_wait = cfg_global.start_timeout;
+    int count = names_and_seconds(argc, argv, &hook_wait, NULL);
+    if (count == 0)
+        die("Usage: lightbox start <name>... [-t <seconds>]");
+    require_root("start");
+    each_container("not started", count, argv, start_one, hook_wait);
+}
+
 /* ─── cmd_stop ──────────────────────────────────────────────────────────── */
 
 /* What init gets beyond its own limit before stop ends it by force. */
@@ -3601,22 +3551,7 @@ static bool ask_init_to_stop(int32_t pidfd, int seconds) {
     return rc >= 0;
 }
 
-static void cmd_stop(int argc, char **argv) {
-    if (argc < 1) die("Usage: lightbox stop <name> [-t <seconds>]");
-    const char *name = argv[0];
-    validate_name(name);
-
-    /* how long the container gets to end by itself */
-    int seconds = cfg_global.stop_timeout;
-    for (int i = 1; i < argc; i++) {
-        if (!streq(argv[i], "-t") && !streq(argv[i], "--timeout"))
-            die2(argv[i][0] == '-' ? "Error: unknown option: " : "Error: unexpected argument: ", argv[i]);
-        if (i + 1 >= argc)
-            die2("Error: option needs a number of seconds: ", argv[i]);
-        if (!parse_seconds(argv[++i], &seconds))
-            die2("Error: not a number of seconds from 0 to " STRINGIFY(SECONDS_MAX) ": ", argv[i]);
-    }
-
+static void stop_one(const char *name, int seconds) {
     require_root("stop");
     container_lock(name);
 
@@ -3676,8 +3611,125 @@ static void cmd_stop(int argc, char **argv) {
     print_str(STDOUT,"' stopped\n");
 }
 
+static void cmd_stop(int argc, char **argv) {
+    /* how long each container gets to end by itself */
+    int seconds = cfg_global.stop_timeout;
+    int count = names_and_seconds(argc, argv, &seconds, NULL);
+    if (count == 0)
+        die("Usage: lightbox stop <name>... [-t <seconds>]");
+    require_root("stop");
+    each_container("not stopped", count, argv, stop_one, seconds);
+}
+
+/* A container that runs, stopped in a process of its own, as stop does it:
+ * true when it does not run afterwards. */
+static bool stop_if_running(const char *name, int seconds) {
+    if (!is_running(name))
+        return true;
+    lc_sysret pid = lc_kernel_fork();
+    if (pid < 0)
+        die("Error: cannot make a process to stop the container in");
+    if (pid == 0) {
+        stop_one(name, seconds);
+        lc_kernel_exit(0);
+    }
+    int32_t status = 0;
+    lc_sysret got;
+    do {
+        got = lc_kernel_wait_for_child((int32_t)pid, &status, 0);
+    } while (got == -LB_EINTR);
+    return got == pid && exit_code_from_status(status) == 0;
+}
+
+/* restart: stopped, with -t as stop has it, if it runs, and started. */
+static void restart_one(const char *name, int seconds) {
+    require_root("restart");
+    if (!stop_if_running(name, seconds))
+        lc_kernel_exit(1);
+    start_one(name, cfg_global.start_timeout);
+}
+
+static void cmd_restart(int argc, char **argv) {
+    int seconds = cfg_global.stop_timeout;
+    int count = names_and_seconds(argc, argv, &seconds, NULL);
+    if (count == 0)
+        die("Usage: lightbox restart <name>... [-t <seconds>]");
+    require_root("restart");
+    each_container("not restarted", count, argv, restart_one, seconds);
+}
+
+/* ─── cmd_update ────────────────────────────────────────────────────────── */
+
+/*
+ * update <name> --mem/--pids/--cpu: the limits in the container's
+ * configuration, which every start reads, and in the cgroup of a container
+ * that runs. The configuration is changed first; a running container that
+ * does not take a limit has it from its next start, and that is said.
+ */
+static void cmd_update(int argc, char **argv) {
+    static container_config given;
+    container_config_init(&given);
+    given.mem[0] = given.pids[0] = given.cpu[0] = '\0';
+    const char *name = NULL;
+    for (int i = 0; i < argc; i++) {
+        if (limit_option(argc, argv, &i, &given))
+            continue;
+        if (argv[i][0] == '-')
+            die2("Error: unknown option: ", argv[i]);
+        if (name)
+            die2("Error: unexpected argument: ", argv[i]);
+        name = argv[i];
+    }
+    if (!name || (!given.mem[0] && !given.pids[0] && !given.cpu[0]))
+        die("Usage: lightbox update <name> [--mem <limit>] [--pids <limit>] [--cpu <num>]");
+    validate_name(name);
+    require_root("update");
+    container_lock(name);
+
+    static container_config config;
+    container_config_load_or_die(name, &config);
+    if (given.mem[0])  lc_bytes_copy(config.mem, given.mem, sizeof(config.mem));
+    if (given.pids[0]) lc_bytes_copy(config.pids, given.pids, sizeof(config.pids));
+    if (given.cpu[0])  lc_bytes_copy(config.cpu, given.cpu, sizeof(config.cpu));
+    const char *wrong = container_config_save(name, &config);
+    if (wrong)
+        die_about("Error: container ", wrong, name);
+    print_str(STDOUT, "Container '");
+    print_str(STDOUT, name);
+    print_str(STDOUT, "' updated\n");
+    if (!is_running(name)) {
+        print_str(STDOUT, "It is not running: it has them from its next start\n");
+        return;
+    }
+
+    char cg[MAX_PATH], cpu_max[32];
+    if (!cgroup_path(cg, name))
+        die("Error: the path of the container's cgroup is too long");
+    const struct { const char *file, *value, *what; } live[] = {
+        { "memory.max", given.mem, "memory limit" },
+        { "pids.max", given.pids, "process limit" },
+        { "cpu.max", given.cpu[0] && cpu_max_text(given.cpu, cpu_max, sizeof(cpu_max)) ? cpu_max : "", "CPU limit" },
+    };
+    int failed = 0;
+    for (size_t i = 0; i < sizeof(live) / sizeof(live[0]); i++) {
+        if (!live[i].value[0])
+            continue;
+        if (cgroup_write(cg, live[i].file, live[i].value) < 0) {
+            print_str(STDERR, "Error: the running container did not take the new ");
+            print_str(STDERR, live[i].what);
+            print_str(STDERR, " (");
+            print_str(STDERR, live[i].file);
+            print_str(STDERR, "); it has it from its next start\n");
+            failed++;
+        }
+    }
+    if (failed)
+        lc_kernel_exit(1);
+}
+
 static void cmd_add_vol(int argc, char **argv) {
     if (argc < 2) die("Usage: lightbox add-vol <name> <src:dst[:ro]>");
+    if (argc > 2) die2("Error: unexpected argument: ", argv[2]);
     const char *name = argv[0];
     validate_name(name);
 
@@ -3729,7 +3781,8 @@ static void cmd_add_vol(int argc, char **argv) {
  * read as a volume's destination is, so /data/ and /data are the same place.
  */
 static void cmd_rm_vol(int argc, char **argv) {
-    if (argc != 2) die("Usage: lightbox rm-vol <name> <dst>");
+    if (argc < 2) die("Usage: lightbox rm-vol <name> <dst>");
+    if (argc > 2) die2("Error: unexpected argument: ", argv[2]);
     const char *name = argv[0];
     validate_name(name);
 
@@ -3761,12 +3814,10 @@ static void cmd_rm_vol(int argc, char **argv) {
 
 /* ─── cmd_rm ────────────────────────────────────────────────────────────── */
 
-static void cmd_rm(int argc, char **argv) {
-    require_tool("rm", tool_path_rm());
-    if (argc < 1) die("Usage: lightbox rm <name>");
-    const char *name = argv[0];
-    validate_name(name);
-
+static void rm_one(const char *name, int force) {
+    /* with --force, one that runs is killed first, as docker rm -f does */
+    if (force && !stop_if_running(name, 0))
+        lc_kernel_exit(1);
     container_lock(name);
 
     if (is_running(name)) die2("Error: container is running (stop it first): ", name);
@@ -3793,6 +3844,15 @@ static void cmd_rm(int argc, char **argv) {
     print_str(STDOUT,"Container '");
     print_str(STDOUT,name);
     print_str(STDOUT,"' removed\n");
+}
+
+static void cmd_rm(int argc, char **argv) {
+    require_tool("rm", tool_path_rm());
+    bool force = false;
+    int count = names_and_seconds(argc, argv, NULL, &force);
+    if (count == 0)
+        die("Usage: lightbox rm [-f] <name>...");
+    each_container("not removed", count, argv, rm_one, force);
 }
 
 /* ─── cmd_exec ──────────────────────────────────────────────────────────── */
@@ -3829,11 +3889,7 @@ static void cmd_exec(int argc, char **argv) {
     static container_config config;
     container_config_load_or_die(name, &config);
     int pid = get_container_pid(name);
-    bool userns = config.userns;
     bool privileged = config.privileged;
-
-    if (userns)
-        die("Error: exec into userns containers is not supported yet");
 
     /* The terminal's modes as they are now. The worker makes the terminal
      * raw while a command has a terminal of its own, and puts the modes back;
@@ -3853,7 +3909,7 @@ static void cmd_exec(int argc, char **argv) {
 
     if (worker == 0) {
         lc_kernel_close_file(signal_fd);
-        int status = exec_inside_container(name, pid, userns, privileged, config.oom_score, &req);
+        int status = exec_inside_container(name, pid, privileged, config.oom_score, &req);
         lc_kernel_exit(exit_code_from_status(status));
     }
 
@@ -3862,7 +3918,7 @@ static void cmd_exec(int argc, char **argv) {
 
 /* ─── cmd_ls ────────────────────────────────────────────────────────────── */
 
-/* ─── Usage ─────────────────────────────────────────────────────────────── */
+/* ─── setup --teardown ──────────────────────────────────────────────────── */
 
 /*
  * setup --teardown: what setup made taken away, once no container runs.
@@ -3902,11 +3958,11 @@ static void cmd_teardown(void) {
     lc_kernel_exit(0);
 }
 
-[[noreturn]] static void usage(void) {
-    print_str(STDERR,
-        "Usage: lightbox <command> [args]\n"
-        "\n"
-        "Commands:\n"
+/* ─── Usage ─────────────────────────────────────────────────────────────── */
+
+/* Each command's lines of the usage, as `lightbox <command> --help` prints them. */
+static const struct { const char *name; const char *text; } command_help[] = {
+    { "create",
         "  create <name> [<ip>] [options]\n"
         "                                Create a new container; without <ip>, the lowest free address\n"
         "         --mem  <limit>         Memory limit: <number>[K|M|G|T] or max (default: 256M)\n"
@@ -3923,26 +3979,99 @@ static void cmd_teardown(void) {
         "         --privileged           Disable security sandbox\n"
         "         --oom-score <n>        OOM score adjustment (default: 500)\n"
         "         --link <name>          Allow network to another container\n"
-        "         --dns <address>        A name server for the container (up to 3; default: the host's)\n"
-        "  start  <name> [-t <seconds>]  Start a stopped container\n"
-        "         -t <seconds>            How long to wait for /init.sh (default: 30, 0: do not wait)\n"
-        "  stop   <name> [-t <seconds>]  Stop a running container\n"
-        "         -t <seconds>            How long its processes get to end (default: 10)\n"
-        "  add-vol <name> <src:dst[:ro]> Add a volume to an existing container\n"
-        "  rm-vol <name> <dst>           Remove the volume at a destination\n"
-        "  rm     <name>                 Remove a container (must be stopped)\n"
+        "         --dns <address>        A name server for the container (up to 3; default: the host's)\n" },
+    { "start",
+        "  start  <name>... [-t <seconds>]  Start stopped containers, one after the other\n"
+        "         -t <seconds>            How long to wait for /init.sh (default: 30, 0: do not wait)\n" },
+    { "stop",
+        "  stop   <name>... [-t <seconds>]  Stop running containers, one after the other\n"
+        "         -t <seconds>            How long their processes get to end (default: 10)\n" },
+    { "add-vol",
+        "  add-vol <name> <src:dst[:ro]> Add a volume to an existing container\n" },
+    { "rm-vol",
+        "  rm-vol <name> <dst>           Remove the volume at a destination\n" },
+    { "restart",
+        "  restart <name>... [-t <seconds>]  Stop containers that run, as stop does, and start them\n" },
+    { "update",
+        "  update <name> [--mem <limit>] [--pids <limit>] [--cpu <num>]\n"
+        "                                Change a container's limits, live if it runs and from its next\n"
+        "                                start in any case\n" },
+    { "rm",
+        "  rm     [-f] <name>...         Remove containers; -f kills one that runs first\n" },
+    { "exec",
         "  exec   <name> [options] [--] [cmd [args...]]  Run a command in a running container\n"
         "         --user <name|uid[:gid]> Who to run it as (default: root)\n"
         "         --env <KEY=VALUE>       Set a variable in its environment (repeatable)\n"
-        "         --workdir <dir>         The directory to run it in (default: /)\n"
-        "  logs   <name> [-f]            Show what the container has printed; -f follows it\n"
-        "  inspect <name>                Show container metadata and runtime state\n"
-        "  doctor                        Show host/runtime dependency status\n"
-        "  ls                            List all containers\n"
+        "         --workdir <dir>         The directory to run it in (default: /)\n" },
+    { "logs",
+        "  logs   <name> [-f]            Show what the container has printed; -f follows it\n" },
+    { "inspect",
+        "  inspect <name> [--json]       Show a container's configuration and state; --json as JSON\n" },
+    { "doctor",
+        "  doctor [--json]               Check what lightbox needs of this host, and say how to fix what\n"
+        "                                is missing; --json as JSON\n" },
+    { "ls",
+        "  ls [--json]                   List all containers\n" },
+    { "setup",
         "  setup                         Setup host networking\n"
-        "  setup --teardown              Take lightbox's host network away, when no container runs\n"
-    );
+        "  setup --teardown              Take lightbox's host network away, when no container runs\n" },
+};
+#define COMMANDS (sizeof(command_help) / sizeof(command_help[0]))
+
+static const char *help_of(const char *command) {
+    for (size_t i = 0; i < COMMANDS; i++)
+        if (streq(command_help[i].name, command))
+            return command_help[i].text;
+    return NULL;
+}
+
+static bool asks_for_help(const char *arg) {
+    return streq(arg, "--help") || streq(arg, "-h");
+}
+
+/* The usage: of one command, or of all of them. */
+static void print_usage(int32_t fd, const char *command) {
+    print_str(fd, "Usage: lightbox [--config <path>] <command> [args]\n\n");
+    if (command) {
+        print_str(fd, help_of(command));
+        return;
+    }
+    print_str(fd, "Commands:\n");
+    for (size_t i = 0; i < COMMANDS; i++)
+        print_str(fd, command_help[i].text);
+    print_str(fd,
+        "\n"
+        "  --config <path>                              The lightbox.conf to read (default:\n"
+        "                                               $LIGHTBOX_CONFIG, else " CONFIG_ETC_FILE ")\n"
+        "  --help, help [<command>], <command> --help   This text, or a command's part of it\n"
+        "  --version                                    The version of lightbox, and of lightc\n");
+}
+
+/* Help that was asked for: on standard output, and no error. */
+[[noreturn]] static void help(const char *command) {
+    print_usage(STDOUT, command);
+    lc_kernel_exit(0);
+}
+
+/* A command line that is not one: the usage on standard error, and an error. */
+[[noreturn]] static void usage(void) {
+    print_usage(STDERR, NULL);
     lc_kernel_exit(1);
+}
+
+[[noreturn]] static void version(void) {
+    char number[16];
+    print_str(STDOUT, "lightbox " LIGHTBOX_VERSION " (lightc ");
+    fmt_int(number, LC_VERSION_MAJOR);
+    print_str(STDOUT, number);
+    lc_print_char(STDOUT, '.');
+    fmt_int(number, LC_VERSION_MINOR);
+    print_str(STDOUT, number);
+    lc_print_char(STDOUT, '.');
+    fmt_int(number, LC_VERSION_PATCH);
+    print_str(STDOUT, number);
+    print_str(STDOUT, ")\n");
+    lc_kernel_exit(0);
 }
 
 /* ─── main ──────────────────────────────────────────────────────────────── */
@@ -3969,15 +4098,43 @@ int main(int argc, char **argv, char **envp) {
     reserve_standard_streams();
     caller_argv = argv;
     caller_env = envp;
-    if (argc < 2) usage();
+
+    /* lightbox [--config <path>] <command> [args] */
+    const char *config = NULL;
+    int first = 1;
+    if (argc > 1 && streq(argv[1], "--config")) {
+        if (argc < 3 || !argv[2][0])
+            die("Error: --config needs the path of a lightbox.conf");
+        config = argv[2];
+        first = 3;
+    }
+    if (argc <= first) usage();
+    char **args = argv + first;
+    int nargs = argc - first;
+
+    /* help and the version need no configuration, and get none of its warnings */
+    if (asks_for_help(args[0]) || streq(args[0], "help")) {
+        if (nargs == 1)
+            help(NULL);
+        if (nargs == 2 && help_of(args[1]))
+            help(args[1]);
+        die2(nargs == 2 ? "Error: there is no such command: " : "Error: unexpected argument: ", args[nargs == 2 ? 1 : 2]);
+    }
+    if (streq(args[0], "--version")) {
+        if (nargs > 1)
+            die2("Error: unexpected argument: ", args[1]);
+        version();
+    }
+    if (nargs > 1 && asks_for_help(args[1]) && help_of(args[0]))
+        help(args[0]);
 
     /* load configuration: built-in defaults → lightbox.conf → env vars */
     cfg_global_init();
-    cfg_global_load(envp);
+    cfg_global_load(envp, config);
 
-    const char *cmd = argv[1];
-    int sub_argc = argc - 2;
-    char **sub_argv = argv + 2;
+    const char *cmd = args[0];
+    int sub_argc = nargs - 1;
+    char **sub_argv = args + 1;
 
     if (streq(cmd, "setup")) {
         if (sub_argc == 0)
@@ -3990,15 +4147,22 @@ int main(int argc, char **argv, char **envp) {
     else if (streq(cmd, "create")) cmd_create(sub_argc, sub_argv);
     else if (streq(cmd, "start"))  cmd_start(sub_argc, sub_argv);
     else if (streq(cmd, "stop"))   cmd_stop(sub_argc, sub_argv);
+    else if (streq(cmd, "restart")) cmd_restart(sub_argc, sub_argv);
+    else if (streq(cmd, "update")) cmd_update(sub_argc, sub_argv);
     else if (streq(cmd, "add-vol")) cmd_add_vol(sub_argc, sub_argv);
     else if (streq(cmd, "rm-vol")) cmd_rm_vol(sub_argc, sub_argv);
     else if (streq(cmd, "rm"))     cmd_rm(sub_argc, sub_argv);
     else if (streq(cmd, "exec"))   cmd_exec(sub_argc, sub_argv);
     else if (streq(cmd, "logs"))   cmd_logs(sub_argc, sub_argv);
     else if (streq(cmd, "inspect")) cmd_inspect(sub_argc, sub_argv);
-    else if (streq(cmd, "doctor")) cmd_doctor();
+    else if (streq(cmd, "doctor")) cmd_doctor(sub_argc, sub_argv);
     else if (streq(cmd, "ls"))     cmd_ls(sub_argc, sub_argv);
-    else                           usage();
+    else {
+        print_str(STDERR, "Error: unknown command: ");
+        print_str(STDERR, cmd);
+        print_str(STDERR, "\n\n");
+        usage();
+    }
 
     return 0;
 }

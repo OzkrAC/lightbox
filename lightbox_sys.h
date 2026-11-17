@@ -39,6 +39,7 @@
 #define LB_SYS_memfd_create 319
 #define LB_SYS_execveat   322
 #define LB_SYS_statx      332
+#define LB_SYS_faccessat  269
 #define LB_SYS_pidfd_send_signal 424
 #define LB_SYS_open_tree  428
 #define LB_SYS_move_mount 429
@@ -61,6 +62,7 @@
 #define LB_SYS_memfd_create 279
 #define LB_SYS_execveat   281
 #define LB_SYS_statx      291
+#define LB_SYS_faccessat  48
 #define LB_SYS_pidfd_send_signal 424
 #define LB_SYS_open_tree  428
 #define LB_SYS_move_mount 429
@@ -82,6 +84,7 @@
 #define LB_EBUSY                  16
 #define LB_EEXIST                 17
 #define LB_EINVAL                 22
+#define LB_ENOSYS                 38
 #define LB_ENOTDIR                20
 
 /* The signals lightbox names that lightc does not (asm/signal.h) */
@@ -454,6 +457,12 @@ static inline lc_sysret lb_sys_move_mount(int32_t from_dirfd, const char *from_p
 /* close_range(2), Linux 5.9: close every descriptor from first to last */
 static inline lc_sysret lb_sys_close_range(uint32_t first, uint32_t last, uint32_t flags) {
     return lc_syscall3(LB_SYS_close_range, first, last, flags);
+}
+
+/* faccessat without flags: what kernels before 5.8, which have no
+ * faccessat2, answer with. */
+static inline lc_sysret lb_sys_faccessat(int32_t dirfd, const char *path, int32_t mode) {
+    return lc_syscall3(LB_SYS_faccessat, dirfd, (int64_t)path, mode);
 }
 
 static inline lc_sysret lb_sys_statfs(const char *path, struct lb_statfs *buf) {

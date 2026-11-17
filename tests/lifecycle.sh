@@ -84,6 +84,8 @@ settings() { # after LIFECYCLE_T is known
     OUT="$T/out"
     CG=$(cat "$T/cgroup_base")
     export HOME="$T/home"
+    # named, so that neither /etc/lightbox nor $HOME is looked at
+    export LIGHTBOX_CONFIG="$HOME/.config/lightbox/lightbox.conf"
 }
 
 # ─── Helpers for cases ──────────────────────────────────────────────────────
@@ -283,11 +285,12 @@ firewall_rules() { iptables-save | grep -v '^#' | sed 's/\[[0-9]*:[0-9]*\]//'; }
 # A lightbox.conf of the suite's with more settings, for a case: sets $ALT.
 alt_conf() { # directory name, settings...
     ALT=$T/$1/home
+    ALT_CONF=$ALT/.config/lightbox/lightbox.conf
     shift
     mkdir -p "$ALT/.config/lightbox" || return 1
     { cat "$HOME/.config/lightbox/lightbox.conf"; printf '%s\n' "$@"; } > "$ALT/.config/lightbox/lightbox.conf"
 }
-alt_lb() { HOME="$ALT" timeout -k 5 60 "$LB" "$@"; }
+alt_lb() { LIGHTBOX_CONFIG="$ALT_CONF" timeout -k 5 60 "$LB" "$@"; }
 
 # What lightbox 0.4 put straight into FORWARD and POSTROUTING, taken out by
 # setup; a rule of the host's that looks like one stays.
@@ -377,7 +380,7 @@ t_setup_refuses_a_gateway_outside() {
     sed -e 's#^bridge = .*#bridge = lbt9#' -e 's#^gw = .*#gw = 10.198.0.1#' "$HOME/.config/lightbox/lightbox.conf" \
         > "$T/gwout/home/.config/lightbox/lightbox.conf"
     rules=$(firewall_rules)
-    said=$(HOME="$T/gwout/home" timeout -k 5 60 "$LB" setup 2>&1) && { echo "setup succeeded"; return 1; }
+    said=$(LIGHTBOX_CONFIG="$T/gwout/home/.config/lightbox/lightbox.conf" timeout -k 5 60 "$LB" setup 2>&1) && { echo "setup succeeded"; return 1; }
     printf '%s\n' "$said"
     no_link lbt9 || { echo "a bridge was made before the refusal"; return 1; }
     [ "$rules" = "$(firewall_rules)" ] || { echo "the firewall rules changed:"; firewall_rules; return 1; }
@@ -402,7 +405,7 @@ t_setup_refuses_other_cgroup_root() {
         -e 's#^bridge = .*#bridge = lbt9#' "$HOME/.config/lightbox/lightbox.conf" \
         > "$T/alt/home/.config/lightbox/lightbox.conf"
     mounts=$(cat /proc/self/mountinfo)
-    said=$(HOME="$T/alt/home" timeout -k 5 60 "$LB" setup 2>&1) && { echo "setup succeeded"; return 1; }
+    said=$(LIGHTBOX_CONFIG="$T/alt/home/.config/lightbox/lightbox.conf" timeout -k 5 60 "$LB" setup 2>&1) && { echo "setup succeeded"; return 1; }
     printf '%s\n' "$said"
     [ "$mounts" = "$(cat /proc/self/mountinfo)" ] || { echo "the mount table changed"; return 1; }
     no_link lbt9 || { echo "a bridge was made before the refusal"; return 1; }
@@ -1269,7 +1272,7 @@ t_without_io_controller() {
     sed -e "s#^cgroup_root = .*#cgroup_root = $sub#" -e "s#^cgroup_base = .*#cgroup_base = $sub/base#" \
         "$HOME/.config/lightbox/lightbox.conf" > "$T/noio/home/.config/lightbox/lightbox.conf"
     echo "controllers below the suite's cgroup: $(cat "$sub/cgroup.controllers")"
-    export HOME="$T/noio/home"
+    export LIGHTBOX_CONFIG="$T/noio/home/.config/lightbox/lightbox.conf"
     box plain || return 1
     lb start plain >"$OUT/plain.start" 2>&1 </dev/null || { cat "$OUT/plain.start"; return 1; }
     cat "$OUT/plain.start"
@@ -1857,8 +1860,8 @@ t_wide_subnet() {
     mkdir -p "$T/wide/home/.config/lightbox"
     sed -e "s#^bridge = .*#bridge = $WIDE_BR#" -e 's#^subnet = .*#subnet = 10.9.0.0/16#' -e 's#^gw = .*#gw = 10.9.0.1#' \
         "$HOME/.config/lightbox/lightbox.conf" > "$T/wide/home/.config/lightbox/lightbox.conf"
-    suite_home=$HOME
-    export HOME="$T/wide/home"
+    suite_conf=$LIGHTBOX_CONFIG
+    export LIGHTBOX_CONFIG="$T/wide/home/.config/lightbox/lightbox.conf"
     lb setup >"$OUT/wide.setup" 2>&1 || { cat "$OUT/wide.setup"; return 1; }
     ip -o -4 addr show dev "$WIDE_BR"
     ip -o -4 addr show dev "$WIDE_BR" | grep -q ' 10\.9\.0\.1/16 ' || { echo "the bridge does not have 10.9.0.1/16"; return 1; }
@@ -1876,7 +1879,7 @@ t_wide_subnet() {
     fi
     lb stop wide >/dev/null || return 1
     # on the suite's network that address is no container's, and start says so
-    export HOME="$suite_home"
+    export LIGHTBOX_CONFIG="$suite_conf"
     said=$(lb start wide 2>&1) && { echo "a container outside the subnet was started"; return 1; }
     printf '%s\n' "$said"
     case $said in *'it is outside the subnet of lightbox.conf'*) ;; *) return 1 ;; esac
@@ -2047,6 +2050,210 @@ t_no_ipv6_in_container() {
     [ -z "$said" ]
 }
 
+# start and stop take several names and do them one after the other. A name
+# that is no container's ends nothing for the others, and is named at the end.
+t_several_names() {
+    box many1 && box many2 || return 1
+    said=$(lb start many1 nosuch many2 2>&1 </dev/null) && { printf '%s\n' "$said"; echo "a start with the name of no container succeeded"; return 1; }
+    printf '%s\n' "$said"
+    [ "$(printf '%s\n' "$said" | tail -n 1)" = 'Error: not started: nosuch' ] || return 1
+    settled many1 && settled many2 || return 1
+    lb stop -t 5 many1 many2 || return 1
+    [ "$(state_of many1)" = stopped ] && [ "$(state_of many2)" = stopped ] ||
+        { echo "states: $(state_of many1) $(state_of many2)"; return 1; }
+    nothing_left many1 && nothing_left many2
+}
+
+# inspect --json of a running container: running, its init's number as a
+# number, and the start time beside it, as text inspect shows them.
+t_inspect_json_running() {
+    command -v python3 >/dev/null 2>&1 || { echo "no python3 to decode JSON with"; return 77; }
+    up seen || return 1
+    json=$(lb inspect seen --json) || return 1
+    printf '%s\n' "$json"
+    printf '%s' "$json" | python3 -I -c '
+import json, sys
+c = json.load(sys.stdin)[0]
+assert c["running"] is True and c["state"] == "running", "not running"
+assert c["pid"] == int(sys.argv[1]), "pid %r" % c["pid"]
+assert isinstance(c["pid_starttime"], str) and c["pid_starttime"].isdigit(), "pid_starttime %r" % c["pid_starttime"]
+' "$(pid_of seen)" || return 1
+    [ "$(lb inspect seen | sed -n 's/^pid_starttime: //p')" = "$(printf '%s' "$json" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)[0]["pid_starttime"])')" ]
+}
+
+# doctor as root on a host set up for lightbox finds nothing missing (see
+# t_doctor). Each precondition of start broken in turn makes it exit 1, with
+# the check that names it and, on the line after, what fixes it.
+t_doctor_names_what_is_missing() {
+    breaks() { # check, fix, doctor's words... : doctor fails that check and says the fix
+        local check=$1 fix=$2
+        shift 2
+        said=$("$@" 2>&1) && { printf '%s\n' "$said"; echo "doctor exited 0 with $check broken"; return 1; }
+        printf '%s\n' "$said" | grep -A1 "^$check: "
+        printf '%s\n' "$said" | grep -A1 -E "^$check: (no|missing)" | tail -n 1 | grep -qF "  to fix: $fix" ||
+            { echo "$check is not said to fail, with: $fix"; return 1; }
+    }
+    lb doctor >/dev/null || { lb doctor; echo "doctor finds something missing before anything is broken"; return 1; }
+    nsenter_path=$(first_existing /usr/bin/nsenter /bin/nsenter /usr/sbin/nsenter /sbin/nsenter)
+    mount --bind /dev/null "$nsenter_path" || return 1
+    breaks bin.nsenter 'install util-linux' lb doctor; rc=$?
+    umount "$nsenter_path" || return 1
+    [ $rc = 0 ] || return 1
+    ip_path=$(first_existing /sbin/ip /usr/sbin/ip /bin/ip /usr/bin/ip)
+    shim "$ip_path" 'case "$1" in -V) echo "ip: invalid option -- '"'"'V'"'"'"; echo "BusyBox v1.36.1 multi-call binary." ;; *) exec "$REAL" "$@" ;; esac' || return 1
+    breaks bin.ip 'install iproute2' lb doctor || return 1
+    umount -l "$ip_path" && : > "$T/shims"
+    mkdir -p "$T/emptyroot" "$T/notcg"
+    alt_conf docrootfs "rootfs = $T/emptyroot" || return 1
+    breaks path.rootfs 'put a root filesystem there' alt_lb doctor || return 1
+    alt_conf doccg "cgroup_root = $T/notcg" || return 1
+    breaks cgroup2 'boot with cgroup_no_v1=all' alt_lb doctor || return 1
+    alt_conf docfwd 'firewall_backend = nftables' || return 1
+    echo 0 > /proc/sys/net/ipv4/ip_forward || return 1
+    breaks ip_forwarding 'sysctl -w net.ipv4.ip_forward=1' alt_lb doctor || return 1
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+    if command -v setpriv >/dev/null 2>&1; then
+        # a copy that another user can reach, which the checkout may not be
+        pub=$(mktemp -d /tmp/lbt-pub.XXXXXX) && chmod 755 "$pub" && cp "$LB" "$pub/lightbox" && chmod 755 "$pub/lightbox" ||
+            return 1
+        breaks root 'run lightbox as root' setpriv --reuid=65534 --regid=65534 --clear-groups \
+            env LIGHTBOX_CONFIG=/dev/null "$pub/lightbox" doctor
+        rc=$?
+        rm -rf -- "$pub"
+        return $rc
+    fi
+    echo "no setpriv to run doctor as another user with"
+}
+
+# ─── Cases: restart, update, rm -f ──────────────────────────────────────────
+
+limits_of() { echo "memory.max $(cat "$CG/$1/memory.max"), pids.max $(cat "$CG/$1/pids.max"), cpu.max $(cat "$CG/$1/cpu.max")"; }
+
+# update of a running container changes its cgroup's limits at once, and its
+# .conf, so that it has them after a restart too.
+t_update_live() {
+    up upd || return 1
+    before=$(limits_of upd)
+    echo "before: $before"
+    lb update upd --mem 64M --pids 50 --cpu 0.5 || return 1
+    echo "after:  $(limits_of upd)"
+    want='memory.max 67108864, pids.max 50, cpu.max 50000 100000'
+    [ "$(limits_of upd)" = "$want" ] || { echo "the running container did not take the limits"; return 1; }
+    old=$(pid_of upd)
+    lb restart upd || return 1
+    settled upd || return 1
+    [ "$(pid_of upd)" != "$old" ] || { echo "restart left the same init"; return 1; }
+    echo "after a restart: $(limits_of upd)"
+    [ "$(limits_of upd)" = "$want" ] || { echo "the limits did not outlast a restart"; return 1; }
+}
+
+# restart stops a container that runs and starts it, and starts one that is
+# stopped.
+t_restart() {
+    up rst || return 1
+    old=$(pid_of rst)
+    lb restart -t 5 rst || return 1
+    settled rst && [ "$(pid_of rst)" != "$old" ] || { echo "the container was not started again"; return 1; }
+    wait_until 5 gone "$old" || { echo "the old init is still there"; return 1; }
+    lb stop rst >/dev/null || return 1
+    lb restart rst || return 1
+    settled rst
+}
+
+# rm of a running container is refused; rm -f kills it first, as docker rm -f
+# does, and removes it, leaving nothing.
+t_rm_force() {
+    up rmf || return 1
+    pid=$(pid_of rmf)
+    port_of rmf >/dev/null
+    refused lb rm rmf || { echo "rm removed a running container"; return 1; }
+    lb rm -f rmf || return 1
+    wait_until 5 gone "$pid" || { echo "init is still there"; return 1; }
+    [ ! -e "$C/rmf" ] || { echo "the container's directory is left"; return 1; }
+    nothing_left rmf
+}
+
+# ─── Cases: the README ──────────────────────────────────────────────────────
+
+# The quick start of README.md: every command of its fenced blocks, as it is
+# written, in order, in one shell that stops at the first that fails. It runs
+# from a directory where ./lightbox is the binary under test, with /opt and
+# /srv a tmpfs of this mount namespace's, and a configuration of its own with
+# the README's network, 10.0.0.0/24, on a bridge of its own. The download is
+# the one thing done otherwise, as this network namespace reaches no
+# internet: wget writes a tarball of the suite's root filesystem by the name
+# it is asked for. Step 5's hook is the /init.sh of a container that starts.
+t_readme_quick_start() {
+    readme=$HERE/../README.md
+    [ -f "$readme" ] || { echo "no README.md"; return 77; }
+    [ -d /opt ] && [ -d /srv ] || { echo "this host has no /opt or /srv to put a tmpfs on"; return 77; }
+    mount -t tmpfs lbt-opt /opt && echo /opt >> "$T/shims" &&
+        mount -t tmpfs lbt-srv /srv && echo /srv >> "$T/shims" || return 1
+    qs=$T/quickstart
+    mkdir -p "$qs/dir" "$qs/image" || return 1
+    ln -sf "$LB" "$qs/dir/lightbox"
+    # the image: the suite's root filesystem, with what the quick start reads in it
+    cp -a "$BASE/." "$qs/image/" && printf 'NAME="lightbox test image"\nID=lbtest\n' > "$qs/image/etc/os-release" &&
+        add_account "$qs/image/etc/passwd" nobody 'nobody:x:65534:65534:nobody:/:/bin/sh' || return 1
+    printf '%s\n' "lightbox_dir = $qs/data" "run_dir = $qs/run" "cgroup_root = /sys/fs/cgroup" "cgroup_base = $CG/qs" \
+        "bridge = lbt-qs" "subnet = 10.0.0.0/24" "gw = 10.0.0.1" > "$qs/lightbox.conf"
+    # steps 1 to 4 as one script, and step 5's block as a hook
+    awk -v hook="$qs/init.sh" '
+        /^## Quick start/ { on = 1; next }
+        on && /^## / { exit }
+        on && /^### / { step = $2 }
+        on && /^```sh$/ { inside = 1; next }
+        inside && /^```$/ { inside = 0; next }
+        inside && step == "5." { print > hook; next }
+        inside { print }' "$readme" > "$qs/script.sh"
+    commands=$(grep -cvE '^[[:space:]]*(#|$)' "$qs/script.sh")
+    echo "commands in the quick start of README.md: $commands"
+    [ "$commands" -ge 30 ] && [ -s "$qs/init.sh" ] || { echo "the quick start was not found whole"; return 1; }
+    wget() { local url; for url; do :; done; tar -C "$qs/image" -czf "${url##*/}" .; }
+    export -f wget
+    export qs LIGHTBOX_CONFIG="$qs/lightbox.conf"
+    ( cd "$qs/dir" && PS4='+ ' bash -e -x "$qs/script.sh" ) > "$OUT/quickstart" 2>&1 </dev/null
+    rc=$?
+    if [ $rc != 0 ]; then
+        # what stopped it first, for a report that shows only the first lines
+        echo "the quick start stopped at: $(grep '^+ ' "$OUT/quickstart" | tail -n 1)"
+        tail -n 12 "$OUT/quickstart"
+        echo "--- the commands that ran:"
+        grep '^+ ' "$OUT/quickstart"
+        return 1
+    fi
+    ran=$(grep -c '^+ ' "$OUT/quickstart")
+    [ "$ran" -ge "$commands" ] || { echo "$ran commands ran of $commands"; grep '^+ ' "$OUT/quickstart"; return 1; }
+    # step 5: its block as the /init.sh of a container from the quick start's image
+    said=$(cd "$qs/dir" && ./lightbox create hooked --rootfs /opt/rootfs/alpine 2>&1 &&
+           cp "$qs/init.sh" "$qs/data/containers/hooked/rootfs/init.sh" &&
+           ./lightbox start hooked 2>&1 && ./lightbox stop hooked 2>&1) ||
+        { echo "a container with step 5's /init.sh did not start and stop:"; printf '%s\n' "$said"; return 1; }
+    echo "$ran commands of the quick start ran, and step 5's hook started a container"
+}
+
+# ─── Cases: where the settings are ──────────────────────────────────────────
+
+# Named by neither --config nor LIGHTBOX_CONFIG, the settings are those of
+# /etc/lightbox/lightbox.conf, and a file at the old place in $HOME is said
+# not to be read. /etc is an overlay in this mount namespace: nothing is
+# written to the host's.
+t_config_in_etc() {
+    mkdir -p "$T/etc-up" "$T/etc-work" || return 1
+    mount -t overlay overlay -o "lowerdir=/etc,upperdir=$T/etc-up,workdir=$T/etc-work" /etc 2>/dev/null ||
+        { echo "no overlay can be put over /etc here"; return 77; }
+    echo /etc >> "$T/shims"         # teardown takes it away
+    mkdir -p /etc/lightbox &&
+        sed 's#^bridge = .*#bridge = lbt-etc#' "$LIGHTBOX_CONFIG" > /etc/lightbox/lightbox.conf || return 1
+    said=$(env -u LIGHTBOX_CONFIG "$LB" doctor 2>&1)
+    printf '%s\n' "$said" | grep -E '^(Note|Warning|bridge):'
+    printf '%s\n' "$said" | grep -qx 'bridge: lbt-etc' || { echo "/etc/lightbox/lightbox.conf was not read"; return 1; }
+    printf '%s\n' "$said" | grep -qx "Note: $HOME/.config/lightbox/lightbox.conf is not read; /etc/lightbox/lightbox.conf is" ||
+        { echo "the file in HOME was not said to be left"; return 1; }
+    [ "$(lb doctor 2>/dev/null | grep '^bridge: ')" = "bridge: $BR" ] || { echo "LIGHTBOX_CONFIG did not come first"; return 1; }
+    [ -f "$T/etc-up/lightbox/lightbox.conf" ] || { echo "the file is not in the overlay, but in the host's /etc"; return 1; }
+}
+
 # ─── Cases: after a reboot, and teardown ────────────────────────────────────
 
 # What a reboot takes: the bridge, every firewall rule and chain, forwarding
@@ -2085,11 +2292,11 @@ t_nft_start_after_the_tables_went() {
     nft_setup nftre; rc=$?; [ $rc = 0 ] || return $rc
     box nrepeer && box nrelinked --link nrepeer || return 1
     ip link delete "$BR" && nft delete table ip lightbox && nft delete table bridge lightbox || return 1
-    HOME="$ALT" start nrepeer || return 1
+    LIGHTBOX_CONFIG="$ALT_CONF" start nrepeer || return 1
     grep -q 'making it again' "$OUT/nrepeer.start" || { echo "start did not say that it made the network again"; return 1; }
     nft list table ip lightbox >/dev/null && nft list table bridge lightbox >/dev/null && ip link show dev "$BR" >/dev/null ||
         { echo "the tables or the bridge are not there"; return 1; }
-    HOME="$ALT" start nrelinked || return 1
+    LIGHTBOX_CONFIG="$ALT_CONF" start nrelinked || return 1
     reaches nrelinked "$(addr_of nrepeer)" && reaches nrelinked "$OUTSIDE"
 }
 
@@ -2188,7 +2395,7 @@ t_nft_links_without_brnf() {
     if [ -e "$BRNF" ]; then brnf 0 || return 1; fi
     nft_setup nftlinks; rc=$?; [ $rc = 0 ] || return $rc
     box npeer && box nlinked --link npeer && box nthird || return 1
-    HOME="$ALT" start npeer && HOME="$ALT" start nlinked && HOME="$ALT" start nthird || return 1
+    LIGHTBOX_CONFIG="$ALT_CONF" start npeer && LIGHTBOX_CONFIG="$ALT_CONF" start nlinked && LIGHTBOX_CONFIG="$ALT_CONF" start nthird || return 1
     nft list set bridge lightbox links
     reaches nlinked "$(addr_of npeer)" && reaches npeer "$(addr_of nlinked)" || return 1
     reaches nthird "$(addr_of nlinked)" && { echo "a container without the link reached nlinked"; return 1; }
@@ -2203,7 +2410,7 @@ t_nft_one_process() {
     nft_setup nftone; rc=$?; [ $rc = 0 ] || return $rc
     box nonepeer && box nonelinked --link nonepeer || return 1
     is_up() { [ "$(state_of nonelinked 2>/dev/null)" = running ]; }
-    HOME="$ALT" timeout -k 5 80 strace -f -qq -e trace=execve -o "$T/nftlinks.strace" \
+    LIGHTBOX_CONFIG="$ALT_CONF" timeout -k 5 80 strace -f -qq -e trace=execve -o "$T/nftlinks.strace" \
         "$LB" start nonelinked >"$OUT/nonelinked.start" 2>&1 </dev/null &
     tracer=$!
     wait_until 60 is_up || { echo "the container did not start under strace:"; cat "$OUT/nonelinked.start"; kill "$tracer" 2>/dev/null; return 1; }
@@ -2222,7 +2429,7 @@ t_nft_one_process() {
 t_nft_rm_leaves_nothing() {
     nft_setup nftrm; rc=$?; [ $rc = 0 ] || return $rc
     box nrpeer --link nrmain && box nrmain --link nrpeer && box nrother --link nrpeer || return 1
-    HOME="$ALT" start nrpeer && HOME="$ALT" start nrmain && HOME="$ALT" start nrother || return 1
+    LIGHTBOX_CONFIG="$ALT_CONF" start nrpeer && LIGHTBOX_CONFIG="$ALT_CONF" start nrmain && LIGHTBOX_CONFIG="$ALT_CONF" start nrother || return 1
     port=$(port_of nrmain) other=$(port_of nrother)
     nft list set bridge lightbox links
     nft list set bridge lightbox links | grep -qF "\"$port\"" || { echo "the link is not in the set"; return 1; }
@@ -2265,7 +2472,7 @@ t_nft_forwarding() {
 t_nft_accept_fwmark() {
     command -v ping >/dev/null 2>&1 || { echo "no ping to try the way in with"; return 77; }
     nft_setup nftmark 'bridge_accept_fwmark = 0x10/0xf0'; rc=$?; [ $rc = 0 ] || return $rc
-    box nmarked && HOME="$ALT" start nmarked || return 1
+    box nmarked && LIGHTBOX_CONFIG="$ALT_CONF" start nmarked || return 1
     ip=$(addr_of nmarked) outside=$(cat "$T/outside")
     nsenter -t "$outside" -n ip route add "$SUBNET" via 192.0.2.2 || return 1
     nsenter -t "$outside" -n ping -c 1 -W 2 "$ip" && { echo "a new connection from outside was not dropped"; return 1; }
@@ -2390,7 +2597,7 @@ teardown() {
     for d in "$CG"/*/; do
         [ -d "$d" ] && kill_cgroup "${d%/}"
     done
-    for p in $(ip -o link show | awk -F': ' '{ sub(/@.*/, "", $2); print $2 }' | grep -E "^(vb-|ve-|lbt-foreign\$|$WIDE_BR\$)"); do
+    for p in $(ip -o link show | awk -F': ' '{ sub(/@.*/, "", $2); print $2 }' | grep -E "^(vb-|ve-|lbt-foreign\$|lbt-qs\$|$WIDE_BR\$)"); do
         ip link delete "$p"
     done
     [ -s "$T/firewall" ] && iptables-restore < "$T/firewall"
@@ -2474,9 +2681,15 @@ if [ "$MODE" = inside ]; then
     check 'ip_forward_no_drop = true leaves the FORWARD policy'           t_ip_forward_no_drop
     check 'firewall = false: no rule is made, and a container with links is refused' t_firewall_false
     check 'doctor finds nothing missing'                                  t_doctor
+    check 'doctor names each precondition of start that is broken, and its fix' t_doctor_names_what_is_missing
 
     check 'create, start, exec, stop and rm'                              t_lifecycle
+    check 'start and stop take several names, and name those they could not do' t_several_names
+    check 'update changes the limits of a running container, and they outlast a restart' t_update_live
+    check 'restart stops a running container and starts it, and starts a stopped one' t_restart
+    check 'rm -f kills a running container and removes it'                t_rm_force
     check 'ls and inspect show a running container'                       t_queries_show_running
+    check 'inspect --json of a running container has its init, as numbers'  t_inspect_json_running
     check 'exec returns the exit status of the command'                   t_exec_status
     check 'exec without a command runs a shell on standard input'         t_exec_default_shell
     check 'a container has its own hostname, processes and root'          t_own_world
@@ -2593,6 +2806,8 @@ if [ "$MODE" = inside ]; then
     check 'a start where the network is there makes nothing'              t_start_with_the_network_there
     check 'nftables: after the tables went, start makes them again'       t_nft_start_after_the_tables_went
     check 'setup --teardown leaves the host as before the first setup'    t_setup_teardown
+    check 'without --config or LIGHTBOX_CONFIG, /etc/lightbox/lightbox.conf is read' t_config_in_etc
+    check 'the quick start of README.md runs as it is written'             t_readme_quick_start
 
     # last: it may leave a kernel setting changed for the rest of this suite's life
     check 'exec works where a memfd may not be executed'                  t_exec_where_memfds_may_not_be_executed

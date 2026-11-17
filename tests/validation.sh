@@ -56,7 +56,7 @@ sandbox() {
     } > "$CONF"
 }
 
-lb() { HOME="$W/home" "$LB" "$@"; }
+lb() { HOME="$W/home" LIGHTBOX_CONFIG="$CONF" "$LB" "$@"; }
 
 # Succeeds when the command fails. Output is kept for the report.
 refused() { ! "$@"; }
@@ -238,7 +238,9 @@ t_stopped_container_cannot_stop_or_exec() {
 
 t_unknown_command_prints_usage() {
     usage=$(lb frobnicate 2>&1)
-    [ $? -ne 0 ] && printf '%s\n' "$usage" | grep -q '^Usage: lightbox'
+    [ $? -ne 0 ] && printf '%s\n' "$usage" | grep -q '^Usage: lightbox' &&
+    [ "$(printf '%s\n' "$usage" | head -n 1)" = 'Error: unknown command: frobnicate' ] &&
+    [ -z "$(lb frobnicate 2>/dev/null)" ]
 }
 
 # ─── Cases: open findings ───────────────────────────────────────────────────
@@ -404,7 +406,7 @@ t_creates_at_once_get_two_addresses() {
     printf '#!/bin/sh\nsleep 1\nexec %s "$@"\n' "$W/cp.real" > "$W/cp.shim"
     chmod +x "$W/cp.shim"
     # shellcheck disable=SC2016     # the script is for the shell in the namespace
-    HOME="$W/home" unshare -r --mount -- sh -c '
+    HOME="$W/home" LIGHTBOX_CONFIG="$CONF" unshare -r --mount -- sh -c '
         for cp in /bin/cp /usr/bin/cp; do
             [ -e "$cp" ] && { mount --bind "$1/cp.shim" "$(readlink -f "$cp")" || exit 77; }
         done
@@ -780,18 +782,19 @@ t_rootfs_from_the_environment() {
     echo base > "$BASE/etc/which"
     built_in=/var/lib/lightbox/rootfs
 
-    # without a lightbox.conf: the variable, and without it what is built in
-    said=$(HOME="$W/nohome" LIGHTBOX_ROOTFS="$W/other" "$LB" doctor 2>/dev/null | grep '^rootfs: ')
+    # without a lightbox.conf, which an empty one is, so that this host's
+    # /etc/lightbox counts for nothing: the variable, and without it what is built in
+    said=$(HOME="$W/nohome" LIGHTBOX_CONFIG=/dev/null LIGHTBOX_ROOTFS="$W/other" "$LB" doctor 2>/dev/null | grep '^rootfs: ')
     echo "no lightbox.conf, with the variable: $said"
     [ "$said" = "rootfs: $W/other" ] || return 1
-    said=$(HOME="$W/nohome" "$LB" doctor 2>/dev/null | grep '^rootfs: ')
+    said=$(HOME="$W/nohome" LIGHTBOX_CONFIG=/dev/null "$LB" doctor 2>/dev/null | grep '^rootfs: ')
     echo "no lightbox.conf, without it: $said"
     [ "$said" = "rootfs: $built_in" ] || return 1
     # an empty variable is no variable, and neither is another that begins like it
-    said=$(HOME="$W/nohome" LIGHTBOX_ROOTFS='' LIGHTBOX_ROOTFS_OLD="$W/other" "$LB" doctor 2>/dev/null | grep '^rootfs: ')
+    said=$(HOME="$W/nohome" LIGHTBOX_CONFIG=/dev/null LIGHTBOX_ROOTFS='' LIGHTBOX_ROOTFS_OLD="$W/other" "$LB" doctor 2>/dev/null | grep '^rootfs: ')
     [ "$said" = "rootfs: $built_in" ] || { echo "an empty variable: $said"; return 1; }
     # no HOME at all, as under some service managers
-    said=$(env -u HOME LIGHTBOX_ROOTFS="$W/other" "$LB" doctor 2>/dev/null | grep '^rootfs: ')
+    said=$(env -u HOME LIGHTBOX_CONFIG=/dev/null LIGHTBOX_ROOTFS="$W/other" "$LB" doctor 2>/dev/null | grep '^rootfs: ')
     [ "$said" = "rootfs: $W/other" ] || { echo "without HOME: $said"; return 1; }
 
     # with a lightbox.conf: the variable comes before the setting, and --rootfs before both
@@ -804,7 +807,7 @@ t_rootfs_from_the_environment() {
     [ "$(cat "$C/fromflag/rootfs/etc/which")" = other ] || return 1
 
     # the variable is held to what the setting is held to
-    msg=$(HOME="$W/nohome" LIGHTBOX_ROOTFS="$(pad_path "$W/other" 460)" "$LB" doctor 2>&1) && { echo "a variable of 460 characters was accepted"; return 1; }
+    msg=$(HOME="$W/nohome" LIGHTBOX_CONFIG=/dev/null LIGHTBOX_ROOTFS="$(pad_path "$W/other" 460)" "$LB" doctor 2>&1) && { echo "a variable of 460 characters was accepted"; return 1; }
     printf '%s\n' "$msg" | cut -c1-80
     case $msg in 'Error: LIGHTBOX_ROOTFS is too long: '*) ;; *) return 1 ;; esac
 }
@@ -980,7 +983,7 @@ t_create_killed_half_way() {
     } > "$W/cp.shim"
     chmod +x "$W/cp.shim"
     # shellcheck disable=SC2016     # the script is for the shell in the namespace
-    HOME="$W/home" unshare -r --mount -- sh -c '
+    HOME="$W/home" LIGHTBOX_CONFIG="$CONF" unshare -r --mount -- sh -c '
         for cp in /bin/cp /usr/bin/cp; do
             [ -e "$cp" ] && { mount --bind "$1/cp.shim" "$(readlink -f "$cp")" || exit 77; }
         done
@@ -1218,39 +1221,200 @@ t_unusable_base_refused() {
     [ -z "$(ls -A "$C")" ]
 }
 
+# inspect shows what a container is configured with, its volumes and links
+# among it, a line each, and its log; "-" where there is none.
 t_inspect_shows_volumes_and_links() {
     lb create db 10.0.0.3 && lb create web 10.0.0.2 --vol "$W/vol:/data:ro" --link db || return 1
     report=$(lb inspect web)
     printf '%s\n' "$report"
-    printf '%s\n' "$report" | grep -q '/data' && printf '%s\n' "$report" | grep -Eq 'link.*db'
+    printf '%s\n' "$report" | grep -qx "volume: $W/vol:/data:ro" && printf '%s\n' "$report" | grep -qx 'link: db' &&
+    printf '%s\n' "$report" | grep -qx "log_path: $C/web/console.log" || return 1
+    report=$(lb inspect db)
+    printf '%s\n' "$report" | grep -qx 'volume: -' && printf '%s\n' "$report" | grep -qx 'link: -'
 }
 
+# inspect --json: the same, as a JSON array of one object, with numbers,
+# true and false, null for what is not there, and arrays of volumes and
+# links. A configuration that cannot be used is an error before anything is
+# printed: a JSON document is whole or not there.
+t_inspect_json() {
+    command -v python3 >/dev/null 2>&1 || { echo "no python3 to decode JSON with"; return 77; }
+    lb create db 10.0.0.3 && lb create web 10.0.0.2 --vol "$W/vol:/data:ro" --vol "$W/vol:/rw" --link db --swap 32M || return 1
+    json=$(lb inspect web --json) || return 1
+    printf '%s\n' "$json"
+    [ "$json" = "$(lb inspect --json web)" ] || { echo "--json before the name gives another answer"; return 1; }
+    printf '%s' "$json" | python3 -I -c '
+import json, sys
+doc = json.load(sys.stdin)
+assert isinstance(doc, list) and len(doc) == 1, "not an array of one"
+c = doc[0]
+want = {"name": "web", "ip": "10.0.0.2", "state": "stopped", "running": False, "pid": None,
+        "pid_starttime": None, "mem": "256M", "swap": "32M", "io": None, "oom_score": 500,
+        "privileged": False, "readonly": False, "links": ["db"],
+        "volumes": [{"src": sys.argv[1], "dst": "/data", "ro": True}, {"src": sys.argv[1], "dst": "/rw", "ro": False}]}
+bad = [k for k in want if c.get(k) != want[k]]
+assert not bad, "differ: " + ", ".join("%s=%r" % (k, c.get(k)) for k in bad)
+assert c["log_path"].endswith("/web/console.log") and c["host_interface"].startswith("vb-"), "paths"
+assert "userns" not in c and "uid_start" not in c, "user namespace keys"
+' "$W/vol" || return 1
+    echo 'colour=blue' >> "$C/web/.conf"
+    out=$(lb inspect web --json 2>"$W/err") && { echo "inspect --json of a configuration that cannot be used succeeded"; return 1; }
+    cat "$W/err"
+    [ -z "$out" ] || { echo "it printed: $out"; return 1; }
+    grep -q "^Error: the container's configuration cannot be used: " "$W/err"
+}
+
+# A carriage return at the end of a line is no part of the value, as a file
+# written on Windows has it, and neither is a # after a space: the rest of
+# the line is a comment. A # with no space before it is part of the value.
 t_config_strips_carriage_returns() {
     printf 'bridge = br9\r\n' >> "$CONF"
-    lb doctor 2>/dev/null | grep -x 'bridge: br9'
+    lb doctor 2>/dev/null | grep -x 'bridge: br9' || return 1
+    printf 'bridge = br8 # the test bridge\r\n\r\n# a comment\r\n' >> "$CONF"
+    lb doctor 2>/dev/null | grep -x 'bridge: br8' || return 1
+    [ -z "$(lb doctor 2>&1 >/dev/null)" ] || { echo "CRLF lines were warned about:"; { lb doctor >/dev/null; } 2>&1; return 1; }
 }
 t_config_strips_inline_comments() {
     printf 'bridge = br9 # the test bridge\n' >> "$CONF"
-    lb doctor 2>/dev/null | grep -x 'bridge: br9'
+    lb doctor 2>/dev/null | grep -x 'bridge: br9' || return 1
+    printf 'bridge = br#7\ndns = 9.9.9.9\t# tab before\n' >> "$CONF"
+    lb doctor 2>/dev/null | grep -x 'bridge: br#7'
 }
+# A key that lightbox does not know, and a line that is no setting, are said
+# with the file and the line, and change nothing; the command goes on.
 t_config_reports_unknown_keys() {
-    printf 'defualt_mem = 1G\n' >> "$CONF"
-    lb doctor 2>&1 >/dev/null | grep -q 'defualt_mem'
+    lines=$(wc -l < "$CONF")
+    printf 'defualt_mem = 1G\nthis is not a setting\n' >> "$CONF"
+    said=$(lb doctor 2>&1 >/dev/null)
+    printf '%s\n' "$said"
+    [ "$said" = "Warning: $CONF: line $((lines + 1)): a key lightbox does not know: defualt_mem
+Warning: $CONF: line $((lines + 2)): not a setting, which is <key> = <value>: this is not a setting" ] || return 1
+    lb create web 10.0.0.2 >/dev/null 2>&1 && grep -qx 'mem=256M' "$C/web/.conf" ||
+        { echo "the misspelt key changed default_mem: $(grep '^mem=' "$C/web/.conf")"; return 1; }
 }
 
+# Where the settings come from: --config, then LIGHTBOX_CONFIG, then
+# /etc/lightbox/lightbox.conf, then the place in $HOME that lightbox read
+# before, which it says it will stop reading. A file that is named and not
+# there is an error. (No case here writes /etc: the lifecycle suite has that.)
+t_config_lookup_order() {
+    first=$W/first.conf second=$W/second.conf
+    { cat "$CONF"; echo 'bridge = brfirst'; } > "$first"
+    { cat "$CONF"; echo 'bridge = brsecond'; } > "$second"
+    { cat "$CONF"; echo 'bridge = brhome'; } > "$CONF.home" && mv "$CONF.home" "$CONF"
+    bridge() { grep '^bridge: ' | cut -d' ' -f2; }
+    bad=0
+    got=$(LIGHTBOX_CONFIG="$second" HOME="$W/home" "$LB" --config "$first" doctor 2>/dev/null | bridge)
+    [ "$got" = brfirst ] || { echo "--config and LIGHTBOX_CONFIG: $got"; bad=1; }
+    got=$(LIGHTBOX_CONFIG="$second" HOME="$W/home" "$LB" doctor 2>/dev/null | bridge)
+    [ "$got" = brsecond ] || { echo "LIGHTBOX_CONFIG and HOME: $got"; bad=1; }
+    if [ ! -e /etc/lightbox/lightbox.conf ]; then
+        said=$(LIGHTBOX_CONFIG='' HOME="$W/home" "$LB" doctor 2>&1)
+        [ "$(printf '%s\n' "$said" | bridge)" = brhome ] || { echo "an empty LIGHTBOX_CONFIG, and HOME: $(printf '%s\n' "$said" | bridge)"; bad=1; }
+        printf '%s\n' "$said" | grep -F "Warning: the configuration is read from $CONF, where lightbox 0.7 will" ||
+            { echo "the place in HOME was not said to be going"; bad=1; }
+    else
+        echo "this host has /etc/lightbox/lightbox.conf: HOME is not looked at, and that is not tried"
+    fi
+    for words in "--config $W/none.conf ls" "--config $W ls"; do
+        # shellcheck disable=SC2086
+        said=$(env -u LIGHTBOX_CONFIG "$LB" $words 2>&1) && { echo "lightbox $words succeeded"; bad=1; }
+        path=${words#--config }
+        [ "$said" = "Error: cannot read the configuration: ${path% ls}" ] || { echo "lightbox $words: $said"; bad=1; }
+    done
+    said=$(LIGHTBOX_CONFIG="$W/none.conf" "$LB" ls 2>&1) && { echo "a LIGHTBOX_CONFIG that is not there was taken"; bad=1; }
+    [ "$said" = "Error: cannot read the configuration: $W/none.conf" ] || { echo "LIGHTBOX_CONFIG not there: $said"; bad=1; }
+    said=$("$LB" --config 2>&1) && bad=1
+    [ "$said" = 'Error: --config needs the path of a lightbox.conf' ] || { echo "--config alone: $said"; bad=1; }
+    "$LB" --config "$first" --help | grep -q '^Usage: lightbox \[--config <path>\]' || { echo "help after --config"; bad=1; }
+    return $bad
+}
+
+# make install puts everything under DESTDIR, the configuration in
+# DESTDIR/etc/lightbox, and writes nothing in the home of whoever runs it. A
+# configuration that is there already is kept.
+t_make_install_stays_in_destdir() {
+    src=$(dirname "$LB")
+    [ -f "$src/Makefile" ] && [ -f "$src/lightbox.conf.example" ] || { echo "no source tree beside $LB"; return 77; }
+    mkdir -p "$W/installer"
+    inst() { env -u MAKEFLAGS -u MAKELEVEL -u MFLAGS HOME="$W/installer" make -s -C "$src" install DESTDIR="$W/dest" >"$W/install.out" 2>&1; }
+    inst || { cat "$W/install.out"; return 1; }
+    find "$W/dest" -type f | sed "s#^$W/dest##" | sort
+    [ -x "$W/dest/usr/local/bin/lightbox" ] && cmp -s "$W/dest/etc/lightbox/lightbox.conf" "$src/lightbox.conf.example" ||
+        { echo "the binary or the configuration is not under DESTDIR"; return 1; }
+    [ -z "$(ls -A "$W/installer")" ] || { echo "written in the home of whoever ran it: $(find "$W/installer")"; return 1; }
+    echo 'bridge = brkept' >> "$W/dest/etc/lightbox/lightbox.conf"
+    inst || { cat "$W/install.out"; return 1; }
+    grep -qx 'bridge = brkept' "$W/dest/etc/lightbox/lightbox.conf" || { echo "a second install replaced the configuration"; return 1; }
+}
+
+# Help that is asked for goes to standard output and is no error: the whole
+# usage, or one command's part of it. It reads no lightbox.conf, and says
+# nothing about one. --version names lightbox's version and lightc's.
 t_help_exits_zero() {
-    usage=$(lb --help 2>&1) || return 1
-    printf '%s\n' "$usage" | grep -q '^Usage: lightbox'
+    echo 'firewall = maybe' >> "$CONF"
+    usage=$(lb --help 2>/dev/null) || return 1
+    printf '%s\n' "$usage" | grep -q '^Usage: lightbox' || return 1
+    bad=0
+    for words in -h help 'help start' 'start --help' 'rm -h' 'exec --help' 'setup --help' 'ls -h'; do
+        # shellcheck disable=SC2086
+        out=$(lb $words 2>&1) || { echo "lightbox $words: exit $?"; bad=1; continue; }
+        printf '%s\n' "$out" | grep -q '^Usage: lightbox' || { echo "lightbox $words printed no usage"; bad=1; }
+        ! printf '%s\n' "$out" | grep -q '^Warning' || { echo "lightbox $words read lightbox.conf"; bad=1; }
+    done
+    commands=$(lb start --help | grep -c '^  [a-z]')
+    [ "$commands" = 1 ] || { echo "start --help shows $commands commands"; bad=1; }
+    lb help | grep -q -- '--version' || { echo "the usage does not name --version"; bad=1; }
+    out=$(lb help nosuch 2>&1) && { echo "help of no command succeeded"; bad=1; }
+    [ "$out" = 'Error: there is no such command: nosuch' ] || { echo "help nosuch: $out"; bad=1; }
+    v=$(lb --version) || { echo "--version: exit $?"; bad=1; }
+    echo "$v"
+    printf '%s\n' "$v" | grep -Eqx 'lightbox [0-9]+\.[0-9]+\.[0-9]+(-dev)? \(lightc [0-9]+\.[0-9]+\.[0-9]+\)' || bad=1
+    out=$(lb --version now 2>&1) && bad=1
+    [ "$out" = 'Error: unexpected argument: now' ] || { echo "--version now: $out"; bad=1; }
+    return $bad
 }
 
 # rm with two names removes both, or refuses and removes neither.
+# rm takes several names, as Docker's does: each is removed or says why not,
+# the others are removed all the same, and those that were not are named.
 t_rm_handles_every_argument() {
-    lb create a 10.0.0.2 && lb create b 10.0.0.3 || return 1
-    if lb rm a b; then
-        [ ! -e "$C/a" ] && [ ! -e "$C/b" ]
-    else
-        [ -e "$C/a" ] && [ -e "$C/b" ]
-    fi
+    lb create a 10.0.0.2 && lb create b 10.0.0.3 && lb create c 10.0.0.4 || return 1
+    lb rm a b || return 1
+    [ ! -e "$C/a" ] && [ ! -e "$C/b" ] || { echo "rm a b left one of them"; return 1; }
+    said=$(lb rm nosuch c 2>&1) && { printf '%s\n' "$said"; echo "rm of a container that does not exist succeeded"; return 1; }
+    printf '%s\n' "$said"
+    [ ! -e "$C/c" ] || { echo "rm stopped at the name it could not remove"; return 1; }
+    [ "$(printf '%s\n' "$said" | tail -n 1)" = 'Error: not removed: nosuch' ]
+}
+
+# A word that a command will not use is an error that names it, and the
+# command does nothing.
+t_surplus_arguments_are_errors() {
+    lb create web 10.0.0.2 || return 1
+    bad=0
+    expect() { # message, words...
+        local want=$1
+        shift
+        msg=$(lb "$@" 2>&1) && { echo "lightbox $*: succeeded"; bad=1; return; }
+        echo "lightbox $*: $msg"
+        [ "$msg" = "$want" ] || bad=1
+    }
+    expect 'Error: unexpected argument: b' inspect web b
+    expect 'Error: unknown option: --all' inspect web --all
+    expect 'Error: unexpected argument: extra' doctor extra
+    expect 'Error: unknown option: --jsno' ls --jsno
+    expect 'Error: unexpected argument: all' ls all
+    expect 'Error: unexpected argument: /mnt' add-vol web /tmp:/srv /mnt
+    expect 'Error: unexpected argument: /var' rm-vol web /srv /var
+    expect 'Error: unexpected argument: again' create web2 10.0.0.3 again
+    expect 'Error: unknown option: --all' rm web --all
+    expect 'Error: unknown option: --now' stop web --now
+    expect 'Error: not a number of seconds from 0 to 86400: soon' start web other -t soon
+    expect 'Usage: lightbox start <name>... [-t <seconds>]' start -t 5
+    [ -e "$C/web/.conf" ] && [ ! -e "$C/web2" ] || { echo "a command that was refused changed something"; bad=1; }
+    grep -q '/srv' "$C/web/.conf" && { echo "add-vol added the volume"; bad=1; }
+    return $bad
 }
 
 # Without root, start says so and leaves the container's state alone.
@@ -1275,8 +1439,150 @@ t_start_options_are_checked() {
     said -t -1     && case $msg in *'number of seconds'*) ;; *) return 1 ;; esac || return 1
     said -t        && case $msg in *'number of seconds'*) ;; *) return 1 ;; esac || return 1
     said --bogus   && case $msg in *'unknown option'*--bogus*) ;; *) return 1 ;; esac || return 1
-    said another   && case $msg in *'unexpected argument'*another*) ;; *) return 1 ;; esac || return 1
+    # a second word is a second name, and is checked as one before anything else
+    said 'an@other' && case $msg in *'container name must only contain'*) ;; *) return 1 ;; esac || return 1
     [ "$before" = "$(kept_sum)" ] || { echo "the container's records changed"; return 1; }
+}
+
+# doctor run by an ordinary user says that lightbox needs root, and how to
+# run it, and exits 1. Each check that fails is followed by what fixes it.
+# A rootfs with nothing in it is one create cannot copy.
+t_doctor_says_how_to_fix() {
+    [ "$(id -u)" -ne 0 ] || { echo "run as root: root is no failure to show"; return 77; }
+    report=$(lb doctor 2>&1) && { printf '%s\n' "$report"; echo "doctor exited 0 for an ordinary user"; return 1; }
+    printf '%s\n' "$report" | sed -n '/^root: /,$p'
+    printf '%s\n' "$report" | grep -qx "root: no (uid $(id -u))" || return 1
+    printf '%s\n' "$report" | grep -Eqx 'kernel: (yes|no) \(.+; lightbox needs Linux 5\.10 or later\)' || return 1
+    printf '%s\n' "$report" | grep -q '^syscalls: ' && printf '%s\n' "$report" | grep -q '^bin.nsenter: ' || return 1
+    # from root on the lines are checks, and one that fails has its fix next
+    printf '%s\n' "$report" | awk '/^root: / { on = 1 }
+        on && want { if ($0 !~ /^  to fix: ./) { print "no fix after " name; bad = 1 } want = 0; next }
+        on && /^[a-z_.0-9-]+: (no|missing|unusable)( |$)/ { want = 1; name = $1 }
+        END { if (want) { print "no fix after " name; bad = 1 } exit bad }' || return 1
+    mkdir "$W/emptyroot" && echo "rootfs = $W/emptyroot" >> "$CONF"
+    report=$(lb doctor 2>&1)
+    printf '%s\n' "$report" | grep -A1 '^path.rootfs: '
+    printf '%s\n' "$report" | grep -qx "path.rootfs: missing ($W/emptyroot is empty)" &&
+    printf '%s\n' "$report" | grep -A1 '^path.rootfs: ' | grep -q '^  to fix: put a root filesystem there'
+}
+
+# doctor --json: the settings, and every check as an object with ok as true
+# or false, the text of its line, and the fix of one that fails.
+t_doctor_json() {
+    command -v python3 >/dev/null 2>&1 || { echo "no python3 to decode JSON with"; return 77; }
+    json=$(lb doctor --json)
+    rc=$?
+    printf '%s\n' "$json" | cut -c1-300
+    # 0 or 1 as the overall verdict says, 3 when the document is not as it should be
+    printf '%s' "$json" | python3 -I -c '
+import json, sys
+def wrong(why):
+    print("not as it should be:", why)
+    sys.exit(3)
+try:
+    d = json.load(sys.stdin)
+except ValueError as e:
+    wrong(e)
+checks = {c["check"]: c for c in d["checks"]}
+for name in ("root", "kernel", "syscalls", "network", "cgroup2", "path.rootfs", "bin.ip", "bin.nsenter", "exec_sealing"):
+    if name not in checks:
+        wrong("no check " + name)
+for c in d["checks"]:
+    if not isinstance(c["ok"], bool):
+        wrong(c)
+    if (c["fix"] is None) != c["ok"]:
+        wrong(c)
+    if not (c["text"].startswith(("yes", "no", "ok", "missing", "unusable")) or c["check"] == "network"):
+        wrong(c)
+if d["overall"] != ("ok" if all(c["ok"] is True for c in d["checks"]) else "degraded"):
+    wrong("overall " + repr(d["overall"]))
+if d["settings"]["firewall"] is not True or d["settings"]["bridge_accept_fwmark"] is not None:
+    wrong("settings")
+sys.exit(0 if d["overall"] == "ok" else 1)
+'
+    verdict=$?
+    [ $verdict != 3 ] || return 1
+    [ $verdict = "$rc" ] || { echo "the exit status $rc is not that of the overall verdict, $verdict"; return 1; }
+    said=$(lb doctor --json --bogus 2>&1) && return 1
+    [ "$said" = 'Error: unknown option: --bogus' ]
+}
+
+# update takes --mem, --pids and --cpu, held to what create holds them to,
+# and refuses anything else before it looks at the container; restart takes
+# -t, and rm -f; each needs root as the command it is made of does.
+t_update_restart_rm_options() {
+    lb create web 10.0.0.2 || return 1
+    before=$(cat "$C/web/.conf")
+    bad=0
+    expect() { # message, words...
+        local want=$1
+        shift
+        msg=$(lb "$@" 2>&1) && { echo "lightbox $*: succeeded"; bad=1; return; }
+        echo "lightbox $*: $msg"
+        [ "$msg" = "$want" ] || bad=1
+    }
+    usage='Usage: lightbox update <name> [--mem <limit>] [--pids <limit>] [--cpu <num>]'
+    expect "$usage" update
+    expect "$usage" update web
+    expect 'Error: --mem takes <number>[K|M|G|T] or max, not: 1x' update web --mem 1x
+    expect 'Error: --cpu takes a number of CPUs from 0.01 to 512, such as 2 or 0.5, not: 0' update web --cpu 0
+    expect 'Error: --pids takes a number from 1 to 4194304 or max, not: 0' update web --pids 0
+    expect 'Error: unknown option: --swap' update web --swap 1G
+    expect 'Error: unexpected argument: db' update web db --mem 64M
+    expect 'Error: not a number of seconds from 0 to 86400: soon' restart web -t soon
+    expect 'Usage: lightbox restart <name>... [-t <seconds>]' restart
+    expect 'Usage: lightbox rm [-f] <name>...' rm -f
+    expect 'Error: unknown option: --forcefully' rm --forcefully web
+    if [ "$(id -u)" -ne 0 ]; then
+        expect 'Error: lightbox update must be run as root' update web --mem 64M
+        expect 'Error: lightbox restart must be run as root' restart web
+    fi
+    [ "$before" = "$(cat "$C/web/.conf")" ] || { echo "a refused command changed the .conf"; bad=1; }
+    for words in 'update --help' 'restart --help' 'rm --help'; do
+        # shellcheck disable=SC2086
+        lb $words | grep -q '^  [a-z]' || { echo "no help for $words"; bad=1; }
+    done
+    return $bad
+}
+
+# update of a container that is not running writes its .conf, the limits
+# given and nothing else changed, and says that it has them from its next
+# start. rm -f of one that is not running removes it as rm does.
+t_update_rewrites_the_conf() {
+    unshare -r --mount true 2>/dev/null || { echo "user namespaces are not available to this user"; return 77; }
+    lb create web 10.0.0.2 --vol "$W/vol:/data:ro" --swap 32M || return 1
+    lb create gone 10.0.0.3 || return 1
+    # shellcheck disable=SC2016     # the script is for the shell in the namespace
+    HOME="$W/home" LIGHTBOX_CONFIG="$CONF" unshare -r --mount -- sh -c '
+        "$1" update web --mem 64M --cpu 0.5 || exit 1
+        "$1" update web --pids 50 || exit 1
+        "$1" rm -f gone || exit 1
+    ' _ "$LB" > "$W/ns.out" 2>&1
+    rc=$?
+    cat "$W/ns.out"
+    cat "$C/web/.conf"
+    [ $rc -eq 0 ] || return 1
+    grep -qx 'It is not running: it has them from its next start' "$W/ns.out" || return 1
+    for line in mem=64M cpu=0.5 pids=50 swap=32M "vol=$W/vol:/data:ro" oom_score=500 version=1; do
+        grep -qx "$line" "$C/web/.conf" || { echo "the .conf has no $line"; return 1; }
+    done
+    [ ! -e "$C/gone" ] || { echo "rm -f left the container"; return 1; }
+}
+
+# README.md's command reference is the usage that lightbox prints, line for
+# line, and the size it gives is the binary's, near enough for "about".
+t_readme_matches_the_binary() {
+    readme=$(dirname "$LB")/README.md
+    [ -f "$readme" ] || { echo "no README.md beside $LB"; return 77; }
+    awk '/^## Command reference/ { on = 1; next }
+         on && /^```$/ { if (inside) exit; inside = 1; next }
+         inside { print }' "$readme" > "$W/reference"
+    lb --help > "$W/usage"
+    diff "$W/usage" "$W/reference" || { echo "the command reference of README.md is not the usage"; return 1; }
+    said=$(sed -n '3s/.*about \([0-9][0-9]*\) KB.*/\1/p' "$readme")
+    size=$(( $(stat -c %s "$LB") / 1024 ))
+    echo "README.md: about ${said:-?} KB; the binary: $size KB"
+    [ -n "$said" ] && [ $((size * 4)) -ge $((said * 3)) ] && [ $((size * 4)) -le $((said * 5)) ]
 }
 
 # A start_timeout or stop_timeout that cannot be read is said so, and stops
@@ -1303,7 +1609,8 @@ t_stop_options_are_checked() {
     said -t soon   && case $msg in *soon*) ;; *) return 1 ;; esac || return 1
     said -t        && case $msg in *'number of seconds'*) ;; *) return 1 ;; esac || return 1
     said --bogus   && case $msg in *'unknown option'*--bogus*) ;; *) return 1 ;; esac || return 1
-    said another   && case $msg in *'unexpected argument'*another*) ;; *) return 1 ;; esac || return 1
+    # a second word is a second name, and is checked as one before anything else
+    said 'an@other' && case $msg in *'container name must only contain'*) ;; *) return 1 ;; esac || return 1
     # with options that are fine it goes on: to who runs it, and as root to the container, which is not running
     said -t 3      && case $msg in *'must be run as root'*|*'not running'*) ;; *) return 1 ;; esac || return 1
     [ "$before" = "$(kept_sum)" ] || { echo "the container's records changed"; return 1; }
@@ -1318,7 +1625,7 @@ t_logs_prints_the_log() {
     [ "$(lb logs web)" = "one
 two" ] || return 1
     # a container that is not running has nothing to follow
-    followed=$(HOME="$W/home" timeout 5 "$LB" logs web -f) || { echo "logs -f of a stopped container did not end by itself"; return 1; }
+    followed=$(HOME="$W/home" LIGHTBOX_CONFIG="$CONF" timeout 5 "$LB" logs web -f) || { echo "logs -f of a stopped container did not end by itself"; return 1; }
     [ "$followed" = "one
 two" ] || return 1
     refused lb logs missing || return 1
@@ -1365,7 +1672,7 @@ last" ]
 # A command that is run with its standard streams closed must not take a file
 # of its own for one of them: its messages would be written into the file.
 t_closed_streams_are_harmless() {
-    HOME="$W/home" "$LB" create web 10.0.0.2 <&- >&- 2>&- || { echo "create failed with status $?"; return 1; }
+    HOME="$W/home" LIGHTBOX_CONFIG="$CONF" "$LB" create web 10.0.0.2 <&- >&- 2>&- || { echo "create failed with status $?"; return 1; }
     echo "$(lb inspect web | grep '^state: '), ip: $(cat "$C/web/.ip")"
     lb inspect web | grep -qx 'state: stopped' && [ ! -e "$C/web/.creating" ] &&
     [ "$(cat "$C/web/.ip")" = 10.0.0.2 ] && conf_has web 'mem=256M' || return 1
@@ -1541,12 +1848,21 @@ check 'ls --json escapes whatever a record holds'             t_ls_json_escapes_
 check 'ls --json gives pid as null for a stopped container'   t_ls_json_pid_is_null_when_stopped
 check 'ls is sorted by name'                                  t_ls_is_sorted
 check 'ls lists only directories with a container name'       t_ls_lists_only_containers
-xfail CLI-inspect          'inspect shows volumes and links'                 t_inspect_shows_volumes_and_links
-xfail CFG-parse            'configuration: carriage returns are stripped'    t_config_strips_carriage_returns
-xfail CFG-parse            'configuration: inline comments are stripped'     t_config_strips_inline_comments
-xfail CFG-parse            'configuration: unknown keys are reported'        t_config_reports_unknown_keys
-xfail CLI-help             '--help exits 0'                                  t_help_exits_zero
-xfail CLI-extra-args       'rm handles every argument or none'               t_rm_handles_every_argument
+check 'inspect shows volumes, links and the log'                       t_inspect_shows_volumes_and_links
+check 'inspect --json is one JSON object, typed, or nothing'             t_inspect_json
+check 'configuration: carriage returns are stripped'                   t_config_strips_carriage_returns
+check 'configuration: inline comments are stripped'                    t_config_strips_inline_comments
+check 'configuration: unknown keys and lines that are no setting are said, with the line' t_config_reports_unknown_keys
+check 'configuration: --config, LIGHTBOX_CONFIG, /etc, then HOME with a warning' t_config_lookup_order
+check 'make install writes under DESTDIR only, and keeps a configuration' t_make_install_stays_in_destdir
+check 'help goes to standard output with status 0, and --version names the release' t_help_exits_zero
+check 'rm takes several names, and names those it did not remove'      t_rm_handles_every_argument
+check 'a surplus argument is an error that names it'                    t_surplus_arguments_are_errors
+check 'doctor says how to fix each thing it finds missing'              t_doctor_says_how_to_fix
+check 'doctor --json: settings and checks, typed'                       t_doctor_json
+check 'update, restart and rm -f check their options before anything'  t_update_restart_rm_options
+check 'update writes the limits into a stopped container'"'"'s .conf'       t_update_rewrites_the_conf
+check 'README.md'"'"'s command reference is the usage, and its size the binary'"'"'s' t_readme_matches_the_binary
 check 'start without root is a clean error'                   t_start_without_root_is_a_clean_error
 
 summary validation

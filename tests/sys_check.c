@@ -72,6 +72,7 @@ SAME_NR(mount_setattr);
 SAME_NR(move_mount);
 SAME_NR(pidfd_send_signal);
 SAME_NR(statx);
+SAME_NR(faccessat);
 
 #define SAME_VALUE(ours, kernels) \
     _Static_assert((ours) == (kernels), #ours " differs from the kernel's " #kernels)
@@ -95,6 +96,7 @@ SAME_VALUE(LB_MOVE_MOUNT_F_EMPTY_PATH, MOVE_MOUNT_F_EMPTY_PATH);
 SAME_VALUE(LB_MOVE_MOUNT_T_SYMLINKS, MOVE_MOUNT_T_SYMLINKS);
 SAME_VALUE(LB_EBUSY, EBUSY);
 SAME_VALUE(LB_EINVAL, EINVAL);
+SAME_VALUE(LB_ENOSYS, ENOSYS);
 SAME_VALUE(LB_MFD_CLOEXEC, MFD_CLOEXEC);
 SAME_VALUE(LB_MFD_ALLOW_SEALING, MFD_ALLOW_SEALING);
 SAME_VALUE(LB_MFD_EXEC, MFD_EXEC);
