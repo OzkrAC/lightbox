@@ -16,8 +16,9 @@
  *   oom_score=500
  *   privileged=1            only when set, like the three after it
  *   readonly=1
- *   userns=1
- *   uid_start=100000
+ *   userns=0 and uid_start=<n>, which lightbox up to 0.5 could write, are
+ *   read and mean nothing; userns=1 is refused, as user namespaces are not
+ *   supported yet
  *   io=8:0 rbps=1048576     only when given: <major>:<minor>, and rbps, wbps,
  *                           riops or wiops, each at most once
  *   vol=/src:/dst[:ro]      once for each volume, in the order they are mounted
@@ -481,11 +482,16 @@ static const char *config_line(container_config *config, char *line, unsigned *s
             return parse_flag(value, &config->privileged) ? NULL : "privileged is not 0 or 1";
         case KEY_READONLY:
             return parse_flag(value, &config->read_only) ? NULL : "readonly is not 0 or 1";
-        case KEY_USERNS:
-            return parse_flag(value, &config->userns) ? NULL : "userns is not 0 or 1";
-        case KEY_UID_START:
-            return parse_int_in(value, 0, INT32_MAX, &config->uid_start) ? NULL
-                                                                         : "uid_start is not a number";
+        case KEY_USERNS: {
+            bool userns;
+            if (!parse_flag(value, &userns))
+                return "userns is not 0 or 1";
+            return userns ? "userns=1: user namespaces are not supported yet" : NULL;
+        }
+        case KEY_UID_START: {
+            int uid_start;
+            return parse_int_in(value, 0, INT32_MAX, &uid_start) ? NULL : "uid_start is not a number";
+        }
         default:    /* KEY_IO */
             return io_limit_ok(value) && str_copy(config->io, value, sizeof(config->io))
                    ? NULL : "io is not <major>:<minor> with rbps, wbps, riops or wiops =<number> or =max";
@@ -580,7 +586,6 @@ static bool same_config(const container_config *a, const container_config *b) {
         !streq(a->cpu, b->cpu) ||
         !streq(a->io, b->io) || a->oom_score != b->oom_score ||
         a->privileged != b->privileged || a->read_only != b->read_only ||
-        a->userns != b->userns || (a->userns && a->uid_start != b->uid_start) ||
         a->nvols != b->nvols || a->nlinks != b->nlinks)
         return false;
     for (int i = 0; i < a->nvols; i++) {
@@ -609,10 +614,6 @@ const char *container_config_save(const char *name, const container_config *conf
     put_number(&out, "oom_score", config->oom_score);
     if (config->privileged) put_line(&out, "privileged", "1");
     if (config->read_only)  put_line(&out, "readonly", "1");
-    if (config->userns) {
-        put_line(&out, "userns", "1");
-        put_number(&out, "uid_start", config->uid_start);
-    }
     if (config->io[0])
         put_line(&out, "io", config->io);
 

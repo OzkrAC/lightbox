@@ -1250,11 +1250,12 @@ assert isinstance(doc, list) and len(doc) == 1, "not an array of one"
 c = doc[0]
 want = {"name": "web", "ip": "10.0.0.2", "state": "stopped", "running": False, "pid": None,
         "pid_starttime": None, "mem": "256M", "swap": "32M", "io": None, "oom_score": 500,
-        "privileged": False, "readonly": False, "userns": False, "links": ["db"],
+        "privileged": False, "readonly": False, "links": ["db"],
         "volumes": [{"src": sys.argv[1], "dst": "/data", "ro": True}, {"src": sys.argv[1], "dst": "/rw", "ro": False}]}
 bad = [k for k in want if c.get(k) != want[k]]
 assert not bad, "differ: " + ", ".join("%s=%r" % (k, c.get(k)) for k in bad)
 assert c["log_path"].endswith("/web/console.log") and c["host_interface"].startswith("vb-"), "paths"
+assert "userns" not in c and "uid_start" not in c, "user namespace keys"
 ' "$W/vol" || return 1
     echo 'colour=blue' >> "$C/web/.conf"
     out=$(lb inspect web --json 2>"$W/err") && { echo "inspect --json of a configuration that cannot be used succeeded"; return 1; }

@@ -2093,8 +2093,6 @@ cpu 0.5
 oom_score -300
 privileged 1
 readonly 1
-userns 0
-uid_start 0
 io 8:0 rbps=1048576
 swap 1G
 vol /srv/data -> /data rw
@@ -2105,6 +2103,21 @@ link cache'
     [ "$got" = "$want" ]
 }
 t_config_is_read_whole() { in_config_dir config_as_written; }
+
+# userns=0 and uid_start, which lightbox up to 0.5 could write, still read and
+# change nothing; userns=1 is refused with its line, as user namespaces are
+# not supported.
+config_old_userns_keys() {
+    printf 'version=1\nmem=64M\npids=32\ncpu=1\noom_score=0\nuserns=0\nuid_start=100000\n' > "$D/web/.conf"
+    got=$(config)
+    printf '%s\n' "$got"
+    printf '%s\n' "$got" | grep -qx 'mem 64M' || return 1
+    printf 'version=1\nmem=64M\npids=32\ncpu=1\noom_score=0\nuserns=1\nuid_start=100000\n' > "$D/web/.conf"
+    got=$(config)
+    printf '%s\n' "$got"
+    [ "$got" = "refused: $D/web/.conf: line 6: userns=1: user namespaces are not supported yet" ]
+}
+t_config_old_userns_keys() { in_config_dir config_old_userns_keys; }
 
 # What a file does not say is what lightbox.conf says, and a file may say
 # nothing at all.
@@ -2119,8 +2132,6 @@ cpu 1
 oom_score 500
 privileged 0
 readonly 0
-userns 0
-uid_start 0
 io -
 swap -' ] || return 1
     # a default that cannot be used is no default: the file must have the limit
@@ -2248,8 +2259,6 @@ cpu 2
 oom_score 100
 privileged 1
 readonly 0
-userns 0
-uid_start 0
 io -
 swap -
 vol /srv/data -> /data rw
@@ -2652,6 +2661,7 @@ check 'subnet and gw are one network, and an address on it is one a container ca
 check 'no prefix is written into the source: subnet gives it'      t_no_prefix_of_its_own
 check 'a .conf is read into one structure, whole'                t_config_is_read_whole
 check 'what a .conf leaves out is the default, if that is usable' t_config_defaults
+check 'userns=0 and uid_start of 0.5 are read, and userns=1 is refused' t_config_old_userns_keys
 check 'a .conf with a version is read strictly, by line'         t_config_is_read_strictly
 check 'a .conf from before the version line is still read'       t_config_from_before_the_version_line
 check 'a .conf is written as it will be read, or not written'    t_config_is_written_as_it_will_be_read

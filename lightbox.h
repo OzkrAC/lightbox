@@ -116,8 +116,6 @@ typedef struct {
     int  oom_score;
     bool privileged;
     bool read_only;
-    bool userns;
-    int  uid_start;
     int  nvols;
     volume_spec vols[MAX_VOLS];
     int  nlinks;
@@ -314,7 +312,6 @@ const char *tool_path_iptables(void);
 const char *tool_path_iptables_restore(void);
 const char *tool_path_nft(void);
 const char *tool_path_cp(void);
-const char *tool_path_chown(void);
 const char *tool_path_rm(void);
 const char *tool_path_nsenter(void);
 bool tool_available(const char *path);

@@ -28,8 +28,6 @@
 /* ─── Compile-time limits ───────────────────────────────────────────────── */
 
 #define MAX_PATH         512
-#define USERNS_RANGE_SIZE 65536
-#define USERNS_MIN_START 100000
 #define MAX_DNS          3       /* as many as a resolver reads from resolv.conf */
 #define CHILD_STACK_SIZE (1024 * 1024) /* 1 MiB */
 
@@ -40,9 +38,6 @@
 global_config cfg_global;
 
 /* cfg_global_init() and cfg_global_load() defined after utility functions */
-
-/* device numbers: makedev(major, minor) */
-#define MAKEDEV(ma, mi) (((uint64_t)(ma) << 8) | (mi))
 
 /* ─── Structs ───────────────────────────────────────────────────────────── */
 
@@ -151,38 +146,6 @@ bool name_is_valid(const char *name) {
             return false;
     }
     return true;
-}
-
-static bool uid_ranges_overlap(int start_a, int start_b) {
-    int end_a = start_a + USERNS_RANGE_SIZE;
-    int end_b = start_b + USERNS_RANGE_SIZE;
-    return !(end_a <= start_b || end_b <= start_a);
-}
-
-static bool userns_range_in_use(const char *exclude_name, int uid_start) {
-    static char names[MAX_LISTED][NAME_MAX_LEN + 1];
-    int count = list_containers(names, MAX_LISTED, NULL);
-
-    for (int i = 0; i < count; i++) {
-        if (exclude_name && streq(names[i], exclude_name))
-            continue;
-        /* one whose configuration cannot be read has no range to keep clear of */
-        static container_config other;
-        if (container_config_load(names[i], &other) != NULL)
-            continue;
-        if (other.userns && other.uid_start > 0 && uid_ranges_overlap(other.uid_start, uid_start))
-            return true;
-    }
-    return false;
-}
-
-static int allocate_uid_start(const char *exclude_name) {
-    int candidate = USERNS_MIN_START;
-    for (int i = 0; i < 4096; i++, candidate += USERNS_RANGE_SIZE) {
-        if (!userns_range_in_use(exclude_name, candidate))
-            return candidate;
-    }
-    return -1;
 }
 
 /* ─── Time ──────────────────────────────────────────────────────────────── */
@@ -909,23 +872,6 @@ static void cmd_create(int argc, char **argv) {
     }
 
     /* write config */
-    if (cfg.userns) {
-        if (cfg.uid_start == 0) {
-            cfg.uid_start = allocate_uid_start(name);
-            if (cfg.uid_start <= 0) {
-                create_err = "failed to allocate uid_start";
-                goto fail_create;
-            }
-        }
-        if (cfg.uid_start < USERNS_MIN_START) {
-            create_err = "uid_start is below the managed userns range";
-            goto fail_create;
-        }
-        if (userns_range_in_use(name, cfg.uid_start)) {
-            create_err = "uid_start overlaps an existing container userns range";
-            goto fail_create;
-        }
-    }
     create_err = container_config_save(name, &cfg);
     if (create_err)
         goto fail_create;
@@ -997,26 +943,6 @@ static void cmd_create(int argc, char **argv) {
         }
     }
 
-    /* shift rootfs ownership for user namespace */
-    if (cfg.userns && cfg.uid_start > 0) {
-        if (!tool_available(tool_path_chown())) {
-            create_err = "chown is needed to shift the rootfs ownership and was not found";
-            goto fail_create;
-        }
-        print_str(STDOUT,"Shifting rootfs ownership...\n");
-        /* use chown -R via fork+exec for simplicity */
-        char uid_str[32];
-        size_t pos = (size_t)fmt_int(uid_str, cfg.uid_start);
-        uid_str[pos++] = ':';
-        fmt_int(uid_str + pos, cfg.uid_start);
-
-        const char *chown_argv[] = { "chown", "-R", "-h", uid_str, root, NULL };
-        if (run_cmd(tool_path_chown(), chown_argv) != 0) {
-            create_err = "failed to shift rootfs ownership";
-            goto fail_create;
-        }
-    }
-
     /* made: and with no runtime record, stopped */
     if (remove_file_durably(creating) != 0) {
         create_err = "failed to mark the container as created";
@@ -1076,7 +1002,6 @@ struct child_args {
     const char  *root;
     const char  *hook;                      /* the script init runs when it is ready */
     int          stop_grace;                /* seconds the container gets to end, unless a stop says otherwise */
-    int          userns;
     int          privileged;
     int          read_only;
 };
@@ -2503,7 +2428,7 @@ static int finish_exec(int32_t worker, int32_t signal_fd, const struct lb_termio
 
 /* ─── exec: entering the container ──────────────────────────────────────── */
 
-static int exec_inside_container(const char *name, int target_pid, int userns,
+static int exec_inside_container(const char *name, int target_pid,
                                  int privileged, int oom_score, const struct exec_request *req) {
     /* From here to the command's execve this process, and the child it
      * forks, are lightbox inside a container. Not dumpable, their memory and
@@ -2516,13 +2441,6 @@ static int exec_inside_container(const char *name, int target_pid, int userns,
     if (rootfd < 0)
         die("Error: failed to open target root");
 
-    int userfd = -1;
-    if (userns) {
-        userfd = open_target_path(target_pid, "/ns/user");
-        if (userfd < 0)
-            die("Error: failed to open target user namespace");
-    }
-
     int mntfd = open_target_path(target_pid, "/ns/mnt");
     int utsfd = open_target_path(target_pid, "/ns/uts");
     int ipcfd = open_target_path(target_pid, "/ns/ipc");
@@ -2530,9 +2448,6 @@ static int exec_inside_container(const char *name, int target_pid, int userns,
     int pidfd = open_target_path(target_pid, "/ns/pid");
     if (mntfd < 0 || utsfd < 0 || ipcfd < 0 || netfd < 0 || pidfd < 0)
         die("Error: failed to open target namespace fd");
-
-    if (userns)
-        require_setns_fd(userfd, CLONE_NEWUSER, "user");
 
     /* Join the host-side container cgroup before switching mount namespaces. */
     cgroup_join_self(name);
@@ -2888,27 +2803,6 @@ static bool reconcile(const char *name) {
     return true;
 }
 
-static void enter_user_namespace_root(void) {
-    struct lb_cap_header hdr = { LB_CAPABILITY_VERSION_3, 0 };
-    struct lb_cap_data data[LB_CAPABILITY_WORDS];
-
-    if (lc_kernel_prctl(LB_PR_SET_KEEPCAPS, 1, 0, 0, 0) < 0)
-        die("Error: failed to enable keepcaps for userns");
-    if (lc_kernel_setgid(0) < 0)
-        die("Error: failed to setgid(0) in userns");
-    if (lc_kernel_setuid(0) < 0)
-        die("Error: failed to setuid(0) in userns");
-
-    if (lb_sys_capget(&hdr, data) < 0)
-        die("Error: capget failed in userns");
-
-    data[0].effective = data[0].permitted;
-    data[1].effective = data[1].permitted;
-
-    if (lb_sys_capset(&hdr, data) < 0)
-        die("Error: capset failed in userns");
-}
-
 /* A volume on its way into a container. */
 struct volume_mount {
     int32_t tree;               /* a clone of the source's mount, attached nowhere yet */
@@ -3000,9 +2894,6 @@ static void attach_volumes(const struct volume_mount *vols, int count) {
  * with the reason on stderr; the command then sees init's pipe close.
  */
 static void build_container(const struct child_args *ca) {
-    if (ca->userns)
-        enter_user_namespace_root();
-
     /* make all mounts private — prevents host mount events (including
      * the host's /proc) from propagating into the container */
     require_mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
@@ -3016,20 +2907,20 @@ static void build_container(const struct child_args *ca) {
     struct volume_mount volumes[MAX_VOLS];
     int nvolumes = open_volumes(ca->config, volumes);
 
-    /* set up /dev via bind mounts (works in both userns and non-userns) */
+    /* /dev: the host's devices, bound one by one onto empty files */
     {
         char dev_path[MAX_PATH];
         path_join_or_die(dev_path, MAX_PATH, ca->root, "dev");
         lc_kernel_mkdirat(AT_FDCWD, dev_path, 0755);   /* a minimal image may not have it */
         require_mount("tmpfs", dev_path, "tmpfs", MS_NOSUID | MS_NOEXEC, "mode=755");
 
-        struct { const char *name; uint64_t dev; int mode; } devs[] = {
-            { "null",    MAKEDEV(1, 3), 0666 },
-            { "zero",    MAKEDEV(1, 5), 0666 },
-            { "full",    MAKEDEV(1, 7), 0666 },
-            { "random",  MAKEDEV(1, 8), 0444 },
-            { "urandom", MAKEDEV(1, 9), 0444 },
-            { "tty",     MAKEDEV(5, 0), 0666 },
+        static const struct { const char *name; int mode; } devs[] = {
+            { "null",    0666 },
+            { "zero",    0666 },
+            { "full",    0666 },
+            { "random",  0444 },
+            { "urandom", 0444 },
+            { "tty",     0666 },
         };
 
         for (size_t i = 0; i < sizeof(devs) / sizeof(devs[0]); i++) {
@@ -3083,12 +2974,7 @@ static void build_container(const struct child_args *ca) {
     /* mount proc, sys */
     require_mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL);
 
-    /*
-     * sysfs mounting is typically not permitted inside an unprivileged user
-     * namespace. Leave /sys as the rootfs directory in that mode.
-     */
-    if (!ca->userns)
-        require_mount("sysfs", "/sys", "sysfs", MS_RDONLY, NULL);
+    require_mount("sysfs", "/sys", "sysfs", MS_RDONLY, NULL);
 
     /* devpts and shm inside container */
     require_mount("devpts", "/dev/pts", "devpts",
@@ -3294,14 +3180,9 @@ static void start_one(const char *name, int hook_wait) {
      * start. Init gets it with the memory it is cloned with. */
     static container_config config;
     container_config_load_or_die(name, &config);
-    bool userns = config.userns;
-    int uid_start = config.uid_start;
     bool privileged = config.privileged;
     bool read_only = config.read_only;
     int oom_score = config.oom_score;
-
-    if (userns)
-        die("Error: containers configured with user namespaces are not supported yet");
 
     /* A container without links gets an isolated port on the bridge: it
      * reaches the host and, through it, the outside, and no other container.
@@ -3413,12 +3294,10 @@ static void start_one(const char *name, int hook_wait) {
         .root = root,
         .hook = "/init.sh",
         .stop_grace = cfg_global.stop_timeout,
-        .userns = userns,
         .privileged = privileged,
         .read_only = read_only,
     };
     int clone_flags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET;
-    if (userns) clone_flags |= CLONE_NEWUSER;
 
     start_err = init_spawn(&init, &ca, clone_flags, container_child);
     close_container_streams(&null_fd, &log_fd);     /* init has its own copies */
@@ -3427,28 +3306,6 @@ static void start_one(const char *name, int hook_wait) {
     if (start_err)
         goto fail_start;
     int child_pid = (int)init.pid;
-
-    /* write uid/gid maps if userns */
-    if (userns) {
-        char proc_path[64], map_buf[32];
-        bool cut = false;
-
-        /* deny setgroups */
-        if (!proc_pid_path(proc_path, sizeof(proc_path), child_pid, "/setgroups") ||
-            write_file(proc_path, "deny") < 0) { start_err = "failed to write setgroups"; goto fail_start; }
-
-        /* uid_map and gid_map: the same range for both */
-        {
-            char first[16]; fmt_int(first, uid_start);
-            size_t mp = str_append(map_buf, 0, "0 ", sizeof(map_buf), &cut);
-            mp = str_append(map_buf, mp, first, sizeof(map_buf), &cut);
-            str_append(map_buf, mp, " 65536", sizeof(map_buf), &cut);
-        }
-        if (cut || !proc_pid_path(proc_path, sizeof(proc_path), child_pid, "/uid_map") ||
-            write_file(proc_path, map_buf) < 0) { start_err = "failed to write uid_map"; goto fail_start; }
-        if (!proc_pid_path(proc_path, sizeof(proc_path), child_pid, "/gid_map") ||
-            write_file(proc_path, map_buf) < 0) { start_err = "failed to write gid_map"; goto fail_start; }
-    }
 
     /*
      * Set up cgroup, networking, and OOM score before init gets its first
@@ -3899,11 +3756,7 @@ static void cmd_exec(int argc, char **argv) {
     static container_config config;
     container_config_load_or_die(name, &config);
     int pid = get_container_pid(name);
-    bool userns = config.userns;
     bool privileged = config.privileged;
-
-    if (userns)
-        die("Error: exec into userns containers is not supported yet");
 
     /* The terminal's modes as they are now. The worker makes the terminal
      * raw while a command has a terminal of its own, and puts the modes back;
@@ -3923,7 +3776,7 @@ static void cmd_exec(int argc, char **argv) {
 
     if (worker == 0) {
         lc_kernel_close_file(signal_fd);
-        int status = exec_inside_container(name, pid, userns, privileged, config.oom_score, &req);
+        int status = exec_inside_container(name, pid, privileged, config.oom_score, &req);
         lc_kernel_exit(exit_code_from_status(status));
     }
 

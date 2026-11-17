@@ -355,8 +355,6 @@ void cmd_inspect(int argc, char **argv) {
         report_text(&r, "cpu", config.cpu);
         report_text(&r, "io", config.io[0] ? config.io : NULL);
         report_number(&r, "oom_score", config.oom_score);
-        report_flag(&r, "userns", config.userns, "1", "0");
-        report_number(&r, "uid_start", config.uid_start);
         report_flag(&r, "privileged", config.privileged, "1", "0");
         report_flag(&r, "readonly", config.read_only, "1", "0");
         report_volumes(&r, &config);
@@ -626,7 +624,6 @@ void cmd_doctor(int argc, char **argv) {
         { "bin.iptables-restore", tool_path_iptables_restore, false, true, "install iptables" },
         { "bin.nft", tool_path_nft, true, false, "install nftables" },
         { "bin.cp", tool_path_cp, true, true, "install coreutils" },
-        { "bin.chown", tool_path_chown, true, true, "install coreutils" },
         { "bin.rm", tool_path_rm, true, true, "install coreutils" },
     };
     bool nftables = cfg_global.firewall_backend == FIREWALL_NFTABLES;

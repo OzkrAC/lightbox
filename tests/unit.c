@@ -238,8 +238,6 @@ static void put_config(const container_config *config) {
     put_number("oom_score", config->oom_score);
     put_number("privileged", config->privileged);
     put_number("readonly", config->read_only);
-    put_number("userns", config->userns);
-    put_number("uid_start", config->uid_start);
     put_line("io ", config->io[0] ? config->io : "-");
     put_line("swap ", config->swap[0] ? config->swap : "-");
     for (int i = 0; i < config->nvols; i++) {

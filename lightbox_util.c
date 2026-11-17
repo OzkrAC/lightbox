@@ -300,14 +300,6 @@ const char *tool_path_cp(void) {
     return pick_tool_path(candidates, sizeof(candidates) / sizeof(candidates[0]));
 }
 
-const char *tool_path_chown(void) {
-    static const char *const candidates[] = {
-        "/bin/chown",
-        "/usr/bin/chown",
-    };
-    return pick_tool_path(candidates, sizeof(candidates) / sizeof(candidates[0]));
-}
-
 const char *tool_path_rm(void) {
     static const char *const candidates[] = {
         "/bin/rm",
