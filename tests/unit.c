@@ -8,6 +8,26 @@
  *   unit run     <program> [args...]          run_cmd
  *   unit quiet   <program> [args...]          run_cmd_quiet
  *   unit capture <size> <program> [args...]   run_cmd_capture, into <size> bytes
+ *   unit input   <text> <program> [args...]   run_cmd_input, with <text> as its input; then
+ *                                             "left open <n>": descriptors it left open
+ *   unit names <name>                         host_port_name and link_chain_name, a line each
+ *   unit owner <name> <listing>               port_owner_of_listing: absent, ours or foreign
+ *   unit chain <text>                         link_chain_ok: ok or refused
+ *   unit firewall links <name> [<link>...]    firewall_links_text for a container with those links;
+ *                                             links-into-64 gives it 64 bytes to write into
+ *   unit firewall setup <subnet> <gw> <bridge> <ip_masq>
+ *                                             firewall_setup_text for that network
+ *   unit firewall nft-setup <subnet> <gw> <bridge> <ip_masq> [<fwmark>]
+ *                                             nft_setup_text, with bridge_accept_fwmark if given
+ *   unit firewall nft-record <name> [<link>...]
+ *                                             nft_links_record for a container with those links
+ *   unit nftlinks add|remove <record>         nft_links_text for that record, or "refused"; a line
+ *                                             it would take lies right after the record's end
+ *   unit fwmark <text>                        parse_fwmark: lines "mark <m>", "mask <k>", "as <text>",
+ *                                             or "refused"
+ *   unit portname <text>                      host_port_ok: ok or refused
+ *   unit dropping <listing>                   forward_drop_chains of what "nft list chains"
+ *                                             printed: how many, and their names
  *   unit status  <wait status>                exit_code_from_status
  *   unit mount   <source> <target> <fstype> <flags> <data>     do_mount
  *   unit mkdirs  <path>                       make_dirs
@@ -17,6 +37,22 @@
  *   unit maskproc                             mask_proc_paths
  *   unit noipv6  <pid>                        netns_disable_ipv6
  *   unit seconds <text>                       parse_seconds
+ *   unit number  <text> <min> <max>           parse_number: the number, or "refused"
+ *   unit limit   mem|pids|cpu|oom <text>      the check that an option, a setting and a .conf
+ *                                             share: "ok", for cpu "quota <n>", for oom
+ *                                             "score <n>"; or "refused"
+ *   unit text copy   <size> <text>            str_copy into <size> bytes
+ *   unit text append <size> <a> <b>           str_append of <b> after <a>
+ *   unit text join   <size> <a> <b>           path_join
+ *                                             each: "whole <text>", or "cut <what is there>"
+ *   unit config <dir> <name> [nodefaults]     container_config_load of <dir>/<name>/.conf: a line
+ *                                             for each value, or "refused: <why>"; nodefaults
+ *                                             is a lightbox.conf whose default_* are all unusable
+ *   unit config-write <dir> <name> [<field>=<value>...]
+ *                                             container_config_save of a configuration with these
+ *                                             values put in unchecked, as no command would: mem,
+ *                                             pids, cpu, io, link, and src and dst for a volume.
+ *                                             "written", or "refused: <why>"
  *   unit streams <file>                       reserve_standard_streams, then the number
  *                                             the next descriptor gets, written to <file>
  *   unit init    <how> confined|open <seconds> <hook script | -> <log file | -> [<grace>]
@@ -24,6 +60,13 @@
  *   unit stop    <pid> <seconds>              ask_init_to_stop, then wait as stop does:
  *                                             "asked" or "gone", then "ended" or "still there"
  *   unit pids    <file>                       each_listed_pid: a line for each, then the count
+ *   unit remove  <file>                       remove_file_durably
+ *   unit record  <run_dir> <name> <state>     record_container_state, which makes run_dir and the
+ *                                             container's directory in it when they are missing
+ *   unit reconcile <container_dir> <run_dir> <name>
+ *                                             reconcile, as start, stop and rm call it for a
+ *                                             container that ended without a stop: "cleared" or
+ *                                             "nothing", then "state <what is on record now>"
  *   unit volspec <spec>                       parse_volume_spec: "<src> -> <dst> ro|rw",
  *                                             or "invalid: <what is wrong>"
  *   unit volumes <root> <spec>... [-- <probe>...]
@@ -35,6 +78,18 @@
  *                                             where an executable memfd is refused
  *   unit relay <ptmx> -- <command...>         what exec does about a command's standard streams,
  *                                             without a container: see below
+ *   unit controllers <listed> <mem> <pids> <swap|-> <io|->
+ *                                             controllers_check for a container with those
+ *                                             limits and a cgroup.controllers of <listed>:
+ *                                             "have <controller>..." after the warnings, on
+ *                                             standard error, or "refused: <why>"
+ *   unit address <text>                       parse_ipv4: the address as format_ipv4 writes it,
+ *                                             or "refused"
+ *   unit network <subnet> <gw> [<address>...] container_network_parse: "subnet <net>/<bits>
+ *                                             broadcast <b> gateway <g>", or "<setting> <what is
+ *                                             wrong>"; then for each address "<address>: " and
+ *                                             what address_with_prefix gives, or why
+ *                                             address_unusable refuses it
  *   unit nameservers <resolv.conf>            name_servers_of: a line for each, then the count
  *   unit dnslist <text>                       name_servers_listed: the same for the dns setting
  *   unit userspec <text>                      parse_user_spec: "name <n>", "uid <n>",
@@ -72,7 +127,9 @@
  *                   prints "left" and leaves init running
  *
  * With a log file, init gets /dev/null and that file as its standard streams
- * once it is ready, as in a container; with "-" it keeps the harness's.
+ * once it is ready, as in a container; with "-" it keeps the harness's. When
+ * UNIT_EXIT names a file, init has it as the record of how it ends, as in a
+ * container, and writes its exit status there as its last act.
  * <grace> is how many seconds init gives its processes when a SIGTERM comes
  * without a number of its own; 10 when it is not given.
  *
@@ -103,12 +160,126 @@
 
 static void put(const char *s) { print_str(STDOUT, s); }
 
+/* How many descriptors this process has open, from /proc/self/fd: its
+ * entries, as getdents64 gives them, but for "." and "..". The record's
+ * length is at byte 16 and its name at 19. */
+static int open_descriptors(void) {
+    enum { RECLEN_AT = 16, NAME_AT = 19 };
+    lc_sysret fd = lc_kernel_open_file("/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+    if (fd < 0)
+        return -1;
+    char buf[4096];
+    int count = 0;
+    for (;;) {
+        lc_sysret n = lc_kernel_read_directory((int32_t)fd, buf, sizeof(buf));
+        if (n <= 0)
+            break;
+        for (lc_sysret pos = 0; pos < n; ) {
+            uint16_t reclen;
+            lc_bytes_copy(&reclen, buf + pos + RECLEN_AT, sizeof(reclen));
+            if (reclen == 0)
+                break;
+            if (buf[pos + NAME_AT] != '.')
+                count++;
+            pos += reclen;
+        }
+    }
+    lc_kernel_close_file((int32_t)fd);
+    return count;
+}
+
 static void put_result(int result) {
     char buf[16];
     fmt_int(buf, result);
     put("result ");
     put(buf);
     put("\n");
+}
+
+static int number_arg(const char *text) {
+    int number;
+    if (!parse_int_in(text, INT32_MIN, INT32_MAX, &number))
+        die2("unit: not a number: ", text);
+    return number;
+}
+
+/* "<label> <number>" */
+static void put_number(const char *label, int number) {
+    char buf[16];
+    fmt_int(buf, number);
+    put(label);
+    put(" ");
+    put(buf);
+    put("\n");
+}
+
+static void put_line(const char *label, const char *text) {
+    put(label);
+    put(text);
+    put("\n");
+}
+
+/* a text helper's verdict and what it left in the buffer */
+static void put_text(bool whole, const char *text) {
+    put_line(whole ? "whole " : "cut ", text);
+}
+
+static void put_config(const container_config *config) {
+    put_number("version", config->version);
+    put_line("mem ", config->mem);
+    put_line("pids ", config->pids);
+    put_line("cpu ", config->cpu);
+    put_number("oom_score", config->oom_score);
+    put_number("privileged", config->privileged);
+    put_number("readonly", config->read_only);
+    put_number("userns", config->userns);
+    put_number("uid_start", config->uid_start);
+    put_line("io ", config->io[0] ? config->io : "-");
+    put_line("swap ", config->swap[0] ? config->swap : "-");
+    for (int i = 0; i < config->nvols; i++) {
+        put("vol ");
+        put(config->vols[i].src);
+        put(" -> ");
+        put(config->vols[i].dst);
+        put(config->vols[i].ro ? " ro\n" : " rw\n");
+    }
+    for (int i = 0; i < config->nlinks; i++)
+        put_line("link ", config->links[i]);
+}
+
+/* A field of a configuration set to a value as it is, however long it is
+ * allowed to be and whatever is in it. */
+static void set_unchecked(container_config *config, const char *assignment) {
+    static const char *const fields[] = { "mem=", "pids=", "cpu=", "io=", "link=", "src=", "dst=", "swap=" };
+    size_t which = 0, len = 0;
+    for (; which < sizeof(fields) / sizeof(fields[0]); which++) {
+        len = lc_string_length(fields[which]);
+        if (lc_string_starts_with(assignment, lc_string_length(assignment), fields[which], len))
+            break;
+    }
+    const char *value = assignment + len;
+    bool fits = false;
+    switch (which) {
+        case 0: fits = str_copy(config->mem, value, sizeof(config->mem)); break;
+        case 1: fits = str_copy(config->pids, value, sizeof(config->pids)); break;
+        case 2: fits = str_copy(config->cpu, value, sizeof(config->cpu)); break;
+        case 3: fits = str_copy(config->io, value, sizeof(config->io)); break;
+        case 4: fits = config->nlinks < MAX_LINKS &&
+                       str_copy(config->links[config->nlinks], value, sizeof(config->links[0]));
+                config->nlinks++;
+                break;
+        case 5: fits = config->nvols < MAX_VOLS &&
+                       str_copy(config->vols[config->nvols].src, value, MAX_PATH);
+                break;
+        case 6: fits = config->nvols < MAX_VOLS &&
+                       str_copy(config->vols[config->nvols].dst, value, MAX_PATH);
+                config->nvols++;
+                break;
+        case 7: fits = str_copy(config->swap, value, sizeof(config->swap)); break;
+        default: break;
+    }
+    if (!fits)
+        die2("unit: cannot set ", assignment);
 }
 
 static uint64_t mount_flags_named(const char *names) {
@@ -162,20 +333,11 @@ static void put_own_privileges(void) {
     }
 }
 
-static void put_number(const char *label, int number) {
-    char buf[16];
-    fmt_int(buf, number);
-    put(label);
-    put(" ");
-    put(buf);
-    put("\n");
-}
-
 /* What init is in the harness: all of a container's init but the container. */
 static int unit_init_child(void *arg) {
     const struct child_args *ca = (const struct child_args *)arg;
     init_begin(ca);
-    return init_main(ca);
+    return init_ends(ca, init_main(ca));
 }
 
 /* Give init five seconds to end. */
@@ -209,15 +371,19 @@ static void unit_init(const char *how, bool confined, int seconds, const char *s
     if (signal_fd < 0)
         die("unit: cannot hold signals back");
 
-    int32_t null_fd = -1, log_fd = -1;
+    int32_t null_fd = -1, log_fd = -1, exit_fd = -1;
     if (log && !open_container_streams(log, &null_fd, &log_fd))
         die2("unit: cannot open ", log);
+    const char *exit_record = env_get(caller_env, "UNIT_EXIT");
+    if (exit_record && (exit_fd = open_exit_record(exit_record)) < 0)
+        die2("unit: cannot open ", exit_record);
 
     struct init_link link = INIT_LINK_NONE;
     struct child_args ca = {
         .starter_signals = signal_fd,
         .null_fd = null_fd,
         .log_fd = log_fd,
+        .exit_fd = exit_fd,
         .name = "unit",
         .root = "/",
         .hook = script,
@@ -226,6 +392,8 @@ static void unit_init(const char *how, bool confined, int seconds, const char *s
     };
     const char *failed = init_spawn(&link, &ca, CLONE_NEWPID, unit_init_child);
     close_container_streams(&null_fd, &log_fd);
+    if (exit_fd >= 0)
+        lc_kernel_close_file(exit_fd);
     if (failed) {
         init_abandon(&link);
         die2("unit: ", failed);
@@ -458,7 +626,7 @@ int main(int argc, char **argv, char **envp) {
     }
     if (argc >= 4 && streq(argv[1], "capture")) {
         static char captured[4096];
-        int size = parse_int(argv[2]);
+        int size = number_arg(argv[2]);
         if (size < 1 || size > (int)sizeof(captured))
             die("unit: capture size must be 1 to 4096");
         put_result(run_cmd_capture(argv[3], (const char *const *)(argv + 3), captured, (size_t)size));
@@ -467,8 +635,118 @@ int main(int argc, char **argv, char **envp) {
         put("\n");
         return 0;
     }
+    if (argc >= 4 && streq(argv[1], "input")) {
+        int before = open_descriptors();
+        put_result(run_cmd_input(argv[3], (const char *const *)(argv + 3), argv[2], false));
+        put_number("left open", open_descriptors() - before);
+        return 0;
+    }
+    if (argc == 4 && streq(argv[1], "owner")) {
+        static char listing[4096];
+        if (!str_copy(listing, argv[3], sizeof(listing)))
+            die("unit: owner <name> <listing>");
+        port_owner owner = port_owner_of_listing(listing, argv[2]);
+        put(owner == PORT_OURS ? "ours\n" : owner == PORT_FOREIGN ? "foreign\n" : "absent\n");
+        return 0;
+    }
+    if (argc == 3 && streq(argv[1], "chain")) {
+        put(link_chain_ok(argv[2]) ? "ok\n" : "refused\n");
+        return 0;
+    }
+    if (argc == 3 && streq(argv[1], "names")) {
+        char port[IFNAME_TEXT_MAX], chain[IFNAME_TEXT_MAX];
+        host_port_name(argv[2], port);
+        link_chain_name(argv[2], chain);
+        put_line("", port);
+        put_line("", chain);
+        return 0;
+    }
+    if (argc >= 4 && streq(argv[1], "firewall")) {
+        static char text[FIREWALL_TEXT_MAX];
+        static container_config config;
+        bool fits = false;
+        cfg_global_init();
+        if (streq(argv[2], "links") || streq(argv[2], "links-into-64")) {
+            container_config_init(&config);
+            for (int i = 4; i < argc && config.nlinks < MAX_LINKS; i++)
+                if (!str_copy(config.links[config.nlinks++], argv[i], sizeof(config.links[0])))
+                    die("unit: a link that is too long");
+            fits = firewall_links_text(argv[3], &config, text, streq(argv[2], "links") ? sizeof(text) : 64);
+        } else if (streq(argv[2], "setup") && argc == 7) {
+            container_network net;
+            const char *setting;
+            if (container_network_parse(argv[3], argv[4], &net, &setting) != NULL ||
+                !str_copy(cfg_global.bridge, argv[5], sizeof(cfg_global.bridge)))
+                die("unit: firewall setup <subnet> <gw> <bridge> <true|false>");
+            cfg_global.ip_masq = streq(argv[6], "true");
+            fits = firewall_setup_text(&net, text, sizeof(text));
+        } else if (streq(argv[2], "nft-setup") && (argc == 7 || argc == 8)) {
+            container_network net;
+            const char *setting;
+            if (container_network_parse(argv[3], argv[4], &net, &setting) != NULL ||
+                !str_copy(cfg_global.bridge, argv[5], sizeof(cfg_global.bridge)))
+                die("unit: firewall nft-setup <subnet> <gw> <bridge> <true|false> [<fwmark>]");
+            cfg_global.ip_masq = streq(argv[6], "true");
+            if (argc == 8) {
+                if (!parse_fwmark(argv[7], &cfg_global.accept_fwmark, &cfg_global.accept_fwmask))
+                    die("unit: a fwmark that parse_fwmark refuses");
+                cfg_global.accept_fwmark_set = true;
+            }
+            fits = nft_setup_text(&net, text, sizeof(text));
+        } else if (streq(argv[2], "nft-record")) {
+            container_config_init(&config);
+            for (int i = 4; i < argc && config.nlinks < MAX_LINKS; i++)
+                if (!str_copy(config.links[config.nlinks++], argv[i], sizeof(config.links[0])))
+                    die("unit: a link that is too long");
+            fits = nft_links_record(argv[3], &config, text, sizeof(text));
+        } else {
+            die("unit: firewall links <name> [<link>...] | firewall setup <subnet> <gw> <bridge> <true|false>");
+        }
+        put(fits ? text : "too long\n");
+        return 0;
+    }
+    if (argc == 4 && streq(argv[1], "nftlinks")) {
+        /* the record, and right after its end a line lightbox would take:
+         * a parser that reads past the end takes it */
+        static char record[FIREWALL_TEXT_MAX], text[FIREWALL_TEXT_MAX];
+        static const char beyond[] = "vb-111111111111 vb-222222222222\n";
+        size_t len = lc_string_length(argv[3]);
+        if (len + 1 + sizeof(beyond) > sizeof(record))
+            die("unit: nftlinks add|remove <record>");
+        lc_bytes_copy(record, argv[3], len + 1);
+        lc_bytes_copy(record + len + 1, beyond, sizeof(beyond));
+        put(nft_links_text(record, streq(argv[2], "remove"), text, sizeof(text)) ? text : "refused\n");
+        return 0;
+    }
+    if (argc == 3 && streq(argv[1], "fwmark")) {
+        uint32_t mark, mask;
+        if (!parse_fwmark(argv[2], &mark, &mask)) {
+            put("refused\n");
+            return 0;
+        }
+        char text[24], m[24], k[24];
+        fwmark_text(text, mark, mask);
+        fwmark_text(m, mark, 0xffffffffu);
+        fwmark_text(k, mask, 0xffffffffu);
+        put_line("mark ", m);
+        put_line("mask ", k);
+        put_line("as ", text);
+        return 0;
+    }
+    if (argc == 3 && streq(argv[1], "portname")) {
+        put(host_port_ok(argv[2]) ? "ok\n" : "refused\n");
+        return 0;
+    }
+    if (argc == 3 && streq(argv[1], "dropping")) {
+        static char listing[65536], chains[1024];
+        if (!str_copy(listing, argv[2], sizeof(listing)))
+            die("unit: dropping <listing>");
+        put_number("chains", (int)forward_drop_chains(listing, chains, sizeof(chains)));
+        put_line("", chains);
+        return 0;
+    }
     if (argc == 3 && streq(argv[1], "status")) {
-        put_result(exit_code_from_status(parse_int(argv[2])));
+        put_result(exit_code_from_status(number_arg(argv[2])));
         return 0;
     }
     if (argc == 7 && streq(argv[1], "mount")) {
@@ -499,13 +777,200 @@ int main(int argc, char **argv, char **envp) {
         return 0;
     }
     if (argc == 3 && streq(argv[1], "noipv6")) {
-        put_result(netns_disable_ipv6(parse_int(argv[2])));
+        put_result(netns_disable_ipv6(number_arg(argv[2])));
         return 0;
     }
     if (argc == 3 && streq(argv[1], "seconds")) {
         int seconds = -1;
         bool ok = parse_seconds(argv[2], &seconds);
         put_result(ok ? seconds : -1);
+        return 0;
+    }
+    if (argc == 5 && streq(argv[1], "number")) {
+        int64_t min, max, number;
+        if (!parse_number(argv[3], INT64_MIN, INT64_MAX, &min) ||
+            !parse_number(argv[4], INT64_MIN, INT64_MAX, &max))
+            die("unit: number <text> <min> <max>");
+        if (!parse_number(argv[2], min, max, &number)) {
+            put("refused\n");
+            return 0;
+        }
+        /* in two halves: the harness prints ints */
+        if (number < 0) put("-");
+        uint64_t magnitude = number < 0 ? 0 - (uint64_t)number : (uint64_t)number;
+        char digits[24];
+        int at = (int)sizeof(digits);
+        digits[--at] = '\0';
+        do { digits[--at] = (char)('0' + magnitude % 10); magnitude /= 10; } while (magnitude);
+        put_line("", digits + at);
+        return 0;
+    }
+    if (argc == 4 && streq(argv[1], "limit")) {
+        int number = 0;
+        if (streq(argv[2], "mem"))
+            put(mem_limit_ok(argv[3]) ? "ok\n" : "refused\n");
+        else if (streq(argv[2], "swap"))
+            put(swap_limit_ok(argv[3]) ? "ok\n" : "refused\n");
+        else if (streq(argv[2], "io"))
+            put(io_limit_ok(argv[3]) ? "ok\n" : "refused\n");
+        else if (streq(argv[2], "pids"))
+            put(pids_limit_ok(argv[3]) ? "ok\n" : "refused\n");
+        else if (streq(argv[2], "cpu") && parse_cpu_limit(argv[3], &number))
+            put_number("quota", number);
+        else if (streq(argv[2], "oom") && parse_oom_score(argv[3], &number))
+            put_number("score", number);
+        else
+            put("refused\n");
+        return 0;
+    }
+    if (argc == 7 && streq(argv[1], "controllers")) {
+        static container_config config;
+        container_config_init(&config);
+        if (!str_copy(config.mem, argv[3], sizeof(config.mem)) ||
+            !str_copy(config.pids, argv[4], sizeof(config.pids)) ||
+            !str_copy(config.swap, streq(argv[5], "-") ? "" : argv[5], sizeof(config.swap)) ||
+            !str_copy(config.io, streq(argv[6], "-") ? "" : argv[6], sizeof(config.io)) ||
+            !str_copy(config.cpu, "1", sizeof(config.cpu)))
+            die("unit: controllers <listed> <mem> <pids> <swap|-> <io|->");
+        bool have[CTL_COUNT];
+        const char *lacking = controllers_check(argv[2], &config, have);
+        if (lacking) {
+            put_line("refused: ", lacking);
+            return 0;
+        }
+        put("have");
+        for (int i = 0; i < CTL_COUNT; i++) {
+            if (have[i]) {
+                put(" ");
+                put(CONTROLLER_NAMES[i]);
+            }
+        }
+        put("\n");
+        return 0;
+    }
+    if (argc == 3 && streq(argv[1], "address")) {
+        uint32_t addr;
+        char text[IPV4_TEXT_MAX];
+        if (!parse_ipv4(argv[2], &addr)) {
+            put("refused\n");
+            return 0;
+        }
+        format_ipv4(text, addr);
+        put(text);
+        put("\n");
+        return 0;
+    }
+    if (argc >= 4 && streq(argv[1], "network")) {
+        container_network net;
+        const char *setting;
+        const char *wrong = container_network_parse(argv[2], argv[3], &net, &setting);
+        if (wrong) {
+            put(setting);
+            put(" ");
+            put(wrong);
+            put("\n");
+            return 0;
+        }
+        char text[CIDR_TEXT_MAX];
+        subnet_text(text, &net);
+        put("subnet ");
+        put(text);
+        format_ipv4(text, net.broadcast);
+        put(" broadcast ");
+        put(text);
+        format_ipv4(text, net.gateway);
+        put(" gateway ");
+        put(text);
+        put("\n");
+        for (int i = 4; i < argc; i++) {
+            uint32_t addr;
+            put(argv[i]);
+            put(": ");
+            const char *why = parse_ipv4(argv[i], &addr) ? address_unusable(&net, addr) : "not an address";
+            if (!why)
+                address_with_prefix(text, addr, &net);
+            put(why ? why : text);
+            put("\n");
+        }
+        return 0;
+    }
+    if (argc >= 5 && streq(argv[1], "text")) {
+        static char buf[4096];
+        int size = number_arg(argv[3]);
+        if (size < 1 || size > (int)sizeof(buf))
+            die("unit: text size must be 1 to 4096");
+        lc_bytes_fill(buf, 'x', sizeof(buf));       /* so that what was not written shows */
+        buf[size - 1] = '\0';
+        if (argc == 5 && streq(argv[2], "copy")) {
+            put_text(str_copy(buf, argv[4], (size_t)size), buf);
+        } else if (argc == 6 && streq(argv[2], "append")) {
+            bool cut = false;
+            size_t pos = str_append(buf, 0, argv[4], (size_t)size, &cut);
+            if (cut)
+                die("unit: text append: the first text has to fit");
+            str_append(buf, pos, argv[5], (size_t)size, &cut);
+            put_text(!cut, buf);
+        } else if (argc == 6 && streq(argv[2], "join")) {
+            put_text(path_join(buf, (size_t)size, argv[4], argv[5]), buf);
+        } else {
+            die("unit: text copy|append|join");
+        }
+        return 0;
+    }
+    if ((argc == 4 || argc == 5) && streq(argv[1], "config")) {
+        static container_config config;
+        cfg_global_init();
+        if (argc == 5) {
+            cfg_global.default_mem[0] = cfg_global.default_pids[0] = cfg_global.default_cpu[0] = '\0';
+            cfg_global.default_oom_ok = false;
+        }
+        str_copy_or_die(cfg_global.container_dir, argv[2], MAX_PATH, "the directory");
+        const char *wrong = container_config_load(argv[3], &config);
+        if (wrong)
+            put_line("refused: ", wrong);
+        else
+            put_config(&config);
+        return 0;
+    }
+    if (argc >= 4 && streq(argv[1], "config-write")) {
+        static container_config config;
+        cfg_global_init();
+        str_copy_or_die(cfg_global.container_dir, argv[2], MAX_PATH, "the directory");
+        container_config_init(&config);
+        if (container_config_fill_defaults(&config) != NULL)
+            die("unit: no defaults");
+        for (int i = 4; i < argc; i++)
+            set_unchecked(&config, argv[i]);
+        const char *wrong = container_config_save(argv[3], &config);
+        put_line(wrong ? "refused: " : "written", wrong ? wrong : "");
+        return 0;
+    }
+    if (argc == 3 && streq(argv[1], "remove")) {
+        put_result(remove_file_durably(argv[2]));
+        return 0;
+    }
+    if (argc == 5 && streq(argv[1], "record")) {
+        char text[32];
+        bool cut = false;
+        cfg_global_init();
+        str_copy_or_die(cfg_global.run_dir, argv[2], MAX_PATH, "the directory");
+        size_t pos = str_append(text, 0, argv[4], sizeof(text), &cut);
+        str_append(text, pos, "\n", sizeof(text), &cut);
+        if (cut)
+            die("unit: record <run_dir> <name> <state>");
+        put_result(record_container_state(argv[3], text));
+        return 0;
+    }
+    if (argc == 5 && streq(argv[1], "reconcile")) {
+        char state[32];
+        cfg_global_init();
+        str_copy_or_die(cfg_global.container_dir, argv[2], MAX_PATH, "the directory");
+        str_copy_or_die(cfg_global.run_dir, argv[3], MAX_PATH, "the directory");
+        /* a cgroup tree that is not there: the container has nothing in it */
+        path_join_or_die(cfg_global.cgroup_base, MAX_PATH, argv[3], "no-cgroups");
+        put(reconcile(argv[4]) ? "cleared\n" : "nothing\n");
+        get_container_state(argv[4], state, sizeof(state));
+        put_line("state ", state);
         return 0;
     }
     if (argc == 3 && streq(argv[1], "streams")) {
@@ -533,7 +998,7 @@ int main(int argc, char **argv, char **envp) {
         int seconds = 0;
         if (!parse_seconds(argv[3], &seconds))
             die("unit: stop <pid> <seconds>");
-        lc_sysret pidfd = lb_sys_pidfd_open(parse_int(argv[2]), 0);
+        lc_sysret pidfd = lb_sys_pidfd_open(number_arg(argv[2]), 0);
         if (pidfd < 0)
             die2("unit: no process ", argv[2]);
         put(ask_init_to_stop((int32_t)pidfd, seconds) ? "asked\n" : "gone\n");
@@ -557,6 +1022,7 @@ int main(int argc, char **argv, char **envp) {
     }
     if (argc >= 3 && streq(argv[1], "volumes")) {
         static struct volume_mount volumes[MAX_VOLS];
+        static volume_spec specs[MAX_VOLS];
         const char *root = argv[2];
         int count = 0, i = 3;
 
@@ -564,7 +1030,10 @@ int main(int argc, char **argv, char **envp) {
         for (; i < argc && !streq(argv[i], "--"); i++) {
             if (count == MAX_VOLS)
                 die("unit: too many volumes");
-            open_volume(argv[i], &volumes[count++]);
+            if (parse_volume_spec(argv[i], &specs[count]) != NULL)
+                die2("unit: not a volume: ", argv[i]);
+            open_volume(&specs[count], &volumes[count]);
+            count++;
         }
 
         /* into the root as build_container goes into a container's */

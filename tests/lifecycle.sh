@@ -64,6 +64,7 @@ esac
 # ─── Names used by every stage ──────────────────────────────────────────────
 
 BR=lbt0                     # the bridge; not br0, in case a namespace ever fails to be private
+WIDE_BR=lbt16               # the bridge of the case with a /16
 SUBNET=10.199.0.0/24
 NETP=10.199.0
 GW=10.199.0.1
@@ -78,6 +79,7 @@ settings() { # after LIFECYCLE_T is known
     BB=${LIFECYCLE_BB:-}
     [ -n "$T" ] && [ -d "$T" ] || { echo "lifecycle: no work directory" >&2; exit 2; }
     C="$T/lb/containers"
+    RUN="$T/run"                # run_dir: the records of a container that runs are in $RUN/<name>/
     BASE="$T/base"
     OUT="$T/out"
     CG=$(cat "$T/cgroup_base")
@@ -108,9 +110,12 @@ status_field() { # pid field : a value from /proc/<pid>/status
 alive()   { kill -0 "$1" 2>/dev/null && [ "$(status_field "$1" State)" != Z ]; }
 gone()    { ! kill -0 "$1" 2>/dev/null; }          # exited and reaped
 no_link() { ! ip link show "$1" >/dev/null 2>&1; }
+# the interfaces of this network namespace, by name
+links_now() { ip -o link show | awk -F': ' '{ sub(/@.*/, "", $2); print $2 }' | sort; }
 
-pid_of()   { cat "$C/$1/.pid"; }
-state_of() { cat "$C/$1/.state"; }
+pid_of()   { cat "$RUN/$1/pid"; }
+# what is on record; a container without a record of its state is stopped
+state_of() { if [ -e "$RUN/$1/state" ]; then cat "$RUN/$1/state"; else echo stopped; fi; }
 addr_of()  { cat "$C/$1/.ip"; }
 
 next_ip() {
@@ -126,6 +131,19 @@ box() { # name [create options] : create a container on the next free address
     shift
     ip=$(next_ip) || return 1
     lb create "$name" "$ip" "$@" >"$OUT/$name.create" 2>&1 || { cat "$OUT/$name.create"; return 1; }
+    port_of "$name" >/dev/null
+}
+
+# The end of a container's interface on the host, as inspect names it: kept,
+# so that it can be asked for after the container is removed.
+port_of() { # name
+    [ -s "$T/port.$1" ] || lb inspect "$1" 2>/dev/null | sed -n 's/^host_interface: //p' > "$T/port.$1"
+    cat "$T/port.$1"
+}
+# The chain of a container's links: LB- and the same digits as its port.
+chain_of() { # name
+    local port
+    port=$(port_of "$1") && [ -n "$port" ] && echo "LB-${port#vb-}"
 }
 
 mounted_in()   { awk -v m="$2" '$5 == m { found = 1 } END { exit !found }' "/proc/$1/mountinfo" 2>/dev/null; }
@@ -174,11 +192,23 @@ children_of() { # pid program : the children of a process that run this program
 # What must not remain of a container that is not running.
 nothing_left() { # name
     local bad=0
-    if [ -e "$C/$1/.pid" ] || [ -e "$C/$1/.pid_start" ]; then
-        echo "runtime files are left: $(ls -A "$C/$1" | tr '\n' ' ')"; bad=1
+    if [ -e "$RUN/$1/pid" ] || [ -e "$RUN/$1/pid_start" ] || [ -e "$RUN/$1/exit" ]; then
+        echo "runtime records are left: $(ls -A "$RUN/$1" | tr '\n' ' ')"; bad=1
     fi
-    no_link "vb-$1" || { echo "the interface vb-$1 is left"; bad=1; }
+    local port
+    port=$(port_of "$1")
+    if [ -z "$port" ]; then
+        echo "what the interface of $1 is called on the host cannot be told"; bad=1
+    elif ! no_link "$port"; then
+        echo "the interface $port is left"; bad=1
+    fi
     [ ! -d "$CG/$1" ] || { echo "the cgroup $CG/$1 is left"; bad=1; }
+    if [ -n "$port" ] && { [ -e "$RUN/$1/firewall" ] || iptables -n -L "LB-${port#vb-}" >/dev/null 2>&1; }; then
+        echo "the firewall chain LB-${port#vb-} of its links, or the record of it, is left"; bad=1
+    fi
+    if [ -n "$port" ] && nft list set bridge lightbox links 2>/dev/null | grep -q "\"$port\""; then
+        echo "an element of the nftables set of links names $port"; bad=1
+    fi
     echo "state: $(state_of "$1")"
     return $bad
 }
@@ -217,21 +247,142 @@ shim() { # path script
 
 # ─── Cases: host setup ──────────────────────────────────────────────────────
 
+# setup makes lightbox's chains and jumps to them from the top of FORWARD and
+# POSTROUTING. Forwarding was off (the fixture turned it off), so, as Docker
+# does, setup turns it on with the FORWARD policy at DROP: from then on every
+# case runs with a host firewall that drops what lightbox does not accept.
 t_setup() {
-    lb setup || return 1
+    lb setup >"$OUT/setup" 2>&1 || { cat "$OUT/setup"; return 1; }
+    cat "$OUT/setup"
     ip -o -4 addr show dev "$BR" | grep -q " $GW/24 " || { echo "the bridge has no address:"; ip addr show dev "$BR"; return 1; }
     ip link show dev "$BR" | head -n 1 | grep -q '[<,]UP[,>]' || { echo "the bridge is not up"; return 1; }
     [ "$(cat /proc/sys/net/ipv4/ip_forward)" = 1 ] || { echo "forwarding is off"; return 1; }
-    iptables -t nat -C POSTROUTING -s "$SUBNET" -o "$WAN" -j MASQUERADE &&
-    iptables -C FORWARD -i "$BR" -o "$WAN" -j ACCEPT &&
-    iptables -C FORWARD -i "$WAN" -o "$BR" -m state --state RELATED,ESTABLISHED -j ACCEPT &&
-    iptables -C FORWARD -i "$BR" -o "$BR" -j DROP || { echo "a rule is missing:"; iptables-save; return 1; }
+    iptables -S FORWARD
+    [ "$(iptables -S FORWARD | head -n 1)" = '-P FORWARD DROP' ] || { echo "the FORWARD policy is not DROP"; return 1; }
+    [ "$(iptables -S FORWARD | sed -n '2,3p' | paste -sd'|' -)" = '-A FORWARD -j LIGHTBOX-USER|-A FORWARD -j LIGHTBOX-FORWARD' ] ||
+        { echo "FORWARD does not begin with the jumps to LIGHTBOX-USER and LIGHTBOX-FORWARD"; return 1; }
+    [ "$(iptables -t nat -S POSTROUTING | sed -n 2p)" = '-A POSTROUTING -j LIGHTBOX-POSTROUTING' ] ||
+        { echo "POSTROUTING does not begin with the jump to LIGHTBOX-POSTROUTING"; iptables -t nat -S POSTROUTING; return 1; }
+    iptables -S LIGHTBOX-FORWARD; iptables -t nat -S LIGHTBOX-POSTROUTING
+    iptables -C LIGHTBOX-FORWARD -i "$BR" -o "$BR" -j LIGHTBOX-LINKS &&
+    iptables -C LIGHTBOX-FORWARD -i "$BR" -o "$BR" -j DROP &&
+    iptables -C LIGHTBOX-FORWARD -i "$BR" ! -o "$BR" -j ACCEPT &&
+    iptables -C LIGHTBOX-FORWARD -o "$BR" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT &&
+    iptables -t nat -C LIGHTBOX-POSTROUTING -s "$SUBNET" ! -o "$BR" -j MASQUERADE &&
+    iptables -n -L LIGHTBOX-USER >/dev/null && iptables -n -L LIGHTBOX-LINKS >/dev/null ||
+        { echo "a rule or a chain is missing:"; iptables-save; return 1; }
+    # nothing names the interface the default route leaves by
+    ! iptables-save | grep -qw -- "$WAN" || { echo "a rule names $WAN"; return 1; }
     # the fixture made these 0755, as installations before 0.2 did
-    echo "storage modes after setup: $(stat -c %a "$T/lb") $(stat -c %a "$C")"
-    [ "$(stat -c %a "$T/lb")" = 700 ] && [ "$(stat -c %a "$C")" = 700 ]
+    echo "storage modes after setup: $(stat -c %a "$T/lb") $(stat -c %a "$C"), and of run_dir: $(stat -c %a "$RUN")"
+    [ "$(stat -c %a "$T/lb")" = 700 ] && [ "$(stat -c %a "$C")" = 700 ] && [ "$(stat -c %a "$RUN")" = 700 ]
 }
 
 firewall_rules() { iptables-save | grep -v '^#' | sed 's/\[[0-9]*:[0-9]*\]//'; }
+
+# A lightbox.conf of the suite's with more settings, for a case: sets $ALT.
+alt_conf() { # directory name, settings...
+    ALT=$T/$1/home
+    shift
+    mkdir -p "$ALT/.config/lightbox" || return 1
+    { cat "$HOME/.config/lightbox/lightbox.conf"; printf '%s\n' "$@"; } > "$ALT/.config/lightbox/lightbox.conf"
+}
+alt_lb() { HOME="$ALT" timeout -k 5 60 "$LB" "$@"; }
+
+# What lightbox 0.4 put straight into FORWARD and POSTROUTING, taken out by
+# setup; a rule of the host's that looks like one stays.
+t_setup_takes_out_old_rules() {
+    iptables -t nat -A POSTROUTING -s "$SUBNET" -o "$WAN" -j MASQUERADE &&
+    iptables -A FORWARD -i "$BR" -o "$WAN" -j ACCEPT &&
+    iptables -A FORWARD -i "$WAN" -o "$BR" -m state --state RELATED,ESTABLISHED -j ACCEPT &&
+    iptables -A FORWARD -i "$BR" -o "$BR" -j DROP &&
+    iptables -A FORWARD -s "$NETP.40/32" -d "$NETP.41/32" -i "$BR" -o "$BR" -j ACCEPT &&
+    iptables -A FORWARD -s 192.0.2.7/32 -d 192.0.2.8/32 -j ACCEPT || return 1
+    said=$(lb setup 2>&1) || { printf '%s\n' "$said"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *'Removed 5 firewall rules'*) ;; *) echo "setup did not say that it removed five rules"; return 1 ;; esac
+    old=$( { iptables -S FORWARD; iptables -t nat -S POSTROUTING; } | grep -E -- "$WAN|$NETP\.4[01]/32|-A FORWARD -i $BR -o $BR -j DROP")
+    [ -z "$old" ] || { echo "left: $old"; return 1; }
+    iptables -C FORWARD -s 192.0.2.7/32 -d 192.0.2.8/32 -j ACCEPT || { echo "the host's own rule was taken out"; return 1; }
+    iptables -C FORWARD -j LIGHTBOX-FORWARD && iptables -C LIGHTBOX-FORWARD -i "$BR" ! -o "$BR" -j ACCEPT
+}
+
+# The host's own rules go in LIGHTBOX-USER, which decides before lightbox's
+# rules, and setup leaves them there.
+t_user_chain() {
+    need_nc || return 77
+    up user1 || return 1
+    reaches user1 "$OUTSIDE" || return 1
+    ip=$(addr_of user1)
+    iptables -A LIGHTBOX-USER -s "$ip" -d "$OUTSIDE" -j DROP || return 1
+    lb setup >/dev/null || return 1
+    iptables -C LIGHTBOX-USER -s "$ip" -d "$OUTSIDE" -j DROP || { echo "setup took the host's rule out"; return 1; }
+    reaches user1 "$OUTSIDE" && { echo "the host's rule in LIGHTBOX-USER did not decide"; return 1; }
+    iptables -F LIGHTBOX-USER
+    reaches user1 "$OUTSIDE"
+}
+
+# A host firewall that drops all that is forwarded after lightbox's jumps, as
+# a DROP policy and a last rule of ufw's do: the bridge's traffic still passes.
+t_host_firewall_drops_the_rest() {
+    need_nc || return 77
+    iptables -A FORWARD -j DROP || return 1
+    up behind || return 1
+    reaches behind "$OUTSIDE"
+}
+
+# ip_forward_no_drop = true: setup turns forwarding on and leaves the policy.
+t_ip_forward_no_drop() {
+    alt_conf nodrop 'ip_forward_no_drop = true' || return 1
+    echo 0 > /proc/sys/net/ipv4/ip_forward && iptables -P FORWARD ACCEPT || return 1
+    alt_lb setup >"$OUT/nodrop.setup" 2>&1 || { cat "$OUT/nodrop.setup"; return 1; }
+    cat "$OUT/nodrop.setup"
+    echo "forwarding $(cat /proc/sys/net/ipv4/ip_forward), $(iptables -S FORWARD | head -n 1)"
+    [ "$(cat /proc/sys/net/ipv4/ip_forward)" = 1 ] && [ "$(iptables -S FORWARD | head -n 1)" = '-P FORWARD ACCEPT' ]
+}
+
+# ip_masq = false: nothing is masqueraded, and a container gets no answer
+# from the outside, which has no route back to it.
+t_ip_masq_false() {
+    need_nc || return 77
+    alt_conf nomasq 'ip_masq = false' || return 1
+    alt_lb setup >"$OUT/nomasq.setup" 2>&1 || { cat "$OUT/nomasq.setup"; return 1; }
+    left=$(iptables -t nat -S LIGHTBOX-POSTROUTING | tail -n +2)
+    [ -z "$left" ] || { echo "LIGHTBOX-POSTROUTING has: $left"; return 1; }
+    up nomasq || return 1
+    reaches nomasq "$OUTSIDE" && { echo "the outside answered a container that was not masqueraded"; return 1; }
+    return 0
+}
+
+# firewall = false: setup makes no rule, and a container with links is not
+# started, since only lightbox's rules keep it to them.
+t_firewall_false() {
+    alt_conf nofw 'firewall = false' || return 1
+    rules=$(firewall_rules)
+    said=$(alt_lb setup 2>&1) || { printf '%s\n' "$said"; return 1; }
+    printf '%s\n' "$said"
+    [ "$rules" = "$(firewall_rules)" ] || { echo "setup with firewall = false changed the firewall:"; firewall_rules; return 1; }
+    case $said in *'no firewall rules were made'*) ;; *) return 1 ;; esac
+    box fwpeer && box fwlinked --link fwpeer || return 1
+    said=$(alt_lb start fwlinked 2>&1 </dev/null) && { echo "a container with links started with firewall = false"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *'firewall = false'*) ;; *) return 1 ;; esac
+    nothing_left fwlinked
+}
+
+# setup reads subnet and gw as one network before it changes anything: a
+# gateway outside the subnet ends it, with no bridge made and no rule added.
+t_setup_refuses_a_gateway_outside() {
+    mkdir -p "$T/gwout/home/.config/lightbox"
+    sed -e 's#^bridge = .*#bridge = lbt9#' -e 's#^gw = .*#gw = 10.198.0.1#' "$HOME/.config/lightbox/lightbox.conf" \
+        > "$T/gwout/home/.config/lightbox/lightbox.conf"
+    rules=$(firewall_rules)
+    said=$(HOME="$T/gwout/home" timeout -k 5 60 "$LB" setup 2>&1) && { echo "setup succeeded"; return 1; }
+    printf '%s\n' "$said"
+    no_link lbt9 || { echo "a bridge was made before the refusal"; return 1; }
+    [ "$rules" = "$(firewall_rules)" ] || { echo "the firewall rules changed:"; firewall_rules; return 1; }
+    case $said in *'gw in lightbox.conf is not in the subnet'*) ;; *) return 1 ;; esac
+}
 
 t_setup_again() {
     mounts=$(cat /proc/self/mountinfo)
@@ -289,7 +440,7 @@ Container 'web' stopped" ] || return 1
 
     [ "$(state_of web)" = stopped ] || { echo "state after stop: $(state_of web)"; return 1; }
     wait_until 5 gone "$pid" || { echo "init $pid is still there after stop"; return 1; }
-    wait_until 5 no_link vb-web || { echo "vb-web is still there after stop"; return 1; }
+    wait_until 5 no_link "$(port_of web)" || { echo "$(port_of web) is still there after stop"; return 1; }
     nothing_left web || return 1
 
     lb rm web || return 1
@@ -362,9 +513,141 @@ t_start_after_init_died() {
     lb ls
     lb ls | grep -Eq '^crash +[0-9.]+ +exited' || { echo "ls does not show it as exited"; return 1; }
     # the kernel removes the dead container's interface a moment later
-    wait_until 5 no_link vb-crash || { echo "vb-crash did not go away"; return 1; }
+    wait_until 5 no_link "$(port_of crash)" || { echo "$(port_of crash) did not go away"; return 1; }
     start crash || return 1
     [ "$(sh_in crash 'echo back')" = back ]
+}
+
+# stop is a command that changes a container, so it is where the record of a
+# dead init gets cleaned up, as start is.
+t_stop_of_a_dead_container_cleans_up() {
+    up dead || return 1
+    pid=$(pid_of dead)
+    kill -KILL "$pid"
+    wait_until 5 gone "$pid" || { echo "init $pid survived SIGKILL"; return 1; }
+    [ -d "$CG/dead" ] || { echo "the dead container's cgroup is gone before any command looked"; return 1; }
+    said=$(lb stop dead 2>&1) && { echo "stop of a container whose init is gone succeeded"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *"had ended without a stop"*"not running"*) ;; *) echo "stop does not say what it found"; return 1 ;; esac
+    echo "state after stop: $(state_of dead)"
+    # killed, init said nothing about its end: that is a failure
+    nothing_left dead && [ "$(state_of dead)" = failed ]
+}
+
+# A container that is told to stop from inside, or by a signal from anywhere,
+# ends as it does for lightbox stop. No command is there to clear up after
+# it: the next one that changes it does, and records that it ended well.
+t_stopped_from_inside_is_exited() {
+    up inside || return 1
+    pid=$(pid_of inside)
+    sh_in inside 'kill -TERM 1' >/dev/null 2>&1     # the shell that says it ends with the container
+    wait_until 15 gone "$pid" || { echo "init $pid did not end when a process in the container sent it SIGTERM"; return 1; }
+    # ls says what it sees and changes nothing
+    before=$(ls -A "$RUN/inside" | tr '\n' ' ')
+    lb ls
+    lb ls | grep -Eq '^inside +[0-9.]+ +exited' || { echo "ls does not show it as exited"; return 1; }
+    [ "$(ls -A "$RUN/inside" | tr '\n' ' ')" = "$before" ] && [ -d "$CG/inside" ] ||
+        { echo "ls changed something: records '$before' -> '$(ls -A "$RUN/inside" | tr '\n' ' ')'"; return 1; }
+    echo "what init said when it ended: $(cat "$RUN/inside/exit")"
+    said=$(lb stop inside 2>&1) && { echo "stop of a container that had ended succeeded"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *"had stopped by itself"*) ;; *) echo "stop does not say what it found"; return 1 ;; esac
+    echo "state after stop: $(state_of inside)"
+    nothing_left inside && [ "$(state_of inside)" = exited ] || return 1
+    # and it starts again
+    start inside && [ "$(state_of inside)" = running ]
+}
+
+# A container that was started by a lightbox before 0.5 has its records in
+# its own directory. After an upgrade it is still seen to be running, a
+# command can be run in it, and stop stops it and takes the old records away.
+t_container_started_before_the_upgrade() {
+    up oldstyle || return 1
+    pid=$(pid_of oldstyle)
+    mv "$RUN/oldstyle/pid" "$C/oldstyle/.pid" && mv "$RUN/oldstyle/pid_start" "$C/oldstyle/.pid_start" &&
+    mv "$RUN/oldstyle/state" "$C/oldstyle/.state" && rm -rf -- "$RUN/oldstyle" || return 1
+    lb ls
+    lb ls | grep -Eq "^oldstyle +[0-9.]+ +running +$pid" || { echo "ls does not show it as running"; return 1; }
+    [ "$(sh_in oldstyle 'echo here')" = here ] || { echo "exec does not find it"; return 1; }
+    refused lb start oldstyle 2>/dev/null || { echo "a container that is running was started again"; return 1; }
+    alive "$pid" || { echo "the refused start ended the container"; return 1; }
+    lb stop oldstyle || return 1
+    gone "$pid" || { echo "init $pid is still there"; return 1; }
+    echo "left in the container's directory: $(ls -A "$C/oldstyle" | tr '\n' ' ')"
+    [ ! -e "$C/oldstyle/.pid" ] && [ ! -e "$C/oldstyle/.pid_start" ] && [ ! -e "$C/oldstyle/.state" ] &&
+    nothing_left oldstyle && [ "$(state_of oldstyle)" = stopped ]
+}
+
+# After a reboot nothing runs and run_dir, on a tmpfs, is empty or gone. The
+# containers are stopped, not stale, and start as they did.
+t_after_a_reboot() {
+    up was-up && box never-up || return 1
+    pid=$(pid_of was-up)
+    echo "run_dir is mode $(stat -c %a "$RUN"), a container's records $(stat -c %a "$RUN/was-up"), its PID record $(stat -c %a "$RUN/was-up/pid")"
+    [ "$(stat -c %a "$RUN")" = 700 ] && [ "$(stat -c %a "$RUN/was-up")" = 700 ] && [ "$(stat -c %a "$RUN/was-up/pid")" = 600 ] || return 1
+    # what a reboot does to it, as far as that can be done here
+    kill -KILL "$pid"
+    wait_until 5 gone "$pid" || return 1
+    wait_until 5 no_link "$(port_of was-up)" || return 1
+    rm -rf -- "$RUN"
+    lb ls
+    lb ls | grep -Eq '^was-up +[0-9.]+ +stopped' && lb ls | grep -Eq '^never-up +[0-9.]+ +stopped' ||
+        { echo "ls does not show them as stopped"; return 1; }
+    [ ! -e "$RUN" ] || { echo "ls made run_dir"; return 1; }
+    start was-up && start never-up || return 1
+    [ "$(sh_in was-up 'echo back')" = back ] && [ "$(stat -c %a "$RUN")" = 700 ] && [ "$(state_of never-up)" = running ]
+}
+
+# A create that was killed half way leaves half a root filesystem. Such a
+# container is not started.
+t_half_made_container_is_not_started() {
+    box halfmade || return 1
+    : > "$C/halfmade/.creating"
+    said=$(lb start halfmade 2>&1) && { echo "a half-made container was started"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *'was not created completely'*) ;; *) return 1 ;; esac
+    lb ls | grep -Eq '^halfmade +[0-9.]+ +creating' || { echo "ls does not show it as being created"; return 1; }
+    nothing_left halfmade && lb rm halfmade && [ ! -e "$C/halfmade" ]
+}
+
+# Init has files of the host open: its log, and the record of how it ends.
+# A process in the container cannot get at them by way of init.
+t_init_is_closed_to_the_container() {
+    up closedinit || return 1
+    said=$(sh_in closedinit 'readlink /proc/1/fd/1; echo "readlink: $?"; ( : < /proc/1/fd/1 ) 2>/dev/null; echo "open: $?"; ( : < /proc/1/environ ) 2>/dev/null; echo "environ: $?"' 2>&1)
+    printf '%s\n' "$said"
+    printf '%s\n' "$said" | grep -qx 'readlink: 1' && printf '%s\n' "$said" | grep -qx 'open: [12]' &&
+    printf '%s\n' "$said" | grep -qx 'environ: [12]' || { echo "a process in the container looked into init"; return 1; }
+    # and what it is closed for is there: the host's root can see both files
+    holds() { # a path: is one of init's descriptors this file?
+        local fd
+        for fd in "/proc/$(pid_of closedinit)/fd"/*; do
+            [ "$(readlink "$fd")" = "$1" ] && return 0
+        done
+        echo "init does not have $1 open"
+        return 1
+    }
+    holds "$C/closedinit/console.log" && holds "$RUN/closedinit/exit"
+}
+
+
+# Two starts of one container at once: one starts it, and the other waits for
+# the first to be done and then finds it running.
+t_two_starts_at_once() {
+    box twice || return 1
+    "$LB" start twice >"$OUT/twice.1" 2>&1 </dev/null &
+    first=$!
+    "$LB" start twice >"$OUT/twice.2" 2>&1 </dev/null &
+    second=$!
+    wait "$first"; a=$?
+    wait "$second"; b=$?
+    echo "--- one (status $a):"; cat "$OUT/twice.1"
+    echo "--- the other (status $b):"; cat "$OUT/twice.2"
+    [ $((a + b)) -eq 1 ] || { echo "not exactly one of the two succeeded"; return 1; }
+    cat "$OUT/twice.1" "$OUT/twice.2" | grep -q 'container is already running: twice' || { echo "the one that lost does not say why"; return 1; }
+    settled twice || return 1
+    [ "$(state_of twice)" = running ] || return 1
+    [ "$(wc -l < "$CG/twice/cgroup.procs")" = 1 ] || { echo "the container's cgroup holds $(wc -l < "$CG/twice/cgroup.procs") processes"; return 1; }
 }
 
 t_failed_start_leaves_nothing() {
@@ -613,6 +896,95 @@ t_addvol_applies_at_next_start() {
     [ "$(sh_in addvol 'cat /late/in')" = late ]
 }
 
+t_rmvol_applies_at_next_start() {
+    mkdir -p "$T/vol/going" "$T/vol/staying"
+    echo going > "$T/vol/going/in"
+    echo staying > "$T/vol/staying/in"
+    up rmvol --vol "$T/vol/going:/going" --vol "$T/vol/staying:/staying:ro" || return 1
+    said=$(lb rm-vol rmvol /going) || return 1
+    printf '%s\n' "$said"
+    case $said in *'until the container is restarted'*) ;; *) echo "rm-vol does not say that the volume is still mounted"; return 1 ;; esac
+    [ "$(sh_in rmvol 'cat /going/in')" = going ] || { echo "the volume went away without a restart"; return 1; }
+    lb stop rmvol && start rmvol || return 1
+    refused sh_in rmvol 'cat /going/in' 2>/dev/null || { echo "the removed volume is mounted after a restart"; return 1; }
+    [ "$(sh_in rmvol 'cat /staying/in')" = staying ] || { echo "the other volume is gone as well"; return 1; }
+    [ -e "$T/vol/going/in" ] || { echo "removing the volume removed what was in it"; return 1; }
+}
+
+# A container made by a lightbox from before the configuration had a version
+# line: it starts as it is, with its limits and its volume.
+t_conf_from_before_starts() {
+    mkdir -p "$T/vol/old"
+    echo old > "$T/vol/old/in"
+    box before || return 1
+    printf 'mem=32M\npids=40\ncpu=2\noom_score=200\nnote=by hand\nvol=%s:/old:ro\n' "$T/vol/old" > "$C/before/.conf"
+    start before || return 1
+    pid=$(pid_of before)
+    echo "memory.max $(cat "$CG/before/memory.max"), pids.max $(cat "$CG/before/pids.max"), cpu.max $(cat "$CG/before/cpu.max"), oom_score_adj $(cat "/proc/$pid/oom_score_adj")"
+    [ "$(cat "$CG/before/memory.max")" = 33554432 ] && [ "$(cat "$CG/before/pids.max")" = 40 ] &&
+    [ "$(cat "$CG/before/cpu.max")" = '200000 100000' ] && [ "$(cat "/proc/$pid/oom_score_adj")" = 200 ] &&
+    [ "$(sh_in before 'cat /old/in')" = old ] || return 1
+    lb stop before
+}
+
+# A configuration that cannot be used: nothing is started from it and
+# nothing is run in a container that has it, and the container is stopped
+# all the same, with what stop could not do said.
+# A configuration that cannot be used: exec and start refuse. stop stops the
+# container all the same and takes away all it had, the rules of its links
+# among them, which it knows from their record and not from the .conf.
+t_unusable_conf() {
+    if brnf 1; then
+        box dpeer && box damaged --link dpeer || return 1
+        start damaged || return 1
+        iptables -n -L "$(chain_of damaged)" >/dev/null || { echo "the link put in no chain"; return 1; }
+    else
+        echo "br_netfilter is not loaded: the container has no link"
+        up damaged || return 1
+    fi
+    pid=$(pid_of damaged)
+    echo 'colour=blue' >> "$C/damaged/.conf"
+    said=$(lb exec damaged /bin/true 2>&1 </dev/null) && { echo "exec ran a command without knowing what the container may do"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *"$C/damaged/.conf: line "*': a key lightbox does not know') ;; *) return 1 ;; esac
+    said=$(lb stop damaged 2>&1) || { printf '%s\n' "$said"; echo "stop failed"; return 1; }
+    printf '%s\n' "$said"
+    gone "$pid" && nothing_left damaged || { echo "the container was not stopped and cleared away"; return 1; }
+    said=$(lb start damaged 2>&1) && { echo "a container with a damaged configuration was started"; return 1; }
+    printf '%s\n' "$said"
+    nothing_left damaged
+}
+
+# A start reads the container's configuration once. The command reads it,
+# and init has it from the command; before, each key was looked up in the
+# file again, by both.
+t_start_reads_conf_once() {
+    command -v strace >/dev/null 2>&1 || { echo "no strace to watch a start with"; return 77; }
+    mkdir -p "$T/vol/traced"
+    box traced --vol "$T/vol/traced:/data" --mem 64M || return 1
+    is_up() { [ "$(state_of traced 2>/dev/null)" = running ]; }
+    # strace follows the command and all it starts, init among them, so it
+    # ends when init does
+    timeout -k 5 80 strace -f -qq -e trace=%file,fsync,fdatasync,sync,syncfs -o "$T/traced.strace" \
+        "$LB" start traced >"$OUT/traced.start" 2>&1 </dev/null &
+    tracer=$!
+    wait_until 60 is_up || { echo "the container did not start under strace:"; cat "$OUT/traced.start"; kill "$tracer" 2>/dev/null; return 1; }
+    settled traced || return 1
+    lb stop traced >/dev/null 2>&1 || { echo "stop failed"; return 1; }
+    wait "$tracer"
+    opens=$(grep -cE '\<open(at2?)?\(.*/traced/\.conf"' "$T/traced.strace")
+    echo "the trace has $(wc -l < "$T/traced.strace") lines from $(awk '{ print $1 }' "$T/traced.strace" | sort -u | wc -l) processes"
+    echo "times the container's .conf was opened: $opens"
+    grep -E '/traced/\.conf"' "$T/traced.strace" | head -n 5
+    [ "$opens" = 1 ] || return 1
+    # A start writes its records where no disk has to be waited for: nothing
+    # it does, and nothing it runs, asks for a write to reach the disk.
+    syncs=$(grep -cE '\<(fsync|fdatasync|sync|syncfs)\(' "$T/traced.strace")
+    echo "times the start waited for a disk: $syncs"
+    grep -E '\<(fsync|fdatasync|sync|syncfs)\(' "$T/traced.strace" | head -n 5
+    [ "$syncs" = 0 ]
+}
+
 t_volume_under_run() {
     mkdir -p "$T/vol/secrets"
     echo token > "$T/vol/secrets/token"
@@ -821,12 +1193,98 @@ t_start_runs_nothing_from_the_image() {
 
 # ─── Cases: limits ──────────────────────────────────────────────────────────
 
+# The limits are in the cgroup, with no swap and the whole container for the
+# kernel to kill unless --swap gives some; init and what exec runs have the
+# container's OOM score.
 t_limits() {
     up limits --mem 64M --pids 50 --cpu 2 --oom-score 300 || return 1
     pid=$(pid_of limits)
     echo "memory.max $(cat "$CG/limits/memory.max"), pids.max $(cat "$CG/limits/pids.max"), cpu.max $(cat "$CG/limits/cpu.max"), oom_score_adj $(cat "/proc/$pid/oom_score_adj")"
     [ "$(cat "$CG/limits/memory.max")" = 67108864 ] && [ "$(cat "$CG/limits/pids.max")" = 50 ] &&
-    [ "$(cat "$CG/limits/cpu.max")" = '200000 100000' ] && [ "$(cat "/proc/$pid/oom_score_adj")" = 300 ]
+    [ "$(cat "$CG/limits/cpu.max")" = '200000 100000' ] && [ "$(cat "/proc/$pid/oom_score_adj")" = 300 ] || return 1
+    echo "memory.swap.max $(cat "$CG/limits/memory.swap.max"), memory.oom.group $(cat "$CG/limits/memory.oom.group"), oom_score_adj of what exec runs $(sh_in limits 'cat /proc/self/oom_score_adj')"
+    [ "$(cat "$CG/limits/memory.swap.max")" = 0 ] && [ "$(cat "$CG/limits/memory.oom.group")" = 1 ] &&
+    [ "$(sh_in limits 'cat /proc/self/oom_score_adj')" = 300 ] || return 1
+    # part of a CPU, no limit at all, and some swap
+    up half --mem max --pids max --cpu 0.5 --oom-score -500 --swap 64M || return 1
+    pid=$(pid_of half)
+    echo "memory.max $(cat "$CG/half/memory.max"), pids.max $(cat "$CG/half/pids.max"), cpu.max $(cat "$CG/half/cpu.max"), oom_score_adj $(cat "/proc/$pid/oom_score_adj"), memory.swap.max $(cat "$CG/half/memory.swap.max")"
+    [ "$(cat "$CG/half/memory.max")" = max ] && [ "$(cat "$CG/half/pids.max")" = max ] &&
+    [ "$(cat "$CG/half/cpu.max")" = '50000 100000' ] && [ "$(cat "/proc/$pid/oom_score_adj")" = -500 ] &&
+    [ "$(cat "$CG/half/memory.swap.max")" = 67108864 ] && [ "$(sh_in half 'cat /proc/self/oom_score_adj')" = -500 ]
+}
+
+# A whole disk of this host, as <major>:<minor>: not a partition, a loop
+# device, a RAM disk or an optical drive.
+whole_disk() {
+    local d name
+    for d in /sys/dev/block/*; do
+        [ -e "$d/uevent" ] && [ ! -e "$d/partition" ] || continue
+        name=$(sed -n 's/^DEVNAME=//p' "$d/uevent")
+        case $name in loop*|ram*|zram*|sr*|'') continue ;; esac
+        echo "${d##*/}"
+        return 0
+    done
+    return 1
+}
+
+# --io-max reaches io.max.
+t_io_limit() {
+    disk=$(whole_disk) || { echo "this host has no whole disk to limit"; return 77; }
+    up iolimit --io-max "$disk wbps=1048576 riops=max" || return 1
+    echo "io.max: $(cat "$CG/iolimit/io.max")"
+    grep -qx "$disk rbps=max wbps=1048576 riops=max wiops=max" "$CG/iolimit/io.max"
+}
+
+# Past its memory limit a process is killed, and does not go on in swap; and
+# with it the whole container, which the next command clears away.
+t_past_the_memory_limit() {
+    chroot "$BASE" /bin/sh -c 'command -v dd' >/dev/null 2>&1 || { echo "this image has no dd to fill memory with"; return 77; }
+    echo "swap on this host: $(awk 'NR > 1 { n++; k += $3 } END { print n + 0 " areas, " k + 0 " KiB" }' /proc/swaps)"
+    up hungry --mem 32M || return 1
+    pid=$(pid_of hungry)
+    # 64 MiB in one buffer, which dd fills from /dev/zero
+    sh_in hungry 'dd if=/dev/zero of=/dev/null bs=67108864 count=1' >"$OUT/hungry.dd" 2>&1
+    rc=$?
+    cat "$OUT/hungry.dd"
+    echo "exec ended with status $rc"
+    [ $rc -ne 0 ] || { echo "dd went past the memory limit and finished"; return 1; }
+    echo "memory.events: $(tr '\n' ' ' < "$CG/hungry/memory.events")"
+    kills=$(awk '$1 == "oom_kill" { print $2 }' "$CG/hungry/memory.events")
+    [ "${kills:-0}" -ge 1 ] || { echo "the kernel killed nothing for the limit"; return 1; }
+    wait_until 5 gone "$pid" || { echo "init $pid outlived the kill of a process in its container"; return 1; }
+    lb stop hungry
+    nothing_left hungry && [ "$(state_of hungry)" = failed ]
+}
+
+# Without the io controller, which a kernel may lack or a parent keep to
+# itself, a container without an I/O limit starts and is told so once; one
+# with an I/O limit is refused, and nothing of it is left. Here the suite's
+# cgroup keeps io from the one below it, which this case's lightbox.conf has
+# for its cgroup_root.
+t_without_io_controller() {
+    sub=$CG/noio
+    mkdir -p "$T/noio/home/.config/lightbox" "$sub" || return 1
+    echo -io > "$CG/cgroup.subtree_control" || { echo "io could not be kept from below the suite's cgroup"; return 1; }
+    sed -e "s#^cgroup_root = .*#cgroup_root = $sub#" -e "s#^cgroup_base = .*#cgroup_base = $sub/base#" \
+        "$HOME/.config/lightbox/lightbox.conf" > "$T/noio/home/.config/lightbox/lightbox.conf"
+    echo "controllers below the suite's cgroup: $(cat "$sub/cgroup.controllers")"
+    export HOME="$T/noio/home"
+    box plain || return 1
+    lb start plain >"$OUT/plain.start" 2>&1 </dev/null || { cat "$OUT/plain.start"; return 1; }
+    cat "$OUT/plain.start"
+    [ "$(grep -c '^Warning:' "$OUT/plain.start")" = 1 ] && grep -q '^Warning: .* no io controller' "$OUT/plain.start" ||
+        { echo "start did not warn once, about io"; return 1; }
+    settled plain || return 1
+    echo "the container's cgroup has: $(cat "$sub/base/plain/cgroup.controllers"); memory.max $(cat "$sub/base/plain/memory.max")"
+    [ "$(cat "$sub/base/plain/memory.max")" = 268435456 ] || { echo "the other limits are not there"; return 1; }
+    lb stop plain >/dev/null || return 1
+    disk=$(whole_disk) || { echo "this host has no whole disk for an I/O limit, so that refusal is not tried"; return 0; }
+    box limited --io-max "$disk wbps=1048576" || return 1
+    said=$(lb start limited 2>&1 </dev/null) && { echo "a container with an I/O limit started without io"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *"has no io controller, and the container has an I/O limit"*) ;; *) return 1 ;; esac
+    [ ! -d "$sub/base/limited" ] && no_link "$(port_of limited)"
 }
 
 t_cgroup_membership() {
@@ -1067,14 +1525,16 @@ printed by the service" ] || { echo "logs -f showed:"; cat "$OUT/logged.followed
 }
 
 # Nothing that was open in the command stays open in the container: init has
-# /dev/null, the log twice, and its signalfd. The command here has a file on
-# descriptor 9, and no standard streams of its own the second time.
+# /dev/null, the log twice, its signalfd, and the record of how it ends, once.
+# The command here has a file on descriptor 9, and no standard streams of its
+# own the second time.
 t_init_keeps_nothing_of_the_command() {
     box clean || return 1
     look() { # name
-        local pid fd n to log bad=0
+        local pid fd n to log record records=0 bad=0
         pid=$(pid_of "$1") || return 1
         log=$C/$1/console.log
+        record=$RUN/$1/exit
         for fd in "/proc/$pid/fd"/*; do
             n=${fd##*/}
             to=$(readlink "$fd")
@@ -1083,10 +1543,12 @@ t_init_keeps_nothing_of_the_command() {
             if [ "$n" = 0 ] && [ "$fd" -ef /dev/null ]; then continue; fi
             if { [ "$n" = 1 ] || [ "$n" = 2 ]; } && [ "$fd" -ef "$log" ]; then continue; fi
             if [ "$n" -gt 2 ] && [ "$to" = 'anon_inode:[signalfd]' ]; then continue; fi
+            if [ "$n" -gt 2 ] && [ "$fd" -ef "$record" ]; then records=$((records + 1)); continue; fi
             echo "  init should not have that"
             bad=1
         done
         [ -e "/proc/$pid/fd/0" ] && [ -e "/proc/$pid/fd/1" ] && [ -e "/proc/$pid/fd/2" ] || { echo "  init lacks a standard stream"; bad=1; }
+        [ "$records" = 1 ] || { echo "  init has the record of how it ends open $records times, not once"; bad=1; }
         return $bad
     }
     : > "$T/open-in-the-command"
@@ -1260,7 +1722,8 @@ t_killed_start_leaves_no_container() {
 
 t_stale_pid_start() {
     box stale || return 1
-    printf '12345' > "$C/stale/.pid_start"
+    mkdir -p "$RUN/stale"
+    printf '12345' > "$RUN/stale/pid_start"
     start stale
 }
 
@@ -1386,6 +1849,40 @@ t_reaches_outside() {
     reaches tonat "$OUTSIDE"
 }
 
+# A subnet that is not a /24: the bridge, the address translation and the
+# container's interface have its prefix, and a container at an address
+# outside the gateway's /24 reaches the gateway. lightbox.conf here is the
+# suite's but for the bridge and the network.
+t_wide_subnet() {
+    mkdir -p "$T/wide/home/.config/lightbox"
+    sed -e "s#^bridge = .*#bridge = $WIDE_BR#" -e 's#^subnet = .*#subnet = 10.9.0.0/16#' -e 's#^gw = .*#gw = 10.9.0.1#' \
+        "$HOME/.config/lightbox/lightbox.conf" > "$T/wide/home/.config/lightbox/lightbox.conf"
+    suite_home=$HOME
+    export HOME="$T/wide/home"
+    lb setup >"$OUT/wide.setup" 2>&1 || { cat "$OUT/wide.setup"; return 1; }
+    ip -o -4 addr show dev "$WIDE_BR"
+    ip -o -4 addr show dev "$WIDE_BR" | grep -q ' 10\.9\.0\.1/16 ' || { echo "the bridge does not have 10.9.0.1/16"; return 1; }
+    iptables -t nat -C LIGHTBOX-POSTROUTING -s 10.9.0.0/16 ! -o "$WIDE_BR" -j MASQUERADE || { echo "no address translation for 10.9.0.0/16"; return 1; }
+    lb create wide 10.9.5.2 >"$OUT/wide.create" 2>&1 || { cat "$OUT/wide.create"; return 1; }
+    start wide || return 1
+    said=$(sh_in wide 'ip addr; ip route')
+    printf '%s\n' "$said"
+    printf '%s\n' "$said" | grep -q 'inet 10\.9\.5\.2/16' && printf '%s\n' "$said" | grep -q '^default via 10\.9\.0\.1 ' ||
+        { echo "the container does not have 10.9.5.2/16 and a route by 10.9.0.1"; return 1; }
+    if [ -e "$T/have_nc" ]; then
+        reaches wide 10.9.0.1 || return 1
+    else
+        echo "this image has no nc: whether the gateway answers is not tried"
+    fi
+    lb stop wide >/dev/null || return 1
+    # on the suite's network that address is no container's, and start says so
+    export HOME="$suite_home"
+    said=$(lb start wide 2>&1) && { echo "a container outside the subnet was started"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *'it is outside the subnet of lightbox.conf'*) ;; *) return 1 ;; esac
+    nothing_left wide
+}
+
 t_isolated_when_filtered() {
     need_nc || return 77
     brnf 1 || { echo "br_netfilter is not loaded, so bridged traffic cannot be filtered here"; return 77; }
@@ -1430,7 +1927,28 @@ t_linked_containers() {
     reaches linked "$(addr_of peer)" && reaches peer "$(addr_of linked)" || return 1
     up third || return 1
     reaches third "$(addr_of peer)" && { echo "a container without the link reached peer"; return 1; }
-    return 0
+    lb stop linked >/dev/null && nothing_left linked
+}
+
+# A start puts in a container's link rules with one process, iptables-restore.
+t_link_rules_in_one_process() {
+    command -v strace >/dev/null 2>&1 || { echo "no strace to watch a start with"; return 77; }
+    brnf 1 || { echo "br_netfilter is not loaded, and a container with a link does not start without it"; return 77; }
+    box onepeer && box onelinked --link onepeer || return 1
+    is_up() { [ "$(state_of onelinked 2>/dev/null)" = running ]; }
+    timeout -k 5 80 strace -f -qq -e trace=execve -o "$T/links.strace" \
+        "$LB" start onelinked >"$OUT/onelinked.start" 2>&1 </dev/null &
+    tracer=$!
+    wait_until 60 is_up || { echo "the container did not start under strace:"; cat "$OUT/onelinked.start"; kill "$tracer" 2>/dev/null; return 1; }
+    settled onelinked || return 1
+    lb stop onelinked >/dev/null 2>&1 || { echo "stop failed"; return 1; }
+    wait "$tracer"
+    # but for the look at whether setup's rules are there, which every start has
+    tools=$(grep -E 'execve\("[^"]*/(ip6?tables[^"]*|nft)"' "$T/links.strace" | grep -v ' = -1 ')
+    printf '%s\n' "$tools"
+    count=$(printf '%s\n' "$tools" | grep -v '"-C", "FORWARD", "-j", "LIGHTBOX-FORWARD"' | grep -c .)
+    echo "firewall tools the start ran to put rules in: $count"
+    [ "$count" = 1 ] && printf '%s\n' "$tools" | grep -v '"-C", "FORWARD"' | grep -q 'restore'
 }
 
 t_link_to_later_container() {
@@ -1446,30 +1964,79 @@ t_rm_leaves_no_rule() {
     brnf 1 || { echo "br_netfilter is not loaded, and a container with a link does not start without it"; return 77; }
     box lpeer && box lmain --link lpeer || return 1
     start lpeer && start lmain || return 1
-    ip=$(addr_of lmain)
     pid=$(pid_of lmain)
-    iptables -S FORWARD | grep -qF -- "$ip/32" || { echo "the link added no rule to begin with"; return 77; }
+    chain=$(chain_of lmain) || return 1
+    iptables -S "$chain" && iptables -C LIGHTBOX-LINKS -j "$chain" || { echo "the link put in no chain to begin with"; return 1; }
+    echo "the record: $(cat "$RUN/lmain/firewall")"
     kill -KILL "$pid"
     wait_until 5 gone "$pid" || return 1
     lb rm lmain || return 1
-    left=$(iptables -S FORWARD | grep -cF -- "$ip/32")
-    echo "FORWARD rules that still name $ip after rm: $left"
-    [ "$left" -eq 0 ]
+    iptables -n -L "$chain" >/dev/null 2>&1 && { echo "the chain $chain is left"; return 1; }
+    iptables -C LIGHTBOX-LINKS -j "$chain" 2>/dev/null && { echo "the jump to $chain is left"; return 1; }
+    [ ! -e "$RUN/lmain" ] || { echo "left in run_dir: $(ls -A "$RUN/lmain")"; return 1; }
 }
 
+# An interface on the host by the name lightbox would give a container's,
+# without lightbox's alias: start refuses, says so, and leaves it alone.
+# One with the alias is what an earlier run left, and start takes it away.
 t_start_spares_foreign_interface() {
     box clobber || return 1
-    ip link add vb-clobber type veth peer name lbt-foreign || return 1
-    start clobber       # it may refuse, or use another name
-    no_link lbt-foreign && { echo "start deleted an interface it had not created"; return 1; }
-    return 0
+    port=$(port_of clobber)
+    ip link add "$port" type dummy 2>/dev/null || ip link add "$port" type veth peer name lbt-foreign || return 1
+    said=$(lb start clobber 2>&1 </dev/null) && { echo "start went ahead"; return 1; }
+    printf '%s\n' "$said"
+    ip link show dev "$port" >/dev/null 2>&1 || { echo "start deleted an interface it had not created"; return 1; }
+    case $said in *"interface $port that lightbox did not make"*) ;; *) return 1 ;; esac
+    [ "$(state_of clobber)" = failed ] || [ "$(state_of clobber)" = stopped ] || { echo "state: $(state_of clobber)"; return 1; }
+    ip link delete "$port" || return 1
+    # what an earlier run of the container left: its own, which goes
+    ip link add "$port" type dummy 2>/dev/null || ip link add "$port" type veth peer name lbt-foreign || return 1
+    ip link set dev "$port" alias lightbox:clobber || return 1
+    start clobber || return 1
+    ip -d link show dev "$port" | grep -q 'veth' || { echo "the interface is not the container's veth"; return 1; }
+}
+
+# A start that fails after it made the container's interface takes it away,
+# though the interface has no alias yet: it gets one as it joins the bridge,
+# and here the ip that would do that refuses, before it changes anything.
+t_start_fails_at_the_bridge() {
+    ip_path=$(first_existing /sbin/ip /usr/sbin/ip /bin/ip /usr/bin/ip)
+    shim "$ip_path" 'case " $* " in *" alias lightbox:"*" master "*) echo "refused here" >&2; exit 2 ;; esac
+exec "$REAL" "$@"' || return 1
+    box nobridge || return 1
+    said=$(lb start nobridge 2>&1 </dev/null) && { echo "start went ahead without its bridge"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *"failed to attach the container's interface to the bridge"*) ;; *) return 1 ;; esac
+    nothing_left nobridge
+}
+
+# The host's end of a container's interface carries lightbox's alias, and the
+# container's end is eth0, in the container only.
+t_interface_is_tagged() {
+    up tagged || return 1
+    port=$(port_of tagged)
+    ip link show dev "$port"
+    ip link show dev "$port" | grep -q '^ *alias lightbox:tagged$' || { echo "no alias lightbox:tagged"; return 1; }
+    ! ip link show dev eth0 2>/dev/null | grep -q 'link-netns' || { echo "an eth0 of a container is on the host"; return 1; }
+}
+
+# A name of 30 characters: start, exec, stop and rm, and nothing left.
+t_long_name() {
+    long='a-container-of-30-characters-x'
+    box "$long" || return 1
+    start "$long" || return 1
+    [ "$(sh_in "$long" 'echo here')" = here ] || return 1
+    [ "$(sh_in "$long" 'hostname')" = "$long" ] || { echo "the hostname is $(sh_in "$long" hostname)"; return 1; }
+    lb stop "$long" >/dev/null && nothing_left "$long" && lb rm "$long" >/dev/null
 }
 
 t_interface_is_eth0() {
     up ifname || return 1
     said=$(sh_in ifname 'cat /proc/net/dev')
     printf '%s\n' "$said" | sed '1,2d' | awk -F: '{ gsub(/ /, "", $1); printf "%s ", $1 } END { print "" }'
-    printf '%s\n' "$said" | grep -q '^ *eth0:'
+    printf '%s\n' "$said" | grep -q '^ *eth0:' || return 1
+    ! printf '%s\n' "$said" | grep -q '^ *ve-' || { echo "the container has a ve- interface"; return 1; }
+    printf '%s\n' "$(sh_in ifname 'ip -4 addr show dev eth0')" | grep -q "inet $(addr_of ifname)/"
 }
 
 t_no_ipv6_in_container() {
@@ -1478,6 +2045,239 @@ t_no_ipv6_in_container() {
     said=$(sh_in six 'cat /proc/net/if_inet6 2>/dev/null')
     printf 'IPv6 addresses in the container:\n%s\n' "${said:-none}"
     [ -z "$said" ]
+}
+
+# ─── Cases: after a reboot, and teardown ────────────────────────────────────
+
+# What a reboot takes: the bridge, every firewall rule and chain, forwarding
+# and run_dir. A start makes the host's side of the network again, as setup
+# makes it, and says so; the container reaches the gateway and the outside.
+t_start_after_a_reboot_of_the_network() {
+    box rebuilt || return 1
+    ip link delete "$BR" &&
+    iptables -F && iptables -X && iptables -t nat -F && iptables -t nat -X && iptables -P FORWARD ACCEPT &&
+    echo 0 > /proc/sys/net/ipv4/ip_forward || return 1
+    rm -rf -- "$RUN"
+    start rebuilt || return 1
+    grep -q 'making it again' "$OUT/rebuilt.start" || { echo "start did not say that it made the network again"; return 1; }
+    ip -o -4 addr show dev "$BR" | grep -q " $GW/24 " || { echo "the bridge is not there with $GW/24"; return 1; }
+    iptables -C FORWARD -j LIGHTBOX-USER && iptables -C FORWARD -j LIGHTBOX-FORWARD &&
+    iptables -t nat -C POSTROUTING -j LIGHTBOX-POSTROUTING || { echo "lightbox's jumps are not there"; return 1; }
+    [ "$(cat /proc/sys/net/ipv4/ip_forward)" = 1 ] && [ "$(iptables -S FORWARD | head -n 1)" = '-P FORWARD DROP' ] ||
+        { echo "forwarding is not on with the FORWARD policy at DROP"; return 1; }
+    if [ -e "$T/have_nc" ]; then
+        reaches rebuilt "$GW" && reaches rebuilt "$OUTSIDE"
+    else
+        echo "this image has no nc: whether the container reaches anything is not tried"
+    fi
+}
+
+# A start where everything is there looks once, and makes nothing.
+t_start_with_the_network_there() {
+    up steady || return 1
+    ! grep -q 'making it again' "$OUT/steady.start" || { echo "start made the network again, which was there"; return 1; }
+}
+
+# With nftables: a firewall service that flushes the ruleset, and the bridge
+# gone. A start makes the tables and the bridge again, and links hold.
+t_nft_start_after_the_tables_went() {
+    need_nc || return 77
+    nft_setup nftre; rc=$?; [ $rc = 0 ] || return $rc
+    box nrepeer && box nrelinked --link nrepeer || return 1
+    ip link delete "$BR" && nft delete table ip lightbox && nft delete table bridge lightbox || return 1
+    HOME="$ALT" start nrepeer || return 1
+    grep -q 'making it again' "$OUT/nrepeer.start" || { echo "start did not say that it made the network again"; return 1; }
+    nft list table ip lightbox >/dev/null && nft list table bridge lightbox >/dev/null && ip link show dev "$BR" >/dev/null ||
+        { echo "the tables or the bridge are not there"; return 1; }
+    HOME="$ALT" start nrelinked || return 1
+    reaches nrelinked "$(addr_of nrepeer)" && reaches nrelinked "$OUTSIDE"
+}
+
+# setup --teardown does nothing while a container runs, and says which. With
+# none running it takes away all that setup and the containers made: the
+# interfaces are those there were before the first setup, no rule or chain of
+# lightbox's is left, in iptables or nftables, and cgroup_base is gone. What
+# setup changed of forwarding stays, and is said. A container that is only
+# stopped stays as it is, and starts again, which makes the network again.
+t_setup_teardown() {
+    box kept && up busy || return 1
+    said=$(lb setup --teardown 2>&1) && { printf '%s\n' "$said"; echo "teardown went ahead with a container running"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *"container 'busy' is running"*) ;; *) return 1 ;; esac
+    ip link show dev "$BR" >/dev/null || { echo "a teardown that was refused took the bridge away"; return 1; }
+    lb stop busy >/dev/null || return 1
+    # forwarding as before the first setup, so that setup turns it on and says so
+    echo 0 > /proc/sys/net/ipv4/ip_forward && iptables -P FORWARD ACCEPT && lb setup >/dev/null || return 1
+    nft_ok >/dev/null 2>&1 && { nft add table ip lightbox && nft add table bridge lightbox || return 1; }
+    said=$(lb setup --teardown 2>&1) || { printf '%s\n' "$said"; return 1; }
+    printf '%s\n' "$said"
+    links_now | diff "$T/links.before" - || { echo "the interfaces are not those there were before the first setup"; return 1; }
+    left=$(iptables-save | grep -E '^(-A |:LIGHTBOX|:LB-)')
+    [ -z "$left" ] || { echo "left in iptables:"; printf '%s\n' "$left"; return 1; }
+    ! nft list tables 2>/dev/null | grep -q ' lightbox$' || { echo "left in nftables: $(nft list tables)"; return 1; }
+    [ ! -d "$CG" ] || { echo "cgroup_base $CG is left"; return 1; }
+    case $said in *'sysctl -w net.ipv4.ip_forward=0 && iptables -P FORWARD ACCEPT'*) ;; *)
+        echo "teardown did not say what setup changed of forwarding"; return 1 ;; esac
+    [ "$(cat /proc/sys/net/ipv4/ip_forward)" = 1 ] || { echo "teardown turned forwarding off"; return 1; }
+    [ -e "$C/kept/.conf" ] || { echo "the stopped container was taken away"; return 1; }
+    start kept
+}
+
+# ─── Cases: firewall_backend = nftables ─────────────────────────────────────
+
+# Can this host have lightbox's tables: nft, and nf_tables with the bridge
+# family and its meta match, in this network namespace?
+nft_ok() {
+    command -v nft >/dev/null 2>&1 || { echo "nft is not installed"; return 1; }
+    printf '%s\n' 'table bridge lbt-probe {' '  chain f {' '    type filter hook forward priority filter; policy accept;' \
+        '    meta ibrname "lbt-x" accept' '  }' '}' | nft -f - ||
+        { echo "nf_tables here has no bridge family, or no meta ibrname"; return 1; }
+    nft delete table bridge lbt-probe
+}
+
+# A lightbox.conf of the suite's with firewall_backend = nftables, and setup
+# with it. As Docker asks of its nftables backend, the iptables FORWARD
+# policy that drops (t_setup set it) is ACCEPT; teardown puts it back.
+nft_setup() { # directory name, settings...
+    nft_ok || return 77
+    local dir=$1
+    shift
+    alt_conf "$dir" 'firewall_backend = nftables' "$@" || return 1
+    iptables -P FORWARD ACCEPT || return 1
+    alt_lb setup >"$OUT/$dir.setup" 2>&1 || { cat "$OUT/$dir.setup"; return 1; }
+}
+
+# setup makes lightbox's two tables and takes out what lightbox had in
+# iptables, but for the host's LIGHTBOX-USER. A FORWARD policy that drops
+# what nftables accepts is said, by setup and by doctor. A second setup
+# changes nothing, and one with iptables takes the tables away again.
+t_nft_setup() {
+    nft_ok || return 77
+    alt_conf nft 'firewall_backend = nftables' || return 1
+    said=$(alt_lb setup 2>&1) || { printf '%s\n' "$said"; return 1; }
+    printf '%s\n' "$said"
+    nft list table ip lightbox && nft list table bridge lightbox || return 1
+    nft list chain ip lightbox forward | grep -qF "oifname \"$BR\" iifname != \"$BR\" drop" &&
+    nft list chain ip lightbox forward | grep -qF "oifname \"$BR\" ct state established,related accept" &&
+    nft list chain ip lightbox postrouting | grep -qF "ip saddr $SUBNET oifname != \"$BR\" masquerade" &&
+    nft list chain bridge lightbox forward | grep -qF "ibrname \"$BR\" iifname . oifname @links accept" &&
+    nft list chain bridge lightbox forward | grep -qF "ibrname \"$BR\" drop" || { echo "a rule is missing"; return 1; }
+    iptables -n -L LIGHTBOX-FORWARD >/dev/null 2>&1 && { echo "LIGHTBOX-FORWARD is left"; return 1; }
+    iptables -n -L LIGHTBOX-LINKS >/dev/null 2>&1 && { echo "LIGHTBOX-LINKS is left"; return 1; }
+    iptables -t nat -n -L LIGHTBOX-POSTROUTING >/dev/null 2>&1 && { echo "LIGHTBOX-POSTROUTING is left"; return 1; }
+    iptables -C FORWARD -j LIGHTBOX-USER || { echo "the host's LIGHTBOX-USER lost its jump"; return 1; }
+    case $said in *'iptables FORWARD'*'iptables -P FORWARD ACCEPT'*) ;; *) echo "setup did not name the FORWARD policy that drops"; return 1 ;; esac
+    alt_lb doctor | grep -x 'forward_drops: iptables FORWARD' || { echo "doctor did not name it"; return 1; }
+    tables() { nft list table ip lightbox; nft list table bridge lightbox; }
+    before=$(tables)
+    alt_lb setup >/dev/null 2>&1 || return 1
+    [ "$before" = "$(tables)" ] || { echo "a second setup changed the tables:"; tables; return 1; }
+    said=$(lb setup 2>&1) || { printf '%s\n' "$said"; return 1; }
+    printf '%s\n' "$said"
+    ! nft list tables | grep -q ' lightbox$' || { echo "left: $(nft list tables)"; return 1; }
+    iptables -C FORWARD -j LIGHTBOX-FORWARD && iptables -t nat -C POSTROUTING -j LIGHTBOX-POSTROUTING
+}
+
+# Where nothing passes bridged traffic through iptables, linked containers
+# reach each other and a third reaches neither. The peer has no link of its
+# own and so an isolated port, as the third has: the bridge keeps those two
+# apart. Between the third and the linked one, which shares the bridge, it is
+# the bridge table that decides. Out, through nftables' masquerading.
+t_nft_links_without_brnf() {
+    need_nc || return 77
+    if [ -e "$BRNF" ]; then brnf 0 || return 1; fi
+    nft_setup nftlinks; rc=$?; [ $rc = 0 ] || return $rc
+    box npeer && box nlinked --link npeer && box nthird || return 1
+    HOME="$ALT" start npeer && HOME="$ALT" start nlinked && HOME="$ALT" start nthird || return 1
+    nft list set bridge lightbox links
+    reaches nlinked "$(addr_of npeer)" && reaches npeer "$(addr_of nlinked)" || return 1
+    reaches nthird "$(addr_of nlinked)" && { echo "a container without the link reached nlinked"; return 1; }
+    reaches nthird "$(addr_of npeer)" && { echo "a container without the link reached npeer"; return 1; }
+    reaches nthird "$OUTSIDE" || { echo "the outside was not reached through masquerading"; return 1; }
+    alt_lb stop nlinked >/dev/null && nothing_left nlinked
+}
+
+# A start puts in a container's links with one process, nft.
+t_nft_one_process() {
+    command -v strace >/dev/null 2>&1 || { echo "no strace to watch a start with"; return 77; }
+    nft_setup nftone; rc=$?; [ $rc = 0 ] || return $rc
+    box nonepeer && box nonelinked --link nonepeer || return 1
+    is_up() { [ "$(state_of nonelinked 2>/dev/null)" = running ]; }
+    HOME="$ALT" timeout -k 5 80 strace -f -qq -e trace=execve -o "$T/nftlinks.strace" \
+        "$LB" start nonelinked >"$OUT/nonelinked.start" 2>&1 </dev/null &
+    tracer=$!
+    wait_until 60 is_up || { echo "the container did not start under strace:"; cat "$OUT/nonelinked.start"; kill "$tracer" 2>/dev/null; return 1; }
+    settled nonelinked || return 1
+    alt_lb stop nonelinked >/dev/null 2>&1 || { echo "stop failed"; return 1; }
+    wait "$tracer"
+    # but for the look at whether setup's tables are there, which every start has
+    tools=$(grep -E 'execve\("[^"]*/(ip6?tables[^"]*|nft)"' "$T/nftlinks.strace" | grep -v ' = -1 ' |
+            grep -v '"list", "tables"')
+    printf '%s\n' "$tools"
+    [ "$(printf '%s\n' "$tools" | grep -c .)" = 1 ] && printf '%s\n' "$tools" | grep -q '/nft"'
+}
+
+# rm of a container whose init died takes its links out of the set, by its
+# record, and leaves the peer's in.
+t_nft_rm_leaves_nothing() {
+    nft_setup nftrm; rc=$?; [ $rc = 0 ] || return $rc
+    box nrpeer --link nrmain && box nrmain --link nrpeer && box nrother --link nrpeer || return 1
+    HOME="$ALT" start nrpeer && HOME="$ALT" start nrmain && HOME="$ALT" start nrother || return 1
+    port=$(port_of nrmain) other=$(port_of nrother)
+    nft list set bridge lightbox links
+    nft list set bridge lightbox links | grep -qF "\"$port\"" || { echo "the link is not in the set"; return 1; }
+    echo "the record: $(cat "$RUN/nrmain/firewall")"
+    pid=$(pid_of nrmain)
+    kill -KILL "$pid"
+    wait_until 5 gone "$pid" || return 1
+    alt_lb rm nrmain || return 1
+    nft list set bridge lightbox links
+    ! nft list set bridge lightbox links | grep -qF "\"$port\"" || { echo "an element naming $port is left"; return 1; }
+    nft list set bridge lightbox links | grep -qF "\"$other\"" || { echo "the link of nrother went with it"; return 1; }
+    [ ! -e "$RUN/nrmain" ] || { echo "left in run_dir: $(ls -A "$RUN/nrmain")"; return 1; }
+    # the peer linked to nrmain as well, and its stop finds that pair gone;
+    # nrother's pair with it is nrother's, and goes when nrother stops
+    alt_lb stop nrother >/dev/null && alt_lb stop nrpeer >/dev/null && nothing_left nrpeer && nothing_left nrother
+}
+
+# As Docker with nftables: setup does not turn forwarding on, and with it
+# off and ip_forward = true it stops before it changes anything.
+t_nft_forwarding() {
+    nft_ok || return 77
+    alt_conf nftfwd 'firewall_backend = nftables' || return 1
+    echo 0 > /proc/sys/net/ipv4/ip_forward || return 1
+    before=$(nft list tables)
+    said=$(alt_lb setup 2>&1) && { printf '%s\n' "$said"; echo "setup went ahead with forwarding off"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *'IPv4 forwarding is off'*'ip_forward = false'*) ;; *) return 1 ;; esac
+    [ "$(cat /proc/sys/net/ipv4/ip_forward)" = 0 ] || { echo "setup turned forwarding on"; return 1; }
+    [ "$before" = "$(nft list tables)" ] || { echo "setup changed the firewall before it stopped"; return 1; }
+    alt_conf nftfwd 'firewall_backend = nftables' 'ip_forward = false' || return 1
+    said=$(alt_lb setup 2>&1) || { printf '%s\n' "$said"; return 1; }
+    printf '%s\n' "$said"
+    [ "$(cat /proc/sys/net/ipv4/ip_forward)" = 0 ] || { echo "setup turned forwarding on"; return 1; }
+    nft list table bridge lightbox >/dev/null
+}
+
+# What comes in from outside to a container is dropped; with
+# bridge_accept_fwmark, what a chain of the host's marks before lightbox's
+# chains is accepted.
+t_nft_accept_fwmark() {
+    command -v ping >/dev/null 2>&1 || { echo "no ping to try the way in with"; return 77; }
+    nft_setup nftmark 'bridge_accept_fwmark = 0x10/0xf0'; rc=$?; [ $rc = 0 ] || return $rc
+    box nmarked && HOME="$ALT" start nmarked || return 1
+    ip=$(addr_of nmarked) outside=$(cat "$T/outside")
+    nsenter -t "$outside" -n ip route add "$SUBNET" via 192.0.2.2 || return 1
+    nsenter -t "$outside" -n ping -c 1 -W 2 "$ip" && { echo "a new connection from outside was not dropped"; return 1; }
+    nft -f - <<EOF || return 1
+table ip lbt-mine {
+    chain tagging {
+        type filter hook forward priority filter - 1; policy accept;
+        ip daddr $ip meta mark set 0x13
+    }
+}
+EOF
+    nsenter -t "$outside" -n ping -c 1 -W 2 "$ip" || { echo "the marked packets were not accepted"; return 1; }
 }
 
 # ─── Fixture ────────────────────────────────────────────────────────────────
@@ -1516,10 +2316,13 @@ build_rootfs() {
 
 network() {
     ip link set lo up || return 1
+    # as on a host that forwards nothing until lightbox's setup
+    echo 0 > /proc/sys/net/ipv4/ip_forward || return 1
     # A second namespace stands for the internet: setup wants a default route,
     # and address translation needs somewhere to go.
     unshare --net -- sleep 86400 >/dev/null 2>&1 </dev/null &
     local outside=$!
+    echo "$outside" > "$T/outside"
     different_net() { [ "$(readlink "/proc/$outside/ns/net" 2>/dev/null)" != "$(readlink /proc/self/ns/net)" ] &&
                       [ -n "$(readlink "/proc/$outside/ns/net" 2>/dev/null)" ]; }
     wait_until 5 different_net || return 1
@@ -1550,11 +2353,15 @@ EOF
     echo 1 > "$T/next_ip"
     : > "$T/shims"
     : > "$T/background"
-    build_rootfs && network
+    build_rootfs && network && links_now > "$T/links.before"
 }
 
-kill_cgroup() { # directory
+kill_cgroup() { # directory, after every cgroup below it
     [ -d "$1" ] || return 0
+    local sub
+    for sub in "$1"/*/; do
+        [ -d "$sub" ] && kill_cgroup "${sub%/}"
+    done
     if [ -e "$1/cgroup.kill" ]; then
         echo 1 > "$1/cgroup.kill"
     else
@@ -1583,12 +2390,21 @@ teardown() {
     for d in "$CG"/*/; do
         [ -d "$d" ] && kill_cgroup "${d%/}"
     done
-    for p in $(ip -o link show | awk -F': ' '{ sub(/@.*/, "", $2); print $2 }' | grep -E '^(vb-|ve-|lbt-foreign$)'); do
+    for p in $(ip -o link show | awk -F': ' '{ sub(/@.*/, "", $2); print $2 }' | grep -E "^(vb-|ve-|lbt-foreign\$|$WIDE_BR\$)"); do
         ip link delete "$p"
     done
     [ -s "$T/firewall" ] && iptables-restore < "$T/firewall"
+    # what a case of firewall_backend = nftables made, and the forwarding
+    # setup turned on, which a case may have turned off
+    for p in "ip lightbox" "bridge lightbox" "ip lbt-mine"; do
+        nft list table $p >/dev/null 2>&1 && nft delete table $p
+    done
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+    nsenter -t "$(cat "$T/outside")" -n ip route del "$SUBNET"
     [ -w "$BRNF" ] && echo 1 > "$BRNF"
     find "$C" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+    # and the records of the ones that ran; a case may have taken run_dir away
+    [ -d "$RUN" ] && find "$RUN" -mindepth 1 -maxdepth 1 ! -name .forwarding -exec rm -rf -- {} +
     rm -f "$T/nsenter.reached" "$T/mount.ran"
 } 2>/dev/null
 
@@ -1653,6 +2469,10 @@ if [ "$MODE" = inside ]; then
 
     check 'setup again changes no mount and adds no rule'                 t_setup_again
     check 'setup refuses a cgroup_root that is not cgroup v2'             t_setup_refuses_other_cgroup_root
+    check 'setup refuses a gateway outside the subnet, and changes nothing' t_setup_refuses_a_gateway_outside
+    check 'setup takes out the rules lightbox 0.4 put in FORWARD and POSTROUTING' t_setup_takes_out_old_rules
+    check 'ip_forward_no_drop = true leaves the FORWARD policy'           t_ip_forward_no_drop
+    check 'firewall = false: no rule is made, and a container with links is refused' t_firewall_false
     check 'doctor finds nothing missing'                                  t_doctor
 
     check 'create, start, exec, stop and rm'                              t_lifecycle
@@ -1663,6 +2483,13 @@ if [ "$MODE" = inside ]; then
     check 'a running container cannot be started again or removed'        t_running_container_is_protected
     check 'a stopped container starts again and keeps its files'          t_restart_keeps_files
     check 'a container whose init died starts again'                      t_start_after_init_died
+    check 'stop of a container whose init died clears it away, as failed' t_stop_of_a_dead_container_cleans_up
+    check 'a container stopped from inside is exited, and cleared away by the next command' t_stopped_from_inside_is_exited
+    check 'after a reboot containers are stopped, and start'              t_after_a_reboot
+    check 'a container started before the upgrade is seen, and stopped'   t_container_started_before_the_upgrade
+    check 'a container that create did not finish is not started'         t_half_made_container_is_not_started
+    check 'a process in the container cannot get at what init has open'   t_init_is_closed_to_the_container
+    check 'of two starts at once, one starts the container and one finds it running' t_two_starts_at_once
     check 'a start that fails leaves no interface, cgroup or runtime file' t_failed_start_leaves_nothing
 
     check 'exec --user takes a name or a number and sets groups and HOME' t_exec_user
@@ -1681,6 +2508,10 @@ if [ "$MODE" = inside ]; then
     check 'a file volume is mounted'                                      t_volume_file
     check 'a read-only volume cannot be written'                          t_volume_read_only
     check 'add-vol takes effect at the next start'                        t_addvol_applies_at_next_start
+    check 'rm-vol takes effect at the next start'                         t_rmvol_applies_at_next_start
+    check 'a container from before the version line starts as it is'      t_conf_from_before_starts
+    check 'a configuration that cannot be used: no start, no exec, a stop' t_unusable_conf
+    check 'a start opens the container'"'"'s configuration once and waits for no disk' t_start_reads_conf_once
     check 'a volume under /run is visible'                                t_volume_under_run
     check 'volumes under /tmp and /run, and with a read-only root'        t_volume_under_tmp
     check 'a volume'"'"'s destination is looked up inside the container'      t_volume_destination_is_inside
@@ -1693,7 +2524,10 @@ if [ "$MODE" = inside ]; then
     check 'an image of one static binary starts'                          t_image_with_one_binary
     check 'start runs nothing from the image'                             t_start_runs_nothing_from_the_image
 
-    check 'limits reach the cgroup and the oom score reaches init'        t_limits
+    check 'limits reach the cgroup, without swap, and the oom score init and exec' t_limits
+    check '--io-max reaches io.max'                                        t_io_limit
+    check 'past its memory limit a process is killed, and its container with it' t_past_the_memory_limit
+    check 'without io, a container starts and is told once; with an I/O limit, not' t_without_io_controller
     check 'init and commands run by exec are in the container cgroup'     t_cgroup_membership
 
     check 'the init hook runs with /tmp and /run mounted'                 t_hook_runs
@@ -1731,15 +2565,34 @@ if [ "$MODE" = inside ]; then
     check 'a container has loopback, its address and a default route'     t_network_inside
     check 'a container reaches the bridge address'                        t_reaches_gateway
     check 'a container reaches an outside address through address translation' t_reaches_outside
+    check 'on a /16, a container far from the gateway has its prefix and reaches it' t_wide_subnet
+    check 'the host'"'"'s own rules in LIGHTBOX-USER decide first, and setup keeps them' t_user_chain
+    check 'a host firewall that drops the rest does not stop the bridge'   t_host_firewall_drops_the_rest
+    check 'ip_masq = false: nothing is masqueraded'                       t_ip_masq_false
     check 'containers cannot reach each other when bridged traffic is filtered' t_isolated_when_filtered
     check 'containers cannot reach each other without br_netfilter'      t_isolated_when_not_filtered
     check 'a container with a link is refused where nothing filters bridged traffic' t_link_needs_filtering
     check 'linked containers reach each other, and a third reaches neither' t_linked_containers
-    xfail NET-link-leak        'a link to a container created later applies'           t_link_to_later_container
-    xfail NET-link-leak        'rm of a dead container leaves no firewall rule'        t_rm_leaves_no_rule
-    xfail NET-veth-clobber     'start leaves alone an interface it did not create'     t_start_spares_foreign_interface
-    xfail NET-ifname           'the interface in the container is eth0'                t_interface_is_eth0
+    check 'a link to a container created later applies'                  t_link_to_later_container
+    check 'a start puts in its link rules with one process'               t_link_rules_in_one_process
+    check 'rm of a dead container leaves no firewall rule'                t_rm_leaves_no_rule
+    check 'start leaves alone an interface it did not create, and says so' t_start_spares_foreign_interface
+    check 'a start that fails at the bridge takes away the interface it made' t_start_fails_at_the_bridge
+    check 'the interface in the container is eth0'                       t_interface_is_eth0
+    check 'the host'"'"'s end of the interface carries lightbox'"'"'s alias'  t_interface_is_tagged
+    check 'a name of 30 characters works from create to rm'              t_long_name
     check 'a container has no IPv6 address'                               t_no_ipv6_in_container
+
+    check 'nftables: setup makes the two tables, and takes lightbox'"'"'s iptables chains out' t_nft_setup
+    check 'nftables: linked containers reach each other without br_netfilter, a third neither' t_nft_links_without_brnf
+    check 'nftables: a start puts in its links with one process'          t_nft_one_process
+    check 'nftables: rm of a dead container takes its links out of the set' t_nft_rm_leaves_nothing
+    check 'nftables: setup does not turn forwarding on, as Docker does not' t_nft_forwarding
+    check 'nftables: what comes in is dropped, and bridge_accept_fwmark accepts it' t_nft_accept_fwmark
+    check 'after a reboot took the network, start makes it again'         t_start_after_a_reboot_of_the_network
+    check 'a start where the network is there makes nothing'              t_start_with_the_network_there
+    check 'nftables: after the tables went, start makes them again'       t_nft_start_after_the_tables_went
+    check 'setup --teardown leaves the host as before the first setup'    t_setup_teardown
 
     # last: it may leave a kernel setting changed for the rest of this suite's life
     check 'exec works where a memfd may not be executed'                  t_exec_where_memfds_may_not_be_executed
@@ -1859,8 +2712,8 @@ remove_cgroups() {
     done
 }
 
-# lightbox enables controllers at the cgroup root and leaves them enabled
-# (RT-cgroup-controllers). Switch off the ones that were off before.
+# lightbox enables controllers at the cgroup root, which its containers' cgroups
+# need, and leaves them enabled. Switch off the ones that were off before.
 restore_controllers() {
     local c
     for c in $(cat /sys/fs/cgroup/cgroup.subtree_control); do

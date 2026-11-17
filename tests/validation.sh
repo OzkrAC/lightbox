@@ -36,9 +36,11 @@ trap cleanup EXIT
 # Every case gets its own directory tree and configuration:
 #   $W       root of the tree            $C     container_dir
 #   $BASE    base rootfs to copy         $CONF  the host configuration file
+#   $R       run_dir: the records of a container that runs are in $R/<name>/
 sandbox() {
     W="$ROOT/$1"
     C="$W/data/containers"
+    R="$W/run"
     BASE="$W/base"
     CONF="$W/home/.config/lightbox/lightbox.conf"
     mkdir -p "$W/home/.config/lightbox" "$C" "$BASE/etc" "$BASE/bin" "$BASE/dev" \
@@ -63,6 +65,16 @@ conf_has()  { grep -qxF -- "$2" "$C/$1/.conf"; }
 vol_count() { grep -c '^vol=' "$C/$1/.conf"; }
 mode_of()   { stat -c %a "$1"; }
 tree_sum()  { (cd "$1" && find . -print0 | sort -z | xargs -0 stat -c '%n %F %s %Y' | sha256sum); }
+# everything lightbox keeps: the containers, and the records of the ones that run
+kept_sum()  { tree_sum "$W/data"; tree_sum "$R"; }
+
+# The runtime records of a container, as a start leaves them.
+record() { # name, pid, start time, state
+    mkdir -p "$R/$1"
+    printf '%s' "$2" > "$R/$1/pid"
+    printf '%s' "$3" > "$R/$1/pid_start"
+    printf '%s\n' "$4" > "$R/$1/state"
+}
 
 # Reads stdin. 0 valid JSON, 1 invalid, 77 no tool to tell.
 json_valid() {
@@ -103,7 +115,14 @@ t_create_stores_options() {
         --vol "$W/vol:/data:ro" || return 1
     conf_has web 'mem=64M' && conf_has web 'pids=50' && conf_has web 'cpu=2' &&
     conf_has web 'oom_score=300' && conf_has web "vol=$W/vol:/data:ro" &&
-    [ "$(cat "$C/web/.ip")" = 10.0.0.2 ]
+    [ "$(cat "$C/web/.ip")" = 10.0.0.2 ] || return 1
+    # what a container may do is in the file only when it was asked for
+    ! grep -q '^privileged=\|^readonly=' "$C/web/.conf" || { echo "a flag nobody gave is stored"; return 1; }
+    lb create open 10.0.0.3 --privileged --read-only || return 1
+    cat "$C/open/.conf"
+    conf_has open 'privileged=1' && conf_has open 'readonly=1' &&
+    lb inspect open | grep -x 'privileged: 1' && lb inspect open | grep -x 'readonly: 1' &&
+    lb inspect web | grep -x 'privileged: 0' && lb inspect web | grep -x 'readonly: 0'
 }
 
 t_create_copies_base() {
@@ -119,8 +138,26 @@ t_create_refuses_existing_name() {
 t_create_refuses_bad_names() {
     refused lb create 'bad name' 10.0.0.2 &&
     refused lb create 'bad/name' 10.0.0.2 &&
-    refused lb create waytoolongname1 10.0.0.2 &&
+    refused lb create a-name-of-thirty-one-characters 10.0.0.2 &&
     [ -z "$(ls -A "$C")" ]
+}
+
+# A name of 30 characters is a container's, and one of 31 is not. On the host
+# a container is called by twelve digits of its name's hash, which inspect
+# shows, the same for a name every time and another for another name.
+t_long_names() {
+    long=a-name-of-thirty-characters-0k
+    [ ${#long} -eq 30 ] || return 1
+    lb create "$long" || return 1
+    lb ls | grep -q "^$long " || { echo "ls does not show it"; return 1; }
+    port=$(lb inspect "$long" | sed -n 's/^host_interface: //p')
+    echo "host interface of $long: $port"
+    case $port in vb-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+        *) echo "not vb- and twelve hex digits"; return 1 ;; esac
+    lb create web || return 1
+    [ "$(lb inspect web | sed -n 's/^host_interface: //p')" = vb-5ea0e1194872 ] || { echo "web is not vb-5ea0e1194872"; return 1; }
+    lb rm "$long" >/dev/null && lb create "$long" >/dev/null || return 1
+    [ "$(lb inspect "$long" | sed -n 's/^host_interface: //p')" = "$port" ] || { echo "the name changed for the same container name"; return 1; }
 }
 
 t_create_refuses_bad_addresses() {
@@ -152,10 +189,6 @@ t_volume_spec_rules() {
 
 t_unknown_option_refused() {
     refused lb create web 10.0.0.2 --bogus
-}
-
-t_cpu_must_be_whole() {
-    refused lb create web 10.0.0.2 --cpu 0.5
 }
 
 t_ls_lists_containers() {
@@ -276,41 +309,545 @@ t_addvol_respects_the_volume_limit() {
     refused lb add-vol web "/tmp:/m17"
 }
 
-t_addvol_refuses_a_destination_twice() {
-    lb create web 10.0.0.2 --vol "$W/vol:/data" || return 1
-    mkdir -p "$W/other"
-    refused lb add-vol web "$W/other:/data"
-}
-
+# The address of another container, the gateway's, and the first and the
+# last of the subnet: each refused with the reason, and nothing is made.
 t_duplicate_address_refused() {
     lb create a 10.0.0.9 || return 1
-    refused lb create b 10.0.0.9
+    msg=$(lb create b 10.0.0.9 2>&1) && { echo "a second container got 10.0.0.9"; return 1; }
+    printf '%s\n' "$msg"
+    case $msg in *"it is the address of the container 'a'"*) ;; *) return 1 ;; esac
+    [ ! -e "$C/b" ] || { echo "the refused create left $C/b"; return 1; }
+    # whether a holds it or not is what a's record says, not what was typed
+    refused lb create c 10.0.0.9 --mem 64M 2>/dev/null
 }
-t_gateway_address_refused()   { refused lb create a 10.0.0.1; }
-t_network_address_refused()   { refused lb create a 10.0.0.0; }
-t_broadcast_address_refused() { refused lb create a 10.0.0.255; }
+reserved_address_refused() { # address, what the refusal says
+    msg=$(lb create a "$1" 2>&1) && { echo "a container got $1"; return 1; }
+    printf '%s\n' "$msg"
+    case $msg in *"$2"*) ;; *) return 1 ;; esac
+    [ ! -e "$C/a" ] || { echo "the refused create left $C/a"; return 1; }
+}
+t_gateway_address_refused()   { reserved_address_refused 10.0.0.1 "the gateway's"; }
+t_network_address_refused()   { reserved_address_refused 10.0.0.0 'the address of the subnet itself'; }
+t_broadcast_address_refused() { reserved_address_refused 10.0.0.255 'the broadcast address'; }
 
-# A value is stored as given or refused, never shortened.
-t_pids_value_not_cut() {
-    lb create web 10.0.0.2 --pids 123456789 || return 0
-    grep '^pids=' "$C/web/.conf"
-    conf_has web 'pids=123456789'
+# Without an address, create takes the lowest that is free: not the
+# gateway's, and one that rm gave back.
+t_create_takes_the_lowest_free_address() {
+    lb create a && lb create b 10.0.0.3 && lb create c && lb create d --mem 64M || return 1
+    lb ls
+    [ "$(cat "$C/a/.ip")" = 10.0.0.2 ] && [ "$(cat "$C/c/.ip")" = 10.0.0.4 ] && [ "$(cat "$C/d/.ip")" = 10.0.0.5 ] ||
+        { echo "the addresses taken: $(cat "$C"/*/.ip | tr '\n' ' ')"; return 1; }
+    conf_has d 'mem=64M' || { echo "the option after the name was not taken as one"; return 1; }
+    lb rm a >/dev/null && lb create e || return 1
+    [ "$(cat "$C/e/.ip")" = 10.0.0.2 ] || { echo "after rm a, the next got $(cat "$C/e/.ip")"; return 1; }
+    printf 'subnet = 10.0.0.0/24\ngw = 10.0.0.9\n' >> "$CONF"
+    lb rm e >/dev/null && lb create f && lb create g || return 1
+    # with the gateway elsewhere, the first address is a container's
+    [ "$(cat "$C/f/.ip")" = 10.0.0.1 ] && [ "$(cat "$C/g/.ip")" = 10.0.0.2 ] ||
+        { echo "with gw = 10.0.0.9: f got $(cat "$C/f/.ip"), g got $(cat "$C/g/.ip")"; return 1; }
 }
-t_cpu_value_not_cut() {
-    lb create web 10.0.0.2 --cpu 1024 || return 0
-    grep '^cpu=' "$C/web/.conf"
-    conf_has web 'cpu=1024'
+
+# A subnet with every address taken refuses the next container, and makes
+# nothing of it.
+t_full_subnet() {
+    printf 'subnet = 192.168.7.0/30\ngw = 192.168.7.1\n' >> "$CONF"
+    lb create one || return 1
+    msg=$(lb create two 2>&1) && { echo "a container was made on a full subnet: $(cat "$C/two/.ip")"; return 1; }
+    printf '%s\n' "$msg"
+    case $msg in *'every address of the subnet has a container: 192.168.7.0/30'*) ;; *) return 1 ;; esac
+    [ "$(cat "$C/one/.ip")" = 192.168.7.2 ] && [ ! -e "$C/two" ]
 }
-t_mem_must_be_a_size()         { refused lb create web 10.0.0.2 --mem not-a-size; }
-t_oom_score_must_be_a_number() { refused lb create web 10.0.0.2 --oom-score abc; }
-t_number_with_trailing_text_refused() { refused lb create web 10.0.0.2 --oom-score 12abc; }
+
+# On a /16, an address in a /24 other than the gateway's is a container's;
+# the broadcast address is the last of the /16.
+t_wide_subnet() {
+    printf 'subnet = 10.9.0.0/16\ngw = 10.9.0.1\n' >> "$CONF"
+    lb create wide 10.9.5.2 && lb create last 10.9.255.254 && lb create next || return 1
+    refused lb create bcast 10.9.255.255 && refused lb create out 10.10.0.2 || return 1
+    [ "$(cat "$C/wide/.ip")" = 10.9.5.2 ] && [ "$(cat "$C/next/.ip")" = 10.9.0.2 ]
+}
+
+# subnet and gw that are no network end every command that would use them,
+# before anything is made; doctor says so.
+t_network_settings_are_checked() {
+    cp "$CONF" "$W/conf.good"
+    bad=0
+    for settings in 'subnet = 10.9.0.0/16|gw = 10.8.0.1' 'subnet = 10.0.0.0/31|gw = 10.0.0.1' \
+                    'subnet = 10.0.0.0|gw = 10.0.0.1' 'subnet = 10.0.0.0/24|gw = 10.0.0.255' \
+                    'subnet = 10.0.0.0/24|gw = 10.0.0.01'; do
+        { cat "$W/conf.good"; printf '%s\n' "$settings" | tr '|' '\n'; } > "$CONF"
+        msg=$(lb create x 2>&1) && { echo "create worked with: $settings"; bad=1; continue; }
+        case $msg in "Error: subnet in lightbox.conf "*|"Error: gw in lightbox.conf "*) ;;
+            *) echo "with $settings, create said: $msg"; bad=1 ;; esac
+        [ ! -e "$C/x" ] || { echo "with $settings, create left $C/x"; bad=1; }
+        report=$(lb doctor 2>&1) && { echo "doctor exits 0 with: $settings"; bad=1; }
+        printf '%s\n' "$report" | grep -q '^network: unusable (' || { echo "doctor does not say: $settings"; bad=1; }
+        echo "$settings: $msg"
+    done
+    cp "$W/conf.good" "$CONF"
+    lb doctor | grep -x 'network: 10.0.0.0/24' || { echo "doctor does not show the network"; bad=1; }
+    return $bad
+}
+
+# A zero in front of a number is read as octal by some of the programs an
+# address is handed to and refused by others: an address has none.
+t_address_with_leading_zeros_refused() {
+    refused lb create a 10.0.0.05 && refused lb create b 010.0.0.5 && refused lb create c 10.0.0.007 &&
+    [ ! -e "$C/a" ] && [ ! -e "$C/b" ] && [ ! -e "$C/c" ]
+}
+
+# Two creates at once, neither given an address, get two: the second chooses
+# when the first has made its choice, which the copy here makes long.
+t_creates_at_once_get_two_addresses() {
+    unshare -r --mount true 2>/dev/null || { echo "user namespaces are not available to this user"; return 77; }
+    real=$(readlink -f "$(type -P cp)") && cp "$real" "$W/cp.real" || return 1
+    printf '#!/bin/sh\nsleep 1\nexec %s "$@"\n' "$W/cp.real" > "$W/cp.shim"
+    chmod +x "$W/cp.shim"
+    # shellcheck disable=SC2016     # the script is for the shell in the namespace
+    HOME="$W/home" unshare -r --mount -- sh -c '
+        for cp in /bin/cp /usr/bin/cp; do
+            [ -e "$cp" ] && { mount --bind "$1/cp.shim" "$(readlink -f "$cp")" || exit 77; }
+        done
+        "$2" create one > "$1/one.out" 2>&1 &
+        "$2" create two > "$1/two.out" 2>&1 &
+        wait
+    ' _ "$W" "$LB"
+    rc=$?
+    cat "$W/one.out" "$W/two.out"
+    [ $rc -ne 77 ] || { echo "a stand-in could not be mounted over cp here"; return 77; }
+    one=$(cat "$C/one/.ip" 2>/dev/null) && two=$(cat "$C/two/.ip" 2>/dev/null) || { echo "a create failed"; return 1; }
+    echo "one got $one, two got $two"
+    [ "$(printf '%s\n%s\n' "$one" "$two" | sort | paste -sd' ' -)" = '10.0.0.2 10.0.0.3' ]
+}
+
+# ─── Option values ──────────────────────────────────────────────────────────
+
+# A value is what its option takes, or the command says which option it was
+# and makes nothing.
+option_refused() { # option, value
+    msg=$(lb create web 10.0.0.2 "$1" "$2" 2>&1) && { echo "$1 '$2' was accepted"; return 1; }
+    printf '%s\n' "$msg"
+    case $msg in *"$1"*) ;; *) echo "the message does not name $1"; return 1 ;; esac
+    [ ! -e "$C/web" ] || { echo "$1 '$2' was refused, and a container was made all the same"; return 1; }
+}
+t_pids_must_be_a_count() {
+    option_refused --pids 123456789 && option_refused --pids 0 && option_refused --pids 010 &&
+    option_refused --pids -5
+}
+t_cpu_must_be_cpus() {
+    option_refused --cpu 1024 && option_refused --cpu 0 && option_refused --cpu 0.001 &&
+    option_refused --cpu .5 && option_refused --cpu 1. && option_refused --cpu 1e3 && option_refused --cpu abc
+}
+t_mem_must_be_a_size() {
+    option_refused --mem not-a-size && option_refused --mem 0 && option_refused --mem 0100M &&
+    option_refused --mem 1.5G && option_refused --mem 1GB && option_refused --mem 99999999999999999999
+}
+t_oom_score_must_be_a_number() {
+    option_refused --oom-score abc && option_refused --oom-score 1001 && option_refused --oom-score -1001
+}
+t_number_with_trailing_text_refused() {
+    option_refused --oom-score 12abc && option_refused --pids 12abc && option_refused --cpu 2x &&
+    option_refused --mem 64Mb
+}
+
+# What is taken is stored as it was given.
+t_limits_are_stored_as_given() {
+    lb create a 10.0.0.2 --mem 512m --pids max --cpu 0.5 --oom-score -1000 &&
+    lb create b 10.0.0.3 --mem max --pids 4194304 --cpu 1.25 --oom-score 1000 &&
+    lb create c 10.0.0.4 || return 1
+    cat "$C/a/.conf" "$C/b/.conf" "$C/c/.conf"
+    conf_has a 'mem=512m' && conf_has a 'pids=max' && conf_has a 'cpu=0.5' && conf_has a 'oom_score=-1000' &&
+    conf_has b 'mem=max' && conf_has b 'pids=4194304' && conf_has b 'cpu=1.25' && conf_has b 'oom_score=1000' &&
+    conf_has c 'mem=256M' && conf_has c 'pids=128' && conf_has c 'cpu=1' && conf_has c 'oom_score=500' || return 1
+    lb inspect a | grep -x 'cpu: 0.5' && lb inspect a | grep -x 'mem: 512m'
+}
+
+# --swap takes what --mem does, and 0. Without it the file says nothing, and
+# the container has none.
+t_swap_option() {
+    lb create a --swap 64M && lb create b && lb create c --swap 0 && lb create d --swap max || return 1
+    conf_has a 'swap=64M' && conf_has c 'swap=0' && conf_has d 'swap=max' || return 1
+    ! grep -q '^swap=' "$C/b/.conf" || { echo "a swap limit nobody gave is stored"; return 1; }
+    lb inspect a | grep -x 'swap: 64M' && lb inspect b | grep -x 'swap: 0' || return 1
+    for value in lots 0100M 00 -1 '' MAX '64M
+privileged=1'; do
+        msg=$(lb create e --swap "$value" 2>&1) && { echo "--swap '$value' was taken"; return 1; }
+        case $msg in 'Error: --swap takes '*) ;; *) echo "--swap '$value': $msg"; return 1 ;; esac
+        [ ! -e "$C/e" ] || { echo "--swap '$value' left a container"; return 1; }
+    done
+}
+
+# A whole disk of this host, as <major>:<minor>; with "partition", one of its
+# partitions instead.
+block_device() {
+    local d
+    for d in /sys/dev/block/*; do
+        [ -e "$d/uevent" ] || continue
+        if [ "${1:-}" = partition ]; then [ -e "$d/partition" ] || continue; else [ ! -e "$d/partition" ] || continue; fi
+        echo "${d##*/}"
+        return 0
+    done
+    return 1
+}
+
+# --io-max is a line of io.max for one disk that this host has: a partition,
+# a device that is not there, a second --io-max and anything the kernel
+# would read otherwise are refused, and nothing is made.
+t_io_max_option() {
+    bad=0
+    for value in 8:0 '8:0 rbps' '8:0 rbps=01' '8:0 xbps=1' '8:0 rbps=1 rbps=2' '08:0 rbps=1' '8:0 rbps=1
+privileged=1'; do
+        msg=$(lb create e --io-max "$value" 2>&1) && { echo "--io-max '$value' was taken"; bad=1; continue; }
+        case $msg in 'Error: --io-max takes '*) ;; *) echo "--io-max '$value': $msg"; bad=1 ;; esac
+    done
+    msg=$(lb create e --io-max '4095:1048575 rbps=1' 2>&1) && { echo "a device that is not there was taken"; bad=1; }
+    printf '%s\n' "$msg"
+    case $msg in *'no block device with that number'*) ;; *) bad=1 ;; esac
+    if part=$(block_device partition); then
+        msg=$(lb create e --io-max "$part wbps=1048576" 2>&1) && { echo "the partition $part was taken"; bad=1; }
+        printf '%s\n' "$msg"
+        case $msg in *'that is a partition'*) ;; *) bad=1 ;; esac
+    else
+        echo "this host has no partition to try"
+    fi
+    [ ! -e "$C/e" ] || { echo "a refused --io-max left a container"; bad=1; }
+    disk=$(block_device) || { echo "this host has no whole disk to give a limit for"; return $bad; }
+    msg=$(lb create e --io-max "$disk wbps=1" --io-max "$disk rbps=1" 2>&1) && { echo "two --io-max were taken"; bad=1; }
+    case $msg in *'--io-max is given once'*) ;; *) echo "two --io-max: $msg"; bad=1 ;; esac
+    lb create io --io-max "$disk wbps=1048576 riops=max" || return 1
+    conf_has io "io=$disk wbps=1048576 riops=max" && lb inspect io | grep -x "io: $disk wbps=1048576 riops=max" || bad=1
+    lb inspect e >/dev/null 2>&1 && { echo "a refused --io-max left a container"; bad=1; }
+    return $bad
+}
 
 t_missing_value_is_named() {
-    msg=$(lb create web 10.0.0.2 --mem 2>&1) && return 1
+    for option in --mem --swap --pids --cpu --oom-score --io-max --vol --dns --link --rootfs; do
+        msg=$(lb create web 10.0.0.2 "$option" 2>&1) && { echo "$option without a value was accepted"; return 1; }
+        printf '%s\n' "$msg"
+        [ "$msg" = "Error: option $option requires a value" ] || return 1
+        [ ! -e "$C/web" ] || { echo "a container was made"; return 1; }
+    done
+}
+
+# A container's configuration is a file of lines. No value that is more than
+# one line gets into it, from any option: the rest of it would be read as
+# settings of the container that nobody gave.
+t_no_value_adds_a_line() {
+    nl='
+'
+    bad=0
+    for option in --mem --pids --cpu --oom-score --link; do
+        refused lb create a 10.0.0.2 "$option" "1${nl}privileged=1" 2>/dev/null || { echo "$option took two lines"; bad=1; }
+    done
+    mkdir -p "$W/vol${nl}privileged=1"
+    refused lb create a 10.0.0.2 --vol "$W/vol${nl}privileged=1:/data" 2>/dev/null || { echo "--vol took a source of two lines"; bad=1; }
+    refused lb create a 10.0.0.2 --vol "$W/vol:/data${nl}privileged=1" 2>/dev/null || { echo "--vol took a destination of two lines"; bad=1; }
+    [ ! -e "$C/a" ] || { echo "a container was made"; bad=1; }
+
+    lb create web 10.0.0.2 || return 1
+    before=$(cat "$C/web/.conf")
+    msg=$(lb add-vol web "$W/vol${nl}privileged=1:/data" 2>&1) && { echo "add-vol took a source of two lines"; bad=1; }
     printf '%s\n' "$msg"
-    case $msg in *'unknown option'*) return 1 ;; esac
-    case $msg in *--mem*) return 0 ;; esac
-    return 1
+    case $msg in *'control characters'*) ;; *) echo "the refusal does not say why"; bad=1 ;; esac
+    refused lb add-vol web "$W/vol:/data${nl}privileged=1" 2>/dev/null || { echo "add-vol took a destination of two lines"; bad=1; }
+    refused lb add-vol web "$W/vol:/da$(printf '\t')ta" 2>/dev/null || { echo "add-vol took a tab"; bad=1; }
+    refused lb add-vol web "$W/vol:/data$(printf '\r')" 2>/dev/null || { echo "add-vol took a carriage return"; bad=1; }
+    [ "$(cat "$C/web/.conf")" = "$before" ] || { echo "the configuration changed:"; cat "$C/web/.conf"; bad=1; }
+    lb inspect web | grep -x 'privileged: 0' || { echo "the container is privileged"; bad=1; }
+    return $bad
+}
+
+# ─── Volumes of a container that exists ─────────────────────────────────────
+
+# Two volumes at one place would be mounted one over the other, and only the
+# later one would ever be seen.
+t_one_volume_at_a_destination() {
+    mkdir -p "$W/other"
+    msg=$(lb create two 10.0.0.3 --vol "$W/vol:/data" --vol "$W/other:/data/" 2>&1) && { echo "create took two volumes at one place"; return 1; }
+    printf '%s\n' "$msg"
+    case $msg in *'already a volume at that destination'*) ;; *) return 1 ;; esac
+    [ ! -e "$C/two" ] || return 1
+
+    lb create web 10.0.0.2 --vol "$W/vol:/data" || return 1
+    msg=$(lb add-vol web "$W/other:/data" 2>&1) && { echo "add-vol took a second volume at one place"; return 1; }
+    printf '%s\n' "$msg"
+    case $msg in *'already a volume at that destination'*) ;; *) return 1 ;; esac
+    # the same source there, read-only now: also a second volume, not the same one
+    refused lb add-vol web "$W/vol:/data:ro" || return 1
+    [ "$(vol_count web)" -eq 1 ] && conf_has web "vol=$W/vol:/data" || return 1
+    # a place inside another volume is another place
+    lb add-vol web "$W/other:/data/inner" && [ "$(vol_count web)" -eq 2 ]
+}
+
+t_rmvol_removes_a_volume() {
+    mkdir -p "$W/other"
+    lb create web 10.0.0.2 --vol "$W/vol:/data:ro" --vol "$W/other:/more" || return 1
+    # by the place it is at, in whatever spelling
+    msg=$(lb rm-vol web //data/) || return 1
+    printf '%s\n' "$msg"
+    cat "$C/web/.conf"
+    [ "$(vol_count web)" -eq 1 ] && conf_has web "vol=$W/other:/more" || return 1
+    # the place is free again
+    lb add-vol web "$W/other:/data" && [ "$(vol_count web)" -eq 2 ] || return 1
+
+    before=$(cat "$C/web/.conf")
+    msg=$(lb rm-vol web /nowhere 2>&1) && { echo "rm-vol removed a volume that is not there"; return 1; }
+    printf '%s\n' "$msg"
+    case $msg in *'no volume at that destination'*) ;; *) return 1 ;; esac
+    refused lb rm-vol web 2>/dev/null && refused lb rm-vol web /data extra 2>/dev/null &&
+    refused lb rm-vol nosuch /data 2>/dev/null && refused lb rm-vol web data 2>/dev/null &&
+    refused lb rm-vol web /a/../data 2>/dev/null || return 1
+    # a volume as it was added is not where it is: said, not looked for
+    msg=$(lb rm-vol web "$W/other:/data" 2>&1) && return 1
+    printf '%s\n' "$msg"
+    case $msg in *'no colon'*) ;; *) return 1 ;; esac
+    [ "$(cat "$C/web/.conf")" = "$before" ] || { echo "a refused rm-vol changed the configuration"; return 1; }
+    [ "$(mode_of "$C/web/.conf")" = 600 ] || return 1
+    # a container from before this rule can have two at one place: both go
+    printf 'mem=64M\nvol=%s:/twice\nvol=%s:/twice:ro\nvol=%s:/kept\n' "$W/vol" "$W/other" "$W/vol" > "$C/web/.conf"
+    lb rm-vol web /twice || return 1
+    cat "$C/web/.conf"
+    [ "$(vol_count web)" -eq 1 ] && conf_has web "vol=$W/vol:/kept"
+}
+
+# ─── The configuration file of a container ──────────────────────────────────
+
+t_conf_has_a_version() {
+    lb create web 10.0.0.2 --vol "$W/vol:/data" || return 1
+    cat "$C/web/.conf"
+    [ "$(head -n 1 "$C/web/.conf")" = 'version=1' ] || return 1
+
+    # written by a lightbox newer than this one: not guessed at, and not rewritten
+    sed -i '1s/.*/version=2/' "$C/web/.conf"
+    before=$(cat "$C/web/.conf")
+    msg=$(lb add-vol web "$W/vol:/more" 2>&1) && { echo "add-vol rewrote a configuration it cannot read"; return 1; }
+    printf '%s\n' "$msg"
+    case $msg in *"$C/web/.conf: line 1: was written by a newer lightbox"*) ;; *) return 1 ;; esac
+    refused lb rm-vol web /data 2>/dev/null || return 1
+    refused lb inspect web >/dev/null 2>&1 || { echo "inspect showed a configuration it cannot read"; return 1; }
+    [ "$(cat "$C/web/.conf")" = "$before" ] || return 1
+
+    # damaged: said with the line it is on
+    printf 'version=1\nmem=64M\ncolour=blue\n' > "$C/web/.conf"
+    msg=$(lb inspect web 2>&1 >/dev/null) && return 1
+    printf '%s\n' "$msg"
+    case $msg in *"$C/web/.conf: line 3: a key lightbox does not know") ;; *) return 1 ;; esac
+    # none of which stops the container from being removed
+    lb ls >/dev/null && lb rm web && [ ! -e "$C/web" ]
+}
+
+# A container made before the file had a version line keeps working, and the
+# next change to it writes the file as it is written now.
+t_conf_from_before_is_read() {
+    lb create web 10.0.0.2 || return 1
+    # with a key lightbox never wrote, and a first uid without the user
+    # namespace it would be for, which says nothing and is not written again
+    printf 'mem=64M\npids=32\ncpu=2\nreadonly=1\noom_score=100\nnote=by hand\nuid_start=100000\nvol=%s:/data:ro\n' "$W/vol" > "$C/web/.conf"
+    report=$(lb inspect web) || { echo "inspect failed"; return 1; }
+    printf '%s\n' "$report" | grep -E '^(mem|pids|cpu|readonly|oom_score|privileged): '
+    for line in 'mem: 64M' 'pids: 32' 'cpu: 2' 'readonly: 1' 'oom_score: 100' 'privileged: 0'; do
+        printf '%s\n' "$report" | grep -qx "$line" || { echo "missing: $line"; return 1; }
+    done
+    lb add-vol web "$W/vol:/more" || return 1
+    cat "$C/web/.conf"
+    [ "$(head -n 1 "$C/web/.conf")" = 'version=1' ] && conf_has web 'mem=64M' && conf_has web 'pids=32' &&
+    conf_has web 'cpu=2' && conf_has web 'readonly=1' && conf_has web 'oom_score=100' &&
+    conf_has web "vol=$W/vol:/data:ro" && conf_has web "vol=$W/vol:/more" &&
+    ! grep -q '^note=\|^uid_start=' "$C/web/.conf"
+}
+
+# ─── Settings ───────────────────────────────────────────────────────────────
+
+# A default_* setting is held to what the option takes. One that is not a
+# limit is said by every command and stops only the one that would have had
+# to use it: no container gets a limit that nobody chose.
+# The four firewall settings, as Docker's daemon.json has them: doctor shows
+# what they are; one that is not true or false is said, and the built-in
+# value is kept, so that a mistake does not open the firewall.
+t_firewall_settings() {
+    report=$(lb doctor 2>&1)
+    printf '%s\n' "$report" | grep -E '^(firewall|ip_forward|ip_forward_no_drop|ip_masq):'
+    printf '%s\n' "$report" | grep -qx 'firewall: true' && printf '%s\n' "$report" | grep -qx 'ip_forward: true' &&
+    printf '%s\n' "$report" | grep -qx 'ip_forward_no_drop: false' && printf '%s\n' "$report" | grep -qx 'ip_masq: true' ||
+        { echo "the built-in values are not what Docker's are"; return 1; }
+    cp "$CONF" "$W/conf.good"
+    printf 'firewall = false\nip_forward = false\nip_forward_no_drop = true\n' >> "$CONF"
+    report=$(lb doctor 2>&1)
+    printf '%s\n' "$report" | grep -qx 'firewall: false (lightbox makes no firewall rules)' &&
+    printf '%s\n' "$report" | grep -qx 'ip_forward: false' && printf '%s\n' "$report" | grep -qx 'ip_forward_no_drop: true' &&
+    printf '%s\n' "$report" | grep -qx 'ip_masq: true' || { echo "the settings were not taken"; return 1; }
+    { cat "$W/conf.good"; echo 'ip_masq = false'; } > "$CONF"
+    report=$(lb doctor 2>&1)
+    printf '%s\n' "$report" | grep -qx 'ip_masq: false' && printf '%s\n' "$report" | grep -qx 'ip_forward: true' &&
+    printf '%s\n' "$report" | grep -qx 'firewall: true' || { echo "ip_masq = false was not taken by itself"; return 1; }
+    cp "$W/conf.good" "$CONF"
+    sed -i -e '/^firewall = /d' -e '/^ip_forward/d' -e '/^ip_masq = /d' "$CONF"
+    printf 'firewall = no\nip_forward_no_drop = yes\nip_masq = 0\n' >> "$CONF"
+    report=$(lb doctor 2>&1)
+    printf '%s\n' "$report" | grep '^Warning'
+    printf '%s\n' "$report" | grep -qx 'Warning: firewall in lightbox.conf is not true or false: no; using true' &&
+    printf '%s\n' "$report" | grep -qx 'Warning: ip_forward_no_drop in lightbox.conf is not true or false: yes; using false' &&
+    printf '%s\n' "$report" | grep -qx 'Warning: ip_masq in lightbox.conf is not true or false: 0; using true' &&
+    printf '%s\n' "$report" | grep -qx 'firewall: true' && printf '%s\n' "$report" | grep -qx 'ip_forward_no_drop: false'
+}
+
+# firewall_backend and bridge_accept_fwmark, as Docker's firewall-backend and
+# bridge-accept-fwmark: iptables and no mark unless lightbox.conf says
+# otherwise. doctor looks for the firewall tools of the backend in use and not
+# the other's, and a value that is not one is said and not taken.
+t_firewall_backend_settings() {
+    shown() { printf '%s\n' "$report" | grep -E '^(Warning|that a packet|firewall_backend|bridge_accept_fwmark|bridge_filtering|forward_drops|bin\.(iptables|iptables-restore|nft))'; }
+    has() { printf '%s\n' "$report" | grep -qx -- "$1"; }
+    report=$(lb doctor 2>&1); shown
+    has 'firewall_backend: iptables' && has 'bridge_accept_fwmark: none' &&
+    printf '%s\n' "$report" | grep -q '^bin.iptables-restore: ' && ! printf '%s\n' "$report" | grep -q '^bin.nft: ' ||
+        { echo "the built-in values are not Docker's, or doctor looks for nft"; return 1; }
+    cp "$CONF" "$W/conf.good"
+    printf 'firewall_backend = nftables\nbridge_accept_fwmark = 0x10/0xf0\n' >> "$CONF"
+    report=$(lb doctor 2>&1); shown
+    has 'firewall_backend: nftables' && has 'bridge_accept_fwmark: 0x10/0xf0' &&
+    has 'bridge_filtering: not needed (firewall_backend = nftables filters at the bridge)' &&
+    printf '%s\n' "$report" | grep -q '^bin.nft: ' && ! printf '%s\n' "$report" | grep -q '^bin.iptables' ||
+        { echo "the settings were not taken"; return 1; }
+    # what drops forwarded packets is root's to read
+    if [ "$(id -u)" != 0 ]; then
+        has 'forward_drops: unknown (doctor is not run as root)' || { echo "forward_drops is not said to need root"; return 1; }
+    fi
+    { cat "$W/conf.good"; echo 'bridge_accept_fwmark = 0x10'; } > "$CONF"
+    report=$(lb doctor 2>&1); shown
+    has 'bridge_accept_fwmark: 0x10 (not used: with iptables, rules in LIGHTBOX-USER decide first)' ||
+        { echo "with iptables the mark is not said to go unused"; return 1; }
+    ! printf '%s\n' "$report" | grep -q '^forward_drops' || { echo "forward_drops is shown for iptables"; return 1; }
+    { cat "$W/conf.good"; printf 'firewall_backend = nft\nbridge_accept_fwmark = 0\n'; } > "$CONF"
+    report=$(lb doctor 2>&1); shown
+    has 'Warning: firewall_backend in lightbox.conf is not iptables or nftables: nft; using iptables' &&
+    has 'that a packet can carry: 0; using none' && has 'firewall_backend: iptables' && has 'bridge_accept_fwmark: none' ||
+        { echo "a value that is not one was taken, or not said"; return 1; }
+    # one that is wrong after one that is right keeps the right one
+    { cat "$W/conf.good"; printf 'firewall_backend = nftables\nfirewall_backend = both\n'
+      printf 'bridge_accept_fwmark = 0x4\nbridge_accept_fwmark = 0x4/0x1\n'; } > "$CONF"
+    report=$(lb doctor 2>&1); shown
+    has 'Warning: firewall_backend in lightbox.conf is not iptables or nftables: both; using nftables' &&
+    has 'that a packet can carry: 0x4/0x1; using 0x4' && has 'firewall_backend: nftables' && has 'bridge_accept_fwmark: 0x4'
+}
+
+t_default_settings_are_checked() {
+    printf 'default_mem = 64M\ndefault_pids = 32\ndefault_cpu = 0.5\ndefault_oom = -200\n' >> "$CONF"
+    lb create web 10.0.0.2 || return 1
+    cat "$C/web/.conf"
+    conf_has web 'mem=64M' && conf_has web 'pids=32' && conf_has web 'cpu=0.5' && conf_has web 'oom_score=-200' || return 1
+
+    printf 'default_mem = 1Gb\n' >> "$CONF"
+    msg=$(lb ls 2>&1 >/dev/null) || { echo "ls failed over a default it does not use"; return 1; }
+    printf '%s\n' "$msg"
+    case $msg in 'Warning: default_mem in lightbox.conf is not '*': 1Gb; a container that needs it will be refused') ;; *) return 1 ;; esac
+    lb inspect web 2>/dev/null | grep -qx 'mem: 64M' || { echo "inspect of a container with its own limit failed"; return 1; }
+    msg=$(lb create db 10.0.0.3 2>&1) && { echo "a container was created with a limit nobody chose"; return 1; }
+    printf '%s\n' "$msg"
+    case $msg in *'Error: default_mem: '*) ;; *) return 1 ;; esac
+    [ ! -e "$C/db" ] || { echo "the refused container is there"; return 1; }
+    lb create db 10.0.0.3 --mem 32M 2>/dev/null && conf_has db 'mem=32M' && conf_has db 'pids=32' || return 1
+
+    sed -i '$d' "$CONF"
+
+    # each of the four by itself, with the container given every limit but that one
+    n=0
+    for setting in 'default_mem = 0100M:--pids 5 --cpu 1 --oom-score 0' \
+                   'default_pids = 123456789:--mem 32M --cpu 1 --oom-score 0' \
+                   'default_cpu = 1024:--mem 32M --pids 5 --oom-score 0' \
+                   'default_oom = 12abc:--mem 32M --pids 5 --cpu 1'; do
+        printf '%s\n' "${setting%%:*}" >> "$CONF"
+        key=${setting%% *}
+        n=$((n + 1))
+        lb ls 2>&1 >/dev/null | grep "^Warning: $key in lightbox.conf is not " || { echo "no warning for: ${setting%%:*}"; return 1; }
+        # shellcheck disable=SC2086     # the options are words
+        msg=$(lb create "x$n" 10.0.0.4 ${setting#*:} 2>&1) && { echo "a container was created without a usable $key"; return 1; }
+        case $msg in *"Error: $key: "*) ;; *) echo "the refusal does not name $key: $msg"; return 1 ;; esac
+        [ ! -e "$C/x$n" ] || { echo "the refused container is there"; return 1; }
+        sed -i '$d' "$CONF"
+    done
+    # and with nothing wrong any more, nothing is said
+    msg=$(lb create y 10.0.0.5 2>&1 >/dev/null) || return 1
+    [ -z "$msg" ] && conf_has y 'mem=64M' && conf_has y 'oom_score=-200'
+}
+
+# Where the base root filesystem is: --rootfs, then LIGHTBOX_ROOTFS, then the
+# rootfs setting, then what is built in. The variable does not need a
+# lightbox.conf to count.
+t_rootfs_from_the_environment() {
+    mkdir -p "$W/other/etc" "$W/nohome"
+    echo other > "$W/other/etc/which"
+    echo base > "$BASE/etc/which"
+    built_in=/var/lib/lightbox/rootfs
+
+    # without a lightbox.conf: the variable, and without it what is built in
+    said=$(HOME="$W/nohome" LIGHTBOX_ROOTFS="$W/other" "$LB" doctor 2>/dev/null | grep '^rootfs: ')
+    echo "no lightbox.conf, with the variable: $said"
+    [ "$said" = "rootfs: $W/other" ] || return 1
+    said=$(HOME="$W/nohome" "$LB" doctor 2>/dev/null | grep '^rootfs: ')
+    echo "no lightbox.conf, without it: $said"
+    [ "$said" = "rootfs: $built_in" ] || return 1
+    # an empty variable is no variable, and neither is another that begins like it
+    said=$(HOME="$W/nohome" LIGHTBOX_ROOTFS='' LIGHTBOX_ROOTFS_OLD="$W/other" "$LB" doctor 2>/dev/null | grep '^rootfs: ')
+    [ "$said" = "rootfs: $built_in" ] || { echo "an empty variable: $said"; return 1; }
+    # no HOME at all, as under some service managers
+    said=$(env -u HOME LIGHTBOX_ROOTFS="$W/other" "$LB" doctor 2>/dev/null | grep '^rootfs: ')
+    [ "$said" = "rootfs: $W/other" ] || { echo "without HOME: $said"; return 1; }
+
+    # with a lightbox.conf: the variable comes before the setting, and --rootfs before both
+    [ "$(lb doctor 2>/dev/null | grep '^rootfs: ')" = "rootfs: $BASE" ] || return 1
+    LIGHTBOX_ROOTFS="$W/other" lb create fromenv 10.0.0.2 || return 1
+    lb create fromconf 10.0.0.3 || return 1
+    LIGHTBOX_ROOTFS="$W/nowhere" lb create fromflag 10.0.0.4 --rootfs "$W/other" || return 1
+    echo "copied from: $(cat "$C/fromenv/rootfs/etc/which") $(cat "$C/fromconf/rootfs/etc/which") $(cat "$C/fromflag/rootfs/etc/which")"
+    [ "$(cat "$C/fromenv/rootfs/etc/which")" = other ] && [ "$(cat "$C/fromconf/rootfs/etc/which")" = base ] &&
+    [ "$(cat "$C/fromflag/rootfs/etc/which")" = other ] || return 1
+
+    # the variable is held to what the setting is held to
+    msg=$(HOME="$W/nohome" LIGHTBOX_ROOTFS="$(pad_path "$W/other" 460)" "$LB" doctor 2>&1) && { echo "a variable of 460 characters was accepted"; return 1; }
+    printf '%s\n' "$msg" | cut -c1-80
+    case $msg in 'Error: LIGHTBOX_ROOTFS is too long: '*) ;; *) return 1 ;; esac
+}
+
+# A setting that does not fit where it is kept is refused whole. Cut short,
+# a directory would be another directory and a bridge another bridge.
+t_settings_are_not_cut() {
+    printf 'container_dir = %s\n' "$(pad_path "$C" 460)" >> "$CONF"
+    msg=$(lb ls 2>&1) && { echo "a directory of 460 characters was accepted"; return 1; }
+    printf '%s\n' "$msg" | cut -c1-120
+    case $msg in 'Error: container_dir is longer than the 448 characters a directory setting may have: '*) ;; *) return 1 ;; esac
+    sed -i '$d' "$CONF"
+    # the longest that is accepted still leaves room for every path below it
+    long=$(pad_path "$C" 448)
+    mkdir -p "$long"
+    printf 'container_dir = %s\n' "$long" >> "$CONF"
+    lb create web 10.0.0.2 --vol "$W/vol:/data" && lb add-vol web "$W/vol:/more" && lb inspect web >/dev/null &&
+    [ -f "$long/web/.conf" ] && [ -f "$long/web/rootfs/etc/hostname" ] && lb rm web && [ ! -e "$long/web" ] ||
+        { echo "a directory of 448 characters does not work"; return 1; }
+    sed -i '$d' "$CONF"
+
+    printf 'bridge = %s\n' "$(printf 'b%.0s' $(seq 1 40))" >> "$CONF"
+    msg=$(lb ls 2>&1) && { echo "a bridge name of 40 characters was accepted"; return 1; }
+    printf '%s\n' "$msg"
+    case $msg in 'Error: bridge in lightbox.conf is too long: bbbb'*) ;; *) return 1 ;; esac
+    sed -i '$d' "$CONF"
+
+    printf 'rootfs = %s\n' "$(printf '/r%.0s' $(seq 1 300))" >> "$CONF"
+    msg=$(lb ls 2>&1) && { echo "a value of 600 characters was accepted"; return 1; }
+    printf '%s\n' "$msg"
+    case $msg in 'Error: lightbox.conf has a value that is too long, for rootfs') ;; *) return 1 ;; esac
+    sed -i '$d' "$CONF"
+
+    # the file itself: read to its last line, or not at all
+    comment() { for i in $(seq 1 "$1"); do echo "# a comment that fills the file and says nothing, line $i"; done; }
+    { comment 100; echo 'bridge = br9'; } >> "$CONF"
+    echo "a configuration of $(stat -c %s "$CONF") bytes"
+    lb doctor 2>/dev/null | grep -x 'bridge: br9' || { echo "the last line of a long file was not read"; return 1; }
+    { comment 300; echo 'bridge = br8'; } >> "$CONF"
+    echo "a configuration of $(stat -c %s "$CONF") bytes"
+    msg=$(lb doctor 2>&1) && { echo "a file longer than lightbox reads was read in part"; return 1; }
+    printf '%s\n' "$msg"
+    case $msg in 'Error: the configuration is larger than lightbox reads: '*) ;; *) return 1 ;; esac
 }
 
 # A record of a process that no longer exists. Listing must not rewrite it.
@@ -318,25 +855,170 @@ stale_record() {
     lb create web 10.0.0.2 || return 1
     sleep 0 & dead=$!
     wait "$dead"
-    printf '%s' "$dead" > "$C/web/.pid"
-    printf '12345' > "$C/web/.pid_start"
-    printf 'running\n' > "$C/web/.state"
+    record web "$dead" 12345 running
 }
+# A record that is not the number of a process is no record. It is not the
+# process whose number it begins with.
+t_pid_record_is_a_number() {
+    lb create web 10.0.0.2 || return 1
+    mkdir -p "$R/web"
+    for record in "$$abc" "$$ 1" "-$$" 0 '' 99999999999999999999 0x10; do
+        printf '%s' "$record" > "$R/web/pid"
+        printf '12345' > "$R/web/pid_start"
+        report=$(lb inspect web) || { echo "inspect failed with the record '$record'"; return 1; }
+        printf '%s\n' "$report" | grep -qx 'pid: -' && printf '%s\n' "$report" | grep -qx 'running: no' &&
+        printf '%s\n' "$report" | grep -qx 'state: stopped' ||
+            { echo "the record '$record' was taken for a process:"; printf '%s\n' "$report" | grep -E '^(pid|running|state): '; return 1; }
+    done
+    # with a newline after it, as an editor leaves a file, the number is the record
+    printf '%s\n' "$$" > "$R/web/pid"
+    lb inspect web | grep -x "pid: $$"
+}
+
 t_ls_writes_nothing() {
     stale_record || return 1
-    before=$(tree_sum "$C/web")
+    before=$(kept_sum)
     lb ls >/dev/null
-    [ -e "$C/web/.pid" ] || echo ".pid was deleted"
-    echo "state is now: $(cat "$C/web/.state")"
-    [ "$before" = "$(tree_sum "$C/web")" ]
+    [ -e "$R/web/pid" ] || echo "the PID record was deleted"
+    echo "state is now: $(cat "$R/web/state")"
+    [ "$before" = "$(kept_sum)" ]
 }
 t_inspect_writes_nothing() {
     stale_record || return 1
-    before=$(tree_sum "$C/web")
+    before=$(kept_sum)
     lb inspect web >/dev/null
-    [ -e "$C/web/.pid" ] || echo ".pid was deleted"
-    echo "state is now: $(cat "$C/web/.state")"
-    [ "$before" = "$(tree_sum "$C/web")" ]
+    [ -e "$R/web/pid" ] || echo "the PID record was deleted"
+    echo "state is now: $(cat "$R/web/state")"
+    [ "$before" = "$(kept_sum)" ]
+}
+
+# What a container is made of is in its directory, and what is known about it
+# while it runs is in run_dir, which a reboot empties. Without those records a
+# container is stopped.
+t_runtime_records_are_apart() {
+    lb create web 10.0.0.2 || return 1
+    echo "the container's directory: $(ls -A "$C/web" | tr '\n' ' ')"
+    echo "run_dir: $(ls -A "$R" | tr '\n' ' ')"
+    [ "$(ls -A "$C/web" | tr '\n' ' ')" = '.conf .ip rootfs ' ] || { echo "create left more than a container is made of"; return 1; }
+    [ -z "$(ls -A "$R")" ] || { echo "create made a runtime record"; return 1; }
+    report=$(lb inspect web)
+    for line in 'state: stopped' 'running: no' 'pid: -' "pid_path: $R/web/pid" "pid_start_path: $R/web/pid_start" \
+                "state_path: $R/web/state" "config_path: $C/web/.conf"; do
+        printf '%s\n' "$report" | grep -qxF -- "$line" || { echo "inspect does not say: $line"; return 1; }
+    done
+    lb doctor 2>/dev/null | grep -x "run_dir: $R" || return 1
+
+    # A container that was removed by hand, and not by rm, leaves its
+    # records. A new container of that name does not take them for its own.
+    record again 1 1 running
+    lb create again 10.0.0.3 >/dev/null || return 1
+    lb inspect again | grep -x 'state: stopped' && [ ! -e "$R/again" ] ||
+        { echo "a new container has the records of an old one: $(ls -A "$R/again" | tr '\n' ' ')"; return 1; }
+
+    # a stand-in for init, with the records a start leaves
+    [ "$(id -u)" -ne 0 ] || return 0
+    sleep 30 &
+    holder=$!
+    record web "$holder" "$(awk '{ printf "%s", $22 }' "/proc/$holder/stat")" running
+    lb ls | grep -Eq '^web +10\.0\.0\.2 +running' || { kill "$holder"; echo "the records in run_dir are not read"; return 1; }
+    # a reboot: nothing runs and run_dir is empty. The container is stopped, not stale.
+    kill "$holder"
+    find "$R" -mindepth 1 -delete
+    lb ls
+    lb ls | grep -Eq '^web +10\.0\.0\.2 +stopped' && lb inspect web | grep -qx 'state: stopped' || return 1
+    # and without run_dir itself, as after a reboot with /run on a tmpfs
+    rmdir "$R"
+    lb ls | grep -Eq '^web +10\.0\.0\.2 +stopped' && [ ! -e "$R" ] || { echo "a query made run_dir, or failed without it"; return 1; }
+}
+
+# A create that was killed half way leaves a container with half a root
+# filesystem. It says so for as long as it is there.
+t_half_made_container() {
+    lb create web 10.0.0.2 || return 1
+    : > "$C/web/.creating"
+    lb ls
+    lb ls | grep -Eq '^web +10\.0\.0\.2 +creating' && lb inspect web | grep -qx 'state: creating' || return 1
+    lb rm web && [ ! -e "$C/web" ]
+}
+
+# Before 0.5 the records of a running container were files in its own
+# directory. A container that such a lightbox started, and that is still
+# running after an upgrade, is seen to be running.
+t_records_from_before_are_read() {
+    [ "$(id -u)" -ne 0 ] || return 77
+    lb create web 10.0.0.2 || return 1
+    sleep 30 &
+    holder=$!
+    printf '%s' "$holder" > "$C/web/.pid"
+    awk '{ printf "%s", $22 }' "/proc/$holder/stat" > "$C/web/.pid_start"
+    printf 'running\n' > "$C/web/.state"
+    lb ls
+    report=$(lb inspect web)
+    kill "$holder"
+    lb ls | grep -Eq "^web +10\.0\.0\.2 +exited" || { echo "the container is not seen to have been running"; return 1; }
+    printf '%s\n' "$report" | grep -qx 'running: yes' && printf '%s\n' "$report" | grep -qx "pid: $holder" &&
+    printf '%s\n' "$report" | grep -qx 'state: running' || { echo "inspect did not see it running"; return 1; }
+    # what is recorded where records are kept now comes first
+    record web "$$" "$(awk '{ printf "%s", $22 }' /proc/$$/stat)" stopping
+    lb inspect web | grep -x "pid: $$" && lb inspect web | grep -x 'state: running'
+}
+
+# A create that is killed while it copies the root filesystem. It runs here
+# as the root of a user namespace, in a mount namespace where a stand-in is
+# mounted over cp: one that looks whether the container is marked as being
+# created when the copy begins, and, the second time, ends the lightbox that
+# runs it.
+t_create_killed_half_way() {
+    unshare -r --mount true 2>/dev/null || { echo "user namespaces are not available to this user"; return 77; }
+    real=$(readlink -f "$(type -P cp)") && cp "$real" "$W/cp.real" || return 1
+    {
+        echo '#!/bin/sh'
+        echo 'for last; do :; done'                             # the destination: <container>/rootfs
+        echo "if [ -e \"\${last%/rootfs}/.creating\" ]; then echo marked; else echo unmarked; fi >> $W/seen"
+        echo "if [ -e $W/end-it ]; then kill -KILL \$PPID; exit 1; fi"
+        echo "exec $W/cp.real \"\$@\""
+    } > "$W/cp.shim"
+    chmod +x "$W/cp.shim"
+    # shellcheck disable=SC2016     # the script is for the shell in the namespace
+    HOME="$W/home" unshare -r --mount -- sh -c '
+        for cp in /bin/cp /usr/bin/cp; do
+            [ -e "$cp" ] && { mount --bind "$1/cp.shim" "$(readlink -f "$cp")" || exit 77; }
+        done
+        "$2" create whole 10.0.0.2 || exit 1
+        : > "$1/end-it"
+        "$2" create half 10.0.0.3
+        echo "the create that was killed: status $?"
+        "$2" ls
+        "$2" start half
+        echo "start of the half-made container: status $?"
+        "$2" rm half
+    ' _ "$W" "$LB" > "$W/ns.out" 2>&1
+    rc=$?
+    cat "$W/ns.out"
+    [ $rc -ne 77 ] || { echo "a stand-in could not be mounted over cp here"; return 77; }
+    [ $rc -eq 0 ] || return 1
+    echo "the mark, when each copy began: $(paste -sd' ' "$W/seen")"
+    [ "$(paste -sd' ' "$W/seen")" = 'marked marked' ] || { echo "a container was being copied into without being marked"; return 1; }
+    [ ! -e "$C/whole/.creating" ] || { echo "a finished container is still marked"; return 1; }
+    grep -Eq '^whole +10\.0\.0\.2 +stopped' "$W/ns.out" && grep -Eq '^half +- +creating' "$W/ns.out" ||
+        { echo "ls does not tell the finished container from the half-made one"; return 1; }
+    grep -q 'was not created completely' "$W/ns.out" && grep -qx 'start of the half-made container: status 1' "$W/ns.out" ||
+        { echo "the half-made container was not refused by start as one"; return 1; }
+    [ ! -e "$C/half" ] || { echo "rm did not remove the half-made container"; return 1; }
+}
+
+# rm clears away what a container that ended without a stop still had, and
+# its runtime records go with it.
+t_rm_of_a_dead_container() {
+    stale_record || return 1
+    printf '0\n' > "$R/web/exit"
+    msg=$(lb rm web 2>&1) || { printf '%s\n' "$msg"; return 1; }
+    printf '%s\n' "$msg"
+    case $msg in *"Note: container 'web' had stopped by itself"*"Container 'web' removed") ;; *) echo "rm does not say what it found"; return 1 ;; esac
+    [ ! -e "$C/web" ] && [ ! -e "$R/web" ] || { echo "left: $(ls -A "$C" "$R" | tr '\n' ' ')"; return 1; }
+    # a container that was simply stopped has nothing to be said about
+    lb create web 10.0.0.2 >/dev/null && msg=$(lb rm web 2>&1) || return 1
+    case $msg in *Note:*) echo "rm found something to clear away in a stopped container"; return 1 ;; esac
 }
 
 # PID 1 is alive and belongs to root. For an ordinary user kill(1, 0) fails
@@ -344,14 +1026,12 @@ t_inspect_writes_nothing() {
 t_other_users_process_is_not_gone() {
     [ "$(id -u)" -ne 0 ] || return 77
     lb create web 10.0.0.2 || return 1
-    printf '1' > "$C/web/.pid"
-    awk '{ printf "%s", $22 }' /proc/1/stat > "$C/web/.pid_start"
-    printf 'running\n' > "$C/web/.state"
-    before=$(tree_sum "$C/web")
+    record web 1 "$(awk '{ printf "%s", $22 }' /proc/1/stat)" running
+    before=$(kept_sum)
     json=$(lb ls --json)
     printf '%s\n' "$json"
     lb inspect web | grep -x 'running: yes' || return 1
-    printf '%s' "$json" | grep -q '"status":"running"' && [ "$before" = "$(tree_sum "$C/web")" ]
+    printf '%s' "$json" | grep -q '"status":"running"' && [ "$before" = "$(kept_sum)" ]
 }
 
 # What a query shows for a container whose init is gone, without recording it.
@@ -362,13 +1042,88 @@ t_dead_container_shown_as_exited() {
     lb inspect web | grep -x 'running: no'
 }
 
-# stop is a command that changes a container, so it is where the record of a
-# dead init gets cleaned up.
-t_stop_cleans_a_dead_record() {
+# setup, start, stop and exec need root. They say so before they look at
+# anything, and change nothing: the record of a dead init, which stop would
+# clean up, is as it was.
+t_root_is_asked_for_first() {
+    [ "$(id -u)" -ne 0 ] || return 77
     stale_record || return 1
-    refused lb stop web || return 1
-    echo "state is now: $(cat "$C/web/.state")"
-    [ ! -e "$C/web/.pid" ] && [ ! -e "$C/web/.pid_start" ] && [ "$(cat "$C/web/.state")" = failed ]
+    chmod 755 "$W/data" "$C"
+    before=$(kept_sum)
+    bad=0
+    for words in setup 'setup --teardown' 'start web' 'stop web' 'exec web /bin/true'; do
+        # shellcheck disable=SC2086
+        msg=$(lb $words 2>&1) && { echo "lightbox $words succeeded"; bad=1; }
+        echo "lightbox $words: $msg"
+        [ "$msg" = "Error: lightbox ${words%% web*} must be run as root" ] || bad=1
+    done
+    [ "$before" = "$(kept_sum)" ] || { echo "something under $W/data or $R changed"; bad=1; }
+    [ "$(mode_of "$C")" = 755 ] || { echo "setup changed the mode of container_dir"; bad=1; }
+    return $bad
+}
+
+# setup takes --teardown and nothing else, and says so before it asks for root.
+t_setup_arguments() {
+    bad=0
+    for words in 'setup --teardown now' 'setup --tear-down' 'setup br0'; do
+        # shellcheck disable=SC2086
+        msg=$(lb $words 2>&1) && { echo "lightbox $words succeeded"; bad=1; }
+        echo "lightbox $words: $msg"
+        [ "$msg" = 'Usage: lightbox setup [--teardown]' ] || bad=1
+    done
+    lb 2>&1 | grep -F 'setup --teardown' || { echo "the usage does not name setup --teardown"; bad=1; }
+    return $bad
+}
+
+# Two commands that change one container do it one after the other. Eight
+# add-vol at once all get their volume in: each reads the configuration,
+# adds to it and writes it back, and without a lock some would write over
+# what another had just added.
+t_commands_take_turns() {
+    lb create web 10.0.0.2 || return 1
+    for i in 1 2 3 4 5 6 7 8; do
+        lb add-vol web "$W/vol:/data/$i" >"$W/addvol.$i" 2>&1 &
+    done
+    wait
+    echo "volumes after eight add-vol at once: $(vol_count web)"
+    [ "$(vol_count web)" = 8 ] || { cat "$W"/addvol.*; return 1; }
+    for i in 1 2 3 4 5 6 7 8; do conf_has web "vol=$W/vol:/data/$i" || return 1; done
+}
+
+# A command waits for the lock and says that it does; a query never waits.
+t_lock_is_waited_for() {
+    command -v flock >/dev/null 2>&1 || { echo "no flock(1) to hold a lock with"; return 77; }
+    lb create web 10.0.0.2 || return 1
+    flock "$C/web" sleep 2 &
+    holder=$!
+    sleep 0.3
+    began=$SECONDS
+    listed=$(lb ls) || return 1
+    [ $((SECONDS - began)) -lt 2 ] || { echo "ls waited for the lock"; return 1; }
+    printf '%s\n' "$listed" | grep -q '^web ' || return 1
+    msg=$(lb add-vol web "$W/vol:/data" 2>&1) || { echo "$msg"; return 1; }
+    printf '%s\n' "$msg"
+    wait "$holder"
+    case $msg in *"Waiting for another lightbox command to finish with container 'web'"*) ;; *) echo "it did not say that it waited"; return 1 ;; esac
+    conf_has web "vol=$W/vol:/data" || return 1
+
+    # create waits for the lock of the whole store
+    flock "$C" sleep 1 &
+    holder=$!
+    sleep 0.3
+    msg=$(lb create db 10.0.0.3 2>&1) || { echo "$msg"; return 1; }
+    wait "$holder"
+    printf '%s\n' "$msg"
+    case $msg in *"Waiting for another lightbox command to finish with the container store"*) ;; *) return 1 ;; esac
+
+    # a container that is removed while a command waits for it is gone for that command
+    flock "$C/db" sh -c "sleep 1; rm -rf '$C/db'" &
+    holder=$!
+    sleep 0.3
+    msg=$(lb add-vol db "$W/vol:/data" 2>&1) && { echo "add-vol worked on a container that was removed meanwhile"; return 1; }
+    wait "$holder"
+    printf '%s\n' "$msg"
+    case $msg in *'container does not exist: db'*) ;; *) return 1 ;; esac
 }
 
 t_ls_json_escapes_names() {
@@ -383,16 +1138,23 @@ t_ls_json_escapes_names() {
 # one field of the first entry of ls --json, decoded by a real JSON parser
 json_field() { python3 -I -c 'import json, sys; sys.stdout.write(str(json.load(sys.stdin)[0][sys.argv[1]]))' "$1"; }
 
-# A record is a file anyone with access can damage. Whatever it holds, the
-# listing stays JSON and gives the value back unchanged.
+# A record is a file anyone with access can damage. Whatever the state record
+# holds, the listing stays JSON and gives the value back unchanged; an address
+# record that is no address is not shown at all.
 t_ls_json_escapes_values() {
     command -v python3 >/dev/null 2>&1 || { echo "no python3 to decode JSON with"; return 77; }
     lb create web 10.0.0.2 || return 1
-    printf '1"2\\3\t4\001' > "$C/web/.ip"
+    mkdir -p "$R/web"
+    printf '1"2\\3\t4\001' > "$R/web/state"
     json=$(lb ls --json)
     printf '%s\n' "$json"
     printf '%s' "$json" | json_valid || return 1
-    [ "$(printf '%s' "$json" | json_field ip | od -An -c | tr -s ' ')" = "$(printf '1"2\\3\t4\001' | od -An -c | tr -s ' ')" ]
+    [ "$(printf '%s' "$json" | json_field status | od -An -c | tr -s ' ')" = "$(printf '1"2\\3\t4\001' | od -An -c | tr -s ' ')" ] ||
+        { echo "the state record did not come back as it is"; return 1; }
+    printf '1"2\\3\t4\001' > "$C/web/.ip"
+    json=$(lb ls --json)
+    printf '%s\n' "$json"
+    printf '%s' "$json" | json_valid && [ "$(printf '%s' "$json" | json_field ip)" = - ]
 }
 
 t_ls_json_pid_is_null_when_stopped() {
@@ -416,7 +1178,7 @@ t_ls_is_sorted() {
 # valid container name are listed.
 t_ls_lists_only_containers() {
     lb create web 10.0.0.2 || return 1
-    mkdir "$C/has space" "$C/far-too-long-for-a-name" "$C/.hidden"
+    mkdir "$C/has space" "$C/a-name-of-thirty-one-characters" "$C/.hidden"
     : > "$C/afile"
     ln -s web "$C/alink"
     listing=$(lb ls | sed '1,2d' | awk '{print $1}' | tr '\n' ' ')
@@ -495,18 +1257,18 @@ t_rm_handles_every_argument() {
 t_start_without_root_is_a_clean_error() {
     [ "$(id -u)" -ne 0 ] || return 77
     lb create web 10.0.0.2 || return 1
-    before=$(cat "$C/web/.state")
+    before=$(kept_sum)
     msg=$(lb start web 2>&1) && return 1
     printf '%s\n' "$msg" | head -5
-    echo "state: $before -> $(cat "$C/web/.state")"
-    printf '%s\n' "$msg" | grep -qi 'root' && [ "$(cat "$C/web/.state")" = "$before" ]
+    lb inspect web | grep -x 'state: stopped' || return 1
+    printf '%s\n' "$msg" | grep -qi 'root' && [ "$(kept_sum)" = "$before" ]
 }
 
 # start reads its options before it touches anything, so a mistyped one
 # changes nothing, with or without root.
 t_start_options_are_checked() {
     lb create web 10.0.0.2 || return 1
-    before=$(tree_sum "$C/web")
+    before=$(kept_sum)
     said() { msg=$(lb start web "$@" 2>&1) && { echo "start web $* succeeded"; return 1; }; echo "start web $*: $msg"; }
     said -t soon   && case $msg in *soon*) ;; *) return 1 ;; esac || return 1
     said -t 86401  && case $msg in *86401*) ;; *) return 1 ;; esac || return 1
@@ -514,7 +1276,7 @@ t_start_options_are_checked() {
     said -t        && case $msg in *'number of seconds'*) ;; *) return 1 ;; esac || return 1
     said --bogus   && case $msg in *'unknown option'*--bogus*) ;; *) return 1 ;; esac || return 1
     said another   && case $msg in *'unexpected argument'*another*) ;; *) return 1 ;; esac || return 1
-    [ "$before" = "$(tree_sum "$C/web")" ] || { echo "the container's records changed"; return 1; }
+    [ "$before" = "$(kept_sum)" ] || { echo "the container's records changed"; return 1; }
 }
 
 # A start_timeout or stop_timeout that cannot be read is said so, and stops
@@ -536,15 +1298,15 @@ t_start_timeout_setting() {
 # stop reads its options before it looks at the container.
 t_stop_options_are_checked() {
     lb create web 10.0.0.2 || return 1
-    before=$(tree_sum "$C/web")
+    before=$(kept_sum)
     said() { msg=$(lb stop web "$@" 2>&1) && { echo "stop web $* succeeded"; return 1; }; echo "stop web $*: $msg"; }
     said -t soon   && case $msg in *soon*) ;; *) return 1 ;; esac || return 1
     said -t        && case $msg in *'number of seconds'*) ;; *) return 1 ;; esac || return 1
     said --bogus   && case $msg in *'unknown option'*--bogus*) ;; *) return 1 ;; esac || return 1
     said another   && case $msg in *'unexpected argument'*another*) ;; *) return 1 ;; esac || return 1
-    # with options that are fine it gets as far as the container, which is not running
-    said -t 3      && case $msg in *'not running'*) ;; *) return 1 ;; esac || return 1
-    [ "$before" = "$(tree_sum "$C/web")" ] || { echo "the container's records changed"; return 1; }
+    # with options that are fine it goes on: to who runs it, and as root to the container, which is not running
+    said -t 3      && case $msg in *'must be run as root'*|*'not running'*) ;; *) return 1 ;; esac || return 1
+    [ "$before" = "$(kept_sum)" ] || { echo "the container's records changed"; return 1; }
 }
 
 # logs prints the container's log, and nothing for a container that has none.
@@ -575,9 +1337,7 @@ t_logs_follows() {
     lb create web 10.0.0.2 || return 1
     sleep 30 &
     holder=$!
-    printf '%s' "$holder" > "$C/web/.pid"
-    awk '{ printf "%s", $22 }' "/proc/$holder/stat" > "$C/web/.pid_start"
-    printf 'running\n' > "$C/web/.state"
+    record web "$holder" "$(awk '{ printf "%s", $22 }' "/proc/$holder/stat")" running
     lb inspect web | grep -qx 'running: yes' || { echo "the stand-in does not read as running"; kill "$holder"; return 77; }
     printf 'first\n' > "$C/web/console.log"
     lb logs web -f > "$W/followed" 2>&1 &
@@ -606,8 +1366,9 @@ last" ]
 # of its own for one of them: its messages would be written into the file.
 t_closed_streams_are_harmless() {
     HOME="$W/home" "$LB" create web 10.0.0.2 <&- >&- 2>&- || { echo "create failed with status $?"; return 1; }
-    echo "state: $(cat "$C/web/.state"), ip: $(cat "$C/web/.ip")"
-    [ "$(cat "$C/web/.state")" = stopped ] && [ "$(cat "$C/web/.ip")" = 10.0.0.2 ] && conf_has web 'mem=256M' || return 1
+    echo "$(lb inspect web | grep '^state: '), ip: $(cat "$C/web/.ip")"
+    lb inspect web | grep -qx 'state: stopped' && [ ! -e "$C/web/.creating" ] &&
+    [ "$(cat "$C/web/.ip")" = 10.0.0.2 ] && conf_has web 'mem=256M' || return 1
     ! grep -rl "Creating container" "$C/web" "$W/home" 2>/dev/null | grep -q . || { echo "a message was written into a file"; return 1; }
     lb ls | grep -q '^web '
 }
@@ -686,24 +1447,15 @@ t_create_writes_stay_in_the_rootfs() {
 
 t_storage_is_private() {
     lb create web 10.0.0.2 || return 1
-    echo "modes: dir $(mode_of "$C/web"), .conf $(mode_of "$C/web/.conf"), .ip $(mode_of "$C/web/.ip"), .state $(mode_of "$C/web/.state")"
+    echo "modes: dir $(mode_of "$C/web"), .conf $(mode_of "$C/web/.conf"), .ip $(mode_of "$C/web/.ip")"
     [ "$(mode_of "$C/web")" = 700 ] && [ "$(mode_of "$C/web/.conf")" = 600 ] &&
-    [ "$(mode_of "$C/web/.ip")" = 600 ] && [ "$(mode_of "$C/web/.state")" = 600 ] &&
+    [ "$(mode_of "$C/web/.ip")" = 600 ] &&
     lb add-vol web "$W/vol:/more" >/dev/null && [ "$(mode_of "$C/web/.conf")" = 600 ] &&
     [ "$(mode_of "$C/web/rootfs/etc/resolv.conf")" = 644 ]   # the container's own file
 }
 
 # setup restricts storage directories that an older installation left open. As
 # an ordinary user setup still fails later, at the bridge, which is expected.
-t_setup_restricts_existing_storage() {
-    [ "$(id -u)" -ne 0 ] || return 77
-    [ "$(stat -f -c %T /sys/fs/cgroup 2>/dev/null)" = cgroup2fs ] || return 77
-    sed -i 's#^cgroup_root = .*#cgroup_root = /sys/fs/cgroup#' "$CONF"
-    chmod 755 "$W/data" "$C"
-    lb setup 2>&1 | head -6
-    echo "modes after setup: lightbox_dir $(mode_of "$W/data"), container_dir $(mode_of "$C")"
-    [ "$(mode_of "$W/data")" = 700 ] && [ "$(mode_of "$C")" = 700 ]
-}
 
 # ─── The list ───────────────────────────────────────────────────────────────
 
@@ -711,10 +1463,10 @@ check 'create stores the options it was given'              t_create_stores_opti
 check 'create copies the base rootfs'                       t_create_copies_base
 check 'create refuses a name that exists'                   t_create_refuses_existing_name
 check 'create refuses malformed names'                      t_create_refuses_bad_names
+check 'a name has 30 characters, and on the host twelve hex digits' t_long_names
 check 'create refuses malformed and out-of-subnet addresses' t_create_refuses_bad_addresses
 check 'volume specifications are validated'                 t_volume_spec_rules
 check 'an unknown option is refused'                        t_unknown_option_refused
-check '--cpu takes whole numbers only'                      t_cpu_must_be_whole
 check 'ls lists containers'                                 t_ls_lists_containers
 check 'ls --json prints JSON'                               t_ls_json_is_json
 check 'inspect prints name, address and state'              t_inspect_basics
@@ -724,10 +1476,18 @@ check 'rm removes the container directory'                  t_rm_removes
 check 'stop and exec refuse a stopped container'            t_stopped_container_cannot_stop_or_exec
 check 'an unknown command prints usage and fails'           t_unknown_command_prints_usage
 check 'ls writes nothing'                                   t_ls_writes_nothing
+check 'a PID record is a number and nothing else'           t_pid_record_is_a_number
+check 'runtime records are in run_dir, and none means stopped' t_runtime_records_are_apart
+check 'records an older lightbox left in the container are read' t_records_from_before_are_read
+check 'a half-made container says that it is one'           t_half_made_container
+check 'a create that is killed leaves a container start refuses' t_create_killed_half_way
+check 'rm clears away a container that ended without a stop' t_rm_of_a_dead_container
 check 'inspect writes nothing'                              t_inspect_writes_nothing
 check 'a process owned by another user is not gone'         t_other_users_process_is_not_gone
 check 'a dead container is shown as exited'                 t_dead_container_shown_as_exited
-check 'stop cleans up the record of a dead container'       t_stop_cleans_a_dead_record
+check 'setup, start, stop and exec ask for root first'      t_root_is_asked_for_first
+check 'eight add-vol at once all take effect'               t_commands_take_turns
+check 'a command waits for a lock and says so; ls does not' t_lock_is_waited_for
 check 'start checks its options before it does anything'    t_start_options_are_checked
 check 'a timeout setting that cannot be read is a warning'  t_start_timeout_setting
 check 'stop checks its options before it does anything'     t_stop_options_are_checked
@@ -737,7 +1497,6 @@ check 'a command with its standard streams closed is harmless' t_closed_streams_
 check 'create writes name servers, hostname and hosts'      t_create_writes_names
 check 'what create writes stays in the new root filesystem' t_create_writes_stay_in_the_rootfs
 check 'container storage is private to root'                t_storage_is_private
-check 'setup restricts existing storage directories'        t_setup_restricts_existing_storage
 check 'create keeps every volume or refuses'                t_create_keeps_every_volume
 check 'add-vol stores whole lines and fails honestly'       t_addvol_fails_honestly
 check 'add-vol respects the volume limit'                   t_addvol_respects_the_volume_limit
@@ -746,18 +1505,37 @@ check 'a symlinked base is copied, not linked'              t_symlinked_base_is_
 check 'create leaves the base rootfs alone'                 t_create_leaves_the_base_alone
 check 'an empty base is refused by name'                    t_empty_base_refused
 check 'a missing or non-directory base is refused'          t_unusable_base_refused
+check '--pids takes a count or max, and says so'            t_pids_must_be_a_count
+check '--cpu takes CPUs or parts of one, and says so'       t_cpu_must_be_cpus
+check '--mem takes a size or max, and says so'              t_mem_must_be_a_size
+check '--oom-score takes a number in its range'             t_oom_score_must_be_a_number
+check 'a number with trailing text is refused'              t_number_with_trailing_text_refused
+check 'limits are stored as they were given'                t_limits_are_stored_as_given
+check 'an option without its value is named'                t_missing_value_is_named
+check 'no value adds a line to the configuration'           t_no_value_adds_a_line
+check 'one volume at a destination, from create and add-vol' t_one_volume_at_a_destination
+check 'rm-vol removes the volume at a destination'          t_rmvol_removes_a_volume
+check 'a .conf has a version, and a strange one is not used' t_conf_has_a_version
+check 'a .conf from before the version line is read'        t_conf_from_before_is_read
+check 'default_* settings are checked, and said if unusable' t_default_settings_are_checked
+check 'a setting or a settings file is never cut to fit'    t_settings_are_not_cut
+check 'LIGHTBOX_ROOTFS counts with or without a lightbox.conf' t_rootfs_from_the_environment
 
-xfail FS-addvol-checks     'add-vol refuses a destination twice'             t_addvol_refuses_a_destination_twice
-xfail NET-ip-validate      'a duplicate address is refused'                  t_duplicate_address_refused
-xfail NET-ip-validate      'the gateway address is refused'                  t_gateway_address_refused
-xfail NET-ip-validate      'the network address is refused'                  t_network_address_refused
-xfail NET-ip-validate      'the broadcast address is refused'                t_broadcast_address_refused
-xfail CLI-opt-values       '--pids is stored whole or refused'               t_pids_value_not_cut
-xfail CLI-opt-values       '--cpu is stored whole or refused'                t_cpu_value_not_cut
-xfail CLI-opt-values       '--mem must be a size'                            t_mem_must_be_a_size
-xfail CFG-parse-int        '--oom-score must be a number'                    t_oom_score_must_be_a_number
-xfail CFG-parse-int        'a number with trailing text is refused'          t_number_with_trailing_text_refused
-xfail CLI-missing-value    'an option without its value is named'            t_missing_value_is_named
+check 'a duplicate address is refused, with its holder named' t_duplicate_address_refused
+check 'the gateway address is refused'                        t_gateway_address_refused
+check 'the network address is refused'                        t_network_address_refused
+check 'the broadcast address is refused'                      t_broadcast_address_refused
+check 'create without an address takes the lowest free one'   t_create_takes_the_lowest_free_address
+check 'a full subnet refuses one more container'              t_full_subnet
+check 'a /16 subnet has the addresses of a /16'               t_wide_subnet
+check 'subnet and gw that are no network are refused'         t_network_settings_are_checked
+check 'an address with a zero in front of a number is refused' t_address_with_leading_zeros_refused
+check 'two creates at once get two addresses'                 t_creates_at_once_get_two_addresses
+check '--swap takes what --mem does and 0, and is none unless given' t_swap_option
+check '--io-max is a line of io.max for a whole disk that is there' t_io_max_option
+check 'the firewall settings are Docker'"'"'s, and a wrong one keeps the built-in' t_firewall_settings
+check 'firewall_backend and bridge_accept_fwmark: Docker'"'"'s, and a wrong one is not taken' t_firewall_backend_settings
+check 'setup takes --teardown and no other argument'                    t_setup_arguments
 check 'ls --json stays JSON next to an odd directory name'    t_ls_json_escapes_names
 check 'ls --json escapes whatever a record holds'             t_ls_json_escapes_values
 check 'ls --json gives pid as null for a stopped container'   t_ls_json_pid_is_null_when_stopped
@@ -769,6 +1547,6 @@ xfail CFG-parse            'configuration: inline comments are stripped'     t_c
 xfail CFG-parse            'configuration: unknown keys are reported'        t_config_reports_unknown_keys
 xfail CLI-help             '--help exits 0'                                  t_help_exits_zero
 xfail CLI-extra-args       'rm handles every argument or none'               t_rm_handles_every_argument
-xfail RT-no-root-check     'start without root is a clean error'             t_start_without_root_is_a_clean_error
+check 'start without root is a clean error'                   t_start_without_root_is_a_clean_error
 
 summary validation

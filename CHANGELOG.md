@@ -2,6 +2,73 @@
 
 What changed for someone who uses lightbox, newest first. `ROADMAP.md` has the reasons and the finding each change closes.
 
+## 0.5.0
+
+Not tagged yet. Phase 5 of the roadmap: one reader and writer for a container's configuration, strict values, locks, the clearing away of containers that died, records in `run_dir`, addresses and limits that are checked, firewall rules in chains and tables of lightbox's own with nftables as a backend to choose, interfaces that lightbox owns, and a host network that comes back after a reboot.
+
+### Changes you may have to act on
+
+- **`setup`, `start`, `stop` and `exec` refuse to run as an ordinary user**, with "must be run as root", before they look at anything. `start` used to go ahead, fail at its first privileged step and record the container as failed; `setup` changed the modes of the storage directories before it failed.
+- **Commands wait for each other.** `start`, `stop`, `rm` and `add-vol` on the same container, and `create` and `setup` on the store, run one after the other; the one that waits prints "Waiting for another lightbox command to finish". A `stop` typed while a `start` is still waiting for the init hook waits for that `start`. `ls` and `inspect` never wait.
+- **An option's value is what the option takes, or `create` refuses it** with the option named, and makes nothing. `--mem` takes a number of bytes, optionally with `K`, `M`, `G` or `T`, or `max`; `--pids` a number from 1 to 4194304, or `max`; `--cpu` a number of CPUs from 0.01 to 512; `--oom-score` a number from -1000 to 1000. Before, `--mem not-a-size` was stored and failed the start, `--oom-score abc` was stored as 0 and `--oom-score 12abc` as 12, and a long value was cut: `--pids 123456789` became 1234567 and `--cpu 1024` became 102. A number that begins with a 0, as in `--mem 0100M`, is refused too: the kernel would have read it as octal.
+- **The `default_*` settings in `lightbox.conf` are held to the same.** One that is not a limit is reported as a warning by every command, and `create` refuses a container that would have needed it; give that container the option, or correct the setting.
+- **A second volume at a destination is refused**, by `create` and by `add-vol`. The second one used to be mounted over the first. Adding the very same volume again still does nothing and is no error.
+- **A volume path with a control character in it, such as a newline, is refused.**
+- **A setting in `lightbox.conf` that does not fit is an error, not a shorter setting.** A directory may be up to 448 characters long. A `lightbox.conf` of more than 16 KB is refused as a whole; one of more than 2 KB used to be read up to that point, and the settings after it did not count.
+- **The records of a running container are in `run_dir`**, `/run/lightbox` unless set otherwise, and no longer in the container's directory: `<run_dir>/<name>/pid`, `pid_start`, `state` and `exit`. Scripts that read `<container_dir>/<name>/.pid` or `.state` have to read these, or better `lightbox inspect`. A container that an older lightbox started and that is still running is found through its old records, and can be stopped as usual. If `run_dir` is set to a directory that is not on a tmpfs, the records outlast a reboot and containers show as `exited` after one until a command clears them.
+- **A container that ended without `lightbox stop` is cleared away by the next `start`, `stop` or `rm`**, which prints a note saying so: its cgroup, its interface and the firewall rules of its links are removed, and its state becomes `exited` if its init ended with status 0, as it does when it is sent SIGTERM, and `failed` otherwise. Before, such a container became `failed` in every case, and its cgroup and rules stayed; `rm` left the rules for good.
+- **A container that `create` did not finish is not started.** A `create` that is interrupted while it copies the root filesystem leaves a container that `ls` shows as `creating`; `start` used to run it with whatever had been copied.
+- **`create` refuses an address that no container can have**: another container's, which it names, the gateway's, and the first and the last address of the subnet. It took them all; two containers on one address, or one on the bridge's, could not be reached.
+- **An address with a zero in front of one of its numbers, such as `10.0.0.05`, is refused**, by `create`, `--dns` and the `dns` setting: some programs read such a number as octal and others refuse it. A container that was created with one does not start; create it again.
+- **`subnet` and `gw` are checked together** by `setup`, `create` and `start`, and reported by `doctor`: `subnet` is `<address>/<bits>` with 8 to 30 bits, and `gw` is an address in it that is neither its first nor its last. Either one wrong ends the command, with the setting named, before anything is made.
+- **The prefix of `subnet` is used.** `setup` gave the bridge a `/24`, and `start` gave every container one, whatever `subnet` said: on a `/16`, a container outside the gateway's `/24` did not start. A bridge that an earlier `setup` made keeps the address it was given, so with a `subnet` that is not a `/24`, delete the bridge while no container runs (`ip link delete br0`) and run `setup` again.
+- **`start` refuses a container whose address is not in `subnet`**, as after a change of `subnet`. It would have started and reached nothing.
+- **A container has no swap unless `--swap` gives it some**, containers made before included. Past its memory limit a process is killed instead of going on in swap, and with `memory.oom.group` the kernel ends the whole container, which the next `start`, `stop` or `rm` clears away. Give a container that needs swap `--swap`, by creating it again or by adding `swap=<size>` to its `.conf`.
+- **The `io` line of a `.conf` is checked**: `<major>:<minor>` and one or more of `rbps`, `wbps`, `riops` and `wiops`, each `=<number>` or `=max`, without a zero in front of a number. One that is not is an error that names the line. It could only have come from an edit by hand.
+- **lightbox's firewall rules are in chains of its own**, as Docker's are: `LIGHTBOX-FORWARD`, `LIGHTBOX-LINKS` with an `LB-<name>` chain for each running container with links, and `LIGHTBOX-POSTROUTING`, reached from the top of `FORWARD` and `POSTROUTING`. Run `setup` after the upgrade: it makes them and takes out the rules that earlier versions put straight into `FORWARD` and `POSTROUTING`. A container with links that is running through the upgrade gets its link rules back when it is started again. Scripts that looked for lightbox's rules in `FORWARD` have to look in these chains.
+- **When `setup` turns IPv4 forwarding on, the `FORWARD` policy becomes DROP**, as Docker does it: the host forwards what a rule accepts and nothing else. A host that had forwarding on keeps its policy. `ip_forward_no_drop = true` in `lightbox.conf` leaves the policy in any case.
+- **Rules of the host's that are to decide before lightbox's go in `LIGHTBOX-USER`**, like Docker's `DOCKER-USER`. lightbox makes the chain and never changes it.
+- **Masquerading no longer names the interface of the default route.** What leaves by any interface but the bridge is masqueraded, and forwarded out of the bridge: a host whose default route moves to another interface, or that reaches some networks by another one, does not cut its containers off. `setup` no longer fails on a host without a default route.
+- **`setup` fills `LIGHTBOX-FORWARD` and `LIGHTBOX-POSTROUTING` for the bridge of its `lightbox.conf`**: one host has one lightbox network. Before, a second `lightbox.conf` with another bridge added rules beside the first one's.
+- **The interface in a container is `eth0`.** It was `ve-<name>`; a service that names its interface has to name `eth0`. A container started before keeps its old interface until it is started again.
+- **The host's end of a container's interface is `vb-` and twelve hex digits** of a hash of the container's name, no longer `vb-<name>`, and carries the alias `lightbox:<name>`. `inspect` shows it as `host_interface`. lightbox removes only interfaces that carry its alias: `start` used to delete whatever was called `vb-<name>` or `ve-<name>`, a name systemd-nspawn uses as well, and now refuses with the interface named and leaves it alone.
+- **The chain of a container's links is `LB-` and the same twelve digits.**
+- **A container's `.conf` that lightbox cannot use is an error that names the file and the line**, for `start`, `exec`, `inspect`, `add-vol` and `rm-vol`. `stop` still stops such a container and clears away all it had, the firewall rules of its links among them, which it knows from their record in `run_dir`. `rm` removes it as before.
+
+### Added
+
+- **`--cpu` takes parts of a CPU**: `--cpu 0.5` is half of one, `--cpu 1.25` one and a quarter.
+- **`--mem max` and `--pids max`** for a container without that limit.
+- **`lightbox create <name>` without an address** gives the container the lowest address of the subnet that is free: not the gateway's and not another container's. Two `create` at once get two addresses.
+- `doctor` shows the network that `subnet` and `gw` make, or what is wrong with them.
+- **`--swap <limit>`** lets a container use swap: `0`, a size as for `--mem`, or `max`.
+- **`--io-max "<major>:<minor> <key>=<value>..."`** gives a container an I/O limit for one whole disk, as `io.max` takes it. Before, only an edit of the `.conf` could. `create` refuses a device that the host does not have, and a partition, for which the kernel takes no limit.
+- `inspect` shows `swap` and `io`, and `host_interface`.
+- **A container's name can have 30 characters**, where it could have 12: the name is no longer part of an interface's name.
+- **Four firewall settings in `lightbox.conf`, those of Docker's `daemon.json`**: `firewall` (Docker's `iptables`), `ip_forward`, `ip_forward_no_drop` and `ip_masq`, each `true` or `false`. `firewall = false` makes no rules at all, and then a container with links is not started. `doctor` shows the four.
+- **`firewall_backend = nftables`**, Docker's `firewall-backend`: lightbox's rules go in two nftables tables of its own, `ip lightbox` and `bridge lightbox`, and a container's links are elements of a set there. A table of the bridge family sees what the bridge switches, so a container with links starts without `br_netfilter`, and a start runs one `nft`. As with Docker's nftables backend, `setup` does not turn IPv4 forwarding on, and stops if it is off and `ip_forward` is true; there is no `LIGHTBOX-USER`; and `setup` and `doctor` name the chains of other tables, iptables' `FORWARD` among them, whose drop policy drops the containers' traffic as well. Moving from one backend to the other, `setup` takes out what the other made. `iptables` stays the default.
+- **`start` makes the host's network again when it is not all there**: the bridge, lightbox's firewall rules and, with iptables, forwarding, as `setup` makes them, after a reboot or after a firewall service loaded its own rules over lightbox's. It used to fail with "failed to attach the container's interface to the bridge" until someone ran `setup`. A start looks with one process more than before.
+- **`lightbox setup --teardown`** takes lightbox's firewall rules, in either backend, the bridge and `cgroup_base` away once no container runs, and refuses while one does. Forwarding and the `FORWARD` policy stay, and it says what `setup` had changed of them.
+- **`bridge_accept_fwmark`**, Docker's `bridge-accept-fwmark`: with nftables, packets that a chain of the host's gave this mark, or mark and mask, are accepted by lightbox's rules before they drop anything.
+- **`lightbox rm-vol <name> <dst>`** takes the volume at a destination out of a container's configuration. Like `add-vol`, it takes effect at the next start.
+- A container's `.conf` begins with `version=1`. Containers made by earlier versions keep working as they are, and get the line the next time `add-vol` or `rm-vol` writes the file.
+
+### Fixed
+
+- Two commands working on one container at the same time could both go ahead: two `start` could each set up an interface and a cgroup for the same container, and of two `add-vol` one could write over what the other had just added.
+- `LIGHTBOX_ROOTFS` was ignored unless a `lightbox.conf` existed. With the variable set as the README's quick start has it and no file, `create` copied `/var/lib/lightbox/rootfs`, or failed because that is not there. The variable now counts either way: after `--rootfs`, before the `rootfs` setting.
+- A newline in a `--vol` path, or in `--mem`, was written into the container's `.conf` as it was, where the text after it was read as further settings of the container.
+- `create --mem` without a value, and the same for every other option, said "unknown option". It says that the option requires a value.
+- A path or a text that did not fit where lightbox kept it was cut and used: a long `container_dir` could make lightbox work on another directory than the one configured.
+- `start` read the container's `.conf` once for every setting in it, and init read it again. It is read once.
+- `start` waited for the disk each time it wrote a record of the container, several times in every start. It no longer waits for any.
+- After a reboot, containers that had been running were shown as `exited`, from records that were kept on disk. They are shown as `stopped`.
+- `start` enabled the `memory`, `pids`, `cpu` and `io` controllers in one write, which failed as a whole when any one was missing: on a host without `io` no container started, I/O limit or not. Each is enabled on its own, and a missing one stops only a container whose limits need it.
+- A command that `exec` ran had the OOM score of whoever ran `exec`, not the container's.
+- A link to a container that was created after the one with the link never applied: the rule named the other's address, which it did not have yet. Link rules name the two ports on the bridge, and hold whichever of the two starts first.
+- A container's link rules stayed when it ended without a stop, and `stop` left them when the container's `.conf` could not be read. They are in a chain of the container's own, which `stop`, `rm` and the clearing away of a dead container remove without reading the `.conf`.
+- A start put in each link rule with two `iptables` processes, a check and an insert, for each direction of each link. It runs `iptables-restore` once.
+
 ## 0.4.0
 
 Not tagged yet. Phase 4 of the roadmap: who `exec` runs a command as, how it finds it and what terminal it gives it, where volumes are mounted, and what `create` writes into a new container.

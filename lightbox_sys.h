@@ -26,8 +26,10 @@
 
 #if defined(__x86_64__)
 #define LB_SYS_fcntl      72
+#define LB_SYS_flock      73
 #define LB_SYS_fsync      74
 #define LB_SYS_fchdir     81
+#define LB_SYS_geteuid    107
 #define LB_SYS_capget     125
 #define LB_SYS_capset     126
 #define LB_SYS_statfs     137
@@ -46,6 +48,7 @@
 #define LB_SYS_mount_setattr 442
 #elif defined(__aarch64__)
 #define LB_SYS_fcntl      25
+#define LB_SYS_flock      32
 #define LB_SYS_renameat   38
 #define LB_SYS_statfs     43
 #define LB_SYS_fchdir     50
@@ -54,6 +57,7 @@
 #define LB_SYS_fsync      82
 #define LB_SYS_capget     90
 #define LB_SYS_capset     91
+#define LB_SYS_geteuid    175
 #define LB_SYS_memfd_create 279
 #define LB_SYS_execveat   281
 #define LB_SYS_statx      291
@@ -104,6 +108,7 @@
 #define LB_AT_EMPTY_PATH          0x1000
 
 #define LB_STATX_TYPE             0x00000001U
+#define LB_STATX_INO              0x00000100U
 #define LB_STATX_MODE             0x00000002U
 #define LB_STATX_ATTR_MOUNT_ROOT  0x00002000U   /* reported since Linux 5.8 */
 
@@ -171,6 +176,12 @@
 
 /* mount_setattr(2), Linux 5.12 (linux/mount.h) */
 #define LB_MOUNT_ATTR_RDONLY          0x00000001
+
+/* flock(2) (asm-generic/fcntl.h). A lock belongs to the open file, and is
+ * gone when the last descriptor of that open file is closed. */
+#define LB_LOCK_SH                    1
+#define LB_LOCK_EX                    2
+#define LB_LOCK_NB                    4
 
 /* open(2): fail if the file is there already (asm-generic/fcntl.h); the one
  * open flag lightbox uses that lightc does not name */
@@ -395,6 +406,14 @@ static inline lc_sysret lb_sys_pidfd_open(int32_t pid, uint32_t flags) {
 static inline lc_sysret lb_sys_pidfd_send_signal(int32_t pidfd, int32_t sig,
                                                  const struct lb_siginfo_queue *info, uint32_t flags) {
     return lc_syscall4(LB_SYS_pidfd_send_signal, pidfd, sig, (int64_t)info, flags);
+}
+
+static inline lc_sysret lb_sys_flock(int32_t fd, int32_t operation) {
+    return lc_syscall2(LB_SYS_flock, fd, operation);
+}
+
+static inline lc_sysret lb_sys_geteuid(void) {
+    return lc_syscall0(LB_SYS_geteuid);
 }
 
 static inline lc_sysret lb_sys_fcntl(int32_t fd, int32_t request, uint64_t argument) {

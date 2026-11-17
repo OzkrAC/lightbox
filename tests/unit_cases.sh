@@ -36,6 +36,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 SH=$(type -P sh)
 TRUE=$(type -P true)
 ENV=$(type -P env)
+CAT=$(type -P cat)
 
 RUN_FORK_FAILED=256 RUN_EXEC_FAILED=257 RUN_SIGNALED=258
 
@@ -464,8 +465,9 @@ wait_for() { # seconds, command...
 # Is "sleep <seconds>" running? The odd number of seconds is what tells a
 # case's own sleep from every other process, so the whole command line has to
 # be that and nothing else: a shell or an editor that merely names the number
-# does not count.
-NAP=31.4159
+# does not count. The number has this suite's process ID in it, so that two
+# suites running on one machine do not take each other's sleep for their own.
+NAP=31.$$
 sleeping() {
     local f
     for f in /proc/[0-9]*/cmdline; do
@@ -473,6 +475,8 @@ sleeping() {
     done
     return 1
 }
+
+t_init_reports_its_end() { in_handshake_dir h_init_reports_its_end; }
 
 h_without_hook() {
     handshake whole confined 5 - -
@@ -566,12 +570,13 @@ h_command_gone() {
 }
 
 # The hook gets three standard streams and nothing else: not init's pipes to
-# the command, not its signalfd, no blocked signal, and nothing that was open
-# in the command, which here has a file on descriptor 9.
+# the command, not its signalfd, not the record of how init ends, no blocked
+# signal, and nothing that was open in the command, which here has a file on
+# descriptor 9.
 h_hook_inherits_nothing() {
     printf 'grep SigBlk: /proc/self/status > %s/blocked\nexec ls /proc/self/fd > %s/fds\n' "$D" "$D" > "$D/hook"
     : > "$D/open-in-the-command"
-    handshake whole confined 5 "$D/hook" - 9< "$D/open-in-the-command"
+    UNIT_EXIT="$D/exit" handshake whole confined 5 "$D/hook" - 9< "$D/open-in-the-command"
     # ls itself has the directory it lists on 3
     echo "descriptors in the hook: $(tr '\n' ' ' < "$D/fds")"
     echo "blocked in the hook: $(cat "$D/blocked")"
@@ -598,15 +603,15 @@ complained by the hook" ] && [ "$(cat "$D/stdin")" -ef /dev/null ] || return 1
 
 # A start that worked ends and leaves init running. A shell that captures the
 # command's output must get it then: init holds nothing of the command, is in
-# a session and a process group of its own, and has only its three streams and
-# its signalfd open.
+# a session and a process group of its own, and has only its three streams,
+# its signalfd and the record of how it ends open, as after a real start.
 #
 # The command writes to a pipe here, as it does under $( ). What reads the
 # pipe ends when nothing has it open any more, and is given ten seconds: an
 # init that held on to the pipe must fail this case, not stall it.
 h_command_returns_and_init_stays() {
     : > "$D/open-in-the-command"
-    ( unshare -r "$UNIT" init leave confined 5 - "$D/log" 2>&1 9< "$D/open-in-the-command" | cat > "$D/out" ) &
+    ( UNIT_EXIT="$D/exit" unshare -r "$UNIT" init leave confined 5 - "$D/log" 2>&1 9< "$D/open-in-the-command" | cat > "$D/out" ) &
     reader=$!
     i=0
     while kill -0 "$reader" 2>/dev/null && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
@@ -627,6 +632,7 @@ h_command_returns_and_init_stays() {
     read -r _ _ _ _ group session _ < "/proc/$init/stat"
     echo "init $init is in process group $group and session $session; this shell is $$"
     [ "$session" = "$init" ] && [ "$group" = "$init" ] || { echo "init does not lead a session of its own"; bad=1; }
+    records=0
     for fd in "/proc/$init/fd"/*; do
         n=${fd##*/}
         to=$(readlink "$fd")
@@ -635,10 +641,12 @@ h_command_returns_and_init_stays() {
         if [ "$n" = 0 ] && [ "$fd" -ef /dev/null ]; then continue; fi
         if { [ "$n" = 1 ] || [ "$n" = 2 ]; } && [ "$fd" -ef "$D/log" ]; then continue; fi
         if [ "$n" -gt 2 ] && [ "$to" = 'anon_inode:[signalfd]' ]; then continue; fi
+        if [ "$n" -gt 2 ] && [ "$fd" -ef "$D/exit" ]; then records=$((records + 1)); continue; fi
         echo "  init should not have that"
         bad=1
     done
     [ -e "/proc/$init/fd/0" ] && [ -e "/proc/$init/fd/1" ] && [ -e "/proc/$init/fd/2" ] || { echo "  init lacks a standard stream"; bad=1; }
+    [ "$records" = 1 ] || { echo "  init has the record of how it ends open $records times, not once"; bad=1; }
     kill -KILL "$init"
     wait "$reader" 2>/dev/null
     return $bad
@@ -883,9 +891,6 @@ t_volume_that_cannot_be_had() {
         out=$(unshare --mount "$UNIT" volumes "$D/root" "$D/missing:/data" 2>&1) && { echo "a missing source was accepted"; exit 1; }
         echo "$out"
         [ "$out" = "Error: volume source does not exist: $D/missing" ] || exit 1
-        out=$(unshare --mount "$UNIT" volumes "$D/root" "$D/src:/a/../b" 2>&1) && { echo "a destination with .. was accepted"; exit 1; }
-        echo "$out"
-        case $out in *"cannot be used"*"$D/src:/a/../b") ;; *) exit 1 ;; esac
         # a directory cannot go where the image has a file
         : > "$D/root/file"
         out=$(unshare --mount "$UNIT" volumes "$D/root" "$D/src:/file" 2>&1) && { echo "a directory was mounted on a file"; exit 1; }
@@ -1462,7 +1467,7 @@ t_start_has_one_way_out() {
     [ -n "$region" ] || { echo "cmd_start, or the start of its guarded part, was not found in $src"; return 1; }
     echo "lines looked at: $(printf '%s\n' "$region" | wc -l)"
     bad=0
-    if printf '%s\n' "$region" | grep -nE '\b(die|die2|require_[a-z_]+|set_container_state|usage)\(' ; then
+    if printf '%s\n' "$region" | grep -nE '\b(die|die2|[a-z_]+_or_die|require_[a-z_]+|set_container_state|usage)\(' ; then
         echo "these end the process where it stands"; bad=1
     fi
     exits=$(printf '%s\n' "$region" | grep -c 'lc_kernel_exit(')
@@ -1470,6 +1475,1024 @@ t_start_has_one_way_out() {
     printf '%s\n' "$region" | grep -q 'goto fail_start' || { echo "nothing goes to fail_start"; bad=1; }
     return $bad
 }
+
+# ─── Text and numbers ───────────────────────────────────────────────────────
+
+# The three helpers that put text into a buffer never put part of it there.
+t_text_is_whole_or_refused() {
+    bad=0
+    expect() { # expected output, then the harness's arguments
+        want=$1; shift
+        got=$("$UNIT" text "$@")
+        [ "$got" = "$want" ] || { echo "text $*: '$got', expected '$want'"; bad=1; }
+    }
+    # five characters need six bytes
+    expect 'whole hello'  copy 6 hello
+    expect 'cut '         copy 5 hello
+    expect 'cut '         copy 1 hello
+    expect 'whole '       copy 1 ''
+    # what does not fit is not appended, and what was there stays whole
+    expect 'whole abcdef' append 7 abc def
+    expect 'cut abc'      append 6 abc def
+    expect 'cut abc'      append 4 abc def
+    # one slash between the two, whatever they bring
+    expect 'whole /a/b'   join 5 /a b
+    expect 'whole /a/b'   join 5 /a/ b
+    expect 'whole /a/b'   join 5 /a /b
+    expect 'whole /a/b'   join 5 /a/ /b
+    expect 'cut '         join 4 /a b
+    expect 'cut '         join 3 /a b
+    expect 'whole /b'     join 3 / b
+    return $bad
+}
+
+t_numbers_are_strict() {
+    bad=0
+    expect() { # text, min, max, expected
+        got=$("$UNIT" number "$1" "$2" "$3")
+        [ "$got" = "$4" ] || { echo "'$1' in [$2, $3]: $got, expected $4"; bad=1; }
+    }
+    expect 0 0 10 0
+    expect 10 0 10 10
+    expect 11 0 10 refused
+    expect -1 0 10 refused
+    expect -5 -10 10 -5
+    expect 007 0 10 7
+    # nothing but a sign and digits
+    for text in '' '-' '+5' ' 5' '5 ' 5s s5 1.5 0x10 1e3 '5
+' -0 --5; do
+        expect "$text" -100 100 refused
+    done
+    # the ends of what a number can be, and one past each
+    expect 9223372036854775807 0 9223372036854775807 9223372036854775807
+    expect 9223372036854775808 0 9223372036854775807 refused
+    expect -9223372036854775808 -9223372036854775808 0 -9223372036854775808
+    expect -9223372036854775809 -9223372036854775808 0 refused
+    # a number that would come round to a small one
+    expect 18446744073709551621 0 100 refused
+    expect 99999999999999999999999999 0 9223372036854775807 refused
+    return $bad
+}
+
+# What --mem, --pids, --cpu and --oom-score take; the settings default_* and
+# the lines of a .conf are held to the same.
+# An address is four numbers of 0 to 255 and three dots, and nothing else:
+# no shorter form, and no zero in front of a number, which some programs
+# read as octal.
+t_addresses_are_strict() {
+    bad=0
+    expect() { # text, expected
+        got=$("$UNIT" address "$1")
+        [ "$got" = "$2" ] || { echo "'$1': $got, expected $2"; bad=1; }
+    }
+    expect 10.0.0.2 10.0.0.2
+    expect 0.0.0.0 0.0.0.0
+    expect 255.255.255.255 255.255.255.255
+    expect 192.168.100.10 192.168.100.10
+    expect 10.0.0.0 10.0.0.0
+    for text in '' 10 10.0 10.0.0 10.0.0.0.0 10.0.0. .10.0.0 10..0.0 10.0.0.256 10.0.0.1000 256.0.0.1 \
+                '10.0.0.2 ' ' 10.0.0.2' '10.0.0.2
+' 10.0.0.2/24 10.0.0.-2 10.0.0.+2 10.0.0.0x2 1e1.0.0.2 10.0.0.a 10,0,0,2 ::1 \
+                010.0.0.2 10.0.0.02 10.00.0.2 10.0.0.007 00.0.0.0; do
+        expect "$text" refused
+    done
+    return $bad
+}
+
+# subnet and gw are one network, read and checked together: any address of
+# the subnet names it, its prefix is 8 to 30 bits, and the gateway is one of
+# its addresses that an interface can have. On it, a container can have any
+# address but the first, the last and the gateway's, with the subnet's prefix.
+t_network_settings() {
+    bad=0
+    expect() { # subnet, gw, expected
+        got=$("$UNIT" network "$1" "$2")
+        [ "$got" = "$3" ] || { echo "subnet '$1', gw '$2': $got, expected $3"; bad=1; }
+    }
+    expect 10.0.0.0/24 10.0.0.1 'subnet 10.0.0.0/24 broadcast 10.0.0.255 gateway 10.0.0.1'
+    expect 10.9.0.0/16 10.9.0.1 'subnet 10.9.0.0/16 broadcast 10.9.255.255 gateway 10.9.0.1'
+    expect 10.9.5.7/16 10.9.200.1 'subnet 10.9.0.0/16 broadcast 10.9.255.255 gateway 10.9.200.1'
+    expect 10.0.0.0/8 10.255.255.254 'subnet 10.0.0.0/8 broadcast 10.255.255.255 gateway 10.255.255.254'
+    expect 192.168.7.0/30 192.168.7.2 'subnet 192.168.7.0/30 broadcast 192.168.7.3 gateway 192.168.7.2'
+    for subnet in 10.0.0.0 10.0.0.0/ 10.0.0.0/7 10.0.0.0/31 10.0.0.0/32 10.0.0.0/024 10.0.0.0/24x 10.0.0/24 \
+                  /24 10.0.0.0/-24 '10.0.0.0/24 ' 010.0.0.0/24 10.0.0.0//24 ''; do
+        got=$("$UNIT" network "$subnet" 10.0.0.1)
+        case $got in 'subnet is not <address>/<bits>'|'subnet takes 8 to 30 bits after the /') ;;
+            *) echo "subnet '$subnet' was taken: $got"; bad=1 ;; esac
+    done
+    expect 10.0.0.0/24 10.0.1.1 'gw is not in the subnet'
+    expect 10.9.0.0/16 10.8.0.1 'gw is not in the subnet'
+    expect 10.0.0.0/24 10.0.0.0 'gw is the first or the last address of the subnet, which no interface can have'
+    expect 10.0.0.0/24 10.0.0.255 'gw is the first or the last address of the subnet, which no interface can have'
+    expect 10.0.0.0/24 10.0.0.01 'gw is not an IPv4 address'
+    expect 10.0.0.0/24 '' 'gw is not an IPv4 address'
+
+    got=$("$UNIT" network 10.9.0.0/16 10.9.0.1 10.9.5.2 10.9.0.1 10.9.0.0 10.9.255.255 10.10.0.2 10.8.255.255 \
+                  10.9.255.254 10.9.0.2 10.9.0.02 | tail -n +2)
+    want='10.9.5.2: 10.9.5.2/16
+10.9.0.1: it is the gateway'"'"'s, the address of the bridge
+10.9.0.0: it is the address of the subnet itself
+10.9.255.255: it is the broadcast address of the subnet
+10.10.0.2: it is outside the subnet of lightbox.conf
+10.8.255.255: it is outside the subnet of lightbox.conf
+10.9.255.254: 10.9.255.254/16
+10.9.0.2: 10.9.0.2/16
+10.9.0.02: not an address'
+    [ "$got" = "$want" ] || { echo "on 10.9.0.0/16:"; printf '%s\n' "$got"; bad=1; }
+    # a gateway that is not the first address leaves the first to a container
+    got=$("$UNIT" network 10.0.0.0/24 10.0.0.254 10.0.0.1 10.0.0.254 | tail -n +2 | paste -sd'|' -)
+    [ "$got" = "10.0.0.1: 10.0.0.1/24|10.0.0.254: it is the gateway's, the address of the bridge" ] ||
+        { echo "with the gateway at .254: $got"; bad=1; }
+    return $bad
+}
+
+# The prefix of every address an interface is given comes from subnet: no
+# source names one of its own.
+t_no_prefix_of_its_own() {
+    src=$HERE/..
+    if grep -nE '"/[0-9]+"' "$src"/lightbox*.c; then
+        echo "a prefix is written into the source"
+        return 1
+    fi
+}
+
+# A program gets its input whole, whether it reads it or not, and an input
+# that is too long is refused before anything runs.
+t_program_input() {
+    out=$("$UNIT" input 'two
+lines
+' "$CAT")
+    [ "$out" = 'two
+lines
+result 0
+left open 0' ] || { echo "cat said: $out"; return 1; }
+    # one that ends without reading: no wait, and no signal for lightbox
+    long=$(head -c 30000 /dev/zero | tr '\0' x)
+    out=$(timeout 10 "$UNIT" input "$long" "$TRUE") || { echo "status $? with a program that does not read"; return 1; }
+    [ "$out" = 'result 0
+left open 0' ] || { echo "true said: $out"; return 1; }
+    out=$(timeout 10 "$UNIT" input "$long" "$CAT" | tail -c 21)
+    [ "$out" = 'result 0
+left open 0' ] || { echo "the end of what cat said: $out"; return 1; }
+    [ "$(timeout 10 "$UNIT" input "$long" "$CAT" | head -n 1 | tr -d x)" = 'result 0' ] || { echo "cat did not get all of it"; return 1; }
+    [ "$(timeout 10 "$UNIT" input "$long" "$CAT" | head -n 1 | tr -cd x | wc -c)" = 30000 ] || { echo "cat did not get all 30000 bytes"; return 1; }
+    out=$("$UNIT" input "$(head -c 40000 /dev/zero | tr '\0' x)" "$CAT" 2>&1)
+    printf '%s\n' "$out"
+    [ "$(printf '%s\n' "$out" | tail -n 2)" = 'result 256
+left open 0' ] || return 1
+    case $out in *'the input is too long for '*) ;; *) return 1 ;; esac
+}
+
+# What a container is called on the host: vb- and LB- with the same twelve
+# hex digits of its name's FNV-1a hash, whatever the name's length, the same
+# for a name every time and another for another name.
+t_host_names() {
+    bad=0
+    expect() { # name, interface, chain
+        got=$("$UNIT" names "$1" | paste -sd' ' -)
+        [ "$got" = "$2 $3" ] || { echo "'$1': $got, expected $2 $3"; bad=1; }
+    }
+    expect web vb-5ea0e1194872 LB-5ea0e1194872
+    expect db vb-08914e07b53b LB-08914e07b53b
+    expect a vb-af63dc4c8601 LB-af63dc4c8601
+    expect abcdefghijklmnopqrstuvwxyz0123 vb-b99d11b887d2 LB-b99d11b887d2
+    [ "$("$UNIT" names web2 | head -n 1)" != vb-5ea0e1194872 ] || { echo "web2 has web's interface"; bad=1; }
+    return $bad
+}
+
+# Whose an interface is, from what "ip link show" prints: lightbox's for this
+# container only with the alias lightbox:<name>, exactly; without an alias,
+# or with another, not lightbox's to touch.
+t_interface_owner() {
+    bad=0
+    expect() { # name, listing, expected
+        got=$("$UNIT" owner "$1" "$2")
+        [ "$got" = "$3" ] || { echo "$1 with: $2"; echo "  $got, expected $3"; bad=1; }
+    }
+    head='7: vb-5ea0e1194872@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue master br0 state UP mode DEFAULT group default qlen 1000
+    link/ether 2a:51:0c:7e:1b:93 brd ff:ff:ff:ff:ff:ff link-netnsid 1'
+    expect web "$head
+    alias lightbox:web" ours
+    expect web "$head
+    alias lightbox:web2" foreign
+    expect web "$head
+    alias lightbox:we" foreign
+    expect web "$head
+    alias lightbox:web " foreign
+    expect web "$head
+    alias something:web" foreign
+    expect web "$head" foreign
+    expect web "$head
+    altname enp0s31f6" foreign
+    expect web "$head
+    altname lightbox:web
+    alias lightbox:web" ours
+    return $bad
+}
+
+# A record of link rules names a chain of lightbox's, or nothing is done with it.
+t_link_chain_names() {
+    bad=0
+    for chain in LB-5ea0e1194872 LB-web LB-a LB-abcdefghijklmnopqrstuvwxy; do
+        [ "$("$UNIT" chain "$chain")" = ok ] || { echo "$chain was refused"; bad=1; }
+    done
+    for chain in '' LB- LB LIGHTBOX-LINKS FORWARD 'LB-a b' 'LB-a;b' LB-abcdefghijklmnopqrstuvwxyz '-j ACCEPT' 'LB-x
+-A FORWARD'; do
+        [ "$("$UNIT" chain "$chain")" = refused ] || { echo "'$chain' was taken"; bad=1; }
+    done
+    return $bad
+}
+
+# What iptables-restore is given for a container's links: a chain of its own,
+# a rule for each way of each link that names the two ports and no address,
+# and the jump to it.
+t_firewall_links_text() {
+    got=$("$UNIT" firewall links web db cache)
+    want='*filter
+:LB-5ea0e1194872 - [0:0]
+-A LB-5ea0e1194872 -m physdev --physdev-in vb-5ea0e1194872 --physdev-out vb-08914e07b53b -j ACCEPT
+-A LB-5ea0e1194872 -m physdev --physdev-in vb-08914e07b53b --physdev-out vb-5ea0e1194872 -j ACCEPT
+-A LB-5ea0e1194872 -m physdev --physdev-in vb-5ea0e1194872 --physdev-out vb-1c33d13ab5ec -j ACCEPT
+-A LB-5ea0e1194872 -m physdev --physdev-in vb-1c33d13ab5ec --physdev-out vb-5ea0e1194872 -j ACCEPT
+-A LIGHTBOX-LINKS -j LB-5ea0e1194872
+COMMIT'
+    [ "$got" = "$want" ] || { printf '%s\n' "$got"; return 1; }
+    # eight links of the longest names fit
+    long=abcdefghijklmnopqrstuvwxyz0123
+    got=$("$UNIT" firewall links "$long" "${long%?}1" "${long%?}2" "${long%?}3" "${long%?}4" \
+          "${long%?}5" "${long%?}6" "${long%?}7" "${long%?}8" | grep -c -- '--physdev-in')
+    [ "$got" = 16 ] || { echo "rules for eight links: $got"; return 1; }
+    # and a text that does not fit is no text
+    got=$("$UNIT" firewall links-into-64 web db)
+    [ "$got" = 'too long' ] || { echo "into 64 bytes: $got"; return 1; }
+}
+
+# firewall_backend = nftables: setup's two tables in one transaction. The
+# chains are flushed and filled again and the set of links is not, as its
+# elements are the running containers'. Between two ports of the bridge, the
+# pairs in links and nothing else; out of the bridge anything, and back what
+# belongs to it; the subnet masqueraded when ip_masq is true.
+t_nft_setup_text() {
+    got=$("$UNIT" firewall nft-setup 10.9.5.0/16 10.9.0.1 br7 true)
+    tab=$(printf '\t')
+    want="table ip lightbox {
+${tab}chain forward {
+${tab}${tab}type filter hook forward priority filter; policy accept;
+${tab}}
+${tab}chain postrouting {
+${tab}${tab}type nat hook postrouting priority srcnat; policy accept;
+${tab}}
+}
+flush chain ip lightbox forward
+flush chain ip lightbox postrouting
+add rule ip lightbox forward oifname \"br7\" ct state established,related accept
+add rule ip lightbox forward oifname \"br7\" iifname != \"br7\" drop
+add rule ip lightbox postrouting ip saddr 10.9.0.0/16 oifname != \"br7\" masquerade
+table bridge lightbox {
+${tab}set links {
+${tab}${tab}type ifname . ifname
+${tab}}
+${tab}chain forward {
+${tab}${tab}type filter hook forward priority filter; policy accept;
+${tab}}
+}
+flush chain bridge lightbox forward
+add rule bridge lightbox forward meta ibrname \"br7\" iifname . oifname @links accept
+add rule bridge lightbox forward meta ibrname \"br7\" drop"
+    [ "$got" = "$want" ] || { printf '%s\n' "$got"; return 1; }
+    got=$("$UNIT" firewall nft-setup 10.0.0.0/24 10.0.0.1 br0 false | grep -c masquerade)
+    [ "$got" = 0 ] || { echo "with ip_masq = false, masquerade rules: $got"; return 1; }
+    # bridge_accept_fwmark: accepted before anything is dropped, in both tables
+    got=$("$UNIT" firewall nft-setup 10.0.0.0/24 10.0.0.1 br0 true 0x10/0xf0 | grep -n 'mark')
+    [ "$got" = '11:add rule ip lightbox forward meta mark & 0xf0 == 0x10 accept
+24:add rule bridge lightbox forward meta mark & 0xf0 == 0x10 accept' ] || { printf '%s\n' "$got"; return 1; }
+    got=$("$UNIT" firewall nft-setup 10.0.0.0/24 10.0.0.1 br0 true 0x10 | grep 'mark' | head -n 1)
+    [ "$got" = 'add rule ip lightbox forward meta mark 0x10 accept' ] || { echo "a mark without a mask: $got"; return 1; }
+    # a bridge whose name would not stay between the quotes gets no rules
+    for br in 'br"0' 'br 0' 'br;0' 'abcdefghijklmnop' ''; do
+        got=$("$UNIT" firewall nft-setup 10.0.0.0/24 10.0.0.1 "$br" true)
+        [ "$got" = 'too long' ] || { echo "bridge '$br': $got"; return 1; }
+    done
+}
+
+# A container's links under nftables: a record of the pairs of ports, each
+# once, and from it the elements of the set, both ways of each pair. Removal
+# puts them in and takes them out again, so that what a peer took out already
+# does not stop it.
+t_nft_link_elements() {
+    got=$("$UNIT" firewall nft-record web db cache db web)
+    want='nftables
+vb-5ea0e1194872 vb-08914e07b53b
+vb-5ea0e1194872 vb-1c33d13ab5ec'
+    [ "$got" = "$want" ] || { echo "the record, with a link given twice and one to itself:"; printf '%s\n' "$got"; return 1; }
+    nl='
+'
+    got=$("$UNIT" nftlinks add "$want$nl")
+    elements='{ "vb-5ea0e1194872" . "vb-08914e07b53b", "vb-08914e07b53b" . "vb-5ea0e1194872", "vb-5ea0e1194872" . "vb-1c33d13ab5ec", "vb-1c33d13ab5ec" . "vb-5ea0e1194872" }'
+    [ "$got" = "add element bridge lightbox links $elements" ] || { printf '%s\n' "$got"; return 1; }
+    got=$("$UNIT" nftlinks remove "$want$nl")
+    [ "$got" = "add element bridge lightbox links $elements
+delete element bridge lightbox links $elements" ] || { printf '%s\n' "$got"; return 1; }
+    # a record of no link is nothing to do
+    got=$("$UNIT" nftlinks remove "nftables$nl")
+    [ -z "$got" ] || { echo "for a record of no link: $got"; return 1; }
+    # eight links of the longest names fit
+    long=abcdefghijklmnopqrstuvwxyz0123
+    record=$("$UNIT" firewall nft-record "$long" "${long%??}a1" "${long%??}a2" "${long%??}a3" "${long%??}a4" \
+             "${long%??}a5" "${long%??}a6" "${long%??}a7" "${long%??}a8")
+    got=$("$UNIT" nftlinks remove "$record$nl" | grep -o '" \. "' | wc -l)
+    [ "$got" = 32 ] || { echo "elements for eight links, put in and taken out: $got"; return 1; }
+}
+
+# A record that is not one lightbox writes is not given to nft: each line two
+# ports, as host_port_name names them, and a newline.
+t_nft_records_refused() {
+    nl='
+'
+    a=vb-5ea0e1194872 b=vb-08914e07b53b
+    bad=0
+    for record in "$a $b$nl" "nftables $a $b$nl" "nftables$nl$a $b" "nftables$nl$a  $b$nl" \
+                  "nftables$nl$a $b $b$nl" "nftables$nl$a$nl" "nftables$nl$a $a$nl" \
+                  "nftables$nl${a%?}A $b$nl" "nftables$nl${a%?} $b$nl" "nftables$nl$a ${b}0$nl" \
+                  "nftables$nl\"$a\" $b$nl" "nftables$nl$a $b$nl$nl" "nftables$nl$a $b$nl;$nl" \
+                  "nftables$nl$a vb-08914e07b5\" ;$nl" "NFTABLES$nl$a $b$nl" "LB-5ea0e1194872$nl"; do
+        got=$("$UNIT" nftlinks remove "$record")
+        [ "$got" = refused ] || { printf 'not refused: %s\n  gave: %s\n' "$record" "$got"; bad=1; }
+    done
+    for name in vb-5ea0e1194872 vb-000000000000; do
+        [ "$("$UNIT" portname "$name")" = ok ] || { echo "$name refused"; bad=1; }
+    done
+    for name in vb-5ea0e119487 vb-5ea0e11948720 vb-5EA0E1194872 ve-5ea0e1194872 'vb-5ea0e119487"' vb-web ''; do
+        [ "$("$UNIT" portname "$name")" = refused ] || { echo "$name taken for a port"; bad=1; }
+    done
+    return $bad
+}
+
+# bridge_accept_fwmark: a mark, or a mark and its mask, in decimal or hex,
+# that a packet can carry and nft reads as written.
+t_fwmarks() {
+    bad=0
+    expect() { # text, what parse_fwmark makes of it
+        got=$("$UNIT" fwmark "$1" | paste -sd' ' -)
+        [ "$got" = "$2" ] || { echo "'$1': $got, expected $2"; bad=1; }
+    }
+    expect 0x10 'mark 0x10 mask 0xffffffff as 0x10'
+    expect 16/0xf0 'mark 0x10 mask 0xf0 as 0x10/0xf0'
+    expect 0x1/0x3 'mark 0x1 mask 0x3 as 0x1/0x3'
+    expect 0xFFFFFFFF 'mark 0xffffffff mask 0xffffffff as 0xffffffff'
+    expect 4294967295 'mark 0xffffffff mask 0xffffffff as 0xffffffff'
+    # 0 is every unmarked packet's; a bit outside the mask, no packet's; a
+    # leading 0 is octal to nft
+    for text in 0 0x0 0/0xff 1/0 0x10/0x1 016 08 0x 0x123456789 4294967296 1/ /1 1/2/3 ' 1' '1 ' -1 +1 1x 0x1g ''; do
+        expect "$text" refused
+    done
+    return $bad
+}
+
+# What doctor and setup name as dropping what lightbox's nftables rules
+# accept: forward base chains whose policy is drop, in ip, inet and bridge.
+t_forward_drop_chains() {
+    listing='table ip filter {
+	chain INPUT {
+		type filter hook input priority filter; policy drop;
+	}
+	chain FORWARD {
+		type filter hook forward priority filter; policy drop;
+	}
+}
+table inet firewall {
+	chain fwd {
+		type filter hook forward priority 0; policy drop;
+	}
+	chain mine {
+	}
+}
+table inet open {
+	chain forward {
+		type filter hook forward priority filter; policy accept;
+	}
+}
+table ip6 filter {
+	chain FORWARD {
+		type filter hook forward priority filter; policy drop;
+	}
+}
+table bridge lightbox {
+	chain forward {
+		type filter hook forward priority filter; policy accept;
+	}
+}
+table bridge other {
+	chain forward {
+		type filter hook forward priority filter; policy drop;
+	}
+}'
+    got=$("$UNIT" dropping "$listing")
+    [ "$got" = 'chains 3
+ip filter FORWARD, inet firewall fwd, bridge other forward' ] || { printf '%s\n' "$got"; return 1; }
+    got=$("$UNIT" dropping 'table inet open {
+	chain forward {
+		type filter hook forward priority filter; policy accept;
+	}
+}')
+    [ "$got" = 'chains 0' ] || { printf '%s\n' "$got"; return 1; }
+}
+
+# What setup puts in its chains: between two ports of the bridge what a link
+# allows and nothing else; out by any interface but the bridge, and back what
+# belongs to that; masquerading of the subnet, as the network spells it, when
+# ip_masq is true.
+t_firewall_setup_text() {
+    got=$("$UNIT" firewall setup 10.9.5.0/16 10.9.0.1 br7 true)
+    want='*filter
+-F LIGHTBOX-FORWARD
+-A LIGHTBOX-FORWARD -i br7 -o br7 -j LIGHTBOX-LINKS
+-A LIGHTBOX-FORWARD -i br7 -o br7 -j DROP
+-A LIGHTBOX-FORWARD -i br7 ! -o br7 -j ACCEPT
+-A LIGHTBOX-FORWARD -o br7 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+COMMIT
+*nat
+-F LIGHTBOX-POSTROUTING
+-A LIGHTBOX-POSTROUTING -s 10.9.0.0/16 ! -o br7 -j MASQUERADE
+COMMIT'
+    [ "$got" = "$want" ] || { printf '%s\n' "$got"; return 1; }
+    got=$("$UNIT" firewall setup 10.0.0.0/24 10.0.0.1 br0 false | sed -n '/^\*nat/,$p')
+    [ "$got" = '*nat
+-F LIGHTBOX-POSTROUTING
+COMMIT' ] || { echo "with ip_masq = false:"; printf '%s\n' "$got"; return 1; }
+}
+
+t_limits() {
+    bad=0
+    expect() { # kind, text, expected
+        got=$("$UNIT" limit "$1" "$2")
+        [ "$got" = "$3" ] || { echo "$1 '$2': $got, expected $3"; bad=1; }
+    }
+    for text in 1 4096 268435456 64K 64k 256M 256m 1G 2g 1T 2t max 9223372036854775807 8589934591G 8388607T; do
+        expect mem "$text" ok
+    done
+    # the kernel would read a leading 0 as octal: 0100M is 64M to it
+    for text in '' 0 0100M 00 M 1P 1GB 1.5G -1 +1 ' 1G' '1G ' 'not-a-size' MAX 9223372036854775808 8589934592G 8388608T 99999999999999999999 '1G
+privileged=1'; do
+        expect mem "$text" refused
+    done
+    for text in 1 128 4194304 max; do expect pids "$text" ok; done
+    for text in '' 0 010 -1 4194305 123456789 12a 1.5 MAX '5
+'; do
+        expect pids "$text" refused
+    done
+    expect cpu 1 'quota 100000'
+    expect cpu 2 'quota 200000'
+    expect cpu 0.5 'quota 50000'
+    expect cpu 0.25 'quota 25000'
+    expect cpu 1.5 'quota 150000'
+    expect cpu 0.01 'quota 1000'
+    expect cpu 512 'quota 51200000'
+    expect cpu 02 'quota 200000'
+    for text in '' 0 0.0 0.00 0.001 0.125 .5 1. 1.x -1 +1 512.01 513 1024 1e3 abc '1 ' 1,5; do
+        expect cpu "$text" refused
+    done
+    expect oom 0 'score 0'
+    expect oom -1000 'score -1000'
+    expect oom 1000 'score 1000'
+    for text in '' abc 12abc 1001 -1001 1.5 ' 5'; do expect oom "$text" refused; done
+    # swap: what mem takes, or none
+    for text in 0 1 64M 1g max 8388607T; do expect swap "$text" ok; done
+    for text in '' 00 0100M -1 lots MAX '0 ' '64M
+mem=1G'; do expect swap "$text" refused; done
+    # a line of io.max for one disk, with numbers the kernel cannot read in another base
+    for text in '8:0 rbps=1048576' '8:0 wbps=max' '259:0 rbps=1 wbps=2 riops=3 wiops=4' '8:16 wiops=max riops=10' \
+                '4095:1048575 rbps=9223372036854775807'; do
+        expect io "$text" ok
+    done
+    for text in '' 8:0 '8:0 ' '8:0 rbps' '8:0 rbps=' '8:0 rbps=0' '8:0 rbps=01' '8:0 rbps=0x10' '8:0 xbps=1' \
+                '8:0 rbps=1 rbps=2' '8:0  rbps=1' '8:0 rbps=1 ' ' 8:0 rbps=1' '08:0 rbps=1' '8:00 rbps=1' \
+                '0:0 rbps=1' '4096:0 rbps=1' '8:1048576 rbps=1' '8 rbps=1' '8:0,rbps=1' '8:0 rbps=maximum' \
+                '8:0 rbps=9223372036854775808' '8:0 rbps=1
+privileged=1' 'a:b rbps=1'; do
+        expect io "$text" refused
+    done
+    return $bad
+}
+
+# The controllers a container's cgroup has: one that a limit needs is there
+# or the start is refused; one that is missing and not needed is said once.
+t_controllers() {
+    bad=0
+    expect() { # listed, mem, pids, swap, io, expected (with what was said before it)
+        got=$("$UNIT" controllers "$1" "$2" "$3" "$4" "$5" 2>&1 | paste -sd'|' -)
+        [ "$got" = "$6" ] || { echo "'$1' for mem $2 pids $3 swap $4 io '$5': $got"; echo "  expected $6"; bad=1; }
+    }
+    all='cpuset cpu io memory hugetlb pids rdma misc'
+    expect "$all" 256M 128 - - 'have memory pids cpu io'
+    expect "$all" 256M 128 64M '8:0 rbps=1' 'have memory pids cpu io'
+    # without io: a container without an I/O limit is told once, one with one is refused
+    expect 'cpuset cpu memory pids' 256M 128 - - "Warning: the container's cgroup has no io controller; the container has no I/O limit that needs it|have memory pids cpu"
+    expect 'cpuset cpu memory pids' 256M 128 - '8:0 rbps=1' "refused: the container's cgroup has no io controller, and the container has an I/O limit"
+    # cpuset is not cpu, nor is a name with more to it
+    expect 'cpuset memory pids io' 256M 128 - - "refused: the container's cgroup has no cpu controller, and every container has a CPU limit"
+    expect 'cpuacct memory pids io' 256M 128 - - "refused: the container's cgroup has no cpu controller, and every container has a CPU limit"
+    # memory, for a memory limit or a swap limit that was given; not for the 0 of no --swap
+    expect 'cpu io pids' 256M 128 - - "refused: the container's cgroup has no memory controller, and the container has a memory or a swap limit"
+    expect 'cpu io pids' max 128 1G - "refused: the container's cgroup has no memory controller, and the container has a memory or a swap limit"
+    expect 'cpu io pids' max 128 0 - "refused: the container's cgroup has no memory controller, and the container has a memory or a swap limit"
+    expect 'cpu io pids' max 128 - - "Warning: the container's cgroup has no memory controller: nothing keeps the container from swapping|have pids cpu io"
+    expect 'cpu io pids' max 128 max - "Warning: the container's cgroup has no memory controller: nothing keeps the container from swapping|have pids cpu io"
+    # pids, for a process limit
+    expect 'cpu io memory' 256M 128 - - "refused: the container's cgroup has no pids controller, and the container has a process limit"
+    expect 'cpu io memory' 256M max - - "Warning: the container's cgroup has no pids controller; the container has no process limit that needs it|have memory cpu io"
+    # a refusal says nothing of what else is missing, not before it either
+    expect 'cpu memory' 256M max - '8:0 rbps=1' "refused: the container's cgroup has no io controller, and the container has an I/O limit"
+    # two missing, two warnings, and a list with a newline at its end as the kernel writes it
+    expect 'cpu memory
+' max max - - "Warning: the container's cgroup has no pids controller; the container has no process limit that needs it|Warning: the container's cgroup has no io controller; the container has no I/O limit that needs it|have memory cpu"
+    return $bad
+}
+
+# ─── A container's configuration ────────────────────────────────────────────
+
+# Runs a function with $D as a directory of containers that holds one, "web".
+in_config_dir() { # function
+    D=$(mktemp -d "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    mkdir "$D/web"
+    ( "$1" )
+    rc=$?
+    rm -rf -- "$D"
+    return $rc
+}
+config()  { "$UNIT" config "$D" web "$@"; }
+written() { "$UNIT" config-write "$D" web "$@"; }
+
+config_as_written() {
+    {
+        echo 'version=1'
+        echo 'mem=512M'
+        echo 'pids=64'
+        echo 'cpu=0.5'
+        echo 'oom_score=-300'
+        echo 'privileged=1'
+        echo 'readonly=1'
+        echo 'io=8:0 rbps=1048576'
+        echo 'swap=1G'
+        echo 'vol=/srv/data:/data'
+        echo 'vol=/etc/app.conf:/etc/app.conf:ro'
+        echo 'link=db'
+        echo 'link=cache'
+    } > "$D/web/.conf"
+    got=$(config)
+    want='version 1
+mem 512M
+pids 64
+cpu 0.5
+oom_score -300
+privileged 1
+readonly 1
+userns 0
+uid_start 0
+io 8:0 rbps=1048576
+swap 1G
+vol /srv/data -> /data rw
+vol /etc/app.conf -> /etc/app.conf ro
+link db
+link cache'
+    printf '%s\n' "$got"
+    [ "$got" = "$want" ]
+}
+t_config_is_read_whole() { in_config_dir config_as_written; }
+
+# What a file does not say is what lightbox.conf says, and a file may say
+# nothing at all.
+config_defaults() {
+    : > "$D/web/.conf"
+    got=$(config)
+    printf '%s\n' "$got"
+    [ "$got" = 'version 0
+mem 256M
+pids 128
+cpu 1
+oom_score 500
+privileged 0
+readonly 0
+userns 0
+uid_start 0
+io -
+swap -' ] || return 1
+    # a default that cannot be used is no default: the file must have the limit
+    got=$(config nodefaults)
+    printf '%s\n' "$got"
+    case $got in 'refused: '*"$D/web/.conf"*'default_mem') ;; *) return 1 ;; esac
+    printf 'version=1\nmem=1G\npids=max\ncpu=2\noom_score=0\n' > "$D/web/.conf"
+    got=$(config nodefaults)
+    printf '%s\n' "$got"
+    case $got in 'version 1
+mem 1G
+pids max
+cpu 2
+oom_score 0
+'*) ;; *) return 1 ;; esac
+    # each limit by itself: the file lacks it, and its default is the one named
+    for missing in mem pids cpu oom_score; do
+        printf 'version=1\nmem=1G\npids=max\ncpu=2\noom_score=0\n' | grep -v "^$missing=" > "$D/web/.conf"
+        got=$(config nodefaults)
+        setting=default_${missing%_score}
+        case $got in 'refused: '*": $setting") ;; *) echo "without $missing: $got"; return 1 ;; esac
+        got=$(config)
+        case $got in 'version 1'*) ;; *) echo "without $missing, and a default: $got"; return 1 ;; esac
+    done
+    # and no file is not an empty file
+    rm "$D/web/.conf"
+    got=$(config)
+    printf '%s\n' "$got"
+    case $got in 'refused: '*'cannot be read') ;; *) return 1 ;; esac
+}
+t_config_defaults() { in_config_dir config_defaults; }
+
+# A file with the version line is lightbox's own writing: whatever in it is
+# not what lightbox writes means the file is damaged, and is said with the
+# line it is on.
+config_strict() {
+    bad=0
+    refuses() { # what the message must say, then the file's lines
+        want=$1; shift
+        printf '%s\n' "$@" > "$D/web/.conf"
+        got=$(config)
+        # shellcheck disable=SC2254     # $want is a pattern, and is meant as one
+        case $got in "refused: $D/web/.conf: "$want) ;; *) echo "expected '$want', got: $got"; bad=1 ;; esac
+    }
+    refuses 'line 2: a key lightbox does not know'      version=1 colour=blue
+    refuses 'line 3: is not key=value'                  version=1 mem=1G junk
+    refuses 'line 3: a key the file already has'        version=1 mem=1G mem=2G
+    refuses 'line 2: mem is not *'                      version=1 mem=lots
+    refuses 'line 2: mem is not *'                      version=1 mem=0100M
+    refuses 'line 2: pids is not *'                     version=1 pids=123456789
+    refuses 'line 2: cpu is not *'                      version=1 cpu=1024
+    refuses 'line 2: oom_score is not *'                version=1 oom_score=12abc
+    refuses 'line 2: swap is not *'                     version=1 swap=lots
+    refuses 'line 2: swap is not *'                     version=1 swap=064M
+    refuses 'line 3: a key the file already has'        version=1 swap=1G swap=2G
+    refuses 'line 2: io is not *'                       version=1 io=8:0
+    refuses 'line 2: io is not *'                       version=1 'io=8:0 rbps=010'
+    refuses 'line 2: io is not *'                       version=1 'io=8:0 rbps=1 rbps=2'
+    refuses 'line 2: privileged is not 0 or 1'          version=1 privileged=yes
+    refuses 'line 2: readonly is not 0 or 1'            version=1 readonly=2
+    refuses 'line 2: the link is not the name of a container' version=1 'link=a b'
+    refuses 'line 2: the link is not the name of a container' version=1 link=a-name-of-thirty-one-characters
+    refuses 'line 2: *absolute path without ..'         version=1 vol=/srv:/a/../b
+    refuses 'line 2: a volume is written src:dst*'      version=1 vol=/srv
+    refuses 'line 2: *only :ro may follow'              version=1 vol=/srv:/data:rw
+    refuses 'line 2: *may not be under /proc*'          version=1 vol=/srv:/proc/sys
+    refuses 'line 2: the version is not the first line' mem=1G version=1
+    refuses 'line 1: the version is not a number'       version=one
+    refuses 'line 1: the version is not a number'       version=0
+    refuses 'line 1: was written by a newer lightbox*'  version=2 mem=1G
+    # a carriage return is a control character like any other
+    printf 'version=1\r\nmem=1G\r\n' > "$D/web/.conf"
+    got=$(config)
+    case $got in "refused: $D/web/.conf: line 1: has a control character") ;; *) echo "CRLF: $got"; bad=1 ;; esac
+    # what follows a NUL byte would never be read
+    printf 'version=1\nmem=1G\n\0privileged=1\n' > "$D/web/.conf"
+    got=$(config)
+    case $got in "refused: $D/web/.conf: has a NUL byte") ;; *) echo "NUL: $got"; bad=1 ;; esac
+    # more volumes and links than a container has
+    { echo version=1; for i in $(seq 1 17); do echo "vol=/srv:/v$i"; done; } > "$D/web/.conf"
+    got=$(config)
+    case $got in "refused: $D/web/.conf: line 18: more than 16 volumes") ;; *) echo "17 volumes: $got"; bad=1 ;; esac
+    { echo version=1; for i in $(seq 1 9); do echo "link=c$i"; done; } > "$D/web/.conf"
+    got=$(config)
+    case $got in "refused: $D/web/.conf: line 10: more than 8 links") ;; *) echo "9 links: $got"; bad=1 ;; esac
+    # a file too large to be a configuration
+    { echo version=1; head -c 30000 /dev/zero | tr '\0' '\n'; } > "$D/web/.conf"
+    got=$(config)
+    case $got in "refused: $D/web/.conf: is larger than lightbox supports") ;; *) echo "large: $got"; bad=1 ;; esac
+    # the line that is named is the line an editor shows, empty ones counted
+    refuses 'line 5: a key lightbox does not know'      version=1 '' mem=1G '' colour=blue
+    # empty lines are no lines
+    printf '\nversion=1\n\nmem=1G\n\n' > "$D/web/.conf"
+    got=$(config)
+    case $got in 'version 1
+mem 1G
+'*) ;; *) echo "empty lines: $got"; bad=1 ;; esac
+    return $bad
+}
+t_config_is_read_strictly() { in_config_dir config_strict; }
+
+# A file from before the version line is read as it was read then: the first
+# of two values counts, and what lightbox does not know is passed over. What
+# it does know still has to be a value.
+config_from_before() {
+    {
+        echo 'mem=512M'
+        echo 'pids=64'
+        echo 'cpu=2'
+        echo 'a line that is no setting'
+        echo 'colour=blue'
+        echo 'mem=1G'
+        echo 'privileged=1'
+        echo 'oom_score=100'
+        echo 'vol=/srv/data//:/data/'
+        echo 'vol=/srv/other:/data'
+        echo 'link=db'
+    } > "$D/web/.conf"
+    got=$(config)
+    printf '%s\n' "$got"
+    [ "$got" = 'version 0
+mem 512M
+pids 64
+cpu 2
+oom_score 100
+privileged 1
+readonly 0
+userns 0
+uid_start 0
+io -
+swap -
+vol /srv/data -> /data rw
+vol /srv/other -> /data rw
+link db' ] || return 1
+    printf 'mem=lots\n' > "$D/web/.conf"
+    got=$(config)
+    printf '%s\n' "$got"
+    case $got in "refused: $D/web/.conf: line 1: mem is not "*) ;; *) return 1 ;; esac
+    printf 'cpu=1\nversion=1\n' > "$D/web/.conf"
+    got=$(config)
+    printf '%s\n' "$got"
+    case $got in "refused: $D/web/.conf: line 2: the version is not the first line") ;; *) return 1 ;; esac
+}
+t_config_from_before_the_version_line() { in_config_dir config_from_before; }
+
+# What is written is what is read back, and a value that would be read back
+# as anything else is not written at all. No command lets such a value in;
+# this is the writer's own refusal, for the day one does.
+config_written() {
+    bad=0
+    got=$(written mem=1G swap=64M pids=max cpu=0.25 'io=8:0 wbps=1024' src=/srv/data dst=/data link=db)
+    [ "$got" = written ] || { echo "a good configuration: $got"; bad=1; }
+    cat "$D/web/.conf"
+    [ "$(cat "$D/web/.conf")" = 'version=1
+mem=1G
+swap=64M
+pids=max
+cpu=0.25
+oom_score=500
+io=8:0 wbps=1024
+vol=/srv/data:/data
+link=db' ] || { echo "the file is not what was put in"; bad=1; }
+    [ "$(stat -c %a "$D/web/.conf")" = 600 ] || { echo "the file's mode is $(stat -c %a "$D/web/.conf")"; bad=1; }
+    got=$(config | tr '\n' ' ')
+    case $got in 'version 1 mem 1G pids max cpu 0.25 oom_score 500 '*'io 8:0 wbps=1024 swap 64M vol /srv/data -> /data rw link db ') ;;
+        *) echo "read back: $got"; bad=1 ;; esac
+
+    before=$(cat "$D/web/.conf")
+    nl='
+'
+    for value in "mem=1G${nl}privileged=1" "pids=5${nl}cpu=9" "cpu=1${nl}mem=1G" \
+                 "io=8:0 rbps=1${nl}privileged=1" "link=db${nl}cpu=9" \
+                 "src=/srv${nl}privileged=1" "src=/srv:/etc"; do
+        case $value in src=*) got=$(written "$value" dst=/data) ;; *) got=$(written "$value") ;; esac
+        case $got in 'refused: '*) ;; *) echo "written with ${value%%=*} of two lines or two paths: $got"; bad=1 ;; esac
+    done
+    got=$(written src=/srv "dst=/data${nl}privileged=1")
+    case $got in 'refused: '*) ;; *) echo "written with a destination of two lines: $got"; bad=1 ;; esac
+    got=$(written src=/srv dst=/data:ro)
+    case $got in 'refused: '*) ;; *) echo "written with a colon in a destination: $got"; bad=1 ;; esac
+    # a value that the reader takes back shorter, which only the comparison sees
+    got=$(written "swap=64M${nl}")
+    case $got in 'refused: '*) ;; *) echo "written with a swap that ends in a newline: $got"; bad=1 ;; esac
+    got=$(written "mem=1G$(printf '\r')")
+    case $got in 'refused: '*) ;; *) echo "written with a carriage return: $got"; bad=1 ;; esac
+    # values that are one line and still not what a reader takes, or takes as they are
+    for value in mem=lots mem=0100M mem= pids=0 pids= cpu=1024 cpu= 'link=a b' link= swap=lots swap=00 \
+                 io=8:0 'io=8:0 rbps=01' 'io=8:0 xbps=1' \
+                 src=/srv/ src=/srv/../etc src=srv src=/proc/1; do
+        case $value in src=*) got=$(written "$value" dst=/data) ;; *) got=$(written "$value") ;; esac
+        case $got in 'refused: '*) ;; *) echo "written with $value: $got"; bad=1 ;; esac
+    done
+    for value in dst=/data/ dst=/ dst=/proc/x dst=/a/../b dst=data; do
+        got=$(written src=/srv "$value")
+        case $got in 'refused: '*) ;; *) echo "written with $value: $got"; bad=1 ;; esac
+    done
+    # two volumes at one place are refused where one is added, not here: a
+    # container from before can have them, and its file is written all the same
+    got=$(written src=/srv dst=/data src=/other dst=/data)
+    [ "$got" = written ] || { echo "two volumes at one place: $got"; bad=1; }
+    got=$(written mem=1G swap=64M pids=max cpu=0.25 'io=8:0 wbps=1024' src=/srv/data dst=/data link=db)
+    [ "$got" = written ] || { echo "the good configuration again: $got"; bad=1; }
+    [ "$(cat "$D/web/.conf")" = "$before" ] || { echo "a refused configuration changed the file"; bad=1; }
+    for left in "$D/web"/.[!.]* "$D/web"/*; do
+        [ -e "$left" ] || continue
+        [ "$left" = "$D/web/.conf" ] || { echo "left beside the file: $left"; bad=1; }
+    done
+    return $bad
+}
+t_config_is_written_as_it_will_be_read() { in_config_dir config_written; }
+
+# One reader and one writer: nothing else opens a .conf, and nothing else
+# knows what is in one.
+t_conf_has_one_reader() {
+    src=$HERE/..
+    bad=0
+    users=$(grep -l 'container_conf_path(' "$src"/lightbox*.c | xargs -n1 basename | sort | tr '\n' ' ')
+    echo "container_conf_path is called in: $users"
+    [ "$users" = 'lightbox_container.c lightbox_meta.c lightbox_state.c ' ] || { echo "expected the reader and writer, inspect (which prints the path) and the definition"; bad=1; }
+    # inspect names the file and does not read it
+    grep -n 'conf_path' "$src/lightbox_meta.c" | grep -v 'container_conf_path(conf_path, name)\|print_kv("config_path", conf_path)\|char cdir' && { echo "lightbox_meta.c does more with the path than print it"; bad=1; }
+    for file in "$src"/lightbox.c "$src"/lightbox_meta.c "$src"/lightbox_state.c "$src"/lightbox_net.c \
+                "$src"/lightbox_config.c "$src"/lightbox_util.c; do
+        if grep -nE '"(vol|link|mem|pids|cpu|oom_score|privileged|readonly|userns|uid_start|version)="|conf_get|container_conf_read' "$file" /dev/null; then
+            echo "$(basename "$file") looks into a .conf's text"; bad=1
+        fi
+    done
+    # and the helpers that cut are gone
+    grep -n 'str_append_whole\|[^a-z_]parse_int(' "$src"/lightbox*.c "$src"/lightbox.h && { echo "a helper that cuts text or reads half a number is still there"; bad=1; }
+    return $bad
+}
+
+# ─── A container that ended without a stop ──────────────────────────────────
+
+# Init says how it ends, where the command that comes next finds it: 0 when
+# it was asked to stop, something else when its hook failed, and nothing at
+# all when it was killed. While it lives no process it starts can look into
+# it, which keeps the files it holds open on the host its own.
+h_init_reports_its_end() {
+    UNIT_EXIT="$D/exit" handshake whole confined 5 - -
+    echo "asked to stop, init wrote: $(cat "$D/exit")"
+    [ "$(story)" = "ready hook 0 sent SIGTERM init-exit 0" ] && [ "$(cat "$D/exit")" = 0 ] || return 1
+
+    printf 'exit 3\n' > "$D/hook"
+    UNIT_EXIT="$D/exit" handshake whole confined 5 "$D/hook" -
+    echo "after a hook that failed, init wrote: $(cat "$D/exit")"
+    [ "$(story)" = "ready hook 3 init-exit 1" ] && [ "$(cat "$D/exit")" = 1 ] || return 1
+
+    # What init starts cannot get at the files init has open, which are files
+    # of the host: not by asking where one of init's descriptors leads, and
+    # not by opening it. The hook is such a process. /proc is the host's
+    # here, so the hook finds init there as its parent. That init has such
+    # descriptors can be seen, which is no more than their numbers.
+    {
+        # read by the shell itself: a program run for it would name the shell as its parent
+        echo 'while read -r key value; do [ "$key" = PPid: ] && init=$value; done < /proc/self/status'
+        echo 'echo "the hook sees init as process $init"'
+        echo "{"
+        echo "    if readlink /proc/\$init/fd/1 >/dev/null 2>&1; then echo 'read where it leads'; else echo 'not told where it leads'; fi"
+        echo "    if ( : < /proc/\$init/fd/1 ) 2>/dev/null; then echo 'opened it'; else echo 'not let open it'; fi"
+        echo "    if ( : < /proc/\$init/environ ) 2>/dev/null; then echo 'opened its environment'; else echo 'not let see its environment'; fi"
+        echo "} > $D/look"
+    } > "$D/hook"
+    UNIT_EXIT="$D/exit" handshake whole confined 5 "$D/hook" -
+    echo "the hook, at init's first descriptor: $(paste -sd, "$D/look")"
+    seen=$(printf '%s\n' "$out" | sed -n 's/^the hook sees init as process //p')
+    [ -n "$seen" ] && [ "$seen" = "$(printf '%s\n' "$out" | sed -n 's/^init //p')" ] ||
+        { echo "the hook looked at process '$seen', which is not init"; return 1; }
+    out=$(printf '%s\n' "$out" | grep -v '^the hook sees init')
+    [ "$(story)" = "ready hook 0 sent SIGTERM init-exit 0" ] &&
+    [ "$(paste -sd, "$D/look")" = 'not told where it leads,not let open it,not let see its environment' ] || return 1
+
+    # The next start empties the record before init can write it. Init stays
+    # here, and with it whatever it writes to: so its output goes to a file,
+    # as no pipe would end before init does.
+    UNIT_EXIT="$D/exit" handshake_begins leave confined 5 - -
+    handshake_ends
+    pid=$(printf '%s\n' "$out" | sed -n 's/^init //p')
+    [ -n "$pid" ] || { echo "the command did not say which process init is"; return 1; }
+    kill -0 "$pid" 2>/dev/null || { echo "init is not there to be looked at"; return 1; }
+    bad=0
+    [ ! -s "$D/exit" ] || { echo "a start kept the record of the run before: $(cat "$D/exit")"; bad=1; }
+    kill -KILL "$pid"
+    wait_for 5 gone "$pid" || { echo "init $pid survived SIGKILL"; return 1; }
+    echo "killed, init wrote: '$(cat "$D/exit")'"
+    [ ! -s "$D/exit" ] || { echo "an init that was killed left a report"; bad=1; }
+    return $bad
+}
+gone() { ! kill -0 "$1" 2>/dev/null; }
+
+# The records of a container that runs are in run_dir, which a reboot empties:
+# the first record after one makes the directory again, for root alone. The
+# container's own directory there has to be a directory, and no link to one.
+run_dir_cases() {
+    recorded() { result_of "$("$UNIT" record "$@" 2>"$D/err")"; }
+    # run_dir is not there, and neither is what it is in
+    [ "$(recorded "$D/a/b/run" web starting)" = 0 ] || { cat "$D/err"; return 1; }
+    echo "run_dir $(stat -c %a "$D/a/b/run"), the container's directory $(stat -c %a "$D/a/b/run/web"), the record $(stat -c %a "$D/a/b/run/web/state")"
+    [ "$(stat -c %a "$D/a/b/run")" = 700 ] && [ "$(stat -c %a "$D/a/b/run/web")" = 700 ] &&
+    [ "$(stat -c %a "$D/a/b/run/web/state")" = 600 ] && [ "$(cat "$D/a/b/run/web/state")" = starting ] || return 1
+    # a second record replaces the first, and leaves nothing beside it
+    [ "$(recorded "$D/a/b/run" web running)" = 0 ] && [ "$(cat "$D/a/b/run/web/state")" = running ] &&
+    [ "$(ls -A "$D/a/b/run/web")" = state ] || { echo "left: $(ls -A "$D/a/b/run/web")"; return 1; }
+    # a run_dir that is there is left as it is
+    mkdir -m 755 "$D/open"
+    [ "$(recorded "$D/open" web starting)" = 0 ] && [ "$(stat -c %a "$D/open")" = 755 ] && [ "$(stat -c %a "$D/open/web")" = 700 ] || return 1
+    # where the container's directory should be there is a link, or a file
+    mkdir "$D/run" "$D/elsewhere"
+    ln -s "$D/elsewhere" "$D/run/linked"
+    : > "$D/run/file"
+    [ "$(recorded "$D/run" linked starting)" = -1 ] && [ -z "$(ls -A "$D/elsewhere")" ] || { echo "a record was written through a link"; return 1; }
+    cat "$D/err"
+    [ "$(recorded "$D/run" file starting)" = -1 ] || { echo "a file was taken for the container's directory"; return 1; }
+}
+t_run_dir_is_made_when_missing() { in_config_dir run_dir_cases; }
+
+# The mark of a half-made container is removed to stay removed. A file that
+# is gone already is removed; one that cannot be removed is said to be there.
+remove_cases() {
+    removed() { result_of "$("$UNIT" remove "$1")"; }
+    : > "$D/mark"
+    [ "$(removed "$D/mark")" = 0 ] && [ ! -e "$D/mark" ] || { echo "a file was not removed"; return 1; }
+    [ "$(removed "$D/mark")" = 0 ] || { echo "a file that is gone is an error"; return 1; }
+    mkdir "$D/dir"
+    [ "$(removed "$D/dir")" = -1 ] && [ -d "$D/dir" ] || { echo "a directory was taken for a file"; return 1; }
+    [ "$(removed "$D/nowhere/mark")" = -1 ] || { echo "a file in no directory was reported as removed for good"; return 1; }
+}
+t_remove_durably() { in_config_dir remove_cases; }
+
+# What start, stop and rm do first about a container that ended without a
+# stop. The container here has no cgroup, no interface and no links, so what
+# is seen is what goes on record. Its name is one no real container has: the
+# interface that is looked for is called after it.
+REC=zz-unit-rec
+in_records_dir() { # function
+    D=$(mktemp -d "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    mkdir -p "$D/c/$REC" "$D/run"
+    printf 'version=1\nmem=1G\npids=max\ncpu=1\noom_score=0\n' > "$D/c/$REC/.conf"
+    ( "$1" )
+    rc=$?
+    rm -rf -- "$D"
+    return $rc
+}
+reconciled() { "$UNIT" reconcile "$D/c" "$D/run" "$REC" 2>"$D/err"; }
+a_pid_that_is_gone() { sleep 0 & wait $!; echo $!; }
+records() { # pid | -, state | -, what init said | -
+    rm -rf -- "$D/run/$REC"
+    mkdir -p "$D/run/$REC"
+    [ "$1" = - ] || { printf '%s' "$1" > "$D/run/$REC/pid"; printf '1' > "$D/run/$REC/pid_start"; }
+    [ "$2" = - ] || printf '%s\n' "$2" > "$D/run/$REC/state"
+    [ "$3" = - ] || printf '%s\n' "$3" > "$D/run/$REC/exit"
+}
+expect_reconciled() { # what it says, the state after
+    got=$(reconciled)
+    [ "$got" = "$1
+state $2" ] || { echo "expected '$1' and state $2, got: $got"; cat "$D/err"; return 1; }
+}
+reconcile_cases() {
+    RD="$D/run/$REC"
+    # nothing on record: nothing to do, and nothing is made
+    expect_reconciled nothing stopped && [ ! -e "$RD" ] || return 1
+
+    # an init that is gone and said that it ended with 0
+    records "$(a_pid_that_is_gone)" running 0
+    expect_reconciled cleared exited || return 1
+    cat "$D/err"
+    grep -q "had stopped by itself" "$D/err" || { echo "it does not say what it found"; return 1; }
+    [ ! -e "$RD/pid" ] && [ ! -e "$RD/pid_start" ] && [ ! -e "$RD/exit" ] || { echo "records are left: $(ls -A "$RD")"; return 1; }
+    # and a second time there is nothing more to do: the state stays
+    expect_reconciled nothing exited || return 1
+
+    # one that said anything else, or nothing, or was never able to say
+    for said in 1 137 - '' 0x 256 -0 '0 0' zero; do
+        records "$(a_pid_that_is_gone)" running "$said"
+        expect_reconciled cleared failed || { echo "  after init said '$said'"; return 1; }
+        grep -q "had ended without a stop" "$D/err" || { echo "it does not say what it found, for '$said'"; return 1; }
+    done
+
+    # a command that died in the middle: the record says it was at work, and
+    # with the lock held nothing is
+    for state in starting stopping running; do
+        records - "$state" -
+        expect_reconciled cleared failed || { echo "  for a record that says $state"; return 1; }
+    done
+    # a record that says it is at rest is left alone
+    for state in failed exited; do
+        records - "$state" -
+        expect_reconciled nothing "$state" || return 1
+    done
+    rm -rf -- "$RD"
+    : > "$D/c/$REC/.creating"
+    expect_reconciled nothing creating || return 1
+    rm "$D/c/$REC/.creating"
+
+    # A container that a lightbox before 0.5 started has its records in its
+    # own directory. They are read from there, and go when it is cleared away.
+    rm -rf -- "$RD"
+    printf '%s' "$(a_pid_that_is_gone)" > "$D/c/$REC/.pid"
+    printf '1' > "$D/c/$REC/.pid_start"
+    printf 'running\n' > "$D/c/$REC/.state"
+    expect_reconciled cleared failed || { echo "  for records in the place they had before"; return 1; }
+    [ "$(ls -A "$D/c/$REC")" = .conf ] || { echo "old records are left: $(ls -A "$D/c/$REC" | tr '\n' ' ')"; return 1; }
+    [ "$(cat "$RD/state")" = failed ] || return 1
+    # with records in both places, the old ones are not looked at
+    printf 'running\n' > "$D/c/$REC/.state"
+    expect_reconciled nothing failed || return 1
+    rm "$D/c/$REC/.state"
+
+    # an init that is there is not touched, whatever the record says. Only an
+    # ordinary user can stand in for one here: root sees that this shell is
+    # in no PID namespace of its own.
+    if [ "$(id -u)" -ne 0 ]; then
+        records $$ stopping 0
+        awk '{ printf "%s", $22 }' /proc/$$/stat > "$RD/pid_start"
+        expect_reconciled nothing stopping && [ "$(cat "$RD/pid")" = $$ ] && [ "$(cat "$RD/exit")" = 0 ] || return 1
+    fi
+}
+t_reconcile() { in_records_dir reconcile_cases; }
 
 check 'a program that succeeds gives 0'                          t_success
 check 'a non-zero exit status is returned as it is'              t_exit_status
@@ -1560,5 +2583,34 @@ check 'exec'"'"'s options are checked, and a missing value names its option' t_c
 check 'a number of seconds is digits within the limit'           t_seconds
 check 'a file never gets the number of a closed standard stream' t_standard_streams_are_reserved
 check 'cmd_start has one way out once it has changed the host'   t_start_has_one_way_out
+
+check 'text is put into a buffer whole or not at all'            t_text_is_whole_or_refused
+check 'a number is digits in its range, and never wraps'         t_numbers_are_strict
+check 'memory, process, CPU and OOM limits are what they say'    t_limits
+check 'a cgroup without a controller: refused when a limit needs it, said when not' t_controllers
+check 'a program gets its input whole, read or not, and too much is refused' t_program_input
+check 'a container is vb- and LB- with twelve digits of its name'"'"'s hash on the host' t_host_names
+check 'an interface is lightbox'"'"'s for a container only with its alias' t_interface_owner
+check 'a record of link rules names a chain of lightbox'"'"'s or is refused' t_link_chain_names
+check 'a container'"'"'s link rules are a chain of its own, by port and not address' t_firewall_links_text
+check 'setup'"'"'s rules: links between ports, out by any interface, masquerade if set' t_firewall_setup_text
+check 'nftables: setup'"'"'s two tables, flushed chains, a set of links that is kept' t_nft_setup_text
+check 'nftables: a container'"'"'s links are elements of the set, each once, taken out safely' t_nft_link_elements
+check 'nftables: a record that is not lightbox'"'"'s is not given to nft'  t_nft_records_refused
+check 'bridge_accept_fwmark: a mark nft reads as written, and none that matches all' t_fwmarks
+check 'the forward chains that drop what nothing accepts are named'      t_forward_drop_chains
+check 'an address is four numbers and three dots, and no zero in front' t_addresses_are_strict
+check 'subnet and gw are one network, and an address on it is one a container can have' t_network_settings
+check 'no prefix is written into the source: subnet gives it'      t_no_prefix_of_its_own
+check 'a .conf is read into one structure, whole'                t_config_is_read_whole
+check 'what a .conf leaves out is the default, if that is usable' t_config_defaults
+check 'a .conf with a version is read strictly, by line'         t_config_is_read_strictly
+check 'a .conf from before the version line is still read'       t_config_from_before_the_version_line
+check 'a .conf is written as it will be read, or not written'    t_config_is_written_as_it_will_be_read
+check 'one file reads and writes a .conf, and none looks into it' t_conf_has_one_reader
+check 'a runtime record makes its directory when a reboot took it'  t_run_dir_is_made_when_missing
+check 'a file is removed for good, or said not to be'             t_remove_durably
+check 'init says how it ends, and nothing it starts can look into it' t_init_reports_its_end
+check 'a container that ended without a stop is cleared away, and how it ended recorded' t_reconcile
 
 summary unit

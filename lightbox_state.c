@@ -1,55 +1,166 @@
 #include "lightbox.h"
 
+/*
+ * Where a container's files are. Each of these fits MAX_PATH: a container's
+ * name is short, and the settings are refused when they are read if they are
+ * so long that one of these paths would not fit (cfg_global_load). Should
+ * one not fit all the same, the process ends here; no path is ever cut.
+ */
 void container_dir_path(char *buf, const char *name) {
-    path_join(buf, MAX_PATH, cfg_global.container_dir, name);
+    path_join_or_die(buf, MAX_PATH, cfg_global.container_dir, name);
 }
 
 void container_root(char *buf, const char *name) {
     char base[MAX_PATH];
     container_dir_path(base, name);
-    path_join(buf, MAX_PATH, base, "rootfs");
-}
-
-void container_pid_path(char *buf, const char *name) {
-    char base[MAX_PATH];
-    container_dir_path(base, name);
-    path_join(buf, MAX_PATH, base, ".pid");
-}
-
-void container_pid_start_path(char *buf, const char *name) {
-    char base[MAX_PATH];
-    container_dir_path(base, name);
-    path_join(buf, MAX_PATH, base, ".pid_start");
+    path_join_or_die(buf, MAX_PATH, base, "rootfs");
 }
 
 void container_ip_path(char *buf, const char *name) {
     char base[MAX_PATH];
     container_dir_path(base, name);
-    path_join(buf, MAX_PATH, base, ".ip");
+    path_join_or_die(buf, MAX_PATH, base, ".ip");
 }
 
 void container_conf_path(char *buf, const char *name) {
     char base[MAX_PATH];
     container_dir_path(base, name);
-    path_join(buf, MAX_PATH, base, ".conf");
+    path_join_or_die(buf, MAX_PATH, base, ".conf");
 }
 
 void container_log_path(char *buf, const char *name) {
     char base[MAX_PATH];
     container_dir_path(base, name);
-    path_join(buf, MAX_PATH, base, "console.log");
+    path_join_or_die(buf, MAX_PATH, base, "console.log");
 }
 
-void container_state_path(char *buf, const char *name) {
+/* A mark that create has not finished with the container. It is in the
+ * container's directory, written to stay: a container that is half made is
+ * still half made after a reboot. */
+void container_creating_path(char *buf, const char *name) {
     char base[MAX_PATH];
     container_dir_path(base, name);
-    path_join(buf, MAX_PATH, base, ".state");
+    path_join_or_die(buf, MAX_PATH, base, ".creating");
+}
+
+/*
+ * The records of a container that is running, or was: <run_dir>/<name>/ with
+ * the PID of its init, that process's start time, the state of the container
+ * and what init said when it ended. They are of no use after a reboot, which
+ * ends every container, so they are kept where a reboot takes them away,
+ * and are written without waiting for a disk.
+ */
+void container_run_path(char *buf, const char *name) {
+    path_join_or_die(buf, MAX_PATH, cfg_global.run_dir, name);
+}
+
+static void run_file_path(char *buf, const char *name, const char *file) {
+    char base[MAX_PATH];
+    container_run_path(base, name);
+    path_join_or_die(buf, MAX_PATH, base, file);
+}
+
+void container_pid_path(char *buf, const char *name)       { run_file_path(buf, name, "pid"); }
+void container_pid_start_path(char *buf, const char *name) { run_file_path(buf, name, "pid_start"); }
+void container_state_path(char *buf, const char *name)     { run_file_path(buf, name, "state"); }
+void container_exit_path(char *buf, const char *name)      { run_file_path(buf, name, "exit"); }
+void container_firewall_path(char *buf, const char *name)  { run_file_path(buf, name, "firewall"); }
+
+/*
+ * Before 0.5 these records were files in the container's directory: .pid,
+ * .pid_start and .state. A container that an older lightbox started, and
+ * that is still running, has them there. They are read where the records of
+ * today are missing, so that such a container is seen to be running and can
+ * be stopped, and they are removed with today's.
+ */
+static void old_record_path(char *buf, const char *name, const char *file) {
+    char base[MAX_PATH];
+    container_dir_path(base, name);
+    path_join_or_die(buf, MAX_PATH, base, file);
+}
+
+/* A record's text, without the newline after it: its length, 0 for an empty
+ * one and -1 for one that is not there, in either place. */
+static int read_record(const char *name, const char *file, const char *old_file, char *buf, size_t bufsz) {
+    char path[MAX_PATH];
+    run_file_path(path, name, file);
+    int n = read_file(path, buf, bufsz);
+    if (n < 0) {
+        old_record_path(path, name, old_file);
+        n = read_file(path, buf, bufsz);
+    }
+    if (n < 0)
+        return -1;
+    for (size_t i = 0; buf[i]; i++) {
+        if (buf[i] == '\n') { buf[i] = '\0'; break; }
+    }
+    return (int)lc_string_length(buf);
+}
+
+static void forget_old_record(const char *name, const char *old_file) {
+    char path[MAX_PATH];
+    old_record_path(path, name, old_file);
+    lc_kernel_unlinkat(AT_FDCWD, path, 0);
+}
+
+static int report_run_dir(const char *what, const char *path) {
+    print_str(STDERR, "Error: ");
+    print_str(STDERR, what);
+    print_str(STDERR, path);
+    print_str(STDERR, "\n");
+    return -1;
+}
+
+/*
+ * Make run_dir, if a reboot or nobody yet has left none, and the container's
+ * directory in it, both for root alone. A directory that is there is left as
+ * it is; a name that is there and is no directory is an error, a link too.
+ */
+int container_run_dir_make(const char *name) {
+    lc_sysret rc = lc_kernel_mkdirat(AT_FDCWD, cfg_global.run_dir, MODE_PRIVATE_DIR);
+    if (rc == -LB_ENOENT) {
+        /* its parents are missing as well */
+        if (make_dirs(cfg_global.run_dir) != 0)
+            return -1;
+        (void)lc_kernel_fchmodat(AT_FDCWD, cfg_global.run_dir, MODE_PRIVATE_DIR, 0);
+    } else if (rc < 0 && rc != -LB_EEXIST) {
+        return report_run_dir("cannot make the directory for runtime records: ", cfg_global.run_dir);
+    }
+
+    char dir[MAX_PATH];
+    container_run_path(dir, name);
+    rc = lc_kernel_mkdirat(AT_FDCWD, dir, MODE_PRIVATE_DIR);
+    if (rc < 0 && rc != -LB_EEXIST)
+        return report_run_dir("cannot make the directory for the container's runtime records: ", dir);
+
+    struct lb_statx stx;
+    if (lb_sys_statx(AT_FDCWD, dir, AT_SYMLINK_NOFOLLOW, LB_STATX_TYPE, &stx) < 0 ||
+        (stx.stx_mode & LB_S_IFMT) != LB_S_IFDIR)
+        return report_run_dir("not a directory: ", dir);
+    return 0;
+}
+
+/* Take the container's runtime records away, and their directory: what is
+ * left says that the container is stopped. */
+void container_forget_run(const char *name) {
+    char path[MAX_PATH];
+    container_forget_pid(name);
+    container_state_path(path, name);
+    lc_kernel_unlinkat(AT_FDCWD, path, 0);
+    forget_old_record(name, ".state");
+    container_run_path(path, name);
+    lc_kernel_unlinkat(AT_FDCWD, path, AT_REMOVEDIR);
 }
 
 int record_container_state(const char *name, const char *state) {
     char path[MAX_PATH];
+    if (container_run_dir_make(name) != 0)
+        return -1;
     container_state_path(path, name);
-    return write_file_atomic(path, state, MODE_PRIVATE_FILE);
+    if (write_file_volatile(path, state) < 0)
+        return -1;
+    forget_old_record(name, ".state");      /* what an older lightbox last said */
+    return 0;
 }
 
 void set_container_state(const char *name, const char *state) {
@@ -57,92 +168,45 @@ void set_container_state(const char *name, const char *state) {
         die2("Error: cannot record the state of container ", name);
 }
 
+/*
+ * The state on record. Without a runtime record a container is stopped,
+ * whether it was stopped, never started or running before a reboot; unless
+ * create never finished with it.
+ */
 void get_container_state(const char *name, char *buf, size_t bufsz) {
     char path[MAX_PATH];
-    container_state_path(path, name);
-    if (read_file(path, buf, bufsz) <= 0) {
-        str_copy(buf, "unknown", bufsz);
+    if (read_record(name, "state", ".state", buf, bufsz) > 0)
         return;
-    }
-    for (size_t i = 0; buf[i]; i++) {
-        if (buf[i] == '\n') { buf[i] = '\0'; break; }
-    }
-    if (!buf[0]) str_copy(buf, "unknown", bufsz);
+    container_creating_path(path, name);
+    str_copy_or_die(buf, path_exists(path) ? "creating" : "stopped", bufsz, "a container's state");
 }
 
-/*
- * Read a container's whole .conf into a buffer of CONF_MAX bytes. Returns the
- * length, or -1 if the file cannot be read. A file that does not fit stops the
- * command: a shorter config would silently drop volumes or their ":ro".
- */
-int container_conf_read(const char *name, char *buf) {
-    char path[MAX_PATH];
-    container_conf_path(path, name);
-    int n = read_file(path, buf, CONF_MAX);
-    if (n >= CONF_MAX - 1)
-        die2("Error: container config is larger than lightbox supports: ", path);
-    return n;
-}
-
-int conf_get(const char *name, const char *key, char *val, size_t valsz, const char *def) {
-    char buf[CONF_MAX];
-    if (container_conf_read(name, buf) < 0) {
-        str_copy(val, def, valsz);
-        return 0;
+/* What init said when it ended: its exit status. False when it said
+ * nothing, as an init that was killed does. */
+bool container_exit_report(const char *name, int *status) {
+    char path[MAX_PATH], text[16];
+    container_exit_path(path, name);
+    if (read_file(path, text, sizeof(text)) <= 0)
+        return false;
+    for (size_t i = 0; text[i]; i++) {
+        if (text[i] == '\n') { text[i] = '\0'; break; }
     }
-
-    size_t keylen = lc_string_length(key);
-    char *p = buf;
-    while (*p) {
-        if (lc_string_starts_with(p, lc_string_length(p), key, keylen) && p[keylen] == '=') {
-            char *v = p + keylen + 1;
-            char *end = v;
-            while (*end && *end != '\n') end++;
-            size_t len = (size_t)(end - v);
-            if (len >= valsz) len = valsz - 1;
-            lc_bytes_copy(val, v, len);
-            val[len] = '\0';
-            return 1;
-        }
-        while (*p && *p != '\n') p++;
-        if (*p == '\n') p++;
-    }
-    str_copy(val, def, valsz);
-    return 0;
-}
-
-int conf_get_int(const char *name, const char *key, int def) {
-    char val[32];
-    if (conf_get(name, key, val, sizeof(val), "") && val[0])
-        return parse_int(val);
-    return def;
+    return parse_int_in(text, 0, 255, status);
 }
 
 int get_container_pid(const char *name) {
-    char path[MAX_PATH], buf[16];
-    container_pid_path(path, name);
-    if (read_file(path, buf, sizeof(buf)) < 0) return -1;
-    return parse_int(buf);
-}
-
-static void clear_runtime_identity(const char *name, bool mark_failed) {
-    char path[MAX_PATH];
-    container_pid_path(path, name);
-    lc_kernel_unlinkat(AT_FDCWD, path, 0);
-    container_pid_start_path(path, name);
-    lc_kernel_unlinkat(AT_FDCWD, path, 0);
-    if (mark_failed)
-        set_container_state(name, "failed\n");
+    char buf[16];
+    int pid;
+    if (read_record(name, "pid", ".pid", buf, sizeof(buf)) <= 0)
+        return -1;
+    /* a record that is not the number of a process is no record */
+    return parse_int_in(buf, 1, PIDS_LIMIT_MAX, &pid) ? pid : -1;
 }
 
 static int read_proc_starttime(int pid, char *buf, size_t bufsz) {
-    char path[64], statbuf[512], pidbuf[16];
-    fmt_int(pidbuf, pid);
-    size_t pos = str_copy(path, "/proc/", sizeof(path));
-    pos = str_append(path, pos, pidbuf, sizeof(path));
-    str_append(path, pos, "/stat", sizeof(path));
-
-    if (read_file(path, statbuf, sizeof(statbuf)) <= 0)
+    char path[64], statbuf[512];
+    if (!proc_pid_path(path, sizeof(path), pid, "/stat") ||
+        read_file(path, statbuf, sizeof(statbuf)) <= 0)
         return -1;
 
     char *p = statbuf;
@@ -184,30 +248,34 @@ int container_record_pid(const char *name, int pid) {
 
     if (read_proc_starttime(pid, started, sizeof(started)) < 0)
         return -1;
+    if (container_run_dir_make(name) != 0)
+        return -1;
     container_pid_start_path(path, name);
-    if (write_file_atomic(path, started, MODE_PRIVATE_FILE) < 0)
+    if (write_file_volatile(path, started) < 0)
         return -1;
     fmt_int(pidbuf, pid);
     container_pid_path(path, name);
-    if (write_file_atomic(path, pidbuf, MODE_PRIVATE_FILE) < 0)
+    if (write_file_volatile(path, pidbuf) < 0)
         return -1;
     return 0;
 }
 
-/* Forget whatever is recorded about a container's init. */
+/* Forget whatever is recorded about a container's init: which process it
+ * was, and what it said when it ended. */
 void container_forget_pid(const char *name) {
-    clear_runtime_identity(name, false);
+    char path[MAX_PATH];
+    container_pid_path(path, name);
+    lc_kernel_unlinkat(AT_FDCWD, path, 0);
+    container_pid_start_path(path, name);
+    lc_kernel_unlinkat(AT_FDCWD, path, 0);
+    container_exit_path(path, name);
+    lc_kernel_unlinkat(AT_FDCWD, path, 0);
+    forget_old_record(name, ".pid");
+    forget_old_record(name, ".pid_start");
 }
 
 int get_container_pid_starttime(const char *name, char *buf, size_t bufsz) {
-    char path[MAX_PATH];
-    container_pid_start_path(path, name);
-    if (read_file(path, buf, bufsz) <= 0)
-        return -1;
-    for (size_t i = 0; buf[i]; i++) {
-        if (buf[i] == '\n') { buf[i] = '\0'; break; }
-    }
-    return buf[0] ? 0 : -1;
+    return read_record(name, "pid_start", ".pid_start", buf, bufsz) > 0 ? 0 : -1;
 }
 
 /*
@@ -238,11 +306,9 @@ container_liveness container_probe(const char *name) {
         return CONTAINER_DEAD;
 
     /* A container's init lives in a PID namespace of its own. */
-    char proc_path[64], pidbuf[16], pid_ns[64], init_ns[64];
-    fmt_int(pidbuf, pid);
-    size_t pos = str_copy(proc_path, "/proc/", sizeof(proc_path));
-    pos = str_append(proc_path, pos, pidbuf, sizeof(proc_path));
-    str_append(proc_path, pos, "/ns/pid", sizeof(proc_path));
+    char proc_path[64], pid_ns[64], init_ns[64];
+    if (!proc_pid_path(proc_path, sizeof(proc_path), pid, "/ns/pid"))
+        return CONTAINER_RUNNING;   /* cannot look; the start time matched */
 
     lc_sysret n1 = lc_kernel_readlinkat(AT_FDCWD, proc_path, pid_ns, sizeof(pid_ns) - 1);
     if (n1 == -LB_ENOENT || n1 == -LB_ESRCH)
@@ -261,27 +327,106 @@ bool is_running(const char *name) {
 }
 
 /*
- * The clean-up for a container whose init is gone: forget the PID and record
- * the state as failed. Only commands that change a container call this (start
- * and stop). ls, inspect and exec report what they see and write nothing.
- */
-void container_reap_if_dead(const char *name) {
-    if (container_probe(name) == CONTAINER_DEAD)
-        clear_runtime_identity(name, true);
-}
-
-/*
  * The state to show: what is recorded, corrected by what was observed. A
  * record that still says "running" for a process that is gone reads "exited".
  */
 void container_shown_state(const char *name, container_liveness live, char *buf, size_t bufsz) {
     if (live == CONTAINER_RUNNING) {
-        str_copy(buf, "running", bufsz);
+        str_copy_or_die(buf, "running", bufsz, "a container's state");
         return;
     }
     get_container_state(name, buf, bufsz);
     if (live == CONTAINER_DEAD || streq(buf, "running"))
-        str_copy(buf, "exited", bufsz);
+        str_copy_or_die(buf, "exited", bufsz, "a container's state");
+}
+
+/* ─── Locks ─────────────────────────────────────────────────────────────── */
+
+/*
+ * A lock on a directory, taken with flock on a descriptor that stays open
+ * until the process ends. The descriptor is close-on-exec, so no tool this
+ * process runs holds the lock on; a container's init closes everything it
+ * inherits. The descriptor, or a negative errno when the directory cannot be
+ * opened.
+ */
+static lc_sysret lock_directory(const char *path, bool shared, bool wait, const char *whose) {
+    lc_sysret fd = lc_kernel_open_file(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+    if (fd < 0)
+        return fd;
+
+    int32_t kind = shared ? LB_LOCK_SH : LB_LOCK_EX;
+    lc_sysret rc = lb_sys_flock((int32_t)fd, kind | LB_LOCK_NB);
+    if (rc == -LB_EAGAIN && wait) {
+        print_str(STDERR, "Waiting for another lightbox command to finish with ");
+        print_str(STDERR, whose);
+        print_str(STDERR, "...\n");
+        do {
+            rc = lb_sys_flock((int32_t)fd, kind);
+        } while (rc == -LB_EINTR);
+    }
+    if (rc < 0) {
+        lc_kernel_close_file((int32_t)fd);
+        return rc;
+    }
+    return fd;
+}
+
+/* Is the directory a descriptor is open on still the one at this path? rm
+ * removes a container while others may wait for its lock. */
+static bool still_at(int32_t fd, const char *path) {
+    struct lb_statx held, there;
+    if (lb_sys_statx(fd, "", LB_AT_EMPTY_PATH, LB_STATX_INO, &held) < 0 ||
+        lb_sys_statx(AT_FDCWD, path, AT_SYMLINK_NOFOLLOW, LB_STATX_INO, &there) < 0)
+        return false;
+    return held.stx_ino == there.stx_ino && held.stx_dev_major == there.stx_dev_major &&
+           held.stx_dev_minor == there.stx_dev_minor;
+}
+
+void container_lock(const char *name) {
+    char dir[MAX_PATH], whose[NAME_MAX_LEN + 16];
+    container_dir_path(dir, name);
+    bool cut = false;
+    size_t pos = str_append(whose, 0, "container '", sizeof(whose), &cut);
+    pos = str_append(whose, pos, name, sizeof(whose), &cut);
+    str_append(whose, pos, "'", sizeof(whose), &cut);
+    if (cut)
+        die2("Error: not the name of a container: ", name);
+
+    lc_sysret fd = lock_directory(dir, false, true, whose);
+    if (fd == -LB_ENOENT || (fd >= 0 && !still_at((int32_t)fd, dir)))
+        die2("Error: container does not exist: ", name);
+    if (fd < 0)
+        die2("Error: cannot lock container ", name);
+}
+
+void container_lock_if_free(const char *name) {
+    char dir[MAX_PATH];
+    container_dir_path(dir, name);
+    (void)lock_directory(dir, true, false, "");
+}
+
+int32_t store_lock(void) {
+    lc_sysret fd = lock_directory(cfg_global.container_dir, false, true, "the container store");
+    /* a store that is not there yet is locked by nobody; what needs it says so itself */
+    if (fd < 0 && fd != -LB_ENOENT)
+        die2("Error: cannot lock ", cfg_global.container_dir);
+    return fd < 0 ? -1 : (int32_t)fd;
+}
+
+int32_t container_lock_try(const char *name) {
+    char dir[MAX_PATH];
+    container_dir_path(dir, name);
+    lc_sysret fd = lock_directory(dir, false, false, "");
+    return fd < 0 ? -1 : (int32_t)fd;
+}
+
+void require_root(const char *command) {
+    if (lb_sys_geteuid() == 0)
+        return;
+    print_str(STDERR, "Error: lightbox ");
+    print_str(STDERR, command);
+    print_str(STDERR, " must be run as root\n");
+    lc_kernel_exit(1);
 }
 
 /* ─── Listing ───────────────────────────────────────────────────────────── */
@@ -350,7 +495,8 @@ int list_containers(char names[][NAME_MAX_LEN + 1], int max, bool *more) {
                 lc_bytes_copy(names[at], names[at - 1], NAME_MAX_LEN + 1);
                 at--;
             }
-            str_copy(names[at], entry, NAME_MAX_LEN + 1);
+            /* entry is a valid name, so it fits */
+            lc_bytes_copy(names[at], entry, lc_string_length(entry) + 1);
             count++;
         }
     }

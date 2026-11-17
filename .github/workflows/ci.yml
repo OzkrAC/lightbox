@@ -88,16 +88,17 @@ jobs:
       - name: Install the toolchain and what the suite needs
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build gcc-14 busybox-static iproute2 iptables util-linux
+          sudo apt-get install -y ninja-build gcc-14 busybox-static iproute2 iptables nftables util-linux strace
       - name: Build
         run: make CC=gcc-14
       # The suite makes bridge and veth interfaces, and lightbox's firewall
-      # rules use the state match and masquerading. Runner kernels keep some
-      # modules in a package of extras.
+      # rules use the state match and masquerading, in iptables and in
+      # nftables, whose bridge family needs nft_meta_bridge. Runner kernels
+      # keep some modules in a package of extras.
       - name: Kernel modules
         run: |
           missing=
-          for m in bridge veth br_netfilter xt_state xt_conntrack xt_MASQUERADE nf_nat; do
+          for m in bridge veth br_netfilter xt_state xt_conntrack xt_MASQUERADE nf_nat nf_tables nft_meta_bridge nft_masq nft_chain_nat nft_ct; do
             sudo modprobe -n "$m" 2>/dev/null || missing="$missing $m"
           done
           if [ -n "$missing" ]; then
@@ -113,6 +114,7 @@ jobs:
           echo "cgroup controllers: $(cat /sys/fs/cgroup/cgroup.controllers)"
           echo "enabled below the root: $(cat /sys/fs/cgroup/cgroup.subtree_control)"
           iptables --version
+          nft --version
           ip -V
           busybox | head -n 1
           unshare --version

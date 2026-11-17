@@ -4,7 +4,7 @@ set -u
 S=/tmp/claude-1000/-home-c0dr-ozkr-ac-endeavor-lightbox/ee7507ce-59b0-47cb-9e8f-cde3b30f88a2/scratchpad
 SRC="$S/build/lightbox"
 OUT="$S/analysis"
-FILES=(lightbox.c lightbox_meta.c lightbox_state.c lightbox_net.c lightbox_config.c lightbox_util.c)
+FILES=(lightbox.c lightbox_meta.c lightbox_state.c lightbox_container.c lightbox_net.c lightbox_config.c lightbox_util.c)
 BASE=(-std=c23 -O2 -DNDEBUG -ffreestanding -nostdlib -fno-stack-protector "-I$S/build/lightc/include" -c -o /dev/null
       -fdiagnostics-plain-output -fno-diagnostics-show-caret)
 

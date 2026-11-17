@@ -46,11 +46,11 @@ void cmd_ls(int argc, char **argv) {
     int count = list_containers(names, MAX_LISTED, &more);
 
     if (!json) {
-        print_padded("NAME", 20);
+        print_padded("NAME", NAME_MAX_LEN + 2);
         print_padded("IP", 16);
         print_padded("STATUS", 10);
         print_str(STDOUT, "PID\n");
-        print_padded("----", 20);
+        print_padded("----", NAME_MAX_LEN + 2);
         print_padded("--", 16);
         print_padded("------", 10);
         print_str(STDOUT, "---\n");
@@ -67,6 +67,7 @@ void cmd_ls(int argc, char **argv) {
 
         (void)read_container_ip(name, ip_buf, sizeof(ip_buf));
 
+        container_lock_if_free(name);   /* a command that changes it waits until this has read */
         container_liveness live = container_probe(name);
         bool running = live == CONTAINER_RUNNING;
         if (running)
@@ -85,7 +86,7 @@ void cmd_ls(int argc, char **argv) {
             json_key("pid", false);    print_str(STDOUT, running ? pid_str : "null");
             print_str(STDOUT, "}");
         } else {
-            print_padded(name, 20);
+            print_padded(name, NAME_MAX_LEN + 2);
             print_padded(ip_buf, 16);
             print_padded(status, 10);
             print_str(STDOUT, pid_str);
@@ -121,12 +122,6 @@ static void print_check(const char *key, bool ok, const char *detail) {
         print_str(STDOUT, ")");
     }
     lc_print_char(STDOUT, '\n');
-}
-
-static void print_conf_kv(const char *name, const char *key, const char *fallback) {
-    char buf[128];
-    conf_get(name, key, buf, sizeof(buf), fallback);
-    print_kv(key, buf);
 }
 
 /*
@@ -213,8 +208,11 @@ void cmd_inspect(int argc, char **argv) {
     container_pid_start_path(pid_start_path, name);
     container_state_path(state_path, name);
 
-    if (read_container_ip(name, ip, sizeof(ip)) < 0)
-        str_copy(ip, "-", sizeof(ip));
+    container_lock_if_free(name);
+    if (read_container_ip(name, ip, sizeof(ip)) < 0) {
+        ip[0] = '-';
+        ip[1] = '\0';
+    }
     container_liveness live = container_probe(name);
     container_shown_state(name, live, state, sizeof(state));
 
@@ -222,6 +220,11 @@ void cmd_inspect(int argc, char **argv) {
     print_kv("state", state);
     print_kv("running", live == CONTAINER_RUNNING ? "yes" : "no");
     print_kv("ip", ip);
+    {
+        char port[IFNAME_TEXT_MAX];
+        host_port_name(name, port);
+        print_kv("host_interface", port);
+    }
     print_kv("dir", cdir);
     print_kv("rootfs", root);
     print_kv("config_path", conf_path);
@@ -230,8 +233,10 @@ void cmd_inspect(int argc, char **argv) {
     print_kv("pid_start_path", pid_start_path);
     print_kv("state_path", state_path);
 
-    if (path_exists(pid_path))
-        print_kv_int("pid", get_container_pid(name));
+    /* a record that is not the number of a process is no record */
+    int pid = get_container_pid(name);
+    if (pid > 0)
+        print_kv_int("pid", pid);
     else
         print_kv("pid", "-");
     if (get_container_pid_starttime(name, pid_start, sizeof(pid_start)) == 0)
@@ -239,14 +244,22 @@ void cmd_inspect(int argc, char **argv) {
     else
         print_kv("pid_starttime", "-");
 
-    print_conf_kv(name, "mem", cfg_global.default_mem);
-    print_conf_kv(name, "pids", cfg_global.default_pids);
-    print_conf_kv(name, "cpu", cfg_global.default_cpu);
-    print_kv_int("oom_score", conf_get_int(name, "oom_score", cfg_global.default_oom));
-    print_kv_int("userns", conf_get_int(name, "userns", 0));
-    print_kv_int("uid_start", conf_get_int(name, "uid_start", 0));
-    print_kv_int("privileged", conf_get_int(name, "privileged", 0));
-    print_kv_int("readonly", conf_get_int(name, "readonly", 0));
+    /* What it is configured with. A configuration that cannot be used is
+     * said to be so, after everything that could be shown. */
+    static container_config config;
+    const char *wrong = container_config_load(name, &config);
+    if (wrong)
+        die2("Error: the container's configuration cannot be used: ", wrong);
+    print_kv("mem", config.mem);
+    print_kv("swap", config.swap[0] ? config.swap : "0");
+    print_kv("pids", config.pids);
+    print_kv("cpu", config.cpu);
+    print_kv("io", config.io[0] ? config.io : "-");
+    print_kv_int("oom_score", config.oom_score);
+    print_kv_int("userns", config.userns);
+    print_kv_int("uid_start", config.uid_start);
+    print_kv_int("privileged", config.privileged);
+    print_kv_int("readonly", config.read_only);
 }
 
 /* doctor: can exec run from a copy of the binary that cannot be written to? */
@@ -269,13 +282,18 @@ void cmd_doctor(void) {
     static const struct {
         const char *key;
         const char *(*resolve)(void);
+        bool nftables;      /* the firewall tools of one backend: the other's are not looked for */
+        bool iptables;
     } bins[] = {
-        { "bin.ip", tool_path_ip },
-        { "bin.iptables", tool_path_iptables },
-        { "bin.cp", tool_path_cp },
-        { "bin.chown", tool_path_chown },
-        { "bin.rm", tool_path_rm },
+        { "bin.ip", tool_path_ip, true, true },
+        { "bin.iptables", tool_path_iptables, false, true },
+        { "bin.iptables-restore", tool_path_iptables_restore, false, true },
+        { "bin.nft", tool_path_nft, true, false },
+        { "bin.cp", tool_path_cp, true, true },
+        { "bin.chown", tool_path_chown, true, true },
+        { "bin.rm", tool_path_rm, true, true },
     };
+    bool nftables = cfg_global.firewall_backend == FIREWALL_NFTABLES;
 
     int missing = 0;
     bool ok;
@@ -283,14 +301,60 @@ void cmd_doctor(void) {
     print_kv("lightbox_dir", cfg_global.lightbox_dir);
     print_kv("rootfs", cfg_global.rootfs);
     print_kv("container_dir", cfg_global.container_dir);
+    print_kv("run_dir", cfg_global.run_dir);
     print_kv("cgroup_root", cfg_global.cgroup_root);
     print_kv("cgroup_base", cfg_global.cgroup_base);
     print_kv("bridge", cfg_global.bridge);
     print_kv("subnet", cfg_global.subnet);
     print_kv("gw", cfg_global.gw);
+    {
+        /* the two as one network: what setup, create and start go by */
+        container_network net;
+        const char *setting;
+        const char *wrong = container_network_parse(cfg_global.subnet, cfg_global.gw, &net, &setting);
+        if (wrong) {
+            print_str(STDOUT, "network: unusable (");
+            print_str(STDOUT, setting);
+            print_str(STDOUT, " ");
+            print_str(STDOUT, wrong);
+            print_str(STDOUT, ")\n");
+            missing++;
+        } else {
+            char subnet[CIDR_TEXT_MAX];
+            subnet_text(subnet, &net);
+            print_kv("network", subnet);
+        }
+    }
+    print_kv("firewall", cfg_global.firewall ? "true" : "false (lightbox makes no firewall rules)");
+    print_kv("ip_forward", cfg_global.ip_forward ? "true" : "false");
+    print_kv("ip_forward_no_drop", cfg_global.ip_forward_no_drop ? "true" : "false");
+    print_kv("ip_masq", cfg_global.ip_masq ? "true" : "false");
+    print_kv("firewall_backend", nftables ? "nftables" : "iptables");
+    if (cfg_global.accept_fwmark_set) {
+        char mark[24];
+        fwmark_text(mark, cfg_global.accept_fwmark, cfg_global.accept_fwmask);
+        print_str(STDOUT, "bridge_accept_fwmark: ");
+        print_str(STDOUT, mark);
+        print_str(STDOUT, nftables ? "\n" : " (not used: with iptables, rules in LIGHTBOX-USER decide first)\n");
+    } else {
+        print_kv("bridge_accept_fwmark", "none");
+    }
     /* told, not counted as missing: only a container with links depends on it */
-    print_kv("bridge_filtering", bridge_traffic_is_filtered()
-             ? "yes" : "no (a container with --link will not start; it needs br_netfilter)");
+    if (nftables)
+        print_kv("bridge_filtering", "not needed (firewall_backend = nftables filters at the bridge)");
+    else
+        print_kv("bridge_filtering", bridge_traffic_is_filtered()
+                 ? "yes" : "no (a container with --link will not start; it needs br_netfilter)");
+    if (nftables && cfg_global.firewall) {
+        /* told, not counted: it is the host's to change */
+        static char drops[1024];
+        if (lb_sys_geteuid() != 0) {
+            print_kv("forward_drops", "unknown (doctor is not run as root)");
+        } else {
+            forward_drops_on_host(drops, sizeof(drops));
+            print_kv("forward_drops", drops[0] ? drops : "none");
+        }
+    }
 
     ok = path_exists(cfg_global.lightbox_dir);
     print_check("path.lightbox_dir", ok, cfg_global.lightbox_dir);
@@ -309,6 +373,8 @@ void cmd_doctor(void) {
     if (!ok) missing++;
 
     for (size_t i = 0; i < sizeof(bins) / sizeof(bins[0]); i++) {
+        if (nftables ? !bins[i].nftables : !bins[i].iptables)
+            continue;
         const char *path = bins[i].resolve();
         ok = path_exists(path);
         print_check(bins[i].key, ok, path);

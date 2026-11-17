@@ -2,6 +2,10 @@
 #
 # Place this file at ~/.config/lightbox/lightbox.conf
 # All values are optional — built-in defaults are shown below.
+#
+# No value is cut to fit: a directory of more than 448 characters, or a
+# bridge name or address that is too long, ends every command with the
+# setting named. The file may be up to 16 KB.
 
 # Base directory for lightbox data (base rootfs and container directories).
 # `lightbox setup` makes this directory and container_dir mode 0700, so both
@@ -17,18 +21,59 @@
 # Derived from lightbox_dir if not set explicitly
 # container_dir = /var/lib/lightbox/containers
 
-# PID file directory
+# Records of the containers that run: <run_dir>/<name>/ holds the PID of a
+# container's init, its state, and how it ended. Keep it on a tmpfs, as /run
+# is: a reboot ends every container, and has to take these records along. A
+# container without them is stopped. `lightbox setup` makes it mode 0700, and
+# `start` makes it again when a reboot took it.
 # run_dir = /run/lightbox
 
 # cgroup v2 mount point
 # cgroup_root = /sys/fs/cgroup
 
-# Bridge interface and network
+# The firewall, with the settings of Docker's daemon.json; each true or false.
+# firewall: lightbox makes its rules, in its own chains reached from the top
+#   of FORWARD and POSTROUTING ("iptables"). Without them a container with
+#   links is not started.
+# ip_forward: setup turns IPv4 forwarding on ("ip-forward").
+# ip_forward_no_drop: when setup turns forwarding on, it leaves the FORWARD
+#   policy; otherwise the policy becomes DROP ("ip-forward-no-drop").
+# ip_masq: what containers send out by any interface but the bridge is
+#   masqueraded ("ip-masq").
+# Rules of this host's that are to decide before lightbox's go in the chain
+# LIGHTBOX-USER, which lightbox makes and never changes.
+# firewall = true
+# ip_forward = true
+# ip_forward_no_drop = false
+# ip_masq = true
+
+# firewall_backend: iptables or nftables ("firewall-backend"). With nftables
+#   lightbox's rules are in the tables ip lightbox and bridge lightbox, a
+#   container with links needs no br_netfilter, and, as Docker has it, setup
+#   does not turn IPv4 forwarding on and there is no LIGHTBOX-USER.
+# bridge_accept_fwmark: with nftables, packets with this mark, or mark/mask,
+#   are accepted by lightbox's rules before they drop anything; a chain of the
+#   host's that comes before them sets it ("bridge-accept-fwmark").
+# firewall_backend = iptables
+# bridge_accept_fwmark = 0x10/0xf0
+
+# Bridge interface and network. subnet is <address>/<bits>, with 8 to 30 bits;
+# the bridge and every container have its prefix. gw is the bridge's address
+# in it, neither its first nor its last. A bridge that setup has made keeps
+# its address: after a change, delete it while no container runs and run
+# setup again.
 # bridge = br0
 # subnet = 10.0.0.0/24
 # gw = 10.0.0.1
 
-# Default container resource limits
+# Default container resource limits, for a container that `create` is not
+# given the option for. Each takes what its option takes:
+#   default_mem    a number of bytes, optionally with K, M, G or T, or max
+#   default_pids   1 to 4194304, or max
+#   default_cpu    CPUs from 0.01 to 512, such as 2 or 0.5
+#   default_oom    -1000 to 1000
+# One that is anything else is reported by every command, and `create`
+# refuses a container that would have needed it.
 # default_mem = 256M
 # default_pids = 128
 # default_cpu = 1

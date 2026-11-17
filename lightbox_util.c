@@ -24,27 +24,27 @@ bool streq(const char *a, const char *b) {
     return lc_string_equal(a, la, b, lb);
 }
 
-size_t str_copy(char *dst, const char *src, size_t max) {
+/*
+ * Text that has to arrive whole. None of these cut: a source that does not
+ * fit is not copied in part, and the caller is told.
+ */
+
+/* dst is src, or an empty string and false when src does not fit */
+bool str_copy(char *dst, const char *src, size_t max) {
     size_t len = lc_string_length(src);
-    if (len >= max) len = max - 1;
+    if (len >= max) {
+        if (max > 0) dst[0] = '\0';
+        return false;
+    }
     lc_bytes_copy(dst, src, len);
     dst[len] = '\0';
-    return len;
+    return true;
 }
 
-size_t str_append(char *dst, size_t pos, const char *src, size_t max) {
-    size_t len = lc_string_length(src);
-    if (pos + len >= max) len = max - pos - 1;
-    lc_bytes_copy(dst + pos, src, len);
-    dst[pos + len] = '\0';
-    return pos + len;
-}
-
-/*
- * Like str_append, for text that must be stored whole: a source that does not
- * fit is not cut. Nothing is appended and *overflow is set, and stays set.
- */
-size_t str_append_whole(char *dst, size_t pos, const char *src, size_t max, bool *overflow) {
+/* src after the pos characters dst holds: the new length. When it does not
+ * fit nothing is appended and *overflow is set, and stays set, so a text can
+ * be put together from many pieces and asked once whether it is whole. */
+size_t str_append(char *dst, size_t pos, const char *src, size_t max, bool *overflow) {
     size_t len = lc_string_length(src);
     if (pos >= max || len >= max - pos) {
         *overflow = true;
@@ -56,45 +56,128 @@ size_t str_append_whole(char *dst, size_t pos, const char *src, size_t max, bool
     return pos + len;
 }
 
-void path_join(char *buf, size_t bufsz, const char *a, const char *b) {
-    size_t pos = str_copy(buf, a, bufsz);
+/* "a/b" with one slash between them, or an empty string and false */
+bool path_join(char *buf, size_t bufsz, const char *a, const char *b) {
+    bool cut = false;
+    size_t pos = str_append(buf, 0, a, bufsz, &cut);
     if (pos > 0 && buf[pos - 1] != '/')
-        pos = str_append(buf, pos, "/", bufsz);
+        pos = str_append(buf, pos, "/", bufsz, &cut);
     if (b[0] == '/') b++;
-    str_append(buf, pos, b, bufsz);
+    str_append(buf, pos, b, bufsz, &cut);
+    if (cut && bufsz > 0)
+        buf[0] = '\0';
+    return !cut;
 }
 
-int parse_int(const char *s) {
-    int neg = 0, val = 0;
-    if (*s == '-') { neg = 1; s++; }
-    while (*s >= '0' && *s <= '9') {
-        val = val * 10 + (*s - '0');
-        s++;
+void str_copy_or_die(char *dst, const char *src, size_t max, const char *what) {
+    if (str_copy(dst, src, max))
+        return;
+    print_str(STDERR, "Error: ");
+    print_str(STDERR, what);
+    print_str(STDERR, " is too long: ");
+    print_str(STDERR, src);
+    print_str(STDERR, "\n");
+    lc_kernel_exit(1);
+}
+
+void path_join_or_die(char *buf, size_t bufsz, const char *a, const char *b) {
+    if (path_join(buf, bufsz, a, b))
+        return;
+    print_str(STDERR, "Error: path is too long: ");
+    print_str(STDERR, a);
+    print_str(STDERR, "/");
+    print_str(STDERR, b);
+    print_str(STDERR, "\n");
+    lc_kernel_exit(1);
+}
+
+/* "/proc/<pid><suffix>" */
+bool proc_pid_path(char *buf, size_t bufsz, int pid, const char *suffix) {
+    char digits[16];
+    bool cut = false;
+    fmt_int(digits, pid);
+    size_t pos = str_append(buf, 0, "/proc/", bufsz, &cut);
+    pos = str_append(buf, pos, digits, bufsz, &cut);
+    str_append(buf, pos, suffix ? suffix : "", bufsz, &cut);
+    return !cut;
+}
+
+/* "<path>.tmp.<pid of this process>": the name a file is written under
+ * before it takes its own */
+static bool temporary_name(char *tmp, size_t max, const char *path) {
+    char digits[16];
+    bool cut = false;
+    fmt_int(digits, lc_kernel_get_process_id());
+    size_t pos = str_append(tmp, 0, path, max, &cut);
+    pos = str_append(tmp, pos, ".tmp.", max, &cut);
+    str_append(tmp, pos, digits, max, &cut);
+    return !cut;
+}
+
+/* Does the text have a byte that is not printable: a control character,
+ * among them the newline that would end a line in a file of lines? */
+bool has_control_chars(const char *s) {
+    for (; *s; s++) {
+        if ((unsigned char)*s < 0x20 || *s == 0x7f)
+            return true;
     }
-    return neg ? -val : val;
+    return false;
 }
 
-bool parse_seconds(const char *s, int *out) {
-    int val = 0;
-    if (!s || !s[0])
+/*
+ * A whole number written in decimal, from min to max: an optional minus sign
+ * and digits, and nothing else. Empty text, anything after the digits and a
+ * value outside the range are all refused; nothing wraps around.
+ */
+bool parse_number(const char *s, int64_t min, int64_t max, int64_t *out) {
+    if (!s)
         return false;
+    bool negative = *s == '-';
+    if (negative)
+        s++;
+    if (!*s)
+        return false;
+
+    /* the magnitude, which for the most negative number is one more than
+     * the largest positive one */
+    uint64_t limit = negative ? (uint64_t)INT64_MAX + 1 : (uint64_t)INT64_MAX;
+    uint64_t magnitude = 0;
     for (; *s; s++) {
         if (*s < '0' || *s > '9')
             return false;
-        val = val * 10 + (*s - '0');
-        if (val > SECONDS_MAX)
+        uint64_t digit = (uint64_t)(*s - '0');
+        if (magnitude > (limit - digit) / 10)
             return false;
+        magnitude = magnitude * 10 + digit;
     }
-    *out = val;
+
+    if (negative && magnitude == 0)     /* "-0" is nobody's way to write a number */
+        return false;
+    int64_t value = negative ? (int64_t)(0 - magnitude) : (int64_t)magnitude;
+    if (value < min || value > max)
+        return false;
+    *out = value;
     return true;
+}
+
+bool parse_int_in(const char *s, int min, int max, int *out) {
+    int64_t value;
+    if (!parse_number(s, min, max, &value))
+        return false;
+    *out = (int)value;
+    return true;
+}
+
+bool parse_seconds(const char *s, int *out) {
+    return s && s[0] != '-' && parse_int_in(s, 0, SECONDS_MAX, out);
 }
 
 int fmt_int(char *buf, int val) {
     if (val == 0) { buf[0] = '0'; buf[1] = '\0'; return 1; }
-    int neg = 0, len = 0;
+    int neg = val < 0, len = 0;
     char tmp[16];
-    if (val < 0) { neg = 1; val = -val; }
-    while (val > 0) { tmp[len++] = '0' + (val % 10); val /= 10; }
+    unsigned int rest = neg ? 0u - (unsigned int)val : (unsigned int)val;
+    while (rest > 0) { tmp[len++] = (char)('0' + rest % 10); rest /= 10; }
     int pos = 0;
     if (neg) buf[pos++] = '-';
     for (int i = len - 1; i >= 0; i--) buf[pos++] = tmp[i];
@@ -124,23 +207,25 @@ void require_write_file(const char *path, const char *data) {
         die2("Error: write failed: ", path);
 }
 
+/* The directory a path's last component is in: "." for a bare name, "/" for
+ * something in the root. False for an empty path or one that does not fit. */
+bool parent_dir(char *buf, size_t bufsz, const char *path) {
+    size_t len = lc_string_length(path);
+    if (len == 0 || !str_copy(buf, path, bufsz))
+        return false;
+
+    while (len > 0 && buf[len - 1] != '/')
+        len--;
+    if (len == 0)
+        return str_copy(buf, ".", bufsz);
+    buf[len == 1 ? 1 : len - 1] = '\0';
+    return true;
+}
+
 static int sync_parent_dir(const char *path) {
     char dirpath[MAX_PATH];
-    size_t len = lc_string_length(path);
-
-    if (len == 0 || len >= sizeof(dirpath))
+    if (!parent_dir(dirpath, sizeof(dirpath), path))
         return -1;
-
-    str_copy(dirpath, path, sizeof(dirpath));
-    while (len > 0 && dirpath[len - 1] != '/')
-        len--;
-
-    if (len == 0)
-        str_copy(dirpath, ".", sizeof(dirpath));
-    else if (len == 1)
-        dirpath[1] = '\0';
-    else
-        dirpath[len - 1] = '\0';
 
     lc_sysret dirfd = lc_kernel_open_file(dirpath, O_RDONLY, 0);
     if (dirfd < 0)
@@ -169,6 +254,20 @@ const char *tool_path_ip(void) {
     return pick_tool_path(candidates, sizeof(candidates) / sizeof(candidates[0]));
 }
 
+const char *tool_path_iptables_restore(void) {
+    static const char *const candidates[] = {
+        "/usr/sbin/iptables-restore",
+        "/sbin/iptables-restore",
+        "/usr/bin/iptables-restore",
+        "/bin/iptables-restore",
+        "/usr/sbin/iptables-nft-restore",
+        "/sbin/iptables-nft-restore",
+        "/usr/bin/iptables-nft-restore",
+        "/bin/iptables-nft-restore",
+    };
+    return pick_tool_path(candidates, sizeof(candidates) / sizeof(candidates[0]));
+}
+
 const char *tool_path_iptables(void) {
     static const char *const candidates[] = {
         "/usr/sbin/iptables",
@@ -179,6 +278,16 @@ const char *tool_path_iptables(void) {
         "/sbin/iptables-nft",
         "/usr/bin/iptables-nft",
         "/bin/iptables-nft",
+    };
+    return pick_tool_path(candidates, sizeof(candidates) / sizeof(candidates[0]));
+}
+
+const char *tool_path_nft(void) {
+    static const char *const candidates[] = {
+        "/usr/sbin/nft",
+        "/sbin/nft",
+        "/usr/bin/nft",
+        "/bin/nft",
     };
     return pick_tool_path(candidates, sizeof(candidates) / sizeof(candidates[0]));
 }
@@ -233,15 +342,15 @@ void require_tool(const char *label, const char *path) {
 }
 
 
-int write_file_atomic(const char *path, const char *data, int32_t mode) {
+/*
+ * Give a file its content in one step: written under another name and then
+ * renamed, so a reader finds the old content or the new and never part of
+ * either. Durable, it is on the disk when this returns, and so is its name.
+ */
+static int write_file_replacing(const char *path, const char *data, int32_t mode, bool durable) {
     char tmp[MAX_PATH];
-    char pidbuf[16];
-    int pid = lc_kernel_get_process_id();
-
-    fmt_int(pidbuf, pid);
-    size_t pos = str_copy(tmp, path, sizeof(tmp));
-    pos = str_append(tmp, pos, ".tmp.", sizeof(tmp));
-    str_append(tmp, pos, pidbuf, sizeof(tmp));
+    if (!temporary_name(tmp, sizeof(tmp), path))
+        return -1;
 
     lc_sysret fd = lc_kernel_open_file(tmp, O_WRONLY | O_CREAT | O_TRUNC, mode);
     if (fd < 0)
@@ -259,7 +368,7 @@ int write_file_atomic(const char *path, const char *data, int32_t mode) {
         off += (size_t)n;
     }
 
-    if (lb_sys_fsync((int32_t)fd) < 0) {
+    if (durable && lb_sys_fsync((int32_t)fd) < 0) {
         lc_kernel_close_file((int32_t)fd);
         lc_kernel_unlinkat(AT_FDCWD, tmp, 0);
         return -1;
@@ -271,9 +380,24 @@ int write_file_atomic(const char *path, const char *data, int32_t mode) {
         return -1;
     }
 
-    if (sync_parent_dir(path) < 0)
+    if (durable && sync_parent_dir(path) < 0)
         return -1;
     return 0;
+}
+
+int write_file_atomic(const char *path, const char *data, int32_t mode) {
+    return write_file_replacing(path, data, mode, true);
+}
+
+int write_file_volatile(const char *path, const char *data) {
+    return write_file_replacing(path, data, MODE_PRIVATE_FILE, false);
+}
+
+int remove_file_durably(const char *path) {
+    lc_sysret rc = lc_kernel_unlinkat(AT_FDCWD, path, 0);
+    if (rc < 0 && rc != -LB_ENOENT)
+        return -1;
+    return sync_parent_dir(path);
 }
 
 /* <root>/<dir>, opened as a process whose root is <root> would find it. */
@@ -303,11 +427,11 @@ int write_file_in_root(const char *root, const char *dir, const char *name,
     /* From here on every name is one component, looked up in that directory
      * and never through a link: the temporary file is made new, and the
      * rename puts it in the place of whatever had the name. */
-    char tmp[MAX_PATH], pidbuf[16];
-    fmt_int(pidbuf, lc_kernel_get_process_id());
-    size_t pos = str_copy(tmp, name, sizeof(tmp));
-    pos = str_append(tmp, pos, ".tmp.", sizeof(tmp));
-    str_append(tmp, pos, pidbuf, sizeof(tmp));
+    char tmp[MAX_PATH];
+    if (!temporary_name(tmp, sizeof(tmp), name)) {
+        lc_kernel_close_file((int32_t)dirfd);
+        return -1;
+    }
 
     lc_kernel_unlinkat((int32_t)dirfd, tmp, 0);
     lc_sysret fd = lc_kernel_open_file_at((int32_t)dirfd, tmp,
@@ -358,10 +482,6 @@ int read_file_in_root(const char *root, const char *dir, const char *name, char 
     return (int)n;
 }
 
-void require_write_file_atomic(const char *path, const char *data) {
-    if (write_file_atomic(path, data, MODE_PRIVATE_FILE) < 0)
-        die2("Error: atomic write failed: ", path);
-}
 
 int read_file(const char *path, char *buf, size_t bufsz) {
     lc_sysret fd = lc_kernel_open_file(path, O_RDONLY, 0);
@@ -474,6 +594,7 @@ struct run_opts {
     bool   quiet;               /* the program's stdout and stderr go to /dev/null */
     char  *capture;             /* when set, its stdout is collected here as a string */
     size_t capture_size;
+    const char *input;          /* when set, its stdin, at most RUN_INPUT_MAX bytes */
 };
 
 /*
@@ -493,6 +614,30 @@ struct run_opts {
 static int run_program(const char *prog, const char *const argv[], const struct run_opts *opts) {
     int32_t exec_pipe[2];
     int32_t out_pipe[2] = { -1, -1 };
+    int32_t in_pipe[2] = { -1, -1 };
+
+    /* The input is in its pipe before there is a program to read it: a pipe
+     * holds this much, so the write does not wait, and nothing can make it
+     * fail half way, as a program that ends before it has read would. */
+    if (opts->input) {
+        size_t len = lc_string_length(opts->input);
+        if (len > RUN_INPUT_MAX) {
+            report_failure("the input is too long for ", prog, NULL, 0);
+            return RUN_FORK_FAILED;
+        }
+        lc_sysret made = lc_kernel_create_pipe(in_pipe, O_CLOEXEC);
+        if (made < 0) {
+            report_failure("cannot start ", prog, " (no pipe for its input, errno ", (int)-made);
+            return RUN_FORK_FAILED;
+        }
+        lc_sysret wrote = lc_kernel_write_all(in_pipe[1], opts->input, len);
+        lc_kernel_close_file(in_pipe[1]);
+        if (wrote < 0 || (size_t)wrote != len) {
+            lc_kernel_close_file(in_pipe[0]);
+            report_failure("the input did not go into the pipe of ", prog, NULL, 0);
+            return RUN_FORK_FAILED;
+        }
+    }
 
     lc_sysret rc = lc_kernel_create_pipe(exec_pipe, O_CLOEXEC);
     if (rc >= 0 && opts->capture) {
@@ -503,12 +648,16 @@ static int run_program(const char *prog, const char *const argv[], const struct 
         }
     }
     if (rc < 0) {
+        if (in_pipe[0] >= 0)
+            lc_kernel_close_file(in_pipe[0]);
         report_failure("cannot start ", prog, " (pipe failed, errno ", (int)-rc);
         return RUN_FORK_FAILED;
     }
 
     lc_sysret pid = lc_kernel_fork();
     if (pid < 0) {
+        if (in_pipe[0] >= 0)
+            lc_kernel_close_file(in_pipe[0]);
         lc_kernel_close_file(exec_pipe[0]);
         lc_kernel_close_file(exec_pipe[1]);
         if (opts->capture) {
@@ -533,6 +682,8 @@ static int run_program(const char *prog, const char *const argv[], const struct 
         }
         if (opts->capture)
             lc_kernel_duplicate_fd(out_pipe[1], STDOUT, 0);
+        if (in_pipe[0] >= 0)
+            lc_kernel_duplicate_fd(in_pipe[0], STDIN, 0);
 
         lc_sysret failed = exec_program(prog, argv, opts->envp ? opts->envp : TOOL_ENV);
         int32_t exec_errno = (int32_t)-failed;
@@ -541,6 +692,8 @@ static int run_program(const char *prog, const char *const argv[], const struct 
     }
 
     lc_kernel_close_file(exec_pipe[1]);
+    if (in_pipe[0] >= 0)
+        lc_kernel_close_file(in_pipe[0]);
 
     if (opts->capture) {
         lc_kernel_close_file(out_pipe[1]);
@@ -597,6 +750,14 @@ int run_cmd_env(const char *prog, const char *const argv[], const char *const en
 
 int run_cmd_capture(const char *prog, const char *const argv[], char *out, size_t outsz) {
     return run_program(prog, argv, &(struct run_opts){ .capture = out, .capture_size = outsz });
+}
+
+int run_cmd_capture_quiet(const char *prog, const char *const argv[], char *out, size_t outsz) {
+    return run_program(prog, argv, &(struct run_opts){ .capture = out, .capture_size = outsz, .quiet = true });
+}
+
+int run_cmd_input(const char *prog, const char *const argv[], const char *input, bool quiet) {
+    return run_program(prog, argv, &(struct run_opts){ .input = input, .quiet = quiet });
 }
 
 void require_rm_rf(const char *path) {
