@@ -47,6 +47,16 @@
 # ip_forward_no_drop = false
 # ip_masq = true
 
+# firewall_backend: iptables or nftables ("firewall-backend"). With nftables
+#   lightbox's rules are in the tables ip lightbox and bridge lightbox, a
+#   container with links needs no br_netfilter, and, as Docker has it, setup
+#   does not turn IPv4 forwarding on and there is no LIGHTBOX-USER.
+# bridge_accept_fwmark: with nftables, packets with this mark, or mark/mask,
+#   are accepted by lightbox's rules before they drop anything; a chain of the
+#   host's that comes before them sets it ("bridge-accept-fwmark").
+# firewall_backend = iptables
+# bridge_accept_fwmark = 0x10/0xf0
+
 # Bridge interface and network. subnet is <address>/<bits>, with 8 to 30 bits;
 # the bridge and every container have its prefix. gw is the bridge's address
 # in it, neither its first nor its last. A bridge that setup has made keeps

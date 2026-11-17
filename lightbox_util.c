@@ -282,6 +282,16 @@ const char *tool_path_iptables(void) {
     return pick_tool_path(candidates, sizeof(candidates) / sizeof(candidates[0]));
 }
 
+const char *tool_path_nft(void) {
+    static const char *const candidates[] = {
+        "/usr/sbin/nft",
+        "/sbin/nft",
+        "/usr/bin/nft",
+        "/bin/nft",
+    };
+    return pick_tool_path(candidates, sizeof(candidates) / sizeof(candidates[0]));
+}
+
 const char *tool_path_cp(void) {
     static const char *const candidates[] = {
         "/bin/cp",

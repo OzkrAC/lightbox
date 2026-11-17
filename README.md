@@ -6,9 +6,9 @@ A minimal, secure Linux container runtime. Single static binary, ~33KB, no libc 
 
 - Linux with namespace and cgroup v2 support
 - GCC and ninja (build time)
-- `iproute2`, `iptables`, `util-linux` (`nsenter`) at runtime
+- `iproute2`, `util-linux` (`nsenter`) and `iptables` at runtime, or `nft` with `firewall_backend = nftables`
 - BusyBox `ip` is not sufficient; `lightbox start` requires the full `iproute2` `ip` binary for veth creation and bridge attachment
-- For containers created with `--link`: the `br_netfilter` kernel module, with `net.bridge.bridge-nf-call-iptables=1`
+- For containers created with `--link`, with iptables: the `br_netfilter` kernel module, with `net.bridge.bridge-nf-call-iptables=1`. With nftables: nf_tables with the bridge family (`CONFIG_NF_TABLES_BRIDGE`, `nft_meta_bridge`), NAT and masquerading, and no `br_netfilter`
 - Root privileges
 
 ## Building
@@ -239,6 +239,12 @@ firewall = true
 ip_forward = true
 ip_forward_no_drop = false
 ip_masq = true
+
+# iptables or nftables ("firewall-backend"), and with nftables the mark, or
+# mark/mask, of packets that lightbox's rules accept before they drop anything
+# ("bridge-accept-fwmark")
+firewall_backend = iptables
+# bridge_accept_fwmark = 0x10/0xf0
 ```
 
 If `lightbox_dir` is set, `rootfs` and `container_dir` are automatically derived from it (e.g., `rootfs = <lightbox_dir>/rootfs`) unless explicitly overridden.
@@ -268,6 +274,26 @@ The settings are Docker's:
 - `ip_masq = false` (`ip-masq`): nothing is masqueraded.
 
 A setting that is not `true` or `false` is said, and its built-in value is kept. `setup` flushes and fills `LIGHTBOX-FORWARD` and `LIGHTBOX-POSTROUTING` for the bridge of its `lightbox.conf`, so one host has one lightbox network. On a host where lightbox 0.4 or earlier ran `setup`, the next `setup` takes out the rules that it put straight into `FORWARD` and `POSTROUTING`; a running container with links gets its link rules back when it is started again.
+
+#### With nftables
+
+`firewall_backend = nftables` (Docker's `firewall-backend`) puts lightbox's rules in two nftables tables of its own instead, as Docker's nftables backend does:
+
+| Table | Chain or set | What is in it |
+|-------|--------------|---------------|
+| `ip lightbox` | `forward` | What comes back to the bridge for a connection from it; anything else new that would go into the bridge is dropped |
+| `ip lightbox` | `postrouting` | Masquerading of `subnet` for what leaves by any interface but the bridge, when `ip_masq` is true |
+| `bridge lightbox` | `forward` | Between two ports of the bridge, the pairs in `links` and nothing else |
+| `bridge lightbox` | `links` | A pair of ports for each way of each link of a running container |
+
+The bridge-family chain sees what the bridge switches without `br_netfilter`, so a container with links starts without it. `setup` makes both tables in one transaction, and a start of a container with links runs one `nft`. `setup` with nftables takes out the chains lightbox made in iptables, but for `LIGHTBOX-USER` and the jump to it, which are this host's; with iptables it takes the two tables away.
+
+What changes with the backend, as it does for Docker:
+
+- `setup` does not turn IPv4 forwarding on. When it is off and `ip_forward` is true, `setup` stops before it changes anything and says so: turn it on yourself, with rules of this host's against forwarding between its other interfaces, or set `ip_forward = false`. `ip_forward_no_drop` has no use, as no policy is set.
+- There is no `LIGHTBOX-USER`. An nftables `accept` does not get a packet past another table, so the host's rules go in tables of its own: one that drops decides whatever lightbox's accept. To accept what lightbox's rules drop, mark it in a chain of the host's on the same hook with a lower priority (`filter - 1` or below), and set `bridge_accept_fwmark` to that mark, or mark and mask: `0x10`, or `0x10/0xf0`. Mark 0 is every unmarked packet's and is refused.
+- A chain of another table whose policy drops forwarded packets drops the containers' traffic too: iptables' `FORWARD` with policy DROP, which Docker, ufw, firewalld and lightbox's own `setup` with iptables leave, among them. `setup` names every such chain it finds, and so does `doctor`, as `forward_drops`. Change their policy, with `iptables -P FORWARD ACCEPT` for iptables', or accept the bridge's traffic in them.
+- A host firewall that flushes the whole ruleset when it loads, as `/etc/nftables.conf` files that begin with `flush ruleset` do, takes lightbox's tables with it: run `lightbox setup` after it.
 
 ### Rootfs resolution order
 
@@ -354,7 +380,7 @@ The sandbox covers everything in a container: init, the `/init.sh` hook and all 
 | /proc and /sys masking | The paths Docker masks by default are covered, files with `/dev/null` and directories with an empty read-only tmpfs. A mask that cannot be made fails the start |
 | /proc read-only | Remounts /proc/sys, /proc/bus, /proc/fs, /proc/irq read-only |
 | Root filesystem | Mounted `nodev`, and `nosuid` unless privileged. Devices come from the `/dev` that lightbox builds |
-| Container isolation | A container without `--link` has an isolated port on the bridge: it reaches the host and the outside, and no other container. IPv6 is off inside containers. A container with `--link` shares the bridge, is kept to its links by iptables rules that name the two ports of each link, and does not start unless `br_netfilter` lets iptables see bridged traffic. A link holds whichever of the two starts first, and a container's link rules go with it when it stops, is removed or is found dead |
+| Container isolation | A container without `--link` has an isolated port on the bridge: it reaches the host and the outside, and no other container. IPv6 is off inside containers. A container with `--link` shares the bridge, and is kept to its links by firewall rules that name the two ports of each link: with iptables it does not start unless `br_netfilter` lets iptables see bridged traffic, and with nftables a table of the bridge family sees it without. A link holds whichever of the two starts first, and a container's link rules go with it when it stops, is removed or is found dead |
 | The terminal of whoever runs `exec` | A command never holds it. Typed at a terminal, `exec` gives the command a pseudo-terminal of the container and carries the bytes; where only one of its streams is a terminal, a pipe stands in for it |
 | The binary `exec` enters with | `exec` executes itself again from a sealed copy in memory before it enters a container, so the processes it puts there are never the installed binary. Where the kernel refuses executable memfds (`vm.memfd_noexec=2`) it takes the binary through a read-only mount of its own instead. Its worker is not dumpable. `lightbox doctor` says which of the two is in use |
 | User namespaces | Planned future improvement |

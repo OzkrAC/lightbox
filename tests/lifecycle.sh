@@ -204,6 +204,9 @@ nothing_left() { # name
     if [ -n "$port" ] && { [ -e "$RUN/$1/firewall" ] || iptables -n -L "LB-${port#vb-}" >/dev/null 2>&1; }; then
         echo "the firewall chain LB-${port#vb-} of its links, or the record of it, is left"; bad=1
     fi
+    if [ -n "$port" ] && nft list set bridge lightbox links 2>/dev/null | grep -q "\"$port\""; then
+        echo "an element of the nftables set of links names $port"; bad=1
+    fi
     echo "state: $(state_of "$1")"
     return $bad
 }
@@ -2038,6 +2041,161 @@ t_no_ipv6_in_container() {
     [ -z "$said" ]
 }
 
+# ─── Cases: firewall_backend = nftables ─────────────────────────────────────
+
+# Can this host have lightbox's tables: nft, and nf_tables with the bridge
+# family and its meta match, in this network namespace?
+nft_ok() {
+    command -v nft >/dev/null 2>&1 || { echo "nft is not installed"; return 1; }
+    printf '%s\n' 'table bridge lbt-probe {' '  chain f {' '    type filter hook forward priority filter; policy accept;' \
+        '    meta ibrname "lbt-x" accept' '  }' '}' | nft -f - ||
+        { echo "nf_tables here has no bridge family, or no meta ibrname"; return 1; }
+    nft delete table bridge lbt-probe
+}
+
+# A lightbox.conf of the suite's with firewall_backend = nftables, and setup
+# with it. As Docker asks of its nftables backend, the iptables FORWARD
+# policy that drops (t_setup set it) is ACCEPT; teardown puts it back.
+nft_setup() { # directory name, settings...
+    nft_ok || return 77
+    local dir=$1
+    shift
+    alt_conf "$dir" 'firewall_backend = nftables' "$@" || return 1
+    iptables -P FORWARD ACCEPT || return 1
+    alt_lb setup >"$OUT/$dir.setup" 2>&1 || { cat "$OUT/$dir.setup"; return 1; }
+}
+
+# setup makes lightbox's two tables and takes out what lightbox had in
+# iptables, but for the host's LIGHTBOX-USER. A FORWARD policy that drops
+# what nftables accepts is said, by setup and by doctor. A second setup
+# changes nothing, and one with iptables takes the tables away again.
+t_nft_setup() {
+    nft_ok || return 77
+    alt_conf nft 'firewall_backend = nftables' || return 1
+    said=$(alt_lb setup 2>&1) || { printf '%s\n' "$said"; return 1; }
+    printf '%s\n' "$said"
+    nft list table ip lightbox && nft list table bridge lightbox || return 1
+    nft list chain ip lightbox forward | grep -qF "oifname \"$BR\" iifname != \"$BR\" drop" &&
+    nft list chain ip lightbox forward | grep -qF "oifname \"$BR\" ct state established,related accept" &&
+    nft list chain ip lightbox postrouting | grep -qF "ip saddr $SUBNET oifname != \"$BR\" masquerade" &&
+    nft list chain bridge lightbox forward | grep -qF "ibrname \"$BR\" iifname . oifname @links accept" &&
+    nft list chain bridge lightbox forward | grep -qF "ibrname \"$BR\" drop" || { echo "a rule is missing"; return 1; }
+    iptables -n -L LIGHTBOX-FORWARD >/dev/null 2>&1 && { echo "LIGHTBOX-FORWARD is left"; return 1; }
+    iptables -n -L LIGHTBOX-LINKS >/dev/null 2>&1 && { echo "LIGHTBOX-LINKS is left"; return 1; }
+    iptables -t nat -n -L LIGHTBOX-POSTROUTING >/dev/null 2>&1 && { echo "LIGHTBOX-POSTROUTING is left"; return 1; }
+    iptables -C FORWARD -j LIGHTBOX-USER || { echo "the host's LIGHTBOX-USER lost its jump"; return 1; }
+    case $said in *'iptables FORWARD'*'iptables -P FORWARD ACCEPT'*) ;; *) echo "setup did not name the FORWARD policy that drops"; return 1 ;; esac
+    alt_lb doctor | grep -x 'forward_drops: iptables FORWARD' || { echo "doctor did not name it"; return 1; }
+    tables() { nft list table ip lightbox; nft list table bridge lightbox; }
+    before=$(tables)
+    alt_lb setup >/dev/null 2>&1 || return 1
+    [ "$before" = "$(tables)" ] || { echo "a second setup changed the tables:"; tables; return 1; }
+    said=$(lb setup 2>&1) || { printf '%s\n' "$said"; return 1; }
+    printf '%s\n' "$said"
+    ! nft list tables | grep -q ' lightbox$' || { echo "left: $(nft list tables)"; return 1; }
+    iptables -C FORWARD -j LIGHTBOX-FORWARD && iptables -t nat -C POSTROUTING -j LIGHTBOX-POSTROUTING
+}
+
+# Where nothing passes bridged traffic through iptables, linked containers
+# reach each other and a third reaches neither. The peer has no link of its
+# own and so an isolated port, as the third has: the bridge keeps those two
+# apart. Between the third and the linked one, which shares the bridge, it is
+# the bridge table that decides. Out, through nftables' masquerading.
+t_nft_links_without_brnf() {
+    need_nc || return 77
+    if [ -e "$BRNF" ]; then brnf 0 || return 1; fi
+    nft_setup nftlinks; rc=$?; [ $rc = 0 ] || return $rc
+    box npeer && box nlinked --link npeer && box nthird || return 1
+    HOME="$ALT" start npeer && HOME="$ALT" start nlinked && HOME="$ALT" start nthird || return 1
+    nft list set bridge lightbox links
+    reaches nlinked "$(addr_of npeer)" && reaches npeer "$(addr_of nlinked)" || return 1
+    reaches nthird "$(addr_of nlinked)" && { echo "a container without the link reached nlinked"; return 1; }
+    reaches nthird "$(addr_of npeer)" && { echo "a container without the link reached npeer"; return 1; }
+    reaches nthird "$OUTSIDE" || { echo "the outside was not reached through masquerading"; return 1; }
+    alt_lb stop nlinked >/dev/null && nothing_left nlinked
+}
+
+# A start puts in a container's links with one process, nft.
+t_nft_one_process() {
+    command -v strace >/dev/null 2>&1 || { echo "no strace to watch a start with"; return 77; }
+    nft_setup nftone; rc=$?; [ $rc = 0 ] || return $rc
+    box nonepeer && box nonelinked --link nonepeer || return 1
+    is_up() { [ "$(state_of nonelinked 2>/dev/null)" = running ]; }
+    HOME="$ALT" timeout -k 5 80 strace -f -qq -e trace=execve -o "$T/nftlinks.strace" \
+        "$LB" start nonelinked >"$OUT/nonelinked.start" 2>&1 </dev/null &
+    tracer=$!
+    wait_until 60 is_up || { echo "the container did not start under strace:"; cat "$OUT/nonelinked.start"; kill "$tracer" 2>/dev/null; return 1; }
+    settled nonelinked || return 1
+    alt_lb stop nonelinked >/dev/null 2>&1 || { echo "stop failed"; return 1; }
+    wait "$tracer"
+    tools=$(grep -E 'execve\("[^"]*/(ip6?tables[^"]*|nft)"' "$T/nftlinks.strace" | grep -v ' = -1 ')
+    printf '%s\n' "$tools"
+    [ "$(printf '%s\n' "$tools" | grep -c .)" = 1 ] && printf '%s\n' "$tools" | grep -q '/nft"'
+}
+
+# rm of a container whose init died takes its links out of the set, by its
+# record, and leaves the peer's in.
+t_nft_rm_leaves_nothing() {
+    nft_setup nftrm; rc=$?; [ $rc = 0 ] || return $rc
+    box nrpeer --link nrmain && box nrmain --link nrpeer && box nrother --link nrpeer || return 1
+    HOME="$ALT" start nrpeer && HOME="$ALT" start nrmain && HOME="$ALT" start nrother || return 1
+    port=$(port_of nrmain) other=$(port_of nrother)
+    nft list set bridge lightbox links
+    nft list set bridge lightbox links | grep -qF "\"$port\"" || { echo "the link is not in the set"; return 1; }
+    echo "the record: $(cat "$RUN/nrmain/firewall")"
+    pid=$(pid_of nrmain)
+    kill -KILL "$pid"
+    wait_until 5 gone "$pid" || return 1
+    alt_lb rm nrmain || return 1
+    nft list set bridge lightbox links
+    ! nft list set bridge lightbox links | grep -qF "\"$port\"" || { echo "an element naming $port is left"; return 1; }
+    nft list set bridge lightbox links | grep -qF "\"$other\"" || { echo "the link of nrother went with it"; return 1; }
+    [ ! -e "$RUN/nrmain" ] || { echo "left in run_dir: $(ls -A "$RUN/nrmain")"; return 1; }
+    # the peer linked to nrmain as well, and its stop finds that pair gone;
+    # nrother's pair with it is nrother's, and goes when nrother stops
+    alt_lb stop nrother >/dev/null && alt_lb stop nrpeer >/dev/null && nothing_left nrpeer && nothing_left nrother
+}
+
+# As Docker with nftables: setup does not turn forwarding on, and with it
+# off and ip_forward = true it stops before it changes anything.
+t_nft_forwarding() {
+    nft_ok || return 77
+    alt_conf nftfwd 'firewall_backend = nftables' || return 1
+    echo 0 > /proc/sys/net/ipv4/ip_forward || return 1
+    before=$(nft list tables)
+    said=$(alt_lb setup 2>&1) && { printf '%s\n' "$said"; echo "setup went ahead with forwarding off"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *'IPv4 forwarding is off'*'ip_forward = false'*) ;; *) return 1 ;; esac
+    [ "$(cat /proc/sys/net/ipv4/ip_forward)" = 0 ] || { echo "setup turned forwarding on"; return 1; }
+    [ "$before" = "$(nft list tables)" ] || { echo "setup changed the firewall before it stopped"; return 1; }
+    alt_conf nftfwd 'firewall_backend = nftables' 'ip_forward = false' || return 1
+    said=$(alt_lb setup 2>&1) || { printf '%s\n' "$said"; return 1; }
+    printf '%s\n' "$said"
+    [ "$(cat /proc/sys/net/ipv4/ip_forward)" = 0 ] || { echo "setup turned forwarding on"; return 1; }
+    nft list table bridge lightbox >/dev/null
+}
+
+# What comes in from outside to a container is dropped; with
+# bridge_accept_fwmark, what a chain of the host's marks before lightbox's
+# chains is accepted.
+t_nft_accept_fwmark() {
+    command -v ping >/dev/null 2>&1 || { echo "no ping to try the way in with"; return 77; }
+    nft_setup nftmark 'bridge_accept_fwmark = 0x10/0xf0'; rc=$?; [ $rc = 0 ] || return $rc
+    box nmarked && HOME="$ALT" start nmarked || return 1
+    ip=$(addr_of nmarked) outside=$(cat "$T/outside")
+    nsenter -t "$outside" -n ip route add "$SUBNET" via 192.0.2.2 || return 1
+    nsenter -t "$outside" -n ping -c 1 -W 2 "$ip" && { echo "a new connection from outside was not dropped"; return 1; }
+    nft -f - <<EOF || return 1
+table ip lbt-mine {
+    chain tagging {
+        type filter hook forward priority filter - 1; policy accept;
+        ip daddr $ip meta mark set 0x13
+    }
+}
+EOF
+    nsenter -t "$outside" -n ping -c 1 -W 2 "$ip" || { echo "the marked packets were not accepted"; return 1; }
+}
+
 # ─── Fixture ────────────────────────────────────────────────────────────────
 
 add_account() { # file key line
@@ -2080,6 +2238,7 @@ network() {
     # and address translation needs somewhere to go.
     unshare --net -- sleep 86400 >/dev/null 2>&1 </dev/null &
     local outside=$!
+    echo "$outside" > "$T/outside"
     different_net() { [ "$(readlink "/proc/$outside/ns/net" 2>/dev/null)" != "$(readlink /proc/self/ns/net)" ] &&
                       [ -n "$(readlink "/proc/$outside/ns/net" 2>/dev/null)" ]; }
     wait_until 5 different_net || return 1
@@ -2151,6 +2310,13 @@ teardown() {
         ip link delete "$p"
     done
     [ -s "$T/firewall" ] && iptables-restore < "$T/firewall"
+    # what a case of firewall_backend = nftables made, and the forwarding
+    # setup turned on, which a case may have turned off
+    for p in "ip lightbox" "bridge lightbox" "ip lbt-mine"; do
+        nft list table $p >/dev/null 2>&1 && nft delete table $p
+    done
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+    nsenter -t "$(cat "$T/outside")" -n ip route del "$SUBNET"
     [ -w "$BRNF" ] && echo 1 > "$BRNF"
     find "$C" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
     # and the records of the ones that ran; a case may have taken run_dir away
@@ -2332,6 +2498,13 @@ if [ "$MODE" = inside ]; then
     check 'the host'"'"'s end of the interface carries lightbox'"'"'s alias'  t_interface_is_tagged
     check 'a name of 30 characters works from create to rm'              t_long_name
     check 'a container has no IPv6 address'                               t_no_ipv6_in_container
+
+    check 'nftables: setup makes the two tables, and takes lightbox'"'"'s iptables chains out' t_nft_setup
+    check 'nftables: linked containers reach each other without br_netfilter, a third neither' t_nft_links_without_brnf
+    check 'nftables: a start puts in its links with one process'          t_nft_one_process
+    check 'nftables: rm of a dead container takes its links out of the set' t_nft_rm_leaves_nothing
+    check 'nftables: setup does not turn forwarding on, as Docker does not' t_nft_forwarding
+    check 'nftables: what comes in is dropped, and bridge_accept_fwmark accepts it' t_nft_accept_fwmark
 
     # last: it may leave a kernel setting changed for the rest of this suite's life
     check 'exec works where a memfd may not be executed'                  t_exec_where_memfds_may_not_be_executed

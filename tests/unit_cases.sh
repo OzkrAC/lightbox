@@ -1727,6 +1727,177 @@ COMMIT'
     [ "$got" = 'too long' ] || { echo "into 64 bytes: $got"; return 1; }
 }
 
+# firewall_backend = nftables: setup's two tables in one transaction. The
+# chains are flushed and filled again and the set of links is not, as its
+# elements are the running containers'. Between two ports of the bridge, the
+# pairs in links and nothing else; out of the bridge anything, and back what
+# belongs to it; the subnet masqueraded when ip_masq is true.
+t_nft_setup_text() {
+    got=$("$UNIT" firewall nft-setup 10.9.5.0/16 10.9.0.1 br7 true)
+    tab=$(printf '\t')
+    want="table ip lightbox {
+${tab}chain forward {
+${tab}${tab}type filter hook forward priority filter; policy accept;
+${tab}}
+${tab}chain postrouting {
+${tab}${tab}type nat hook postrouting priority srcnat; policy accept;
+${tab}}
+}
+flush chain ip lightbox forward
+flush chain ip lightbox postrouting
+add rule ip lightbox forward oifname \"br7\" ct state established,related accept
+add rule ip lightbox forward oifname \"br7\" iifname != \"br7\" drop
+add rule ip lightbox postrouting ip saddr 10.9.0.0/16 oifname != \"br7\" masquerade
+table bridge lightbox {
+${tab}set links {
+${tab}${tab}type ifname . ifname
+${tab}}
+${tab}chain forward {
+${tab}${tab}type filter hook forward priority filter; policy accept;
+${tab}}
+}
+flush chain bridge lightbox forward
+add rule bridge lightbox forward meta ibrname \"br7\" iifname . oifname @links accept
+add rule bridge lightbox forward meta ibrname \"br7\" drop"
+    [ "$got" = "$want" ] || { printf '%s\n' "$got"; return 1; }
+    got=$("$UNIT" firewall nft-setup 10.0.0.0/24 10.0.0.1 br0 false | grep -c masquerade)
+    [ "$got" = 0 ] || { echo "with ip_masq = false, masquerade rules: $got"; return 1; }
+    # bridge_accept_fwmark: accepted before anything is dropped, in both tables
+    got=$("$UNIT" firewall nft-setup 10.0.0.0/24 10.0.0.1 br0 true 0x10/0xf0 | grep -n 'mark')
+    [ "$got" = '11:add rule ip lightbox forward meta mark & 0xf0 == 0x10 accept
+24:add rule bridge lightbox forward meta mark & 0xf0 == 0x10 accept' ] || { printf '%s\n' "$got"; return 1; }
+    got=$("$UNIT" firewall nft-setup 10.0.0.0/24 10.0.0.1 br0 true 0x10 | grep 'mark' | head -n 1)
+    [ "$got" = 'add rule ip lightbox forward meta mark 0x10 accept' ] || { echo "a mark without a mask: $got"; return 1; }
+    # a bridge whose name would not stay between the quotes gets no rules
+    for br in 'br"0' 'br 0' 'br;0' 'abcdefghijklmnop' ''; do
+        got=$("$UNIT" firewall nft-setup 10.0.0.0/24 10.0.0.1 "$br" true)
+        [ "$got" = 'too long' ] || { echo "bridge '$br': $got"; return 1; }
+    done
+}
+
+# A container's links under nftables: a record of the pairs of ports, each
+# once, and from it the elements of the set, both ways of each pair. Removal
+# puts them in and takes them out again, so that what a peer took out already
+# does not stop it.
+t_nft_link_elements() {
+    got=$("$UNIT" firewall nft-record web db cache db web)
+    want='nftables
+vb-5ea0e1194872 vb-08914e07b53b
+vb-5ea0e1194872 vb-1c33d13ab5ec'
+    [ "$got" = "$want" ] || { echo "the record, with a link given twice and one to itself:"; printf '%s\n' "$got"; return 1; }
+    nl='
+'
+    got=$("$UNIT" nftlinks add "$want$nl")
+    elements='{ "vb-5ea0e1194872" . "vb-08914e07b53b", "vb-08914e07b53b" . "vb-5ea0e1194872", "vb-5ea0e1194872" . "vb-1c33d13ab5ec", "vb-1c33d13ab5ec" . "vb-5ea0e1194872" }'
+    [ "$got" = "add element bridge lightbox links $elements" ] || { printf '%s\n' "$got"; return 1; }
+    got=$("$UNIT" nftlinks remove "$want$nl")
+    [ "$got" = "add element bridge lightbox links $elements
+delete element bridge lightbox links $elements" ] || { printf '%s\n' "$got"; return 1; }
+    # a record of no link is nothing to do
+    got=$("$UNIT" nftlinks remove "nftables$nl")
+    [ -z "$got" ] || { echo "for a record of no link: $got"; return 1; }
+    # eight links of the longest names fit
+    long=abcdefghijklmnopqrstuvwxyz0123
+    record=$("$UNIT" firewall nft-record "$long" "${long%??}a1" "${long%??}a2" "${long%??}a3" "${long%??}a4" \
+             "${long%??}a5" "${long%??}a6" "${long%??}a7" "${long%??}a8")
+    got=$("$UNIT" nftlinks remove "$record$nl" | grep -o '" \. "' | wc -l)
+    [ "$got" = 32 ] || { echo "elements for eight links, put in and taken out: $got"; return 1; }
+}
+
+# A record that is not one lightbox writes is not given to nft: each line two
+# ports, as host_port_name names them, and a newline.
+t_nft_records_refused() {
+    nl='
+'
+    a=vb-5ea0e1194872 b=vb-08914e07b53b
+    bad=0
+    for record in "$a $b$nl" "nftables $a $b$nl" "nftables$nl$a $b" "nftables$nl$a  $b$nl" \
+                  "nftables$nl$a $b $b$nl" "nftables$nl$a$nl" "nftables$nl$a $a$nl" \
+                  "nftables$nl${a%?}A $b$nl" "nftables$nl${a%?} $b$nl" "nftables$nl$a ${b}0$nl" \
+                  "nftables$nl\"$a\" $b$nl" "nftables$nl$a $b$nl$nl" "nftables$nl$a $b$nl;$nl" \
+                  "nftables$nl$a vb-08914e07b5\" ;$nl" "NFTABLES$nl$a $b$nl" "LB-5ea0e1194872$nl"; do
+        got=$("$UNIT" nftlinks remove "$record")
+        [ "$got" = refused ] || { printf 'not refused: %s\n  gave: %s\n' "$record" "$got"; bad=1; }
+    done
+    for name in vb-5ea0e1194872 vb-000000000000; do
+        [ "$("$UNIT" portname "$name")" = ok ] || { echo "$name refused"; bad=1; }
+    done
+    for name in vb-5ea0e119487 vb-5ea0e11948720 vb-5EA0E1194872 ve-5ea0e1194872 'vb-5ea0e119487"' vb-web ''; do
+        [ "$("$UNIT" portname "$name")" = refused ] || { echo "$name taken for a port"; bad=1; }
+    done
+    return $bad
+}
+
+# bridge_accept_fwmark: a mark, or a mark and its mask, in decimal or hex,
+# that a packet can carry and nft reads as written.
+t_fwmarks() {
+    bad=0
+    expect() { # text, what parse_fwmark makes of it
+        got=$("$UNIT" fwmark "$1" | paste -sd' ' -)
+        [ "$got" = "$2" ] || { echo "'$1': $got, expected $2"; bad=1; }
+    }
+    expect 0x10 'mark 0x10 mask 0xffffffff as 0x10'
+    expect 16/0xf0 'mark 0x10 mask 0xf0 as 0x10/0xf0'
+    expect 0x1/0x3 'mark 0x1 mask 0x3 as 0x1/0x3'
+    expect 0xFFFFFFFF 'mark 0xffffffff mask 0xffffffff as 0xffffffff'
+    expect 4294967295 'mark 0xffffffff mask 0xffffffff as 0xffffffff'
+    # 0 is every unmarked packet's; a bit outside the mask, no packet's; a
+    # leading 0 is octal to nft
+    for text in 0 0x0 0/0xff 1/0 0x10/0x1 016 08 0x 0x123456789 4294967296 1/ /1 1/2/3 ' 1' '1 ' -1 +1 1x 0x1g ''; do
+        expect "$text" refused
+    done
+    return $bad
+}
+
+# What doctor and setup name as dropping what lightbox's nftables rules
+# accept: forward base chains whose policy is drop, in ip, inet and bridge.
+t_forward_drop_chains() {
+    listing='table ip filter {
+	chain INPUT {
+		type filter hook input priority filter; policy drop;
+	}
+	chain FORWARD {
+		type filter hook forward priority filter; policy drop;
+	}
+}
+table inet firewall {
+	chain fwd {
+		type filter hook forward priority 0; policy drop;
+	}
+	chain mine {
+	}
+}
+table inet open {
+	chain forward {
+		type filter hook forward priority filter; policy accept;
+	}
+}
+table ip6 filter {
+	chain FORWARD {
+		type filter hook forward priority filter; policy drop;
+	}
+}
+table bridge lightbox {
+	chain forward {
+		type filter hook forward priority filter; policy accept;
+	}
+}
+table bridge other {
+	chain forward {
+		type filter hook forward priority filter; policy drop;
+	}
+}'
+    got=$("$UNIT" dropping "$listing")
+    [ "$got" = 'chains 3
+ip filter FORWARD, inet firewall fwd, bridge other forward' ] || { printf '%s\n' "$got"; return 1; }
+    got=$("$UNIT" dropping 'table inet open {
+	chain forward {
+		type filter hook forward priority filter; policy accept;
+	}
+}')
+    [ "$got" = 'chains 0' ] || { printf '%s\n' "$got"; return 1; }
+}
+
 # What setup puts in its chains: between two ports of the bridge what a link
 # allows and nothing else; out by any interface but the bridge, and back what
 # belongs to that; masquerading of the subnet, as the network spells it, when
@@ -2423,6 +2594,11 @@ check 'an interface is lightbox'"'"'s for a container only with its alias' t_int
 check 'a record of link rules names a chain of lightbox'"'"'s or is refused' t_link_chain_names
 check 'a container'"'"'s link rules are a chain of its own, by port and not address' t_firewall_links_text
 check 'setup'"'"'s rules: links between ports, out by any interface, masquerade if set' t_firewall_setup_text
+check 'nftables: setup'"'"'s two tables, flushed chains, a set of links that is kept' t_nft_setup_text
+check 'nftables: a container'"'"'s links are elements of the set, each once, taken out safely' t_nft_link_elements
+check 'nftables: a record that is not lightbox'"'"'s is not given to nft'  t_nft_records_refused
+check 'bridge_accept_fwmark: a mark nft reads as written, and none that matches all' t_fwmarks
+check 'the forward chains that drop what nothing accepts are named'      t_forward_drop_chains
 check 'an address is four numbers and three dots, and no zero in front' t_addresses_are_strict
 check 'subnet and gw are one network, and an address on it is one a container can have' t_network_settings
 check 'no prefix is written into the source: subnet gives it'      t_no_prefix_of_its_own

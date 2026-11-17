@@ -691,6 +691,46 @@ t_firewall_settings() {
     printf '%s\n' "$report" | grep -qx 'firewall: true' && printf '%s\n' "$report" | grep -qx 'ip_forward_no_drop: false'
 }
 
+# firewall_backend and bridge_accept_fwmark, as Docker's firewall-backend and
+# bridge-accept-fwmark: iptables and no mark unless lightbox.conf says
+# otherwise. doctor looks for the firewall tools of the backend in use and not
+# the other's, and a value that is not one is said and not taken.
+t_firewall_backend_settings() {
+    shown() { printf '%s\n' "$report" | grep -E '^(Warning|that a packet|firewall_backend|bridge_accept_fwmark|bridge_filtering|forward_drops|bin\.(iptables|iptables-restore|nft))'; }
+    has() { printf '%s\n' "$report" | grep -qx -- "$1"; }
+    report=$(lb doctor 2>&1); shown
+    has 'firewall_backend: iptables' && has 'bridge_accept_fwmark: none' &&
+    printf '%s\n' "$report" | grep -q '^bin.iptables-restore: ' && ! printf '%s\n' "$report" | grep -q '^bin.nft: ' ||
+        { echo "the built-in values are not Docker's, or doctor looks for nft"; return 1; }
+    cp "$CONF" "$W/conf.good"
+    printf 'firewall_backend = nftables\nbridge_accept_fwmark = 0x10/0xf0\n' >> "$CONF"
+    report=$(lb doctor 2>&1); shown
+    has 'firewall_backend: nftables' && has 'bridge_accept_fwmark: 0x10/0xf0' &&
+    has 'bridge_filtering: not needed (firewall_backend = nftables filters at the bridge)' &&
+    printf '%s\n' "$report" | grep -q '^bin.nft: ' && ! printf '%s\n' "$report" | grep -q '^bin.iptables' ||
+        { echo "the settings were not taken"; return 1; }
+    # what drops forwarded packets is root's to read
+    if [ "$(id -u)" != 0 ]; then
+        has 'forward_drops: unknown (doctor is not run as root)' || { echo "forward_drops is not said to need root"; return 1; }
+    fi
+    { cat "$W/conf.good"; echo 'bridge_accept_fwmark = 0x10'; } > "$CONF"
+    report=$(lb doctor 2>&1); shown
+    has 'bridge_accept_fwmark: 0x10 (not used: with iptables, rules in LIGHTBOX-USER decide first)' ||
+        { echo "with iptables the mark is not said to go unused"; return 1; }
+    ! printf '%s\n' "$report" | grep -q '^forward_drops' || { echo "forward_drops is shown for iptables"; return 1; }
+    { cat "$W/conf.good"; printf 'firewall_backend = nft\nbridge_accept_fwmark = 0\n'; } > "$CONF"
+    report=$(lb doctor 2>&1); shown
+    has 'Warning: firewall_backend in lightbox.conf is not iptables or nftables: nft; using iptables' &&
+    has 'that a packet can carry: 0; using none' && has 'firewall_backend: iptables' && has 'bridge_accept_fwmark: none' ||
+        { echo "a value that is not one was taken, or not said"; return 1; }
+    # one that is wrong after one that is right keeps the right one
+    { cat "$W/conf.good"; printf 'firewall_backend = nftables\nfirewall_backend = both\n'
+      printf 'bridge_accept_fwmark = 0x4\nbridge_accept_fwmark = 0x4/0x1\n'; } > "$CONF"
+    report=$(lb doctor 2>&1); shown
+    has 'Warning: firewall_backend in lightbox.conf is not iptables or nftables: both; using nftables' &&
+    has 'that a packet can carry: 0x4/0x1; using 0x4' && has 'firewall_backend: nftables' && has 'bridge_accept_fwmark: 0x4'
+}
+
 t_default_settings_are_checked() {
     printf 'default_mem = 64M\ndefault_pids = 32\ndefault_cpu = 0.5\ndefault_oom = -200\n' >> "$CONF"
     lb create web 10.0.0.2 || return 1
@@ -1481,6 +1521,7 @@ check 'two creates at once get two addresses'                 t_creates_at_once_
 check '--swap takes what --mem does and 0, and is none unless given' t_swap_option
 check '--io-max is a line of io.max for a whole disk that is there' t_io_max_option
 check 'the firewall settings are Docker'"'"'s, and a wrong one keeps the built-in' t_firewall_settings
+check 'firewall_backend and bridge_accept_fwmark: Docker'"'"'s, and a wrong one is not taken' t_firewall_backend_settings
 check 'ls --json stays JSON next to an odd directory name'    t_ls_json_escapes_names
 check 'ls --json escapes whatever a record holds'             t_ls_json_escapes_values
 check 'ls --json gives pid as null for a stopped container'   t_ls_json_pid_is_null_when_stopped

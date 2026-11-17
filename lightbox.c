@@ -3242,9 +3242,10 @@ static void cmd_start(int argc, char **argv) {
     /* A container without links gets an isolated port on the bridge: it
      * reaches the host and, through it, the outside, and no other container.
      * One with links has to share the bridge with the containers it is linked
-     * to, and then the firewall is all that keeps it to those. The firewall
-     * sees what the bridge switches only with br_netfilter, so without that
-     * such a container is not started. Decided before anything is set up. */
+     * to, and then the firewall is all that keeps it to those. iptables sees
+     * what the bridge switches only with br_netfilter, so without that such a
+     * container is not started; nftables sees it at the bridge itself.
+     * Decided before anything is set up. */
     bool linked = config.nlinks > 0;
     if (linked && !cfg_global.firewall) {
         print_str(STDERR, "Error: container '");
@@ -3254,9 +3255,12 @@ static void cmd_start(int argc, char **argv) {
                           "links, so it is not started without them\n");
         lc_kernel_exit(1);
     }
-    if (linked)
+    bool nftables = cfg_global.firewall_backend == FIREWALL_NFTABLES;
+    if (linked && nftables)
+        require_tool("nft", tool_path_nft());
+    else if (linked)
         require_tool("iptables-restore", tool_path_iptables_restore());
-    if (linked && !bridge_traffic_is_filtered()) {
+    if (linked && !nftables && !bridge_traffic_is_filtered()) {
         print_str(STDERR, "Error: container '");
         print_str(STDERR, name);
         print_str(STDERR,
@@ -3264,7 +3268,8 @@ static void cmd_start(int argc, char **argv) {
             "through iptables. A linked container shares the bridge with the others, and\n"
             "only the firewall keeps it to its links. Let the firewall see that traffic,\n"
             "then start the container again:\n"
-            "  modprobe br_netfilter && sysctl -w net.bridge.bridge-nf-call-iptables=1\n");
+            "  modprobe br_netfilter && sysctl -w net.bridge.bridge-nf-call-iptables=1\n"
+            "or set firewall_backend = nftables in lightbox.conf, which needs no br_netfilter\n");
         lc_kernel_exit(1);
     }
 

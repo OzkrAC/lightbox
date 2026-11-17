@@ -50,6 +50,10 @@ void cfg_global_init(void) {
     cfg_global.ip_forward = true;
     cfg_global.ip_forward_no_drop = false;
     cfg_global.ip_masq = true;
+    cfg_global.firewall_backend = FIREWALL_IPTABLES;
+    cfg_global.accept_fwmark_set = false;
+    cfg_global.accept_fwmark = 0;
+    cfg_global.accept_fwmask = 0;
 }
 
 /* true or false. Anything else is said, and the built-in value kept: a
@@ -173,6 +177,35 @@ static void cfg_set(const char *key, const char *val, bool derived[3]) {
         cfg_set_flag(key, val, &cfg_global.ip_forward_no_drop);
     } else if (streq(key, "ip_masq")) {
         cfg_set_flag(key, val, &cfg_global.ip_masq);
+    } else if (streq(key, "firewall_backend")) {
+        if (streq(val, "iptables") || streq(val, "nftables")) {
+            cfg_global.firewall_backend = val[0] == 'n' ? FIREWALL_NFTABLES : FIREWALL_IPTABLES;
+        } else {
+            print_str(STDERR, "Warning: firewall_backend in lightbox.conf is not iptables or nftables: ");
+            print_str(STDERR, val);
+            print_str(STDERR, cfg_global.firewall_backend == FIREWALL_NFTABLES ? "; using nftables\n" : "; using iptables\n");
+        }
+    } else if (streq(key, "bridge_accept_fwmark")) {
+        uint32_t mark, mask;
+        if (parse_fwmark(val, &mark, &mask)) {
+            cfg_global.accept_fwmark_set = true;
+            cfg_global.accept_fwmark = mark;
+            cfg_global.accept_fwmask = mask;
+        } else {
+            /* a mark that is wrong accepts nothing it was not meant to */
+            print_str(STDERR, "Warning: bridge_accept_fwmark in lightbox.conf is not a mark, or a mark and a mask,\n"
+                              "that a packet can carry: ");
+            print_str(STDERR, val);
+            if (cfg_global.accept_fwmark_set) {
+                char kept[24];
+                fwmark_text(kept, cfg_global.accept_fwmark, cfg_global.accept_fwmask);
+                print_str(STDERR, "; using ");
+                print_str(STDERR, kept);
+                lc_print_char(STDERR, '\n');
+            } else {
+                print_str(STDERR, "; using none\n");
+            }
+        }
     } else if (streq(key, "dns")) {
         /* create reads it, and says so if it is not a list of addresses */
         cfg_set_text(key, val, cfg_global.dns, sizeof(cfg_global.dns));

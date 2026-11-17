@@ -41,6 +41,9 @@ _Static_assert(CONF_MAX > MAX_VOLS * (2 * MAX_PATH + 8) + MAX_LINKS * (NAME_MAX_
 #define OOM_SCORE_MIN   (-1000)
 #define OOM_SCORE_MAX   1000
 
+/* Which firewall lightbox puts its rules in, as Docker's firewall-backend. */
+typedef enum { FIREWALL_IPTABLES, FIREWALL_NFTABLES } firewall_backend_kind;
+
 typedef struct {
     char lightbox_dir[MAX_PATH];
     char rootfs[MAX_PATH];
@@ -67,6 +70,12 @@ typedef struct {
     bool ip_forward;            /* setup turns IPv4 forwarding on ("ip-forward") */
     bool ip_forward_no_drop;    /* and then leaves the FORWARD policy as it is ("ip-forward-no-drop") */
     bool ip_masq;               /* what leaves by anything but the bridge is masqueraded ("ip-masq") */
+    firewall_backend_kind firewall_backend;     /* "firewall-backend" */
+    /* With nftables, what lightbox's rules accept before they drop anything:
+     * packets whose mark, under the mask, is this ("bridge-accept-fwmark"). */
+    bool     accept_fwmark_set;
+    uint32_t accept_fwmark;
+    uint32_t accept_fwmask;
 } global_config;
 
 extern global_config cfg_global;
@@ -283,6 +292,7 @@ void require_mount(const char *source, const char *target,
 const char *tool_path_ip(void);
 const char *tool_path_iptables(void);
 const char *tool_path_iptables_restore(void);
+const char *tool_path_nft(void);
 const char *tool_path_cp(void);
 const char *tool_path_chown(void);
 const char *tool_path_rm(void);
@@ -465,6 +475,41 @@ int firewall_add_links(const char *name, const container_config *config);
 int firewall_remove_links(const char *name);
 /* does iptables see what the bridge switches between containers? */
 bool bridge_traffic_is_filtered(void);
+
+/*
+ * firewall_backend = nftables: two tables of lightbox's own, made whole by
+ * setup and loaded as one transaction each time.
+ *
+ *   ip lightbox      forward       what comes back to the bridge, and nothing new
+ *                    postrouting   masquerading of what leaves by anything but it
+ *   bridge lightbox  forward       between two ports of the bridge, only what the
+ *                    set links     pairs of ports in links allow
+ *
+ * The bridge-family chain sees what the bridge switches without br_netfilter.
+ * A container's links are elements of links; its record in run_dir names
+ * them, as "nftables" and a line for each link: its port and the other's.
+ */
+#define NFT_RECORD_HEAD "nftables\n"
+/* A mark, or a mark and a mask, "0x10" or "16/0xf0": what a packet can carry. */
+[[nodiscard]] bool parse_fwmark(const char *text, uint32_t *mark, uint32_t *mask);
+/* "0x10/0xf0", or the mark alone when the mask is all of it. */
+void fwmark_text(char out[24], uint32_t mark, uint32_t mask);
+/* vb- and twelve lowercase hex digits: a name host_port_name gives. */
+bool host_port_ok(const char *ifname);
+[[nodiscard]] bool nft_setup_text(const container_network *net, char *out, size_t outsz);
+/* The record of a container's links, from its configuration. */
+[[nodiscard]] bool nft_links_record(const char *name, const container_config *config, char *out, size_t outsz);
+/* What nft is given for a record: its elements added, and with removal taken
+ * out again, so that what is gone already does not stop the rest. False when
+ * the record is not one lightbox writes, or the text does not fit. */
+[[nodiscard]] bool nft_links_text(const char *record, bool removal, char *out, size_t outsz);
+/* From what "nft list chains" printed, which this cuts into lines where it
+ * stands: the base chains on the forward hook, of any table but lightbox's,
+ * whose policy is drop, as "<family> <table> <chain>" with ", " between. */
+size_t forward_drop_chains(char *listing, char *out, size_t outsz);
+/* The same for this host, iptables' FORWARD among them: an empty text when
+ * nothing drops what lightbox's nftables rules accept. */
+void forward_drops_on_host(char *out, size_t outsz);
 
 /* How exec can run from a copy of this binary that cannot be written to. */
 typedef enum {

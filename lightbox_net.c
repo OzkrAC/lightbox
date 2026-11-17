@@ -339,14 +339,48 @@ bool firewall_setup_text(const container_network *net, char *text, size_t max) {
     return !out.cut;
 }
 
+/* Elements of the set of links, as the record names them: each put in and
+ * taken out again in one transaction, so that one a peer's stop took out
+ * already does not keep the others in. */
+static int nft_remove_links(const char *record, const char *recorded) {
+    static char text[FIREWALL_TEXT_MAX];
+    if (!nft_links_text(recorded, true, text, sizeof(text))) {
+        print_str(STDERR, "Error: the record of the container's link rules is not one lightbox writes: ");
+        print_str(STDERR, record);
+        lc_print_char(STDERR, '\n');
+        return -1;
+    }
+    if (text[0]) {
+        const char *nft[] = { "nft", "-f", "-", NULL };
+        bool gone = run_cmd_input(tool_path_nft(), nft, text, true) == 0;
+        if (!gone) {
+            /* without lightbox's set nothing of them is left: a setup with
+             * firewall_backend = iptables took the table away */
+            const char *look[] = { "nft", "list", "set", "bridge", "lightbox", "links", NULL };
+            gone = run_cmd_quiet(tool_path_nft(), look) != 0;
+        }
+        if (!gone) {
+            print_str(STDERR, "Error: cannot take the container's links out of the nftables set bridge lightbox links\n");
+            return -1;
+        }
+    }
+    lc_kernel_unlinkat(AT_FDCWD, record, 0);
+    return 0;
+}
+
 int firewall_remove_links(const char *name) {
-    char record[MAX_PATH], chain[40];
+    char record[MAX_PATH];
+    static char recorded[FIREWALL_TEXT_MAX];
     container_firewall_path(record, name);
     if (!path_exists(record))
         return 0;
+    int n = read_file(record, recorded, sizeof(recorded));
+    if (n > 0 && n < (int)sizeof(recorded) - 1 && lc_string_starts_with(recorded, (size_t)n, NFT_RECORD_HEAD,
+                                                                         lc_string_length(NFT_RECORD_HEAD)))
+        return nft_remove_links(record, recorded);
     /* the chain the record names: the one a start put in, whatever name the
      * lightbox that started the container gave it */
-    int n = read_file(record, chain, sizeof(chain));
+    char *chain = recorded;
     if (n > 0 && chain[n - 1] == '\n')
         chain[n - 1] = '\0';
     if (n <= 0 || !link_chain_ok(chain)) {
@@ -387,9 +421,37 @@ int firewall_remove_links(const char *name) {
     return 0;
 }
 
+static int nft_add_links(const char *name, const container_config *config) {
+    static char recorded[FIREWALL_TEXT_MAX], text[FIREWALL_TEXT_MAX];
+    if (!nft_links_record(name, config, recorded, sizeof(recorded)) ||
+        !nft_links_text(recorded, false, text, sizeof(text))) {
+        print_str(STDERR, "Error: the firewall rules of the container's links are too long\n");
+        return -1;
+    }
+    if (firewall_remove_links(name) != 0)
+        return -1;
+    char record[MAX_PATH];
+    container_firewall_path(record, name);
+    if (container_run_dir_make(name) != 0 || write_file_volatile(record, recorded) != 0) {
+        print_str(STDERR, "Error: cannot record the firewall rules of the container's links\n");
+        return -1;
+    }
+    if (!text[0])
+        return 0;
+    const char *nft[] = { "nft", "-f", "-", NULL };
+    if (run_cmd_input(tool_path_nft(), nft, text, false) != 0) {
+        print_str(STDERR, "Error: the container's links could not be put in the nftables set bridge lightbox links;\n"
+                          "lightbox setup makes it\n");
+        return -1;
+    }
+    return 0;
+}
+
 int firewall_add_links(const char *name, const container_config *config) {
     if (config->nlinks == 0)
         return 0;
+    if (cfg_global.firewall_backend == FIREWALL_NFTABLES)
+        return nft_add_links(name, config);
     static char text[FIREWALL_TEXT_MAX];
     if (!firewall_links_text(name, config, text, sizeof(text))) {
         print_str(STDERR, "Error: the firewall rules of the container's links are too long\n");
@@ -429,6 +491,317 @@ bool bridge_traffic_is_filtered(void) {
     char value[8];
     return read_file("/proc/sys/net/bridge/bridge-nf-call-iptables", value, sizeof(value)) > 0 &&
            value[0] == '1';
+}
+
+/* ─── nftables ──────────────────────────────────────────────────────────── */
+
+/* One number of a mark: decimal without a leading 0, which nft would take
+ * for octal, or 0x and up to eight hex digits. */
+static bool parse_mark_number(const char *s, size_t len, uint32_t *out) {
+    uint64_t value = 0;
+    if (len > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+        if (len - 2 > 8)
+            return false;
+        for (size_t i = 2; i < len; i++) {
+            char c = s[i];
+            int digit = c >= '0' && c <= '9' ? c - '0'
+                      : c >= 'a' && c <= 'f' ? c - 'a' + 10
+                      : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+            if (digit < 0)
+                return false;
+            value = value * 16 + (uint64_t)digit;
+        }
+    } else {
+        if (len == 0 || len > 10 || (len > 1 && s[0] == '0'))
+            return false;
+        for (size_t i = 0; i < len; i++) {
+            if (s[i] < '0' || s[i] > '9')
+                return false;
+            value = value * 10 + (uint64_t)(s[i] - '0');
+        }
+        if (value > 0xffffffffu)
+            return false;
+    }
+    *out = (uint32_t)value;
+    return true;
+}
+
+bool parse_fwmark(const char *text, uint32_t *mark, uint32_t *mask) {
+    size_t len = lc_string_length(text), slash = len;
+    for (size_t i = 0; i < len; i++) {
+        if (text[i] == '/') { slash = i; break; }
+    }
+    uint32_t m, k = 0xffffffffu;
+    if (!parse_mark_number(text, slash, &m))
+        return false;
+    if (slash < len && !parse_mark_number(text + slash + 1, len - slash - 1, &k))
+        return false;
+    /* 0 is the mark of every packet that nothing marked, and a mark with
+     * bits outside its mask is one that no packet has */
+    if (m == 0 || k == 0 || (m & ~k) != 0)
+        return false;
+    *mark = m;
+    *mask = k;
+    return true;
+}
+
+static size_t put_hex32(char *out, uint32_t value) {
+    static const char digits[] = "0123456789abcdef";
+    char rev[8];
+    size_t n = 0, len = 0;
+    do { rev[n++] = digits[value & 0xf]; value >>= 4; } while (value);
+    out[len++] = '0';
+    out[len++] = 'x';
+    while (n) out[len++] = rev[--n];
+    return len;
+}
+
+void fwmark_text(char out[24], uint32_t mark, uint32_t mask) {
+    size_t n = put_hex32(out, mark);
+    if (mask != 0xffffffffu) {
+        out[n++] = '/';
+        n += put_hex32(out + n, mask);
+    }
+    out[n] = '\0';
+}
+
+bool host_port_ok(const char *ifname) {
+    if (lc_string_length(ifname) != 15 || !lc_string_starts_with(ifname, 15, "vb-", 3))
+        return false;
+    for (size_t i = 3; i < 15; i++) {
+        char c = ifname[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+            return false;
+    }
+    return true;
+}
+
+/* An interface name that can go between quotes in a rule as it is. */
+static bool plain_ifname(const char *ifname) {
+    size_t len = lc_string_length(ifname);
+    if (len == 0 || len >= IFNAME_TEXT_MAX)
+        return false;
+    for (size_t i = 0; i < len; i++) {
+        char c = ifname[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+              c == '_' || c == '-' || c == '.'))
+            return false;
+    }
+    return true;
+}
+
+/* "meta mark 0x10 accept", with the mask when there is one */
+static void out_mark_accept(struct text_out *out, const char *family) {
+    char number[24];
+    out_put(out, "add rule ");
+    out_put(out, family);
+    out_put(out, " lightbox forward meta mark ");
+    if (cfg_global.accept_fwmask != 0xffffffffu) {
+        out_put(out, "& ");
+        fwmark_text(number, cfg_global.accept_fwmask, 0xffffffffu);
+        out_put(out, number);
+        out_put(out, " == ");
+    }
+    fwmark_text(number, cfg_global.accept_fwmark, 0xffffffffu);
+    out_put(out, number);
+    out_put(out, " accept\n");
+}
+
+/*
+ * What setup gives nft, in one transaction: both tables, made when they are
+ * not there, their chains flushed and filled again, so that a second setup
+ * changes nothing. The set of links is declared and not flushed: its
+ * elements are the running containers'.
+ */
+bool nft_setup_text(const container_network *net, char *text, size_t max) {
+    struct text_out out = { .text = text, .max = max, .pos = 0, .cut = false };
+    const char *br = cfg_global.bridge;
+    if (!plain_ifname(br))
+        return false;
+    char subnet[CIDR_TEXT_MAX];
+    subnet_text(subnet, net);
+    text[0] = '\0';
+    out_put(&out,
+        "table ip lightbox {\n"
+        "\tchain forward {\n\t\ttype filter hook forward priority filter; policy accept;\n\t}\n"
+        "\tchain postrouting {\n\t\ttype nat hook postrouting priority srcnat; policy accept;\n\t}\n"
+        "}\n"
+        "flush chain ip lightbox forward\n"
+        "flush chain ip lightbox postrouting\n");
+    if (cfg_global.accept_fwmark_set)
+        out_mark_accept(&out, "ip");
+    out_put(&out, "add rule ip lightbox forward oifname \""); out_put(&out, br);
+    out_put(&out, "\" ct state established,related accept\n");
+    out_put(&out, "add rule ip lightbox forward oifname \""); out_put(&out, br);
+    out_put(&out, "\" iifname != \""); out_put(&out, br); out_put(&out, "\" drop\n");
+    if (cfg_global.ip_masq) {
+        out_put(&out, "add rule ip lightbox postrouting ip saddr "); out_put(&out, subnet);
+        out_put(&out, " oifname != \""); out_put(&out, br); out_put(&out, "\" masquerade\n");
+    }
+    out_put(&out,
+        "table bridge lightbox {\n"
+        "\tset links {\n\t\ttype ifname . ifname\n\t}\n"
+        "\tchain forward {\n\t\ttype filter hook forward priority filter; policy accept;\n\t}\n"
+        "}\n"
+        "flush chain bridge lightbox forward\n");
+    if (cfg_global.accept_fwmark_set)
+        out_mark_accept(&out, "bridge");
+    out_put(&out, "add rule bridge lightbox forward meta ibrname \""); out_put(&out, br);
+    out_put(&out, "\" iifname . oifname @links accept\n");
+    out_put(&out, "add rule bridge lightbox forward meta ibrname \""); out_put(&out, br);
+    out_put(&out, "\" drop\n");
+    return !out.cut;
+}
+
+bool nft_links_record(const char *name, const container_config *config, char *text, size_t max) {
+    struct text_out out = { .text = text, .max = max, .pos = 0, .cut = false };
+    char port[IFNAME_TEXT_MAX], seen[MAX_LINKS][IFNAME_TEXT_MAX];
+    int nseen = 0;
+    host_port_name(name, port);
+    text[0] = '\0';
+    out_put(&out, NFT_RECORD_HEAD);
+    for (int i = 0; i < config->nlinks && nseen < MAX_LINKS; i++) {
+        char other[IFNAME_TEXT_MAX];
+        host_port_name(config->links[i], other);
+        /* a pair that is there once: nft takes out each element once */
+        bool again = streq(other, port);
+        for (int j = 0; j < nseen && !again; j++)
+            again = streq(seen[j], other);
+        if (again)
+            continue;
+        lc_bytes_copy(seen[nseen++], other, IFNAME_TEXT_MAX);
+        out_put(&out, port);
+        out_put(&out, " ");
+        out_put(&out, other);
+        out_put(&out, "\n");
+    }
+    return !out.cut;
+}
+
+bool nft_links_text(const char *record, bool removal, char *text, size_t max) {
+    size_t head = lc_string_length(NFT_RECORD_HEAD);
+    if (!lc_string_starts_with(record, lc_string_length(record), NFT_RECORD_HEAD, head))
+        return false;
+    static char elements[FIREWALL_TEXT_MAX];
+    struct text_out list = { .text = elements, .max = sizeof(elements), .pos = 0, .cut = false };
+    elements[0] = '\0';
+    int pairs = 0;
+    /* "<port> <other>\n" for each link, each a name host_port_name gives */
+    for (const char *line = record + head; *line; ) {
+        const char *end = line;
+        while (*end && *end != '\n') end++;
+        if (*end != '\n' || end - line != 31 || line[15] != ' ')
+            return false;
+        char a[IFNAME_TEXT_MAX], b[IFNAME_TEXT_MAX];
+        lc_bytes_copy(a, line, 15);
+        a[15] = '\0';
+        lc_bytes_copy(b, line + 16, 15);
+        b[15] = '\0';
+        if (!host_port_ok(a) || !host_port_ok(b) || streq(a, b))
+            return false;
+        for (int back = 0; back < 2; back++) {
+            out_put(&list, pairs++ ? ", \"" : "{ \"");
+            out_put(&list, back ? b : a);
+            out_put(&list, "\" . \"");
+            out_put(&list, back ? a : b);
+            out_put(&list, "\"");
+        }
+        line = end + 1;
+    }
+    struct text_out out = { .text = text, .max = max, .pos = 0, .cut = list.cut };
+    text[0] = '\0';
+    if (pairs == 0)
+        return !out.cut;
+    out_put(&list, " }\n");
+    out_put(&out, "add element bridge lightbox links ");
+    out_put(&out, elements);
+    if (removal) {
+        out_put(&out, "delete element bridge lightbox links ");
+        out_put(&out, elements);
+    }
+    return !out.cut && !list.cut;
+}
+
+size_t forward_drop_chains(char *listing, char *text, size_t max) {
+    struct text_out out = { .text = text, .max = max, .pos = 0, .cut = false };
+    char table[64] = "", chain[64] = "";
+    size_t found = 0;
+    text[0] = '\0';
+    for (char *line = listing; *line; ) {
+        char *end = line;
+        while (*end && *end != '\n') end++;
+        bool last = *end == '\0';
+        *end = '\0';
+        while (*line == ' ' || *line == '\t') line++;
+        size_t len = lc_string_length(line);
+        /* "table <family> <name> {", "chain <name> {" */
+        bool opens = len > 2 && line[len - 1] == '{' && line[len - 2] == ' ';
+        if (opens && lc_string_starts_with(line, len, "table ", 6)) {
+            line[len - 2] = '\0';
+            bool cut = false;
+            str_append(table, 0, line + 6, sizeof(table), &cut);
+            chain[0] = '\0';
+        } else if (opens && lc_string_starts_with(line, len, "chain ", 6)) {
+            line[len - 2] = '\0';
+            bool cut = false;
+            str_append(chain, 0, line + 6, sizeof(chain), &cut);
+        } else if (lc_string_starts_with(line, len, "type ", 5) && chain[0] &&
+                   (lc_string_starts_with(table, lc_string_length(table), "ip ", 3) ||
+                    lc_string_starts_with(table, lc_string_length(table), "inet ", 5) ||
+                    lc_string_starts_with(table, lc_string_length(table), "bridge ", 7))) {
+            /* "type filter hook forward priority filter; policy drop;" */
+            bool forward = false, drop = false;
+            for (const char *p = line; *p; p++) {
+                if (lc_string_starts_with(p, lc_string_length(p), " hook forward ", 14)) forward = true;
+                if (lc_string_starts_with(p, lc_string_length(p), " policy drop;", 13)) drop = true;
+            }
+            if (forward && drop) {
+                if (found++)
+                    out_put(&out, ", ");
+                out_put(&out, table);
+                out_put(&out, " ");
+                out_put(&out, chain);
+            }
+        }
+        line = last ? end : end + 1;
+    }
+    return found;
+}
+
+void forward_drops_on_host(char *text, size_t max) {
+    struct text_out out = { .text = text, .max = max, .pos = 0, .cut = false };
+    text[0] = '\0';
+    static char listing[65536];
+    bool iptables_drops = false;
+    if (path_exists(tool_path_iptables())) {
+        const char *list[] = { "iptables", "-S", "FORWARD", NULL };
+        iptables_drops = run_cmd_capture_quiet(tool_path_iptables(), list, listing, sizeof(listing)) == 0 &&
+                         lc_string_starts_with(listing, lc_string_length(listing), "-P FORWARD DROP\n", 16);
+        if (iptables_drops)
+            out_put(&out, "iptables FORWARD");
+    }
+    if (!path_exists(tool_path_nft()))
+        return;
+    const char *list[] = { "nft", "list", "chains", NULL };
+    if (run_cmd_capture_quiet(tool_path_nft(), list, listing, sizeof(listing)) != 0)
+        return;
+    static char chains[1024];
+    if (forward_drop_chains(listing, chains, sizeof(chains)) == 0)
+        return;
+    /* iptables-nft's FORWARD is the nftables chain "ip filter FORWARD" */
+    char *chain = chains;
+    while (*chain) {
+        char *next = chain;
+        while (*next && !(next[0] == ',' && next[1] == ' ')) next++;
+        bool more = *next != '\0';
+        *next = '\0';
+        if (!(iptables_drops && streq(chain, "ip filter FORWARD"))) {
+            if (out.pos)
+                out_put(&out, ", ");
+            out_put(&out, chain);
+        }
+        chain = more ? next + 2 : next;
+    }
 }
 
 /* The interface of the default route, if there is one. */
@@ -570,6 +943,108 @@ static void firewall_setup(const container_network *net) {
                       "rules of this host's that are to decide first go in LIGHTBOX-USER\n");
 }
 
+/*
+ * With firewall_backend = nftables: what lightbox put in iptables taken out,
+ * as Docker takes out its iptables rules when it starts with nftables. The
+ * host's LIGHTBOX-USER stays, and the jump to it. The chain of a running
+ * container's links is taken out when the container stops.
+ */
+static void forget_iptables_chains(const container_network *net) {
+    if (!path_exists(tool_path_iptables()))
+        return;
+    int old = forget_old_rules(net);
+    bool forward = iptables_chain_exists("filter", "LIGHTBOX-FORWARD");
+    bool links = iptables_chain_exists("filter", "LIGHTBOX-LINKS");
+    bool post = iptables_chain_exists("nat", "LIGHTBOX-POSTROUTING");
+    if (forward || links || post) {
+        const char *jump[] = { "iptables", "-D", "FORWARD", "-j", "LIGHTBOX-FORWARD", NULL };
+        const char *nat_jump[] = { "iptables", "-t", "nat", "-D", "POSTROUTING", "-j", "LIGHTBOX-POSTROUTING", NULL };
+        (void)iptables_delete_all(jump);
+        (void)iptables_delete_all(nat_jump);
+        static const struct { const char *table, *chain; } ours[] = {
+            { "filter", "LIGHTBOX-FORWARD" }, { "filter", "LIGHTBOX-LINKS" }, { "nat", "LIGHTBOX-POSTROUTING" },
+        };
+        /* all flushed before any goes: LIGHTBOX-FORWARD jumps to LIGHTBOX-LINKS */
+        for (int pass = 0; pass < 2; pass++) {
+            for (size_t i = 0; i < sizeof(ours) / sizeof(ours[0]); i++) {
+                const char *step[] = { "iptables", "-t", ours[i].table, pass ? "-X" : "-F", ours[i].chain, NULL };
+                (void)run_cmd_quiet(tool_path_iptables(), step);
+            }
+        }
+        print_str(STDOUT, "Removed the iptables chains that lightbox made with firewall_backend = iptables.\n"
+                          "LIGHTBOX-USER is this host's and stays; its rules still run in FORWARD\n");
+    }
+    if (old > 0)
+        print_str(STDOUT, "Removed the firewall rules that an earlier lightbox put straight into FORWARD and POSTROUTING\n");
+}
+
+/* With firewall_backend = iptables: the tables of nftables taken away. */
+static void forget_nft_tables(void) {
+    if (!path_exists(tool_path_nft()))
+        return;
+    static char tables[4096];
+    const char *list[] = { "nft", "list", "tables", NULL };
+    if (run_cmd_capture_quiet(tool_path_nft(), list, tables, sizeof(tables)) != 0)
+        return;
+    bool ip = false, bridge = false;
+    for (char *line = tables; *line; ) {
+        char *end = line;
+        while (*end && *end != '\n') end++;
+        bool last = *end == '\0';
+        *end = '\0';
+        ip = ip || streq(line, "table ip lightbox");
+        bridge = bridge || streq(line, "table bridge lightbox");
+        line = last ? end : end + 1;
+    }
+    if (!ip && !bridge)
+        return;
+    const char *text = ip && bridge ? "delete table ip lightbox\ndelete table bridge lightbox\n"
+                     : ip ? "delete table ip lightbox\n" : "delete table bridge lightbox\n";
+    const char *nft[] = { "nft", "-f", "-", NULL };
+    if (run_cmd_input(tool_path_nft(), nft, text, false) != 0)
+        print_str(STDERR, "Warning: the nftables tables that lightbox made with firewall_backend = nftables\n"
+                          "could not be removed\n");
+    else
+        print_str(STDOUT, "Removed the nftables tables that lightbox made with firewall_backend = nftables\n");
+}
+
+/* What drops what lightbox's nftables rules accept, said: an accept in one
+ * table does not get a packet past another that drops it. */
+static void warn_forward_drops(void) {
+    static char drops[1024];
+    forward_drops_on_host(drops, sizeof(drops));
+    if (!drops[0])
+        return;
+    print_str(STDOUT, "Warning: on this host forwarded packets that nothing accepts are dropped by:\n  ");
+    print_str(STDOUT, drops);
+    print_str(STDOUT, "\nand those are dropped there whatever lightbox's nftables rules accept, so containers\n"
+                      "reach this host and nothing beyond it. As Docker asks of its nftables backend,\n"
+                      "set their policy to accept (iptables -P FORWARD ACCEPT for iptables), or accept the\n"
+                      "bridge's traffic in them\n");
+}
+
+/*
+ * firewall_backend = nftables: lightbox's two tables, in one transaction,
+ * and nothing of lightbox's left in iptables.
+ */
+static void nft_firewall_setup(const container_network *net) {
+    require_tool("nft", tool_path_nft());
+    if (!plain_ifname(cfg_global.bridge))
+        die2("Error: bridge in lightbox.conf is not an interface name nft can be given: ", cfg_global.bridge);
+    static char text[FIREWALL_TEXT_MAX];
+    if (!nft_setup_text(net, text, sizeof(text)))
+        die("Error: setup's firewall rules are too long");
+    const char *nft[] = { "nft", "-f", "-", NULL };
+    if (run_cmd_input(tool_path_nft(), nft, text, false) != 0)
+        die("Error: setup's nftables rules could not be put in. They need nf_tables with NAT,\n"
+            "masquerading, connection tracking and the bridge family (CONFIG_NF_TABLES_BRIDGE)");
+    forget_iptables_chains(net);
+    print_str(STDOUT, "Firewall rules are in the nftables tables ip lightbox and bridge lightbox. To accept\n"
+                      "what they drop, give it the mark of bridge_accept_fwmark in a chain of this host's\n"
+                      "that comes before theirs\n");
+    warn_forward_drops();
+}
+
 [[noreturn]] static void die_cgroup_root(const char *root, const char *reason) {
     print_str(STDERR, "Error: cgroup_root ");
     print_str(STDERR, root);
@@ -655,16 +1130,29 @@ static void ensure_private_dir(const char *path) {
     print_str(STDOUT, " to its owner (mode 0700)\n");
 }
 
+static bool forwarding_on(void) {
+    char forwarding[8];
+    return read_file("/proc/sys/net/ipv4/ip_forward", forwarding, sizeof(forwarding)) > 0 && forwarding[0] == '1';
+}
+
 void cmd_setup(void) {
     require_root("setup");
     require_tool("ip", tool_path_ip());
+    bool nftables = cfg_global.firewall_backend == FIREWALL_NFTABLES;
     if (cfg_global.firewall)
-        require_tool("iptables", tool_path_iptables());
+        require_tool(nftables ? "nft" : "iptables", nftables ? tool_path_nft() : tool_path_iptables());
 
     /* Before anything on the host changes: the bridge gets an address of a
      * network that the settings do describe, */
     container_network net;
     container_network_load_or_die(&net);
+    /* with nftables, forwarding that is needed is on already, as Docker has
+     * it: lightbox would have no DROP policy to turn it on with, */
+    if (nftables && cfg_global.ip_forward && !forwarding_on())
+        die("Error: IPv4 forwarding is off. With firewall_backend = nftables lightbox does not turn it\n"
+            "on, as Docker does not: turn it on with rules of this host's against forwarding between\n"
+            "its other interfaces (sysctl -w net.ipv4.ip_forward=1), or set ip_forward = false in\n"
+            "lightbox.conf, and containers reach this host and nothing beyond it");
     /* and a host without cgroup v2 cannot run containers, so setup stops
      * here and leaves no bridge behind. */
     ensure_cgroup2_root();
@@ -700,10 +1188,14 @@ void cmd_setup(void) {
         }
     }
 
-    if (cfg_global.firewall)
-        firewall_setup(&net);
-    else
+    if (!cfg_global.firewall) {
         print_str(STDOUT, "firewall = false in lightbox.conf: no firewall rules were made\n");
+    } else if (nftables) {
+        nft_firewall_setup(&net);
+    } else {
+        firewall_setup(&net);
+        forget_nft_tables();
+    }
 
     /*
      * Forwarding, as Docker does it: when setup is the one that turns it on,
@@ -711,10 +1203,8 @@ void cmd_setup(void) {
      * rule accepts and nothing else. A host that had forwarding on already
      * keeps its policy, and ip_forward_no_drop keeps it in any case.
      */
-    char forwarding[8];
-    bool was_on = read_file("/proc/sys/net/ipv4/ip_forward", forwarding, sizeof(forwarding)) > 0 &&
-                  forwarding[0] == '1';
-    if (!was_on && cfg_global.ip_forward) {
+    bool was_on = forwarding_on();
+    if (!was_on && cfg_global.ip_forward && !nftables) {
         if (cfg_global.firewall && !cfg_global.ip_forward_no_drop) {
             const char *drop[] = { "iptables", "-P", "FORWARD", "DROP", NULL };
             require_cmd(tool_path_iptables(), drop);
@@ -730,7 +1220,7 @@ void cmd_setup(void) {
                           "containers reach this host and nothing beyond it\n");
     }
 
-    if (!bridge_traffic_is_filtered())
+    if (!nftables && !bridge_traffic_is_filtered())
         print_str(STDOUT,
             "Note: br_netfilter is not filtering bridged traffic on this host. Containers\n"
             "are kept apart at the bridge, so that needs nothing. A container created with\n"

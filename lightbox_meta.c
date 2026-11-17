@@ -282,14 +282,18 @@ void cmd_doctor(void) {
     static const struct {
         const char *key;
         const char *(*resolve)(void);
+        bool nftables;      /* the firewall tools of one backend: the other's are not looked for */
+        bool iptables;
     } bins[] = {
-        { "bin.ip", tool_path_ip },
-        { "bin.iptables", tool_path_iptables },
-        { "bin.iptables-restore", tool_path_iptables_restore },
-        { "bin.cp", tool_path_cp },
-        { "bin.chown", tool_path_chown },
-        { "bin.rm", tool_path_rm },
+        { "bin.ip", tool_path_ip, true, true },
+        { "bin.iptables", tool_path_iptables, false, true },
+        { "bin.iptables-restore", tool_path_iptables_restore, false, true },
+        { "bin.nft", tool_path_nft, true, false },
+        { "bin.cp", tool_path_cp, true, true },
+        { "bin.chown", tool_path_chown, true, true },
+        { "bin.rm", tool_path_rm, true, true },
     };
+    bool nftables = cfg_global.firewall_backend == FIREWALL_NFTABLES;
 
     int missing = 0;
     bool ok;
@@ -325,9 +329,32 @@ void cmd_doctor(void) {
     print_kv("ip_forward", cfg_global.ip_forward ? "true" : "false");
     print_kv("ip_forward_no_drop", cfg_global.ip_forward_no_drop ? "true" : "false");
     print_kv("ip_masq", cfg_global.ip_masq ? "true" : "false");
+    print_kv("firewall_backend", nftables ? "nftables" : "iptables");
+    if (cfg_global.accept_fwmark_set) {
+        char mark[24];
+        fwmark_text(mark, cfg_global.accept_fwmark, cfg_global.accept_fwmask);
+        print_str(STDOUT, "bridge_accept_fwmark: ");
+        print_str(STDOUT, mark);
+        print_str(STDOUT, nftables ? "\n" : " (not used: with iptables, rules in LIGHTBOX-USER decide first)\n");
+    } else {
+        print_kv("bridge_accept_fwmark", "none");
+    }
     /* told, not counted as missing: only a container with links depends on it */
-    print_kv("bridge_filtering", bridge_traffic_is_filtered()
-             ? "yes" : "no (a container with --link will not start; it needs br_netfilter)");
+    if (nftables)
+        print_kv("bridge_filtering", "not needed (firewall_backend = nftables filters at the bridge)");
+    else
+        print_kv("bridge_filtering", bridge_traffic_is_filtered()
+                 ? "yes" : "no (a container with --link will not start; it needs br_netfilter)");
+    if (nftables && cfg_global.firewall) {
+        /* told, not counted: it is the host's to change */
+        static char drops[1024];
+        if (lb_sys_geteuid() != 0) {
+            print_kv("forward_drops", "unknown (doctor is not run as root)");
+        } else {
+            forward_drops_on_host(drops, sizeof(drops));
+            print_kv("forward_drops", drops[0] ? drops : "none");
+        }
+    }
 
     ok = path_exists(cfg_global.lightbox_dir);
     print_check("path.lightbox_dir", ok, cfg_global.lightbox_dir);
@@ -346,6 +373,8 @@ void cmd_doctor(void) {
     if (!ok) missing++;
 
     for (size_t i = 0; i < sizeof(bins) / sizeof(bins[0]); i++) {
+        if (nftables ? !bins[i].nftables : !bins[i].iptables)
+            continue;
         const char *path = bins[i].resolve();
         ok = path_exists(path);
         print_check(bins[i].key, ok, path);

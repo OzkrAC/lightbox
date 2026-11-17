@@ -17,6 +17,17 @@
  *                                             links-into-64 gives it 64 bytes to write into
  *   unit firewall setup <subnet> <gw> <bridge> <ip_masq>
  *                                             firewall_setup_text for that network
+ *   unit firewall nft-setup <subnet> <gw> <bridge> <ip_masq> [<fwmark>]
+ *                                             nft_setup_text, with bridge_accept_fwmark if given
+ *   unit firewall nft-record <name> [<link>...]
+ *                                             nft_links_record for a container with those links
+ *   unit nftlinks add|remove <record>         nft_links_text for that record, or "refused"; a line
+ *                                             it would take lies right after the record's end
+ *   unit fwmark <text>                        parse_fwmark: lines "mark <m>", "mask <k>", "as <text>",
+ *                                             or "refused"
+ *   unit portname <text>                      host_port_ok: ok or refused
+ *   unit dropping <listing>                   forward_drop_chains of what "nft list chains"
+ *                                             printed: how many, and their names
  *   unit status  <wait status>                exit_code_from_status
  *   unit mount   <source> <target> <fstype> <flags> <data>     do_mount
  *   unit mkdirs  <path>                       make_dirs
@@ -669,10 +680,69 @@ int main(int argc, char **argv, char **envp) {
                 die("unit: firewall setup <subnet> <gw> <bridge> <true|false>");
             cfg_global.ip_masq = streq(argv[6], "true");
             fits = firewall_setup_text(&net, text, sizeof(text));
+        } else if (streq(argv[2], "nft-setup") && (argc == 7 || argc == 8)) {
+            container_network net;
+            const char *setting;
+            if (container_network_parse(argv[3], argv[4], &net, &setting) != NULL ||
+                !str_copy(cfg_global.bridge, argv[5], sizeof(cfg_global.bridge)))
+                die("unit: firewall nft-setup <subnet> <gw> <bridge> <true|false> [<fwmark>]");
+            cfg_global.ip_masq = streq(argv[6], "true");
+            if (argc == 8) {
+                if (!parse_fwmark(argv[7], &cfg_global.accept_fwmark, &cfg_global.accept_fwmask))
+                    die("unit: a fwmark that parse_fwmark refuses");
+                cfg_global.accept_fwmark_set = true;
+            }
+            fits = nft_setup_text(&net, text, sizeof(text));
+        } else if (streq(argv[2], "nft-record")) {
+            container_config_init(&config);
+            for (int i = 4; i < argc && config.nlinks < MAX_LINKS; i++)
+                if (!str_copy(config.links[config.nlinks++], argv[i], sizeof(config.links[0])))
+                    die("unit: a link that is too long");
+            fits = nft_links_record(argv[3], &config, text, sizeof(text));
         } else {
             die("unit: firewall links <name> [<link>...] | firewall setup <subnet> <gw> <bridge> <true|false>");
         }
         put(fits ? text : "too long\n");
+        return 0;
+    }
+    if (argc == 4 && streq(argv[1], "nftlinks")) {
+        /* the record, and right after its end a line lightbox would take:
+         * a parser that reads past the end takes it */
+        static char record[FIREWALL_TEXT_MAX], text[FIREWALL_TEXT_MAX];
+        static const char beyond[] = "vb-111111111111 vb-222222222222\n";
+        size_t len = lc_string_length(argv[3]);
+        if (len + 1 + sizeof(beyond) > sizeof(record))
+            die("unit: nftlinks add|remove <record>");
+        lc_bytes_copy(record, argv[3], len + 1);
+        lc_bytes_copy(record + len + 1, beyond, sizeof(beyond));
+        put(nft_links_text(record, streq(argv[2], "remove"), text, sizeof(text)) ? text : "refused\n");
+        return 0;
+    }
+    if (argc == 3 && streq(argv[1], "fwmark")) {
+        uint32_t mark, mask;
+        if (!parse_fwmark(argv[2], &mark, &mask)) {
+            put("refused\n");
+            return 0;
+        }
+        char text[24], m[24], k[24];
+        fwmark_text(text, mark, mask);
+        fwmark_text(m, mark, 0xffffffffu);
+        fwmark_text(k, mask, 0xffffffffu);
+        put_line("mark ", m);
+        put_line("mask ", k);
+        put_line("as ", text);
+        return 0;
+    }
+    if (argc == 3 && streq(argv[1], "portname")) {
+        put(host_port_ok(argv[2]) ? "ok\n" : "refused\n");
+        return 0;
+    }
+    if (argc == 3 && streq(argv[1], "dropping")) {
+        static char listing[65536], chains[1024];
+        if (!str_copy(listing, argv[2], sizeof(listing)))
+            die("unit: dropping <listing>");
+        put_number("chains", (int)forward_drop_chains(listing, chains, sizeof(chains)));
+        put_line("", chains);
         return 0;
     }
     if (argc == 3 && streq(argv[1], "status")) {
