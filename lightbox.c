@@ -820,7 +820,7 @@ static void cmd_create(int argc, char **argv) {
             validate_name(value);
             str_copy_or_die(cfg.links[cfg.nlinks++], value, sizeof(cfg.links[0]), "--link");
         } else {
-            die2("Error: unknown option: ", opt);
+            die2(opt[0] == '-' ? "Error: unknown option: " : "Error: unexpected argument: ", opt);
         }
     }
 
@@ -3170,22 +3170,81 @@ static const char *text_with_number(char *buf, size_t bufsz, const char *before,
     return buf;
 }
 
-static void cmd_start(int argc, char **argv) {
-    if (argc < 1) die("Usage: lightbox start <name> [-t <seconds>]");
-    const char *name = argv[0];
-    validate_name(name);
+/* ─── Several containers at once ────────────────────────────────────────── */
 
-    /* how long to wait for the init hook */
-    int hook_wait = cfg_global.start_timeout;
-    for (int i = 1; i < argc; i++) {
-        if (!streq(argv[i], "-t") && !streq(argv[i], "--timeout"))
-            die2(argv[i][0] == '-' ? "Error: unknown option: " : "Error: unexpected argument: ", argv[i]);
-        if (i + 1 >= argc)
-            die2("Error: option needs a number of seconds: ", argv[i]);
-        if (!parse_seconds(argv[++i], &hook_wait))
-            die2("Error: not a number of seconds from 0 to " STRINGIFY(SECONDS_MAX) ": ", argv[i]);
+/*
+ * The names among a command's arguments, moved to its front, and -t or
+ * --timeout with its seconds wherever it is, when the command takes one.
+ * Anything else is an error, named. How many names there are.
+ */
+static int names_and_seconds(int argc, char **argv, int *seconds) {
+    int count = 0;
+    for (int i = 0; i < argc; i++) {
+        if (seconds && (streq(argv[i], "-t") || streq(argv[i], "--timeout"))) {
+            if (i + 1 >= argc)
+                die2("Error: option needs a number of seconds: ", argv[i]);
+            if (!parse_seconds(argv[++i], seconds))
+                die2("Error: not a number of seconds from 0 to " STRINGIFY(SECONDS_MAX) ": ", argv[i]);
+        } else if (argv[i][0] == '-') {
+            die2("Error: unknown option: ", argv[i]);
+        } else {
+            argv[count++] = argv[i];
+        }
     }
+    for (int i = 0; i < count; i++)
+        validate_name(argv[i]);
+    return count;
+}
 
+typedef void (*per_container)(const char *name, int seconds);
+
+/*
+ * start, stop and rm of several containers, as Docker's: each in a process
+ * of its own, one after the other, so that what ends the command for one
+ * ends it for that one only. The exit status is the first that was not 0,
+ * and the ones that were not done are named at the end.
+ */
+[[noreturn]] static void each_container(const char *not_done, int count, char **names, per_container one, int seconds) {
+    if (count == 1) {
+        one(names[0], seconds);
+        lc_kernel_exit(0);
+    }
+    int first = 0;
+    static char failed[4096];
+    size_t pos = 0;
+    bool cut = false;
+    for (int i = 0; i < count; i++) {
+        lc_sysret pid = lc_kernel_fork();
+        if (pid < 0)
+            die("Error: cannot make a process for the next container");
+        if (pid == 0) {
+            one(names[i], seconds);
+            lc_kernel_exit(0);
+        }
+        int32_t status = 0;
+        lc_sysret got;
+        do {
+            got = lc_kernel_wait_for_child((int32_t)pid, &status, 0);
+        } while (got == -LB_EINTR);
+        int code = got == pid ? exit_code_from_status(status) : 1;
+        if (code != 0) {
+            if (!first)
+                first = code;
+            pos = str_append(failed, pos, pos ? ", " : "", sizeof(failed), &cut);
+            pos = str_append(failed, pos, names[i], sizeof(failed), &cut);
+        }
+    }
+    if (first) {
+        print_str(STDERR, "Error: ");
+        print_str(STDERR, not_done);
+        print_str(STDERR, ": ");
+        print_str(STDERR, failed);
+        print_str(STDERR, cut ? " and more\n" : "\n");
+    }
+    lc_kernel_exit(first);
+}
+
+static void start_one(const char *name, int hook_wait) {
     require_root("start");
     require_tool("ip", tool_path_ip());
     require_tool("nsenter", tool_path_nsenter());
@@ -3578,6 +3637,16 @@ fail_start:
     lc_kernel_exit(exit_code);
 }
 
+static void cmd_start(int argc, char **argv) {
+    /* how long each waits for the init hook */
+    int hook_wait = cfg_global.start_timeout;
+    int count = names_and_seconds(argc, argv, &hook_wait);
+    if (count == 0)
+        die("Usage: lightbox start <name>... [-t <seconds>]");
+    require_root("start");
+    each_container("not started", count, argv, start_one, hook_wait);
+}
+
 /* ─── cmd_stop ──────────────────────────────────────────────────────────── */
 
 /* What init gets beyond its own limit before stop ends it by force. */
@@ -3601,22 +3670,7 @@ static bool ask_init_to_stop(int32_t pidfd, int seconds) {
     return rc >= 0;
 }
 
-static void cmd_stop(int argc, char **argv) {
-    if (argc < 1) die("Usage: lightbox stop <name> [-t <seconds>]");
-    const char *name = argv[0];
-    validate_name(name);
-
-    /* how long the container gets to end by itself */
-    int seconds = cfg_global.stop_timeout;
-    for (int i = 1; i < argc; i++) {
-        if (!streq(argv[i], "-t") && !streq(argv[i], "--timeout"))
-            die2(argv[i][0] == '-' ? "Error: unknown option: " : "Error: unexpected argument: ", argv[i]);
-        if (i + 1 >= argc)
-            die2("Error: option needs a number of seconds: ", argv[i]);
-        if (!parse_seconds(argv[++i], &seconds))
-            die2("Error: not a number of seconds from 0 to " STRINGIFY(SECONDS_MAX) ": ", argv[i]);
-    }
-
+static void stop_one(const char *name, int seconds) {
     require_root("stop");
     container_lock(name);
 
@@ -3676,8 +3730,19 @@ static void cmd_stop(int argc, char **argv) {
     print_str(STDOUT,"' stopped\n");
 }
 
+static void cmd_stop(int argc, char **argv) {
+    /* how long each container gets to end by itself */
+    int seconds = cfg_global.stop_timeout;
+    int count = names_and_seconds(argc, argv, &seconds);
+    if (count == 0)
+        die("Usage: lightbox stop <name>... [-t <seconds>]");
+    require_root("stop");
+    each_container("not stopped", count, argv, stop_one, seconds);
+}
+
 static void cmd_add_vol(int argc, char **argv) {
     if (argc < 2) die("Usage: lightbox add-vol <name> <src:dst[:ro]>");
+    if (argc > 2) die2("Error: unexpected argument: ", argv[2]);
     const char *name = argv[0];
     validate_name(name);
 
@@ -3729,7 +3794,8 @@ static void cmd_add_vol(int argc, char **argv) {
  * read as a volume's destination is, so /data/ and /data are the same place.
  */
 static void cmd_rm_vol(int argc, char **argv) {
-    if (argc != 2) die("Usage: lightbox rm-vol <name> <dst>");
+    if (argc < 2) die("Usage: lightbox rm-vol <name> <dst>");
+    if (argc > 2) die2("Error: unexpected argument: ", argv[2]);
     const char *name = argv[0];
     validate_name(name);
 
@@ -3761,12 +3827,8 @@ static void cmd_rm_vol(int argc, char **argv) {
 
 /* ─── cmd_rm ────────────────────────────────────────────────────────────── */
 
-static void cmd_rm(int argc, char **argv) {
-    require_tool("rm", tool_path_rm());
-    if (argc < 1) die("Usage: lightbox rm <name>");
-    const char *name = argv[0];
-    validate_name(name);
-
+static void rm_one(const char *name, int unused) {
+    (void)unused;
     container_lock(name);
 
     if (is_running(name)) die2("Error: container is running (stop it first): ", name);
@@ -3793,6 +3855,14 @@ static void cmd_rm(int argc, char **argv) {
     print_str(STDOUT,"Container '");
     print_str(STDOUT,name);
     print_str(STDOUT,"' removed\n");
+}
+
+static void cmd_rm(int argc, char **argv) {
+    require_tool("rm", tool_path_rm());
+    int count = names_and_seconds(argc, argv, NULL);
+    if (count == 0)
+        die("Usage: lightbox rm <name>...");
+    each_container("not removed", count, argv, rm_one, 0);
 }
 
 /* ─── cmd_exec ──────────────────────────────────────────────────────────── */
@@ -3862,7 +3932,7 @@ static void cmd_exec(int argc, char **argv) {
 
 /* ─── cmd_ls ────────────────────────────────────────────────────────────── */
 
-/* ─── Usage ─────────────────────────────────────────────────────────────── */
+/* ─── setup --teardown ──────────────────────────────────────────────────── */
 
 /*
  * setup --teardown: what setup made taken away, once no container runs.
@@ -3902,11 +3972,11 @@ static void cmd_teardown(void) {
     lc_kernel_exit(0);
 }
 
-[[noreturn]] static void usage(void) {
-    print_str(STDERR,
-        "Usage: lightbox <command> [args]\n"
-        "\n"
-        "Commands:\n"
+/* ─── Usage ─────────────────────────────────────────────────────────────── */
+
+/* Each command's lines of the usage, as `lightbox <command> --help` prints them. */
+static const struct { const char *name; const char *text; } command_help[] = {
+    { "create",
         "  create <name> [<ip>] [options]\n"
         "                                Create a new container; without <ip>, the lowest free address\n"
         "         --mem  <limit>         Memory limit: <number>[K|M|G|T] or max (default: 256M)\n"
@@ -3923,26 +3993,90 @@ static void cmd_teardown(void) {
         "         --privileged           Disable security sandbox\n"
         "         --oom-score <n>        OOM score adjustment (default: 500)\n"
         "         --link <name>          Allow network to another container\n"
-        "         --dns <address>        A name server for the container (up to 3; default: the host's)\n"
-        "  start  <name> [-t <seconds>]  Start a stopped container\n"
-        "         -t <seconds>            How long to wait for /init.sh (default: 30, 0: do not wait)\n"
-        "  stop   <name> [-t <seconds>]  Stop a running container\n"
-        "         -t <seconds>            How long its processes get to end (default: 10)\n"
-        "  add-vol <name> <src:dst[:ro]> Add a volume to an existing container\n"
-        "  rm-vol <name> <dst>           Remove the volume at a destination\n"
-        "  rm     <name>                 Remove a container (must be stopped)\n"
+        "         --dns <address>        A name server for the container (up to 3; default: the host's)\n" },
+    { "start",
+        "  start  <name>... [-t <seconds>]  Start stopped containers, one after the other\n"
+        "         -t <seconds>            How long to wait for /init.sh (default: 30, 0: do not wait)\n" },
+    { "stop",
+        "  stop   <name>... [-t <seconds>]  Stop running containers, one after the other\n"
+        "         -t <seconds>            How long their processes get to end (default: 10)\n" },
+    { "add-vol",
+        "  add-vol <name> <src:dst[:ro]> Add a volume to an existing container\n" },
+    { "rm-vol",
+        "  rm-vol <name> <dst>           Remove the volume at a destination\n" },
+    { "rm",
+        "  rm     <name>...              Remove containers (they must be stopped)\n" },
+    { "exec",
         "  exec   <name> [options] [--] [cmd [args...]]  Run a command in a running container\n"
         "         --user <name|uid[:gid]> Who to run it as (default: root)\n"
         "         --env <KEY=VALUE>       Set a variable in its environment (repeatable)\n"
-        "         --workdir <dir>         The directory to run it in (default: /)\n"
-        "  logs   <name> [-f]            Show what the container has printed; -f follows it\n"
-        "  inspect <name>                Show container metadata and runtime state\n"
-        "  doctor                        Show host/runtime dependency status\n"
-        "  ls                            List all containers\n"
+        "         --workdir <dir>         The directory to run it in (default: /)\n" },
+    { "logs",
+        "  logs   <name> [-f]            Show what the container has printed; -f follows it\n" },
+    { "inspect",
+        "  inspect <name>                Show container metadata and runtime state\n" },
+    { "doctor",
+        "  doctor                        Show host/runtime dependency status\n" },
+    { "ls",
+        "  ls [--json]                   List all containers\n" },
+    { "setup",
         "  setup                         Setup host networking\n"
-        "  setup --teardown              Take lightbox's host network away, when no container runs\n"
-    );
+        "  setup --teardown              Take lightbox's host network away, when no container runs\n" },
+};
+#define COMMANDS (sizeof(command_help) / sizeof(command_help[0]))
+
+static const char *help_of(const char *command) {
+    for (size_t i = 0; i < COMMANDS; i++)
+        if (streq(command_help[i].name, command))
+            return command_help[i].text;
+    return NULL;
+}
+
+static bool asks_for_help(const char *arg) {
+    return streq(arg, "--help") || streq(arg, "-h");
+}
+
+/* The usage: of one command, or of all of them. */
+static void print_usage(int32_t fd, const char *command) {
+    print_str(fd, "Usage: lightbox <command> [args]\n\n");
+    if (command) {
+        print_str(fd, help_of(command));
+        return;
+    }
+    print_str(fd, "Commands:\n");
+    for (size_t i = 0; i < COMMANDS; i++)
+        print_str(fd, command_help[i].text);
+    print_str(fd,
+        "\n"
+        "  --help, help [<command>], <command> --help   This text, or a command's part of it\n"
+        "  --version                                    The version of lightbox, and of lightc\n");
+}
+
+/* Help that was asked for: on standard output, and no error. */
+[[noreturn]] static void help(const char *command) {
+    print_usage(STDOUT, command);
+    lc_kernel_exit(0);
+}
+
+/* A command line that is not one: the usage on standard error, and an error. */
+[[noreturn]] static void usage(void) {
+    print_usage(STDERR, NULL);
     lc_kernel_exit(1);
+}
+
+[[noreturn]] static void version(void) {
+    char number[16];
+    print_str(STDOUT, "lightbox " LIGHTBOX_VERSION " (lightc ");
+    fmt_int(number, LC_VERSION_MAJOR);
+    print_str(STDOUT, number);
+    lc_print_char(STDOUT, '.');
+    fmt_int(number, LC_VERSION_MINOR);
+    print_str(STDOUT, number);
+    lc_print_char(STDOUT, '.');
+    fmt_int(number, LC_VERSION_PATCH);
+    print_str(STDOUT, number);
+    print_str(STDOUT, ")\n");
+    lc_kernel_exit(0);
 }
 
 /* ─── main ──────────────────────────────────────────────────────────────── */
@@ -3971,6 +4105,22 @@ int main(int argc, char **argv, char **envp) {
     caller_env = envp;
     if (argc < 2) usage();
 
+    /* help and the version need no configuration, and get none of its warnings */
+    if (asks_for_help(argv[1]) || streq(argv[1], "help")) {
+        if (argc == 2)
+            help(NULL);
+        if (argc == 3 && help_of(argv[2]))
+            help(argv[2]);
+        die2(argc == 3 ? "Error: there is no such command: " : "Error: unexpected argument: ", argv[argc == 3 ? 2 : 3]);
+    }
+    if (streq(argv[1], "--version")) {
+        if (argc > 2)
+            die2("Error: unexpected argument: ", argv[2]);
+        version();
+    }
+    if (argc > 2 && asks_for_help(argv[2]) && help_of(argv[1]))
+        help(argv[1]);
+
     /* load configuration: built-in defaults → lightbox.conf → env vars */
     cfg_global_init();
     cfg_global_load(envp);
@@ -3996,9 +4146,18 @@ int main(int argc, char **argv, char **envp) {
     else if (streq(cmd, "exec"))   cmd_exec(sub_argc, sub_argv);
     else if (streq(cmd, "logs"))   cmd_logs(sub_argc, sub_argv);
     else if (streq(cmd, "inspect")) cmd_inspect(sub_argc, sub_argv);
-    else if (streq(cmd, "doctor")) cmd_doctor();
+    else if (streq(cmd, "doctor")) {
+        if (sub_argc > 0)
+            die2(sub_argv[0][0] == '-' ? "Error: unknown option: " : "Error: unexpected argument: ", sub_argv[0]);
+        cmd_doctor();
+    }
     else if (streq(cmd, "ls"))     cmd_ls(sub_argc, sub_argv);
-    else                           usage();
+    else {
+        print_str(STDERR, "Error: unknown command: ");
+        print_str(STDERR, cmd);
+        print_str(STDERR, "\n\n");
+        usage();
+    }
 
     return 0;
 }

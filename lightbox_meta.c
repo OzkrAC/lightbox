@@ -38,8 +38,12 @@ static void json_key(const char *key, bool first) {
 
 void cmd_ls(int argc, char **argv) {
     bool json = false;
-    for (int i = 0; i < argc; i++)
-        if (streq(argv[i], "--json")) json = true;
+    for (int i = 0; i < argc; i++) {
+        if (streq(argv[i], "--json"))
+            json = true;
+        else
+            die2(argv[i][0] == '-' ? "Error: unknown option: " : "Error: unexpected argument: ", argv[i]);
+    }
 
     static char names[MAX_LISTED][NAME_MAX_LEN + 1];
     bool more = false;
@@ -193,6 +197,8 @@ void cmd_logs(int argc, char **argv) {
 
 void cmd_inspect(int argc, char **argv) {
     if (argc < 1) die("Usage: lightbox inspect <name>");
+    if (argc > 1)
+        die2(argv[1][0] == '-' ? "Error: unknown option: " : "Error: unexpected argument: ", argv[1]);
     const char *name = argv[0];
     validate_name(name);
 

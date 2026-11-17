@@ -318,16 +318,24 @@ What changes with the backend, as it does for Docker:
 lightbox <command> [args]
 
   setup                         Initialize host networking
+  setup --teardown              Take lightbox's host network away, when no container runs
   create <name> [<ip>] [options]  Create a new container; without <ip>, the lowest free address
-  start  <name> [-t <seconds>]  Start a stopped container
-  stop   <name> [-t <seconds>]  Stop a running container
+  start  <name>... [-t <seconds>]  Start stopped containers, one after the other
+  stop   <name>... [-t <seconds>]  Stop running containers, one after the other
   add-vol <name> <src>:<dst>[:ro]  Add a volume to an existing container
   rm-vol <name> <dst>           Remove the volume at a destination
-  rm     <name>                 Remove a container
+  rm     <name>...              Remove containers
   exec   <name> [options] [--] [cmd [args...]]   Run a command in a container
   logs   <name> [-f]            Show what a container has printed; -f follows it
-  ls                            List all containers
+  inspect <name>                Show a container's configuration and state
+  doctor                        Show what the host has of what lightbox needs
+  ls [--json]                   List all containers
+
+  --help, help [<command>], <command> --help   The usage, or one command's part of it
+  --version                                    The version of lightbox, and of lightc
 ```
+
+Help that is asked for goes to standard output, and the command exits 0. A word that a command will not use is an error that names it, and the command does nothing. `start`, `stop` and `rm` take several names, as Docker's do, and do one container after the other: one that cannot be done ends nothing for the others, the command names those it did not do at the end, and its exit status is the first that was not 0.
 
 ### Create options
 

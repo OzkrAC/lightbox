@@ -2,9 +2,23 @@
 
 What changed for someone who uses lightbox, newest first. `ROADMAP.md` has the reasons and the finding each change closes.
 
-## 0.5.0
+## 0.6.0
 
-Not tagged yet. Phase 5 of the roadmap: one reader and writer for a container's configuration, strict values, locks, the clearing away of containers that died, records in `run_dir`, addresses and limits that are checked, firewall rules in chains and tables of lightbox's own with nftables as a backend to choose, interfaces that lightbox owns, and a host network that comes back after a reboot.
+Not tagged yet, and not complete: the part of Phase 6 that is written so far.
+
+### Changes you may have to act on
+
+- **Help goes to standard output and exits 0**: `lightbox --help`, `-h`, `help`, `help <command>` and `<command> --help`. It used to go to standard error, with status 1. A command line that is not one, such as an unknown command, still prints the usage on standard error and exits 1, and now says first what was wrong.
+- **A word that a command will not use is an error that names it.** `inspect`, `doctor`, `ls`, `add-vol` and `rm-vol` ignored what came after the words they read: `inspect a b` showed `a`, and `rm a b` removed `a` and said nothing of `b`.
+
+### Added
+
+- **`start`, `stop` and `rm` take several names**, as Docker's do, and do one container after the other. One that cannot be done ends nothing for the others; the command names those it did not do, and exits with the first status that was not 0. `-t` for `start` and `stop` may come anywhere among the names.
+- **`lightbox --version`** prints the version of lightbox and of lightc.
+
+## 0.5.1
+
+Tagged `v0.5.1`, at `d0298a3`, the merge of pull request 5; no 0.5.0 was tagged. Phase 5 of the roadmap: one reader and writer for a container's configuration, strict values, locks, the clearing away of containers that died, records in `run_dir`, addresses and limits that are checked, firewall rules in chains and tables of lightbox's own with nftables as a backend to choose, interfaces that lightbox owns, and a host network that comes back after a reboot.
 
 ### Changes you may have to act on
 

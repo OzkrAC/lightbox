@@ -2047,6 +2047,20 @@ t_no_ipv6_in_container() {
     [ -z "$said" ]
 }
 
+# start and stop take several names and do them one after the other. A name
+# that is no container's ends nothing for the others, and is named at the end.
+t_several_names() {
+    box many1 && box many2 || return 1
+    said=$(lb start many1 nosuch many2 2>&1 </dev/null) && { printf '%s\n' "$said"; echo "a start with the name of no container succeeded"; return 1; }
+    printf '%s\n' "$said"
+    [ "$(printf '%s\n' "$said" | tail -n 1)" = 'Error: not started: nosuch' ] || return 1
+    settled many1 && settled many2 || return 1
+    lb stop -t 5 many1 many2 || return 1
+    [ "$(state_of many1)" = stopped ] && [ "$(state_of many2)" = stopped ] ||
+        { echo "states: $(state_of many1) $(state_of many2)"; return 1; }
+    nothing_left many1 && nothing_left many2
+}
+
 # ─── Cases: after a reboot, and teardown ────────────────────────────────────
 
 # What a reboot takes: the bridge, every firewall rule and chain, forwarding
@@ -2476,6 +2490,7 @@ if [ "$MODE" = inside ]; then
     check 'doctor finds nothing missing'                                  t_doctor
 
     check 'create, start, exec, stop and rm'                              t_lifecycle
+    check 'start and stop take several names, and name those they could not do' t_several_names
     check 'ls and inspect show a running container'                       t_queries_show_running
     check 'exec returns the exit status of the command'                   t_exec_status
     check 'exec without a command runs a shell on standard input'         t_exec_default_shell

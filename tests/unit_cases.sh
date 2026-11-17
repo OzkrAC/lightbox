@@ -1455,16 +1455,16 @@ t_standard_streams_are_reserved() {
     return $rc
 }
 
-# From its first change to the host on, cmd_start has one way out, which undoes
+# From its first change to the host on, a start has one way out, which undoes
 # what was done. A call that ends the process where it stands would leave an
 # interface, a cgroup or an init behind.
 t_start_has_one_way_out() {
     src=$HERE/../lightbox.c
-    region=$(awk '/^static void cmd_start\(/ { inside = 1 }
+    region=$(awk '/^static void start_one\(/ { inside = 1 }
                   inside && /const char \*start_err = NULL;/ { on = 1 }
                   on { print }
                   inside && /^}/ { exit }' "$src")
-    [ -n "$region" ] || { echo "cmd_start, or the start of its guarded part, was not found in $src"; return 1; }
+    [ -n "$region" ] || { echo "start_one, or the start of its guarded part, was not found in $src"; return 1; }
     echo "lines looked at: $(printf '%s\n' "$region" | wc -l)"
     bad=0
     if printf '%s\n' "$region" | grep -nE '\b(die|die2|[a-z_]+_or_die|require_[a-z_]+|set_container_state|usage)\(' ; then
@@ -2582,7 +2582,7 @@ check 'exec'"'"'s options are checked, and a missing value names its option' t_c
 
 check 'a number of seconds is digits within the limit'           t_seconds
 check 'a file never gets the number of a closed standard stream' t_standard_streams_are_reserved
-check 'cmd_start has one way out once it has changed the host'   t_start_has_one_way_out
+check 'a start has one way out once it has changed the host'      t_start_has_one_way_out
 
 check 'text is put into a buffer whole or not at all'            t_text_is_whole_or_refused
 check 'a number is digits in its range, and never wraps'         t_numbers_are_strict

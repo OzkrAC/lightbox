@@ -16,6 +16,10 @@
 #error "lightbox needs lightc 0.1.1 or later"
 #endif
 
+/* What --version says: the release, set when it is tagged, and "-dev" after
+ * it on the way to the next one. */
+#define LIGHTBOX_VERSION "0.6.0-dev"
+
 #define MAX_PATH         512
 #define NAME_MAX_LEN     30
 #define MAX_VOLS         16

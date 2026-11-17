@@ -238,7 +238,9 @@ t_stopped_container_cannot_stop_or_exec() {
 
 t_unknown_command_prints_usage() {
     usage=$(lb frobnicate 2>&1)
-    [ $? -ne 0 ] && printf '%s\n' "$usage" | grep -q '^Usage: lightbox'
+    [ $? -ne 0 ] && printf '%s\n' "$usage" | grep -q '^Usage: lightbox' &&
+    [ "$(printf '%s\n' "$usage" | head -n 1)" = 'Error: unknown command: frobnicate' ] &&
+    [ -z "$(lb frobnicate 2>/dev/null)" ]
 }
 
 # ─── Cases: open findings ───────────────────────────────────────────────────
@@ -1238,19 +1240,73 @@ t_config_reports_unknown_keys() {
     lb doctor 2>&1 >/dev/null | grep -q 'defualt_mem'
 }
 
+# Help that is asked for goes to standard output and is no error: the whole
+# usage, or one command's part of it. It reads no lightbox.conf, and says
+# nothing about one. --version names lightbox's version and lightc's.
 t_help_exits_zero() {
-    usage=$(lb --help 2>&1) || return 1
-    printf '%s\n' "$usage" | grep -q '^Usage: lightbox'
+    echo 'firewall = maybe' >> "$CONF"
+    usage=$(lb --help 2>/dev/null) || return 1
+    printf '%s\n' "$usage" | grep -q '^Usage: lightbox' || return 1
+    bad=0
+    for words in -h help 'help start' 'start --help' 'rm -h' 'exec --help' 'setup --help' 'ls -h'; do
+        # shellcheck disable=SC2086
+        out=$(lb $words 2>&1) || { echo "lightbox $words: exit $?"; bad=1; continue; }
+        printf '%s\n' "$out" | grep -q '^Usage: lightbox' || { echo "lightbox $words printed no usage"; bad=1; }
+        ! printf '%s\n' "$out" | grep -q '^Warning' || { echo "lightbox $words read lightbox.conf"; bad=1; }
+    done
+    commands=$(lb start --help | grep -c '^  [a-z]')
+    [ "$commands" = 1 ] || { echo "start --help shows $commands commands"; bad=1; }
+    lb help | grep -q -- '--version' || { echo "the usage does not name --version"; bad=1; }
+    out=$(lb help nosuch 2>&1) && { echo "help of no command succeeded"; bad=1; }
+    [ "$out" = 'Error: there is no such command: nosuch' ] || { echo "help nosuch: $out"; bad=1; }
+    v=$(lb --version) || { echo "--version: exit $?"; bad=1; }
+    echo "$v"
+    printf '%s\n' "$v" | grep -Eqx 'lightbox [0-9]+\.[0-9]+\.[0-9]+(-dev)? \(lightc [0-9]+\.[0-9]+\.[0-9]+\)' || bad=1
+    out=$(lb --version now 2>&1) && bad=1
+    [ "$out" = 'Error: unexpected argument: now' ] || { echo "--version now: $out"; bad=1; }
+    return $bad
 }
 
 # rm with two names removes both, or refuses and removes neither.
+# rm takes several names, as Docker's does: each is removed or says why not,
+# the others are removed all the same, and those that were not are named.
 t_rm_handles_every_argument() {
-    lb create a 10.0.0.2 && lb create b 10.0.0.3 || return 1
-    if lb rm a b; then
-        [ ! -e "$C/a" ] && [ ! -e "$C/b" ]
-    else
-        [ -e "$C/a" ] && [ -e "$C/b" ]
-    fi
+    lb create a 10.0.0.2 && lb create b 10.0.0.3 && lb create c 10.0.0.4 || return 1
+    lb rm a b || return 1
+    [ ! -e "$C/a" ] && [ ! -e "$C/b" ] || { echo "rm a b left one of them"; return 1; }
+    said=$(lb rm nosuch c 2>&1) && { printf '%s\n' "$said"; echo "rm of a container that does not exist succeeded"; return 1; }
+    printf '%s\n' "$said"
+    [ ! -e "$C/c" ] || { echo "rm stopped at the name it could not remove"; return 1; }
+    [ "$(printf '%s\n' "$said" | tail -n 1)" = 'Error: not removed: nosuch' ]
+}
+
+# A word that a command will not use is an error that names it, and the
+# command does nothing.
+t_surplus_arguments_are_errors() {
+    lb create web 10.0.0.2 || return 1
+    bad=0
+    expect() { # message, words...
+        local want=$1
+        shift
+        msg=$(lb "$@" 2>&1) && { echo "lightbox $*: succeeded"; bad=1; return; }
+        echo "lightbox $*: $msg"
+        [ "$msg" = "$want" ] || bad=1
+    }
+    expect 'Error: unexpected argument: b' inspect web b
+    expect 'Error: unknown option: --all' inspect web --all
+    expect 'Error: unexpected argument: extra' doctor extra
+    expect 'Error: unknown option: --jsno' ls --jsno
+    expect 'Error: unexpected argument: all' ls all
+    expect 'Error: unexpected argument: /mnt' add-vol web /tmp:/srv /mnt
+    expect 'Error: unexpected argument: /var' rm-vol web /srv /var
+    expect 'Error: unexpected argument: again' create web2 10.0.0.3 again
+    expect 'Error: unknown option: --force' rm web --force
+    expect 'Error: unknown option: --now' stop web --now
+    expect 'Error: not a number of seconds from 0 to 86400: soon' start web other -t soon
+    expect 'Usage: lightbox start <name>... [-t <seconds>]' start -t 5
+    [ -e "$C/web/.conf" ] && [ ! -e "$C/web2" ] || { echo "a command that was refused changed something"; bad=1; }
+    grep -q '/srv' "$C/web/.conf" && { echo "add-vol added the volume"; bad=1; }
+    return $bad
 }
 
 # Without root, start says so and leaves the container's state alone.
@@ -1275,7 +1331,8 @@ t_start_options_are_checked() {
     said -t -1     && case $msg in *'number of seconds'*) ;; *) return 1 ;; esac || return 1
     said -t        && case $msg in *'number of seconds'*) ;; *) return 1 ;; esac || return 1
     said --bogus   && case $msg in *'unknown option'*--bogus*) ;; *) return 1 ;; esac || return 1
-    said another   && case $msg in *'unexpected argument'*another*) ;; *) return 1 ;; esac || return 1
+    # a second word is a second name, and is checked as one before anything else
+    said 'an@other' && case $msg in *'container name must only contain'*) ;; *) return 1 ;; esac || return 1
     [ "$before" = "$(kept_sum)" ] || { echo "the container's records changed"; return 1; }
 }
 
@@ -1303,7 +1360,8 @@ t_stop_options_are_checked() {
     said -t soon   && case $msg in *soon*) ;; *) return 1 ;; esac || return 1
     said -t        && case $msg in *'number of seconds'*) ;; *) return 1 ;; esac || return 1
     said --bogus   && case $msg in *'unknown option'*--bogus*) ;; *) return 1 ;; esac || return 1
-    said another   && case $msg in *'unexpected argument'*another*) ;; *) return 1 ;; esac || return 1
+    # a second word is a second name, and is checked as one before anything else
+    said 'an@other' && case $msg in *'container name must only contain'*) ;; *) return 1 ;; esac || return 1
     # with options that are fine it goes on: to who runs it, and as root to the container, which is not running
     said -t 3      && case $msg in *'must be run as root'*|*'not running'*) ;; *) return 1 ;; esac || return 1
     [ "$before" = "$(kept_sum)" ] || { echo "the container's records changed"; return 1; }
@@ -1545,8 +1603,9 @@ xfail CLI-inspect          'inspect shows volumes and links'                 t_i
 xfail CFG-parse            'configuration: carriage returns are stripped'    t_config_strips_carriage_returns
 xfail CFG-parse            'configuration: inline comments are stripped'     t_config_strips_inline_comments
 xfail CFG-parse            'configuration: unknown keys are reported'        t_config_reports_unknown_keys
-xfail CLI-help             '--help exits 0'                                  t_help_exits_zero
-xfail CLI-extra-args       'rm handles every argument or none'               t_rm_handles_every_argument
+check 'help goes to standard output with status 0, and --version names the release' t_help_exits_zero
+check 'rm takes several names, and names those it did not remove'      t_rm_handles_every_argument
+check 'a surplus argument is an error that names it'                    t_surplus_arguments_are_errors
 check 'start without root is a clean error'                   t_start_without_root_is_a_clean_error
 
 summary validation
