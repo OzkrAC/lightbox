@@ -10,6 +10,12 @@ Not tagged yet, and not complete: the part of Phase 7 that is written so far.
 
 - **A new container is an overlay of a snapshot of its base, not a copy of it.** The first `create` from a base takes a snapshot of it into `<lightbox_dir>/bases/`, and every container of that base shares it; `create` after the first takes no time or room of the base's size, and a change of the base directory afterwards changes no container. `<container_dir>/<name>/rootfs/` holds only the container's own files, and the base's are not there on the host: a script that reads or changes a file of the base there has to use `--copy`, or work in the container. A file of the base that is changed from the host has to be copied into `rootfs/` first. Containers made before 0.7 are copies, and stay so.
 - **Where an overlay cannot be mounted**, without overlayfs or without the right to mount, `create` makes a copy, as before, and says so.
+- **lightbox runs neither `ip` nor `nsenter`**, so iproute2 and util-linux are no longer needed on the host. `doctor` no longer has the checks `bin.ip` and `bin.nsenter`, in its text or in `--json`: a script that looked for them finds them gone.
+- **A failure in a container's network is said with the kernel's errno** where `ip` printed its own words before, as in `Error: failed to attach the container's interface to the bridge (errno 95)` or `Error: cannot make the bridge br0 (errno 1)`.
+
+### Changed
+
+- **`start`, `stop`, `rm`, `setup` and `setup --teardown` make and take away the bridge, the veth pair and the bridge's port with rtnetlink requests of their own**, and the container's init gives `eth0` its address and its default route from inside the container: nothing enters the container's network namespace from the host.
 
 ### Added
 

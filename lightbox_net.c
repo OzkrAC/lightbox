@@ -9,6 +9,19 @@ static void require_cmd(const char *prog, const char *const argv[]) {
         die_cmd("Error: command failed: ", prog);
 }
 
+/* "Error: <before><what> (errno <n>)", for a request the kernel refused */
+[[noreturn]] static void die_errno(const char *before, const char *what, int rc) {
+    char digits[16];
+    fmt_int(digits, -rc);
+    print_str(STDERR, "Error: ");
+    print_str(STDERR, before);
+    print_str(STDERR, what);
+    print_str(STDERR, " (errno ");
+    print_str(STDERR, digits);
+    print_str(STDERR, ")\n");
+    lc_kernel_exit(1);
+}
+
 static int iptables_check(const char *const argv[]) {
     return run_cmd_quiet(tool_path_iptables(), argv);
 }
@@ -205,29 +218,24 @@ void host_port_name(const char *name, char out[IFNAME_TEXT_MAX]) { hashed_name("
 void link_chain_name(const char *name, char out[IFNAME_TEXT_MAX]) { hashed_name("LB-", name, out); }
 
 port_owner host_port_owner(const char *ifname, const char *name) {
-    static char shown[4096];
-    const char *show[] = { "ip", "link", "show", "dev", ifname, NULL };
-    if (run_cmd_capture_quiet(tool_path_ip(), show, shown, sizeof(shown)) != 0)
+    char alias[256];        /* the kernel's longest alias, and its end */
+    rtnl nl;
+    if (rtnl_open(&nl) < 0)
+        return PORT_UNKNOWN;
+    int rc = rtnl_link_get(&nl, ifname, alias, sizeof(alias));
+    rtnl_close(&nl);
+    if (rc == -LB_ENODEV)
         return PORT_ABSENT;
-    return port_owner_of_listing(shown, name);
+    if (rc < 0)
+        return PORT_UNKNOWN;
+    return port_owner_of_alias(alias, name);
 }
 
-port_owner port_owner_of_listing(char *shown, const char *name) {
+port_owner port_owner_of_alias(const char *alias, const char *name) {
     char want[64];
     bool cut = false;
     str_append(want, str_append(want, 0, "lightbox:", sizeof(want), &cut), name, sizeof(want), &cut);
-    /* "    alias lightbox:<name>", a line of its own */
-    for (char *line = shown; *line; ) {
-        char *end = line;
-        while (*end && *end != '\n') end++;
-        bool last = *end == '\0';
-        *end = '\0';
-        while (*line == ' ' || *line == '\t') line++;
-        if (lc_string_starts_with(line, lc_string_length(line), "alias ", 6))
-            return !cut && streq(line + 6, want) ? PORT_OURS : PORT_FOREIGN;
-        line = last ? end : end + 1;
-    }
-    return PORT_FOREIGN;
+    return !cut && streq(alias, want) ? PORT_OURS : PORT_FOREIGN;
 }
 
 /*
@@ -241,8 +249,12 @@ int remove_own_port(const char *ifname, const char *name) {
         return 0;
     if (owner == PORT_FOREIGN)
         return 1;
-    const char *del[] = { "ip", "link", "delete", ifname, NULL };
-    if (run_cmd_quiet(tool_path_ip(), del) == 0)
+    rtnl nl;
+    if (owner == PORT_UNKNOWN || rtnl_open(&nl) < 0)
+        return -1;
+    int rc = rtnl_link_delete(&nl, ifname);
+    rtnl_close(&nl);
+    if (rc == 0 || rc == -LB_ENODEV)
         return 0;
     return host_port_owner(ifname, name) == PORT_ABSENT ? 0 : -1;
 }
@@ -806,27 +818,14 @@ void forward_drops_on_host(char *text, size_t max) {
 
 /* The interface of the default route, if there is one. */
 static bool find_wan_interface(char *wan_if, size_t bufsz) {
-    char route_buf[256];
-    const char *argv[] = { "ip", "route", "show", "default", NULL };
-    if (run_cmd_capture(tool_path_ip(), argv, route_buf, sizeof(route_buf)) != 0 || !route_buf[0])
+    rtnl nl;
+    if (rtnl_open(&nl) < 0)
         return false;
-
-    const char *dev = NULL;
-    for (char *p = route_buf; *p; p++) {
-        if (p[0] == 'd' && p[1] == 'e' && p[2] == 'v' && p[3] == ' ') {
-            dev = p + 4;
-            break;
-        }
-    }
-    if (!dev)
-        return false;
-    size_t i = 0;
-    while (dev[i] && dev[i] != ' ' && dev[i] != '\n' && i < bufsz - 1) {
-        wan_if[i] = dev[i];
-        i++;
-    }
-    wan_if[i] = '\0';
-    return i > 0;
+    char name[IFNAME_TEXT_MAX];
+    int index = rtnl_default_route_index(&nl);
+    bool found = index > 0 && rtnl_link_name(&nl, index, name) == 0 && str_copy(wan_if, name, bufsz);
+    rtnl_close(&nl);
+    return found;
 }
 
 /*
@@ -1160,24 +1159,32 @@ static void host_network_setup(const container_network *net) {
     bool nftables = cfg_global.firewall_backend == FIREWALL_NFTABLES;
     require_forwarding_for_nftables();
     {
-        const char *show[] = { "ip", "link", "show", cfg_global.bridge, NULL };
-        if (run_cmd_quiet(tool_path_ip(), show) != 0) {
+        const char *br = cfg_global.bridge;
+        rtnl nl;
+        int rc = rtnl_open(&nl);
+        if (rc < 0)
+            die_errno("no netlink socket to make the bridge with", "", rc);
+        int index = rtnl_link_get(&nl, br, NULL, 0);
+        if (index == -LB_ENODEV) {
             print_str(STDOUT, "Creating bridge ");
-            print_str(STDOUT, cfg_global.bridge);
+            print_str(STDOUT, br);
             print_str(STDOUT, "...\n");
-            const char *add[] = { "ip", "link", "add", "name", cfg_global.bridge, "type", "bridge", NULL };
-            require_cmd(tool_path_ip(), add);
-            char gw_cidr[CIDR_TEXT_MAX];
-            address_with_prefix(gw_cidr, net->gateway, net);
-            const char *addr[] = { "ip", "addr", "add", gw_cidr, "dev", cfg_global.bridge, NULL };
-            require_cmd(tool_path_ip(), addr);
-            const char *up[] = { "ip", "link", "set", cfg_global.bridge, "up", NULL };
-            require_cmd(tool_path_ip(), up);
+            if ((rc = rtnl_bridge_add(&nl, br)) < 0)
+                die_errno("cannot make the bridge ", br, rc);
+            if ((index = rtnl_link_get(&nl, br, NULL, 0)) < 0)
+                die_errno("cannot find the bridge it made, ", br, index);
+            if ((rc = rtnl_addr_add(&nl, index, net->gateway, net->prefix)) < 0)
+                die_errno("cannot give its address to the bridge ", br, rc);
+            if ((rc = rtnl_link_up(&nl, br)) < 0)
+                die_errno("cannot bring up the bridge ", br, rc);
+        } else if (index < 0) {
+            die_errno("cannot look for the bridge ", br, index);
         } else {
             print_str(STDOUT, "Bridge ");
-            print_str(STDOUT, cfg_global.bridge);
+            print_str(STDOUT, br);
             print_str(STDOUT, " already exists, skipping\n");
         }
+        rtnl_close(&nl);
     }
 
     if (!cfg_global.firewall) {
@@ -1222,7 +1229,6 @@ static void host_network_setup(const container_network *net) {
 
 void cmd_setup(void) {
     require_root("setup");
-    require_tool("ip", tool_path_ip());
     bool nftables = cfg_global.firewall_backend == FIREWALL_NFTABLES;
     if (cfg_global.firewall)
         require_tool(nftables ? "nft" : "iptables", nftables ? tool_path_nft() : tool_path_iptables());
@@ -1370,8 +1376,14 @@ void teardown_host(void) {
     forget_nft_tables();
 
     if (bridge_present()) {
-        const char *del[] = { "ip", "link", "delete", cfg_global.bridge, NULL };
-        require_cmd(tool_path_ip(), del);
+        rtnl nl;
+        int rc = rtnl_open(&nl);
+        if (rc == 0) {
+            rc = rtnl_link_delete(&nl, cfg_global.bridge);
+            rtnl_close(&nl);
+        }
+        if (rc < 0 && rc != -LB_ENODEV)
+            die_errno("cannot remove the bridge ", cfg_global.bridge, rc);
         print_str(STDOUT, "Removed bridge ");
         print_str(STDOUT, cfg_global.bridge);
         lc_print_char(STDOUT, '\n');

@@ -35,14 +35,19 @@
 #include <linux/fcntl.h>
 #include <linux/filter.h>
 #include <linux/magic.h>
+#include <linux/if_addr.h>
+#include <linux/if_link.h>
 #include <linux/memfd.h>
 #include <linux/mount.h>
+#include <linux/netlink.h>
 #include <linux/openat2.h>
 #include <linux/prctl.h>
+#include <linux/rtnetlink.h>
 #include <linux/sched.h>
 #include <linux/seccomp.h>
 #include <linux/sockios.h>
 #include <linux/stat.h>
+#include <linux/veth.h>
 
 #include "../lightbox_sys.h"
 #include "../lightbox_seccomp.h"
@@ -78,6 +83,7 @@ SAME_NR(faccessat);
     _Static_assert((ours) == (kernels), #ours " differs from the kernel's " #kernels)
 
 SAME_VALUE(LB_ENOENT, ENOENT);
+SAME_VALUE(LB_ENODEV, ENODEV);
 SAME_VALUE(LB_ESRCH, ESRCH);
 SAME_VALUE(LB_EINTR, EINTR);
 SAME_VALUE(LB_EEXIST, EEXIST);
@@ -243,6 +249,89 @@ _Static_assert(offsetof(struct lb_winsize, row) == offsetof(struct winsize, ws_r
 SAME_SIZE(lb_mount_attr, mount_attr);
 SAME_FIELD(lb_mount_attr, mount_attr, attr_set);
 SAME_FIELD(lb_mount_attr, mount_attr, attr_clr);
+
+/* rtnetlink. AF_NETLINK, SOCK_RAW and SOCK_CLOEXEC, which the kernel's
+ * headers do not have, are in sys_check_net.c. */
+SAME_VALUE(LB_NETLINK_ROUTE, NETLINK_ROUTE);
+SAME_VALUE(LB_NLMSG_ERROR, NLMSG_ERROR);
+SAME_VALUE(LB_NLMSG_DONE, NLMSG_DONE);
+SAME_VALUE(LB_NLM_F_REQUEST, NLM_F_REQUEST);
+SAME_VALUE(LB_NLM_F_MULTI, NLM_F_MULTI);
+SAME_VALUE(LB_NLM_F_ACK, NLM_F_ACK);
+SAME_VALUE(LB_NLM_F_EXCL, NLM_F_EXCL);
+SAME_VALUE(LB_NLM_F_CREATE, NLM_F_CREATE);
+SAME_VALUE(LB_NLM_F_DUMP, NLM_F_DUMP);
+SAME_VALUE(LB_RTM_NEWLINK, RTM_NEWLINK);
+SAME_VALUE(LB_RTM_DELLINK, RTM_DELLINK);
+SAME_VALUE(LB_RTM_GETLINK, RTM_GETLINK);
+SAME_VALUE(LB_RTM_NEWADDR, RTM_NEWADDR);
+SAME_VALUE(LB_RTM_NEWROUTE, RTM_NEWROUTE);
+SAME_VALUE(LB_RTM_GETROUTE, RTM_GETROUTE);
+SAME_VALUE(LB_IFLA_IFNAME, IFLA_IFNAME);
+SAME_VALUE(LB_IFLA_MASTER, IFLA_MASTER);
+SAME_VALUE(LB_IFLA_LINKINFO, IFLA_LINKINFO);
+SAME_VALUE(LB_IFLA_NET_NS_PID, IFLA_NET_NS_PID);
+SAME_VALUE(LB_IFLA_IFALIAS, IFLA_IFALIAS);
+SAME_VALUE(LB_IFLA_INFO_KIND, IFLA_INFO_KIND);
+SAME_VALUE(LB_IFLA_INFO_DATA, IFLA_INFO_DATA);
+SAME_VALUE(LB_IFLA_INFO_SLAVE_KIND, IFLA_INFO_SLAVE_KIND);
+SAME_VALUE(LB_IFLA_INFO_SLAVE_DATA, IFLA_INFO_SLAVE_DATA);
+SAME_VALUE(LB_IFLA_BRPORT_ISOLATED, IFLA_BRPORT_ISOLATED);
+SAME_VALUE(LB_VETH_INFO_PEER, VETH_INFO_PEER);
+SAME_VALUE(LB_IFA_ADDRESS, IFA_ADDRESS);
+SAME_VALUE(LB_IFA_LOCAL, IFA_LOCAL);
+SAME_VALUE(LB_RTA_OIF, RTA_OIF);
+SAME_VALUE(LB_RTA_GATEWAY, RTA_GATEWAY);
+SAME_VALUE(LB_RTA_TABLE, RTA_TABLE);
+SAME_VALUE(LB_RT_TABLE_MAIN, RT_TABLE_MAIN);
+SAME_VALUE(LB_RTPROT_BOOT, RTPROT_BOOT);
+SAME_VALUE(LB_RT_SCOPE_UNIVERSE, RT_SCOPE_UNIVERSE);
+SAME_VALUE(LB_RTN_UNICAST, RTN_UNICAST);
+
+/* the same layout under other names */
+#define SAME_MEMBER(ours, ofield, kernels, kfield) \
+    _Static_assert(offsetof(struct ours, ofield) == offsetof(struct kernels, kfield) && \
+                   sizeof(((struct ours *)0)->ofield) == sizeof(((struct kernels *)0)->kfield), \
+                   "struct " #ours "." #ofield " does not match the kernel's struct " #kernels "." #kfield)
+
+SAME_SIZE(lb_nlmsghdr, nlmsghdr);
+SAME_MEMBER(lb_nlmsghdr, len, nlmsghdr, nlmsg_len);
+SAME_MEMBER(lb_nlmsghdr, type, nlmsghdr, nlmsg_type);
+SAME_MEMBER(lb_nlmsghdr, flags, nlmsghdr, nlmsg_flags);
+SAME_MEMBER(lb_nlmsghdr, seq, nlmsghdr, nlmsg_seq);
+SAME_MEMBER(lb_nlmsghdr, pid, nlmsghdr, nlmsg_pid);
+SAME_SIZE(lb_nlmsgerr, nlmsgerr);
+SAME_MEMBER(lb_nlmsgerr, error, nlmsgerr, error);
+SAME_MEMBER(lb_nlmsgerr, msg, nlmsgerr, msg);
+SAME_SIZE(lb_rtattr, rtattr);
+SAME_MEMBER(lb_rtattr, len, rtattr, rta_len);
+SAME_MEMBER(lb_rtattr, type, rtattr, rta_type);
+SAME_SIZE(lb_ifinfomsg, ifinfomsg);
+SAME_MEMBER(lb_ifinfomsg, family, ifinfomsg, ifi_family);
+SAME_MEMBER(lb_ifinfomsg, type, ifinfomsg, ifi_type);
+SAME_MEMBER(lb_ifinfomsg, index, ifinfomsg, ifi_index);
+SAME_MEMBER(lb_ifinfomsg, flags, ifinfomsg, ifi_flags);
+SAME_MEMBER(lb_ifinfomsg, change, ifinfomsg, ifi_change);
+SAME_SIZE(lb_ifaddrmsg, ifaddrmsg);
+SAME_MEMBER(lb_ifaddrmsg, family, ifaddrmsg, ifa_family);
+SAME_MEMBER(lb_ifaddrmsg, prefixlen, ifaddrmsg, ifa_prefixlen);
+SAME_MEMBER(lb_ifaddrmsg, flags, ifaddrmsg, ifa_flags);
+SAME_MEMBER(lb_ifaddrmsg, scope, ifaddrmsg, ifa_scope);
+SAME_MEMBER(lb_ifaddrmsg, index, ifaddrmsg, ifa_index);
+SAME_SIZE(lb_rtmsg, rtmsg);
+SAME_MEMBER(lb_rtmsg, family, rtmsg, rtm_family);
+SAME_MEMBER(lb_rtmsg, dst_len, rtmsg, rtm_dst_len);
+SAME_MEMBER(lb_rtmsg, src_len, rtmsg, rtm_src_len);
+SAME_MEMBER(lb_rtmsg, tos, rtmsg, rtm_tos);
+SAME_MEMBER(lb_rtmsg, table, rtmsg, rtm_table);
+SAME_MEMBER(lb_rtmsg, protocol, rtmsg, rtm_protocol);
+SAME_MEMBER(lb_rtmsg, scope, rtmsg, rtm_scope);
+SAME_MEMBER(lb_rtmsg, type, rtmsg, rtm_type);
+SAME_MEMBER(lb_rtmsg, flags, rtmsg, rtm_flags);
+SAME_SIZE(lb_sockaddr_nl, sockaddr_nl);
+SAME_MEMBER(lb_sockaddr_nl, family, sockaddr_nl, nl_family);
+SAME_MEMBER(lb_sockaddr_nl, pid, sockaddr_nl, nl_pid);
+SAME_MEMBER(lb_sockaddr_nl, groups, sockaddr_nl, nl_groups);
 
 SAME_SIZE(lb_open_how, open_how);
 SAME_FIELD(lb_open_how, open_how, flags);

@@ -83,6 +83,7 @@
 #define LB_EACCES                 13
 #define LB_EBUSY                  16
 #define LB_EEXIST                 17
+#define LB_ENODEV                 19
 #define LB_EINVAL                 22
 #define LB_ENOSYS                 38
 #define LB_ENOTDIR                20
@@ -239,7 +240,112 @@
 #define LB_SIOCSIFFLAGS           0x8914
 #define LB_IFF_UP                 0x1
 
+/* rtnetlink: a socket to the kernel's configuration of interfaces, addresses
+ * and routes, the requests lightbox makes of it and the attributes they carry
+ * (linux/netlink.h, rtnetlink.h, if_link.h, veth.h, if_addr.h). */
+#define LB_AF_NETLINK             16
+#define LB_SOCK_RAW               3
+#define LB_SOCK_CLOEXEC           0x80000
+#define LB_NETLINK_ROUTE          0
+
+#define LB_NLMSG_ERROR            2
+#define LB_NLMSG_DONE             3
+#define LB_NLM_F_REQUEST          0x001
+#define LB_NLM_F_MULTI            0x002
+#define LB_NLM_F_ACK              0x004
+#define LB_NLM_F_EXCL             0x200
+#define LB_NLM_F_CREATE           0x400
+#define LB_NLM_F_DUMP             0x300
+
+#define LB_RTM_NEWLINK            16
+#define LB_RTM_DELLINK            17
+#define LB_RTM_GETLINK            18
+#define LB_RTM_NEWADDR            20
+#define LB_RTM_NEWROUTE           24
+#define LB_RTM_GETROUTE           26
+
+#define LB_IFLA_IFNAME            3
+#define LB_IFLA_MASTER            10
+#define LB_IFLA_LINKINFO          18
+#define LB_IFLA_NET_NS_PID        19
+#define LB_IFLA_IFALIAS           20
+#define LB_IFLA_INFO_KIND         1
+#define LB_IFLA_INFO_DATA         2
+#define LB_IFLA_INFO_SLAVE_KIND   4
+#define LB_IFLA_INFO_SLAVE_DATA   5
+#define LB_IFLA_BRPORT_ISOLATED   33
+#define LB_VETH_INFO_PEER         1
+
+#define LB_IFA_ADDRESS            1
+#define LB_IFA_LOCAL              2
+
+#define LB_RTA_OIF                4
+#define LB_RTA_GATEWAY            5
+#define LB_RTA_TABLE              15
+#define LB_RT_TABLE_MAIN          254
+#define LB_RTPROT_BOOT            3
+#define LB_RT_SCOPE_UNIVERSE      0
+#define LB_RTN_UNICAST            1
+
 /* ─── Structures ────────────────────────────────────────────────────────── */
+
+/* rtnetlink's headers: of a message, of an error the kernel answers with, of
+ * an attribute, and of the three kinds of request; and the address of the
+ * kernel's end (linux/netlink.h, rtnetlink.h, if_link.h, if_addr.h). Every
+ * header and attribute starts at a multiple of 4 bytes. */
+struct lb_nlmsghdr {
+    uint32_t len;
+    uint16_t type;
+    uint16_t flags;
+    uint32_t seq;
+    uint32_t pid;
+};
+
+struct lb_nlmsgerr {
+    int32_t            error;       /* 0 for an acknowledgement, or minus an errno */
+    struct lb_nlmsghdr msg;         /* the header of the request it answers */
+};
+
+struct lb_rtattr {
+    uint16_t len;                   /* with these 4 bytes, and without the padding after */
+    uint16_t type;
+};
+
+struct lb_ifinfomsg {
+    uint8_t  family;
+    uint8_t  pad;
+    uint16_t type;
+    int32_t  index;
+    uint32_t flags;
+    uint32_t change;
+};
+
+struct lb_ifaddrmsg {
+    uint8_t  family;
+    uint8_t  prefixlen;
+    uint8_t  flags;
+    uint8_t  scope;
+    uint32_t index;
+};
+
+struct lb_rtmsg {
+    uint8_t  family;
+    uint8_t  dst_len;
+    uint8_t  src_len;
+    uint8_t  tos;
+    uint8_t  table;
+    uint8_t  protocol;
+    uint8_t  scope;
+    uint8_t  type;
+    uint32_t flags;
+};
+
+struct lb_sockaddr_nl {
+    uint16_t family;
+    uint16_t pad;
+    uint32_t pid;                   /* 0: the kernel */
+    uint32_t groups;
+};
 
 /* struct __user_cap_header_struct and __user_cap_data_struct (linux/capability.h) */
 struct lb_cap_header {
@@ -390,6 +496,17 @@ static inline lc_sysret lb_sys_capset(struct lb_cap_header *header, const struct
 /* socket(2). The number is lightc's own, which its library uses too. */
 static inline lc_sysret lb_sys_socket(int32_t domain, int32_t type, int32_t protocol) {
     return lc_syscall3(SYS_socket, domain, type, protocol);
+}
+
+/* sendto(2) and recvfrom(2), with lightc's numbers too; recvfrom without the
+ * sender's address, which for rtnetlink is always the kernel. */
+static inline lc_sysret lb_sys_sendto(int32_t fd, const void *buf, uint64_t len, int32_t flags,
+                                      const void *addr, uint32_t addrlen) {
+    return lc_syscall6(SYS_sendto, fd, (int64_t)buf, (int64_t)len, flags, (int64_t)addr, addrlen);
+}
+
+static inline lc_sysret lb_sys_recvfrom(int32_t fd, void *buf, uint64_t len, int32_t flags) {
+    return lc_syscall6(SYS_recvfrom, fd, (int64_t)buf, (int64_t)len, flags, 0, 0);
 }
 
 /* ppoll(2) with the caller's signal mask left as it is: wait until one of the

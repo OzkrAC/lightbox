@@ -1479,7 +1479,9 @@ t_doctor_says_how_to_fix() {
     printf '%s\n' "$report" | sed -n '/^root: /,$p'
     printf '%s\n' "$report" | grep -qx "root: no (uid $(id -u))" || return 1
     printf '%s\n' "$report" | grep -Eqx 'kernel: (yes|no) \(.+; lightbox needs Linux 5\.10 or later\)' || return 1
-    printf '%s\n' "$report" | grep -q '^syscalls: ' && printf '%s\n' "$report" | grep -q '^bin.nsenter: ' || return 1
+    printf '%s\n' "$report" | grep -q '^syscalls: ' && printf '%s\n' "$report" | grep -q '^bin.cp: ' || return 1
+    # lightbox runs neither since 0.7, and doctor looks for neither
+    ! printf '%s\n' "$report" | grep -Eq '^bin\.(ip|nsenter): ' || { echo "doctor looks for ip or nsenter"; return 1; }
     # from root on the lines are checks, and one that fails has its fix next
     printf '%s\n' "$report" | awk '/^root: / { on = 1 }
         on && want { if ($0 !~ /^  to fix: ./) { print "no fix after " name; bad = 1 } want = 0; next }
@@ -1510,9 +1512,12 @@ try:
 except ValueError as e:
     wrong(e)
 checks = {c["check"]: c for c in d["checks"]}
-for name in ("root", "kernel", "syscalls", "network", "cgroup2", "path.rootfs", "bin.ip", "bin.nsenter", "exec_sealing"):
+for name in ("root", "kernel", "syscalls", "network", "cgroup2", "path.rootfs", "bin.cp", "bin.rm", "exec_sealing"):
     if name not in checks:
         wrong("no check " + name)
+for name in ("bin.ip", "bin.nsenter"):
+    if name in checks:
+        wrong("a check of " + name)
 for c in d["checks"]:
     if not isinstance(c["ok"], bool):
         wrong(c)

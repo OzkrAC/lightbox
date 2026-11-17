@@ -6,8 +6,10 @@
 #   sudo tests/lifecycle.sh [path/to/lightbox]          default: ./lightbox
 #
 # Needs root, a kernel with bridge, veth and cgroup v2, the host tools lightbox
-# itself needs (iproute2, iptables, util-linux) and a statically linked busybox
-# to build the containers' root filesystem from.
+# needs (iptables, coreutils), those the suite looks with (iproute2,
+# util-linux) and a statically linked busybox to build the containers' root
+# filesystem from. lightbox runs neither ip nor nsenter: every case runs with
+# both masked, and the last but one looks that nothing ran them.
 #
 # The host is not used and nothing is left on it. The suite runs itself again
 # in private network, mount and PID namespaces with a throwaway configuration:
@@ -1702,16 +1704,26 @@ EOF
     nothing_left survivor
 }
 
-# start stands still in nsenter, between the clone and the byte that releases
-# init. Killed there, it must not leave init behind.
+# start stands still in the firewall transaction of the container's links,
+# after init is built and before the byte that lets it run its hook. Killed
+# there, it must not leave init behind. (Until 0.7 it stood still in nsenter,
+# before the first byte; nothing is run there any more.)
 t_killed_start_leaves_no_container() {
-    box orphan || return 1
-    nsenter_path=$(first_existing /usr/bin/nsenter /bin/nsenter /usr/sbin/nsenter /sbin/nsenter)
-    shim "$nsenter_path" ": > '$T/nsenter.reached'; sleep 5; exec \"\$REAL\" \"\$@\"" || return 1
+    box orphanpeer && box orphan --link orphanpeer || return 1
+    restore=$(first_existing /usr/sbin/iptables-restore /sbin/iptables-restore /usr/bin/iptables-restore /bin/iptables-restore)
+    real=$(readlink -f "$restore")
+    cp "$real" "$T/real/iptables-program" || return 1
+    # iptables, iptables-save and iptables-restore may be one program that
+    # does what it is called: the stand-in passes the others on by their name
+    printf '#!/bin/bash\ncase ${0##*/} in *-restore) : > %s; sleep 5; exit 1 ;; esac\nexec -a "$0" %s "$@"\n' \
+        "'$T/restore.reached'" "'$T/real/iptables-program'" > "$T/shim/iptables-program" &&
+        chmod 755 "$T/shim/iptables-program" || return 1
+    mount --bind "$T/shim/iptables-program" "$real" && echo "$real" >> "$T/shims" || return 1
     "$LB" start orphan >"$OUT/orphan.start" 2>&1 </dev/null &
     starter=$!
     echo "$starter" >> "$T/background"
-    wait_until 10 test -e "$T/nsenter.reached" || { echo "start did not reach nsenter:"; cat "$OUT/orphan.start"; return 1; }
+    wait_until 10 test -e "$T/restore.reached" ||
+        { echo "start did not reach the firewall transaction:"; cat "$OUT/orphan.start"; return 1; }
     init=$(children_of "$starter" "$(basename "$LB" | cut -c1-15)")
     [ -n "$init" ] || { echo "the starter has no cloned child"; return 1; }
     kill -KILL "$starter"
@@ -2001,18 +2013,27 @@ t_start_spares_foreign_interface() {
     ip -d link show dev "$port" | grep -q 'veth' || { echo "the interface is not the container's veth"; return 1; }
 }
 
-# A start that fails after it made the container's interface takes it away,
-# though the interface has no alias yet: it gets one as it joins the bridge,
-# and here the ip that would do that refuses, before it changes anything.
+# A start that fails after it made the container's interface takes it away.
+# Here a veth has the bridge's name: it takes no ports, and the kernel refuses
+# the container's interface as one (EOPNOTSUPP).
 t_start_fails_at_the_bridge() {
-    ip_path=$(first_existing /sbin/ip /usr/sbin/ip /bin/ip /usr/bin/ip)
-    shim "$ip_path" 'case " $* " in *" alias lightbox:"*" master "*) echo "refused here" >&2; exit 2 ;; esac
-exec "$REAL" "$@"' || return 1
     box nobridge || return 1
-    said=$(lb start nobridge 2>&1 </dev/null) && { echo "start went ahead without its bridge"; return 1; }
+    ip link set dev "$BR" down && ip link set dev "$BR" name lbt-realbr || return 1
+    ip link add "$BR" type veth peer name lbt-notbr || { put_the_bridge_back; return 1; }
+    said=$(lb start nobridge 2>&1 </dev/null)
+    rc=$?
+    put_the_bridge_back || { echo "the bridge could not be put back"; return 1; }
     printf '%s\n' "$said"
-    case $said in *"failed to attach the container's interface to the bridge"*) ;; *) return 1 ;; esac
+    [ $rc -ne 0 ] || { echo "start went ahead without its bridge"; return 1; }
+    case $said in *"failed to attach the container's interface to the bridge (errno 95)"*) ;; *) return 1 ;; esac
     nothing_left nobridge
+}
+
+# what t_start_fails_at_the_bridge took away, back, wherever it stopped
+put_the_bridge_back() {
+    ip link show dev lbt-realbr >/dev/null 2>&1 || return 0
+    ip link delete "$BR" 2>/dev/null
+    ip link set dev lbt-realbr name "$BR" && ip link set dev "$BR" up
 }
 
 # The host's end of a container's interface carries lightbox's alias, and the
@@ -2096,15 +2117,12 @@ t_doctor_names_what_is_missing() {
             { echo "$check is not said to fail, with: $fix"; return 1; }
     }
     lb doctor >/dev/null || { lb doctor; echo "doctor finds something missing before anything is broken"; return 1; }
-    nsenter_path=$(first_existing /usr/bin/nsenter /bin/nsenter /usr/sbin/nsenter /sbin/nsenter)
-    mount --bind /dev/null "$nsenter_path" || return 1
-    breaks bin.nsenter 'install util-linux' lb doctor; rc=$?
-    umount "$nsenter_path" || return 1
+    cp_path=$(readlink -f "$(type -P cp)")
+    mount --bind /dev/null "$cp_path" || return 1
+    breaks bin.cp 'install coreutils' lb doctor; rc=$?
+    umount "$cp_path" || return 1
     [ $rc = 0 ] || return 1
-    ip_path=$(first_existing /sbin/ip /usr/sbin/ip /bin/ip /usr/bin/ip)
-    shim "$ip_path" 'case "$1" in -V) echo "ip: invalid option -- '"'"'V'"'"'"; echo "BusyBox v1.36.1 multi-call binary." ;; *) exec "$REAL" "$@" ;; esac' || return 1
-    breaks bin.ip 'install iproute2' lb doctor || return 1
-    umount -l "$ip_path" && : > "$T/shims"
+    lb doctor | grep -E '^bin\.(ip|nsenter): ' && { echo "doctor looks for a tool lightbox does not run"; return 1; }
     mkdir -p "$T/emptyroot" "$T/notcg"
     alt_conf docrootfs "rootfs = $T/emptyroot" || return 1
     breaks path.rootfs 'put a root filesystem there' alt_lb doctor || return 1
@@ -2628,7 +2646,43 @@ EOF
     echo 1 > "$T/next_ip"
     : > "$T/shims"
     : > "$T/background"
-    build_rootfs && network && links_now > "$T/links.before"
+    build_rootfs && network && links_now > "$T/links.before" && mask_ip_and_nsenter
+}
+
+# lightbox runs neither ip nor nsenter since 0.7 (ROADMAP 7.2). In this mount
+# namespace both are stand-ins that note who ran them and fail, so that a
+# command of lightbox's that ran one fails where it ran it, and a case at the
+# end looks at the notes. The suite looks with the real ones, copied to
+# $T/bin, which is first in PATH.
+mask_ip_and_nsenter() {
+    local tool path real masked=" "
+    mkdir -p "$T/bin" "$T/mask" && : > "$T/masked.ran" || return 1
+    for tool in ip nsenter; do
+        path=$(type -P "$tool") && cp -L "$path" "$T/bin/$tool" || return 1
+        printf '#!/bin/sh\necho "%s $*" >> %s\nexit 127\n' "$tool" "'$T/masked.ran'" > "$T/mask/$tool" &&
+            chmod 755 "$T/mask/$tool" || return 1
+        for path in "/sbin/$tool" "/usr/sbin/$tool" "/bin/$tool" "/usr/bin/$tool"; do
+            [ -e "$path" ] || continue
+            real=$(readlink -f "$path")
+            case $masked in *" $real "*) continue ;; esac
+            mount --bind "$T/mask/$tool" "$real" || return 1
+            masked="$masked$real "
+        done
+    done
+    export PATH="$T/bin:$PATH"
+}
+
+# Every case ran with ip and nsenter masked: nothing ran either of them.
+t_no_ip_or_nsenter_ran() {
+    local tool path
+    [ -e "$T/masked.ran" ] || { echo "ip and nsenter were not masked"; return 1; }
+    for tool in ip nsenter; do
+        for path in "/sbin/$tool" "/usr/sbin/$tool" "/bin/$tool" "/usr/bin/$tool"; do
+            [ -e "$path" ] || continue
+            cmp -s "$path" "$T/mask/$tool" || { echo "$path is not the stand-in"; return 1; }
+        done
+    done
+    [ ! -s "$T/masked.ran" ] || { echo "ran with ip and nsenter masked:"; cat "$T/masked.ran"; return 1; }
 }
 
 kill_cgroup() { # directory, after every cgroup below it
@@ -2668,6 +2722,7 @@ teardown() {
     for p in $(ip -o link show | awk -F': ' '{ sub(/@.*/, "", $2); print $2 }' | grep -E "^(vb-|ve-|lbt-foreign\$|lbt-qs\$|$WIDE_BR\$)"); do
         ip link delete "$p"
     done
+    put_the_bridge_back
     [ -s "$T/firewall" ] && iptables-restore < "$T/firewall"
     # what a case of firewall_backend = nftables made, and the forwarding
     # setup turned on, which a case may have turned off
@@ -2680,7 +2735,7 @@ teardown() {
     find "$C" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
     # and the records of the ones that ran; a case may have taken run_dir away
     [ -d "$RUN" ] && find "$RUN" -mindepth 1 -maxdepth 1 ! -name .forwarding -exec rm -rf -- {} +
-    rm -f "$T/nsenter.reached" "$T/mount.ran"
+    rm -f "$T/restore.reached" "$T/mount.ran"
 } 2>/dev/null
 
 # ─── Stage: one case ────────────────────────────────────────────────────────
@@ -2879,6 +2934,7 @@ if [ "$MODE" = inside ]; then
     check '--copy makes a container a copy of its base'                   t_copy_root
     check 'base ls, base rm and base add manage the snapshots'            t_base_commands
     check 'the quick start of README.md runs as it is written'             t_readme_quick_start
+    check 'no case ran ip or nsenter, which were masked in every one'     t_no_ip_or_nsenter_ran
 
     # last: it may leave a kernel setting changed for the rest of this suite's life
     check 'exec works where a memfd may not be executed'                  t_exec_where_memfds_may_not_be_executed

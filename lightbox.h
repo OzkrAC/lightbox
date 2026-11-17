@@ -308,13 +308,11 @@ int exit_code_from_status(int32_t status);
 /* the same, ending the process on failure */
 void require_mount(const char *source, const char *target,
                    const char *fstype, uint64_t flags, const char *data);
-const char *tool_path_ip(void);
 const char *tool_path_iptables(void);
 const char *tool_path_iptables_restore(void);
 const char *tool_path_nft(void);
 const char *tool_path_cp(void);
 const char *tool_path_rm(void);
-const char *tool_path_nsenter(void);
 bool tool_available(const char *path);
 void require_tool(const char *label, const char *path);
 /* a macro's value as a string literal */
@@ -495,12 +493,12 @@ int read_container_ip(const char *name, char *ip, size_t ipsz);
 void host_port_name(const char *name, char out[IFNAME_TEXT_MAX]);
 void link_chain_name(const char *name, char out[IFNAME_TEXT_MAX]);
 /* Whose an interface on the host is, by the alias lightbox gives what it
- * makes for a container: lightbox:<name>. One without it is not lightbox's. */
-typedef enum { PORT_ABSENT, PORT_OURS, PORT_FOREIGN } port_owner;
+ * makes for a container: lightbox:<name>. One without it is not lightbox's.
+ * PORT_UNKNOWN: the kernel could not be asked. */
+typedef enum { PORT_ABSENT, PORT_OURS, PORT_FOREIGN, PORT_UNKNOWN } port_owner;
 port_owner host_port_owner(const char *ifname, const char *name);
-/* The same from what "ip link show dev <interface>" printed, which this cuts
- * into lines where it stands. */
-port_owner port_owner_of_listing(char *shown, const char *name);
+/* The same from the interface's alias, "" when it has none. */
+port_owner port_owner_of_alias(const char *alias, const char *name);
 /* Is this a chain a record of link rules may name: LB- and what an iptables
  * chain name may hold, within its 28 characters? */
 bool link_chain_ok(const char *chain);
@@ -508,6 +506,40 @@ bool link_chain_ok(const char *chain);
  * container's is there afterwards, 1 when one of that name that is not
  * lightbox's was left alone, -1 when it could not be removed. */
 int remove_own_port(const char *ifname, const char *name);
+
+/* ─── rtnetlink (lightbox_netlink.c) ─────────────────────────────────────── */
+
+/*
+ * The kernel's configuration of interfaces, addresses and routes, asked over
+ * a netlink socket: what lightbox had ip and nsenter do until 0.7. Each call
+ * is one request: 0, or what it asks for, or minus the errno the kernel
+ * refused it with (-ENODEV for an interface that is not there).
+ */
+typedef struct {
+    int32_t  fd;
+    uint32_t seq;
+} rtnl;
+[[nodiscard]] int rtnl_open(rtnl *nl);
+void rtnl_close(rtnl *nl);
+/* The interface's index; with alias, its alias as well, "" when it has none. */
+[[nodiscard]] int rtnl_link_get(rtnl *nl, const char *ifname, char *alias, size_t alias_max);
+[[nodiscard]] int rtnl_link_name(rtnl *nl, int index, char out[IFNAME_TEXT_MAX]);
+/* A veth pair, its peer made in the network namespace of process peer_pid. */
+[[nodiscard]] int rtnl_veth_add(rtnl *nl, const char *ifname, const char *peer, int peer_pid);
+[[nodiscard]] int rtnl_bridge_add(rtnl *nl, const char *ifname);
+/* The alias, and then the bridge of that index as the interface's master. */
+[[nodiscard]] int rtnl_link_attach(rtnl *nl, const char *ifname, const char *alias, int master);
+/* A bridge's port that does not reach its other isolated ports. */
+[[nodiscard]] int rtnl_port_isolate(rtnl *nl, const char *ifname);
+[[nodiscard]] int rtnl_link_up(rtnl *nl, const char *ifname);
+[[nodiscard]] int rtnl_link_delete(rtnl *nl, const char *ifname);
+[[nodiscard]] int rtnl_addr_add(rtnl *nl, int index, uint32_t addr, int prefix);
+[[nodiscard]] int rtnl_default_route_add(rtnl *nl, uint32_t gateway, int index);
+/* The index of the interface of the main table's default route, 0 for none. */
+[[nodiscard]] int rtnl_default_route_index(rtnl *nl);
+/* Init, in the container's network namespace: eth0 up, with its address and
+ * the default route through the gateway. 0, or -1 once it has said why not. */
+[[nodiscard]] int container_interface_up(uint32_t addr, int prefix, uint32_t gateway);
 #define FIREWALL_TEXT_MAX 4096
 /* What iptables-restore is given: for a container's links, or for setup.
  * False when it does not fit. */

@@ -1176,6 +1176,9 @@ struct child_args {
     const char  *root;
     const char  *overlay;                   /* the options of the root's overlay; NULL: the root is a copy */
     const char  *hook;                      /* the script init runs when it is ready */
+    uint32_t     address;                   /* eth0's, on the network of prefix bits */
+    int          prefix;
+    uint32_t     gateway;                   /* the bridge's, eth0's default route */
     int          stop_grace;                /* seconds the container gets to end, unless a stop says otherwise */
     int          privileged;
     int          read_only;
@@ -2893,8 +2896,11 @@ static void cleanup_start_failure(const char *name, const char *port, bool port_
      * an alias with an interface's creation, and a start that failed before
      * it gave the interface one has left it without. */
     if (port_made) {
-        const char *del[] = { "ip", "link", "delete", port, NULL };
-        (void)run_cmd_quiet(tool_path_ip(), del);   /* clean-up: best effort */
+        rtnl nl;
+        if (rtnl_open(&nl) == 0) {
+            (void)rtnl_link_delete(&nl, port);      /* clean-up: best effort */
+            rtnl_close(&nl);
+        }
     } else if (port && port[0])
         (void)remove_own_port(port, name);          /* clean-up: best effort */
 
@@ -3189,9 +3195,11 @@ static void build_container(const struct child_args *ca) {
         require_mount(NULL, "/", NULL, MS_REMOUNT | MS_RDONLY | MS_BIND, NULL);
     }
 
-    /* Bring up loopback. From the pivot to the hook nothing of the image is
-     * run: its tools are not needed, and not trusted with what init may do. */
-    if (loopback_up() != 0)
+    /* Bring up loopback, and eth0, which the start put here: nothing enters
+     * the namespace from the host for it. From the pivot to the hook nothing
+     * of the image is run: its tools are not needed, and not trusted with
+     * what init may do. */
+    if (loopback_up() != 0 || container_interface_up(ca->address, ca->prefix, ca->gateway) != 0)
         lc_kernel_exit(1);
 }
 
@@ -3314,8 +3322,6 @@ typedef void (*per_container)(const char *name, int seconds);
 
 static void start_one(const char *name, int hook_wait) {
     require_root("start");
-    require_tool("ip", tool_path_ip());
-    require_tool("nsenter", tool_path_nsenter());
 
     /* from here to the end, no other command works on this container */
     container_lock(name);
@@ -3345,17 +3351,16 @@ static void start_one(const char *name, int hook_wait) {
     /* The container's address, which has to be one of the network as it is
      * set now: with another subnet since the container was created, it would
      * start and reach nothing. */
-    char ip[IPV4_TEXT_MAX], ip_cidr[CIDR_TEXT_MAX];
+    char ip[IPV4_TEXT_MAX];
+    container_network net;
+    uint32_t addr;
+    container_network_load_or_die(&net);
+    if (read_container_ip(name, ip, sizeof(ip)) < 0 || !parse_ipv4(ip, &addr))
+        die2("Error: the container has no address on record; remove it and create it again: ", name);
     {
-        container_network net;
-        container_network_load_or_die(&net);
-        uint32_t addr;
-        if (read_container_ip(name, ip, sizeof(ip)) < 0 || !parse_ipv4(ip, &addr))
-            die2("Error: the container has no address on record; remove it and create it again: ", name);
         const char *why = address_unusable(&net, addr);
         if (why)
             die_about_address(ip, why);
-        address_with_prefix(ip_cidr, addr, &net);
     }
 
     /* What the container is configured with: read here, once, for the whole
@@ -3455,6 +3460,11 @@ static void start_one(const char *name, int hook_wait) {
             port[0] = '\0';         /* and nothing goes on to remove it */
             goto fail_start;
         }
+        if (owner == PORT_UNKNOWN) {
+            start_err = "failed to look for what an earlier run left of the container's interface";
+            port[0] = '\0';
+            goto fail_start;
+        }
         if (owner == PORT_OURS && remove_own_port(port, name) != 0) {
             start_err = "failed to remove what an earlier run left of the container's interface";
             goto fail_start;
@@ -3490,6 +3500,9 @@ static void start_one(const char *name, int hook_wait) {
         .root = start_root,
         .overlay = config.base[0] ? overlay : NULL,
         .hook = "/init.sh",
+        .address = addr,
+        .prefix = net.prefix,
+        .gateway = net.gateway,
         .stop_grace = cfg_global.stop_timeout,
         .privileged = privileged,
         .read_only = read_only,
@@ -3525,40 +3538,46 @@ static void start_one(const char *name, int hook_wait) {
      * container's, made in the container's namespace as eth0, so that no end
      * of it is on the host under a name of the container's. The kernel takes
      * no alias with the pair, so the host's end gets it as it joins the
-     * bridge, and until then only this start knows the interface is its own. */
+     * bridge, and until then only this start knows the interface is its own.
+     * Init brings eth0 up and gives it its address once it has its first byte. */
     {
-        char nsbuf[16];
-        fmt_int(nsbuf, child_pid);
-        const char *add[] = { "ip", "link", "add", port, "type", "veth",
-                              "peer", "name", CONTAINER_IFNAME, "netns", nsbuf, NULL };
-        if (run_cmd(tool_path_ip(), add) != 0) { start_err = "failed to create the container's interface"; goto fail_start; }
-        port_made = true;
-    }
-    {
+        rtnl nl;
+        int rc = rtnl_open(&nl);
+        if (rc < 0) {
+            start_err = text_with_number(err_buf, sizeof(err_buf),
+                                         "no netlink socket for the container's interface (errno ", -rc, ")");
+            goto fail_start;
+        }
+        const char *failed = NULL;
         char alias[64];
         bool cut = false;
         str_append(alias, str_append(alias, 0, "lightbox:", sizeof(alias), &cut), name, sizeof(alias), &cut);
-        const char *a[] = { "ip", "link", "set", "dev", port, "alias", alias, "master", cfg_global.bridge, NULL };
-        if (cut || run_cmd(tool_path_ip(), a) != 0) { start_err = "failed to attach the container's interface to the bridge"; goto fail_start; }
-    }
-    if (!linked) {
-        /* isolated ports do not reach each other, whatever the firewall does */
-        const char *a[] = { "ip", "link", "set", "dev", port, "type", "bridge_slave", "isolated", "on", NULL };
-        if (run_cmd(tool_path_ip(), a) != 0) { start_err = "failed to isolate the container's port on the bridge"; goto fail_start; }
-    }
-    { const char *a[] = { "ip", "link", "set", port, "up", NULL };
-      if (run_cmd(tool_path_ip(), a) != 0) { start_err = "failed to bring the container's interface up on the host"; goto fail_start; } }
-
-    /* configure networking inside the container */
-    {
-        char nsbuf[16]; fmt_int(nsbuf, child_pid);
-
-        const char *a1[] = { "nsenter", "-t", nsbuf, "-n", "--", "ip", "link", "set", CONTAINER_IFNAME, "up", NULL };
-        if (run_cmd(tool_path_nsenter(), a1) != 0) { start_err = "failed to bring container veth up"; goto fail_start; }
-        const char *a2[] = { "nsenter", "-t", nsbuf, "-n", "--", "ip", "addr", "add", ip_cidr, "dev", CONTAINER_IFNAME, NULL };
-        if (run_cmd(tool_path_nsenter(), a2) != 0) { start_err = "failed to assign container IP"; goto fail_start; }
-        const char *a3[] = { "nsenter", "-t", nsbuf, "-n", "--", "ip", "route", "add", "default", "via", cfg_global.gw, NULL };
-        if (run_cmd(tool_path_nsenter(), a3) != 0) { start_err = "failed to install default route"; goto fail_start; }
+        int bridge = rtnl_link_get(&nl, cfg_global.bridge, NULL, 0);
+        if (bridge < 0) {
+            rc = bridge;
+            failed = "failed to find the bridge (errno ";
+        } else if ((rc = rtnl_veth_add(&nl, port, CONTAINER_IFNAME, child_pid)) < 0) {
+            failed = "failed to create the container's interface (errno ";
+        } else {
+            port_made = true;
+            if (cut)
+                rc = -LB_EINVAL;
+            else
+                rc = rtnl_link_attach(&nl, port, alias, bridge);
+            if (rc < 0) {
+                failed = "failed to attach the container's interface to the bridge (errno ";
+            } else if (!linked && (rc = rtnl_port_isolate(&nl, port)) < 0) {
+                /* isolated ports do not reach each other, whatever the firewall does */
+                failed = "failed to isolate the container's port on the bridge (errno ";
+            } else if ((rc = rtnl_link_up(&nl, port)) < 0) {
+                failed = "failed to bring the container's interface up on the host (errno ";
+            }
+        }
+        rtnl_close(&nl);
+        if (failed) {
+            start_err = text_with_number(err_buf, sizeof(err_buf), failed, -rc, ")");
+            goto fail_start;
+        }
     }
 
     /* set OOM score */
@@ -4101,7 +4120,6 @@ static void cmd_exec(int argc, char **argv) {
  */
 static void cmd_teardown(void) {
     require_root("setup --teardown");
-    require_tool("ip", tool_path_ip());
     (void)store_lock();
 
     static char names[MAX_LISTED][NAME_MAX_LEN + 1];

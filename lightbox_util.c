@@ -244,16 +244,6 @@ static const char *pick_tool_path(const char *const *candidates, size_t n) {
     return candidates[0];
 }
 
-const char *tool_path_ip(void) {
-    static const char *const candidates[] = {
-        "/sbin/ip",
-        "/usr/sbin/ip",
-        "/bin/ip",
-        "/usr/bin/ip",
-    };
-    return pick_tool_path(candidates, sizeof(candidates) / sizeof(candidates[0]));
-}
-
 const char *tool_path_iptables_restore(void) {
     static const char *const candidates[] = {
         "/usr/sbin/iptables-restore",
@@ -308,15 +298,6 @@ const char *tool_path_rm(void) {
     return pick_tool_path(candidates, sizeof(candidates) / sizeof(candidates[0]));
 }
 
-const char *tool_path_nsenter(void) {
-    static const char *const candidates[] = {
-        "/usr/bin/nsenter",
-        "/bin/nsenter",
-        "/usr/sbin/nsenter",
-        "/sbin/nsenter",
-    };
-    return pick_tool_path(candidates, sizeof(candidates) / sizeof(candidates[0]));
-}
 
 bool tool_available(const char *path) {
     return path && path[0] && path_exists(path);
