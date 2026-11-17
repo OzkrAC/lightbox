@@ -27,6 +27,10 @@ Not tagged yet, and not complete: the part of Phase 6 that is written so far.
 - **`lightbox rm -f <name>`** kills a container that runs first, as `docker rm -f` does, and removes it.
 - **`inspect` shows all of a container's configuration**: a `volume:` line for each volume, as `<src>:<dst>[:ro]`, a `link:` line for each link, `-` for none, and `log_path`. **`inspect --json`** gives the same as an array of one JSON object, as `docker inspect` does, with numbers, `true` and `false`, `null` for what is not there, and arrays of volumes and links; a configuration that cannot be used is an error and prints no JSON.
 
+### Fixed
+
+- **The README says what the code does.** Its command reference is the usage `lightbox --help` prints, which the validation suite compares with it, and its quick start is run by the lifecycle suite as it is written. It gave the binary as about 33 KB, which is about 150; it said everything but a few tools was direct syscalls without naming `nft`, and that containers could have a user namespace. It now says what an image must contain, what the `/init.sh` hook gets and with which privileges, and what lightbox does and does not keep out, in a threat model.
+
 ## 0.5.1
 
 Tagged `v0.5.1`, at `d0298a3`, the merge of pull request 5; no 0.5.0 was tagged. Phase 5 of the roadmap: one reader and writer for a container's configuration, strict values, locks, the clearing away of containers that died, records in `run_dir`, addresses and limits that are checked, firewall rules in chains and tables of lightbox's own with nftables as a backend to choose, interfaces that lightbox owns, and a host network that comes back after a reboot.
