@@ -2798,8 +2798,14 @@ static enum await_result await_report(int32_t report_fd, int32_t signal_fd, int 
 }
 
 /* What a start that failed leaves behind, removed. Init is gone by now. */
-static void cleanup_start_failure(const char *name, const char *port) {
-    if (port && port[0])
+static void cleanup_start_failure(const char *name, const char *port, bool port_made) {
+    /* One this start made goes, whatever its alias: the kernel does not take
+     * an alias with an interface's creation, and a start that failed before
+     * it gave the interface one has left it without. */
+    if (port_made) {
+        const char *del[] = { "ip", "link", "delete", port, NULL };
+        (void)run_cmd_quiet(tool_path_ip(), del);   /* clean-up: best effort */
+    } else if (port && port[0])
         (void)remove_own_port(port, name);          /* clean-up: best effort */
 
     (void)cgroup_destroy(name);     /* it has said so if it could not */
@@ -3289,6 +3295,7 @@ static void cmd_start(int argc, char **argv) {
      * its own. One that is there already is cleared away when lightbox made
      * it for this container; when not, it is left alone and the start ends. */
     char port[IFNAME_TEXT_MAX], port_err[128];
+    bool port_made = false;
     host_port_name(name, port);
     {
         port_owner owner = host_port_owner(port, name);
@@ -3391,20 +3398,26 @@ static void cmd_start(int argc, char **argv) {
         goto fail_start;
     }
 
-    /* The pair: the host's end, with lightbox's alias, on the bridge; and
-     * the container's, made in the container's namespace as eth0, so that
-     * no end of it is on the host under a name of the container's. */
+    /* The pair: the host's end, on the bridge with lightbox's alias; and the
+     * container's, made in the container's namespace as eth0, so that no end
+     * of it is on the host under a name of the container's. The kernel takes
+     * no alias with the pair, so the host's end gets it as it joins the
+     * bridge, and until then only this start knows the interface is its own. */
     {
-        char nsbuf[16], alias[64];
+        char nsbuf[16];
         fmt_int(nsbuf, child_pid);
+        const char *add[] = { "ip", "link", "add", port, "type", "veth",
+                              "peer", "name", CONTAINER_IFNAME, "netns", nsbuf, NULL };
+        if (run_cmd(tool_path_ip(), add) != 0) { start_err = "failed to create the container's interface"; goto fail_start; }
+        port_made = true;
+    }
+    {
+        char alias[64];
         bool cut = false;
         str_append(alias, str_append(alias, 0, "lightbox:", sizeof(alias), &cut), name, sizeof(alias), &cut);
-        const char *add[] = { "ip", "link", "add", port, "alias", alias, "type", "veth",
-                              "peer", "name", CONTAINER_IFNAME, "netns", nsbuf, NULL };
-        if (cut || run_cmd(tool_path_ip(), add) != 0) { start_err = "failed to create the container's interface"; goto fail_start; }
+        const char *a[] = { "ip", "link", "set", "dev", port, "alias", alias, "master", cfg_global.bridge, NULL };
+        if (cut || run_cmd(tool_path_ip(), a) != 0) { start_err = "failed to attach the container's interface to the bridge"; goto fail_start; }
     }
-    { const char *a[] = { "ip", "link", "set", port, "master", cfg_global.bridge, NULL };
-      if (run_cmd(tool_path_ip(), a) != 0) { start_err = "failed to attach the container's interface to the bridge"; goto fail_start; } }
     if (!linked) {
         /* isolated ports do not reach each other, whatever the firewall does */
         const char *a[] = { "ip", "link", "set", "dev", port, "type", "bridge_slave", "isolated", "on", NULL };
@@ -3551,7 +3564,7 @@ fail_start:
         print_str(STDERR, name);
         lc_print_char(STDERR, '\n');
     }
-    cleanup_start_failure(name, port);
+    cleanup_start_failure(name, port, port_made);
     lc_kernel_exit(exit_code);
 }
 

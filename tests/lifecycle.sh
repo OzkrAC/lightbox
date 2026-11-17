@@ -138,6 +138,11 @@ port_of() { # name
     [ -s "$T/port.$1" ] || lb inspect "$1" 2>/dev/null | sed -n 's/^host_interface: //p' > "$T/port.$1"
     cat "$T/port.$1"
 }
+# The chain of a container's links: LB- and the same digits as its port.
+chain_of() { # name
+    local port
+    port=$(port_of "$1") && [ -n "$port" ] && echo "LB-${port#vb-}"
+}
 
 mounted_in()   { awk -v m="$2" '$5 == m { found = 1 } END { exit !found }' "/proc/$1/mountinfo" 2>/dev/null; }
 root_changed() { [ "$(stat -L -c %d:%i "/proc/$1/root" 2>/dev/null)" != "$(stat -c %d:%i /)" ]; }
@@ -196,8 +201,8 @@ nothing_left() { # name
         echo "the interface $port is left"; bad=1
     fi
     [ ! -d "$CG/$1" ] || { echo "the cgroup $CG/$1 is left"; bad=1; }
-    if [ -e "$RUN/$1/firewall" ] || iptables -n -L "LB-$1" >/dev/null 2>&1; then
-        echo "the firewall chain LB-$1 of its links, or the record of it, is left"; bad=1
+    if [ -n "$port" ] && { [ -e "$RUN/$1/firewall" ] || iptables -n -L "LB-${port#vb-}" >/dev/null 2>&1; }; then
+        echo "the firewall chain LB-${port#vb-} of its links, or the record of it, is left"; bad=1
     fi
     echo "state: $(state_of "$1")"
     return $bad
@@ -927,7 +932,7 @@ t_unusable_conf() {
     if brnf 1; then
         box dpeer && box damaged --link dpeer || return 1
         start damaged || return 1
-        iptables -n -L LB-damaged >/dev/null || { echo "the link put in no chain"; return 1; }
+        iptables -n -L "$(chain_of damaged)" >/dev/null || { echo "the link put in no chain"; return 1; }
     else
         echo "br_netfilter is not loaded: the container has no link"
         up damaged || return 1
@@ -1953,13 +1958,14 @@ t_rm_leaves_no_rule() {
     box lpeer && box lmain --link lpeer || return 1
     start lpeer && start lmain || return 1
     pid=$(pid_of lmain)
-    iptables -S LB-lmain && iptables -C LIGHTBOX-LINKS -j LB-lmain || { echo "the link put in no chain to begin with"; return 1; }
+    chain=$(chain_of lmain) || return 1
+    iptables -S "$chain" && iptables -C LIGHTBOX-LINKS -j "$chain" || { echo "the link put in no chain to begin with"; return 1; }
     echo "the record: $(cat "$RUN/lmain/firewall")"
     kill -KILL "$pid"
     wait_until 5 gone "$pid" || return 1
     lb rm lmain || return 1
-    iptables -n -L LB-lmain >/dev/null 2>&1 && { echo "the chain LB-lmain is left"; return 1; }
-    iptables -C LIGHTBOX-LINKS -j LB-lmain 2>/dev/null && { echo "the jump to LB-lmain is left"; return 1; }
+    iptables -n -L "$chain" >/dev/null 2>&1 && { echo "the chain $chain is left"; return 1; }
+    iptables -C LIGHTBOX-LINKS -j "$chain" 2>/dev/null && { echo "the jump to $chain is left"; return 1; }
     [ ! -e "$RUN/lmain" ] || { echo "left in run_dir: $(ls -A "$RUN/lmain")"; return 1; }
 }
 
@@ -1977,10 +1983,22 @@ t_start_spares_foreign_interface() {
     [ "$(state_of clobber)" = failed ] || [ "$(state_of clobber)" = stopped ] || { echo "state: $(state_of clobber)"; return 1; }
     ip link delete "$port" || return 1
     # what an earlier run of the container left: its own, which goes
-    ip link add "$port" alias lightbox:clobber type dummy 2>/dev/null ||
-        ip link add "$port" alias lightbox:clobber type veth peer name lbt-foreign || return 1
+    ip link add "$port" type dummy 2>/dev/null || ip link add "$port" type veth peer name lbt-foreign || return 1
+    ip link set dev "$port" alias lightbox:clobber || return 1
     start clobber || return 1
     ip -d link show dev "$port" | grep -q 'veth' || { echo "the interface is not the container's veth"; return 1; }
+}
+
+# A start that fails after it made the container's interface takes it away,
+# though the interface has no alias yet: it gets one as it joins the bridge,
+# and the bridge it is to join is not there.
+t_start_fails_at_the_bridge() {
+    alt_conf nobridge 'bridge = lbt-none' || return 1
+    box nobridge || return 1
+    said=$(alt_lb start nobridge 2>&1 </dev/null) && { echo "start went ahead without its bridge"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *"failed to attach the container's interface to the bridge"*) ;; *) return 1 ;; esac
+    nothing_left nobridge
 }
 
 # The host's end of a container's interface carries lightbox's alias, and the
@@ -2309,6 +2327,7 @@ if [ "$MODE" = inside ]; then
     check 'a start puts in its link rules with one process'               t_link_rules_in_one_process
     check 'rm of a dead container leaves no firewall rule'                t_rm_leaves_no_rule
     check 'start leaves alone an interface it did not create, and says so' t_start_spares_foreign_interface
+    check 'a start that fails at the bridge takes away the interface it made' t_start_fails_at_the_bridge
     check 'the interface in the container is eth0'                       t_interface_is_eth0
     check 'the host'"'"'s end of the interface carries lightbox'"'"'s alias'  t_interface_is_tagged
     check 'a name of 30 characters works from create to rm'              t_long_name
