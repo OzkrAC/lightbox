@@ -2386,6 +2386,71 @@ t_nft_start_after_the_tables_went() {
     reaches nrelinked "$(addr_of nrepeer)" && reaches nrelinked "$OUTSIDE"
 }
 
+# iptables as it is, without counters and comments
+saved_rules() { iptables-save | grep -v '^#' | sed -E 's/ \[[0-9]+:[0-9]+\]$//'; }
+
+# what a firewall's reload or flush does to lightbox's rules, its policy left
+flush_firewall() {
+    iptables -F && iptables -X && iptables -t nat -F && iptables -t nat -X
+}
+
+# A firewall's flush took lightbox's rules while containers ran, and the link
+# no longer holds. reload puts in again what setup made and the links of the
+# linked container that runs, as they were, and a second reload changes
+# nothing. A container without links has none to put back.
+t_reload_puts_back_what_a_flush_took() {
+    need_nc || return 77
+    up rlpeer && up rllinked --link rlpeer && up rlalone || return 1
+    reaches rllinked "$(addr_of rlpeer)" || { echo "the link did not hold before the flush"; return 1; }
+    before=$(saved_rules)
+    flush_firewall || return 1
+    ! reaches rllinked "$(addr_of rlpeer)" || { echo "the link held without its rules"; return 1; }
+    lb reload >"$OUT/reload" 2>&1 || { cat "$OUT/reload"; return 1; }
+    cat "$OUT/reload"
+    grep -qx "The links of container 'rllinked' are in again" "$OUT/reload" || return 1
+    ! grep -q "'rlalone'\|'rlpeer'" "$OUT/reload" || { echo "reload put in links of a container that has none"; return 1; }
+    [ "$(saved_rules)" = "$before" ] ||
+        { echo "the rules are not as they were:"; diff <(printf '%s\n' "$before") <(saved_rules); return 1; }
+    reaches rllinked "$(addr_of rlpeer)" && reaches rllinked "$OUTSIDE" || return 1
+    lb reload >"$OUT/reload2" 2>&1 || { cat "$OUT/reload2"; return 1; }
+    [ "$(saved_rules)" = "$before" ] ||
+        { echo "a second reload changed the rules:"; diff <(printf '%s\n' "$before") <(saved_rules); return 1; }
+    reaches rllinked "$(addr_of rlpeer)"
+}
+
+# The same flush, and then a start: it makes setup's rules again, puts back
+# the links of the linked container that runs, and leaves the rules as they
+# were before the flush.
+t_start_after_a_flush_puts_back_links() {
+    need_nc || return 77
+    up sfpeer && up sflinked --link sfpeer || return 1
+    before=$(saved_rules)
+    flush_firewall || return 1
+    up sfnew || return 1
+    grep -q 'making it again' "$OUT/sfnew.start" && grep -qx "The links of container 'sflinked' are in again" "$OUT/sfnew.start" ||
+        { echo "start did not make the network again and put back the links"; return 1; }
+    [ "$(saved_rules)" = "$before" ] ||
+        { echo "the rules are not as they were:"; diff <(printf '%s\n' "$before") <(saved_rules); return 1; }
+    reaches sflinked "$(addr_of sfpeer)"
+}
+
+# With nftables: the tables went while a linked container ran. reload makes
+# them again, with the container's link in the set.
+t_nft_reload() {
+    need_nc || return 77
+    nft_setup nftrl; rc=$?; [ $rc = 0 ] || return $rc
+    box nrlpeer && box nrllinked --link nrlpeer || return 1
+    LIGHTBOX_CONFIG="$ALT_CONF" start nrlpeer && LIGHTBOX_CONFIG="$ALT_CONF" start nrllinked || return 1
+    port=$(port_of nrllinked)
+    nft delete table ip lightbox && nft delete table bridge lightbox || return 1
+    alt_lb reload >"$OUT/nreload" 2>&1 || { cat "$OUT/nreload"; return 1; }
+    cat "$OUT/nreload"
+    grep -qx "The links of container 'nrllinked' are in again" "$OUT/nreload" || return 1
+    nft list set bridge lightbox links
+    nft list set bridge lightbox links | grep -qF "\"$port\"" || { echo "the link is not in the set"; return 1; }
+    reaches nrllinked "$(addr_of nrlpeer)" && reaches nrllinked "$OUTSIDE"
+}
+
 # setup --teardown does nothing while a container runs, and says which. With
 # none running it takes away all that setup and the containers made: the
 # interfaces are those there were before the first setup, no rule or chain of
@@ -2928,6 +2993,9 @@ if [ "$MODE" = inside ]; then
     check 'after a reboot took the network, start makes it again'         t_start_after_a_reboot_of_the_network
     check 'a start where the network is there makes nothing'              t_start_with_the_network_there
     check 'nftables: after the tables went, start makes them again'       t_nft_start_after_the_tables_went
+    check 'reload puts back what a flush took: setup'"'"'s rules and the links of running containers' t_reload_puts_back_what_a_flush_took
+    check 'a start after a flush makes the rules again and puts back running containers'"'"' links' t_start_after_a_flush_puts_back_links
+    check 'nftables: reload makes the tables again, with the links of running containers' t_nft_reload
     check 'setup --teardown leaves the host as before the first setup'    t_setup_teardown
     check 'without --config or LIGHTBOX_CONFIG, /etc/lightbox/lightbox.conf is read' t_config_in_etc
     check 'a container overlays a snapshot of its base, and keeps its own files apart' t_overlay_root

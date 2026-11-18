@@ -3346,7 +3346,7 @@ static void start_one(const char *name, int hook_wait) {
     /* The bridge, the firewall rules and forwarding, made again when a
      * reboot took them. What makes them takes the store's lock; teardown,
      * which holds that, never waits for a container's. */
-    ensure_host_network();
+    ensure_host_network(name);
 
     /* The container's address, which has to be one of the network as it is
      * set now: with another subnet since the container was created, it would
@@ -4211,6 +4211,9 @@ static const struct { const char *name; const char *text; } command_help[] = {
     { "setup",
         "  setup                         Setup host networking\n"
         "  setup --teardown              Take lightbox's host network away, when no container runs\n" },
+    { "reload",
+        "  reload                        Put lightbox's firewall rules and bridge in again, and the links\n"
+        "                                of running containers, after a firewall's reload took them\n" },
 };
 #define COMMANDS (sizeof(command_help) / sizeof(command_help[0]))
 
@@ -4354,6 +4357,7 @@ int main(int argc, char **argv, char **envp) {
     else if (streq(cmd, "doctor")) cmd_doctor(sub_argc, sub_argv);
     else if (streq(cmd, "ls"))     cmd_ls(sub_argc, sub_argv);
     else if (streq(cmd, "base"))   cmd_base(sub_argc, sub_argv);
+    else if (streq(cmd, "reload")) cmd_reload(sub_argc, sub_argv);
     else {
         print_str(STDERR, "Error: unknown command: ");
         print_str(STDERR, cmd);

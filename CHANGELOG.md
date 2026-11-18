@@ -22,6 +22,7 @@ Not tagged yet, and not complete: the part of Phase 7 that is written so far.
 - **`create --copy`** makes a container a full copy of its base, as before 0.7, a reflink first where the filesystem has them.
 - **`lightbox base ls`, `base add <dir>` and `base rm <id>`** list the snapshots with their bases and containers, take a new snapshot of a base for the containers made after it, and remove snapshots that no container uses.
 - `inspect` shows `storage`, overlay or copy, and the `base` snapshot; `doctor` says whether the kernel has overlayfs.
+- **`lightbox reload`** puts in again what a firewall's reload or flush took while containers ran, as `podman network reload` does: what `setup` makes, and the link rules of every running container. It changes nothing that is there already. A `start` that finds `setup`'s rules gone, which made them again before, now puts back the links of the running containers too.
 
 ## 0.6.0
 

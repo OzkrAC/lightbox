@@ -1080,7 +1080,7 @@ t_root_is_asked_for_first() {
     chmod 755 "$W/data" "$C"
     before=$(kept_sum)
     bad=0
-    for words in setup 'setup --teardown' 'start web' 'stop web' 'exec web /bin/true'; do
+    for words in setup 'setup --teardown' reload 'start web' 'stop web' 'exec web /bin/true'; do
         # shellcheck disable=SC2086
         msg=$(lb $words 2>&1) && { echo "lightbox $words succeeded"; bad=1; }
         echo "lightbox $words: $msg"
@@ -1429,6 +1429,8 @@ t_surplus_arguments_are_errors() {
     expect 'Error: unexpected argument: b' inspect web b
     expect 'Error: unknown option: --all' inspect web --all
     expect 'Error: unexpected argument: extra' doctor extra
+    expect 'Error: unexpected argument: all' reload all
+    expect 'Error: unknown option: --all' reload --all
     expect 'Error: unknown option: --jsno' ls --jsno
     expect 'Error: unexpected argument: all' ls all
     expect 'Error: unexpected argument: /mnt' add-vol web /tmp:/srv /mnt

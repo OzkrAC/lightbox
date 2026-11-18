@@ -557,7 +557,7 @@ bool bridge_traffic_is_filtered(void);
  * is gone after a reboot: the bridge, the firewall rules and forwarding.
  * start makes it again when it is not all there, as setup makes it.
  */
-void ensure_host_network(void);
+void ensure_host_network(const char *starting);
 /* What of it is not there, as "the bridge, the firewall rules", or NULL
  * when all of it is. The firewall is looked at only by root. */
 const char *host_network_missing(void);
@@ -611,6 +611,12 @@ typedef enum {
 seal_method exec_seal_method(void);
 
 void cmd_setup(void);
+/* setup's part of the network again, and the link rules of the containers
+ * that run: what a firewall's reload took */
+void cmd_reload(int argc, char **argv);
+/* the link rules of the containers that run but except, put in again; how
+ * many could not be */
+int put_back_running_links(const char *except);
 void cmd_doctor(int argc, char **argv);
 void cmd_ls(int argc, char **argv);
 void cmd_inspect(int argc, char **argv);

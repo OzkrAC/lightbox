@@ -1227,8 +1227,66 @@ static void host_network_setup(const container_network *net) {
     }
 }
 
-void cmd_setup(void) {
-    require_root("setup");
+/*
+ * The link rules of every container that runs, put in again: after a
+ * firewall's reload or flush took them, as podman network reload puts back
+ * its containers' rules, or after a start made the network again. A
+ * container that a command is working on is left to it: a start puts its
+ * links in itself, and a stop takes them out. except: the container of the
+ * command that asks, NULL for none. How many could not be put back.
+ */
+int put_back_running_links(const char *except) {
+    if (!cfg_global.firewall)
+        return 0;           /* no container with links starts */
+    static char names[MAX_LISTED][NAME_MAX_LEN + 1];
+    static container_config config;
+    bool more = false;
+    int failed = 0;
+    int count = list_containers(names, MAX_LISTED, &more);
+    for (int i = 0; i < count; i++) {
+        if (except && streq(names[i], except))
+            continue;
+        int32_t lock = container_lock_try(names[i]);
+        if (lock < 0) {
+            print_str(STDERR, "Note: a lightbox command is working on container '");
+            print_str(STDERR, names[i]);
+            print_str(STDERR, "': its links are left to it; if they are not there when it is done,\n"
+                              "lightbox reload puts them back\n");
+            continue;
+        }
+        if (is_running(names[i])) {
+            const char *wrong = container_config_load(names[i], &config);
+            if (wrong) {
+                print_str(STDERR, "Error: the configuration of running container '");
+                print_str(STDERR, names[i]);
+                print_str(STDERR, "' cannot be read, so its links are not put back: ");
+                print_str(STDERR, wrong);
+                lc_print_char(STDERR, '\n');
+                failed++;
+            } else if (config.nlinks > 0) {
+                if (firewall_add_links(names[i], &config) == 0) {
+                    print_str(STDOUT, "The links of container '");
+                    print_str(STDOUT, names[i]);
+                    print_str(STDOUT, "' are in again\n");
+                } else {
+                    failed++;
+                }
+            }
+        }
+        lc_kernel_close_file(lock);
+    }
+    if (more) {
+        print_str(STDERR, "Error: there are more containers than lightbox can look at; the links of some are not put back\n");
+        failed++;
+    }
+    return failed;
+}
+
+/* setup, and with reload what a firewall's reload took: setup's part again,
+ * as setup makes it, and the links of the containers that run */
+static void setup_or_reload(bool reload) {
+    const char *command = reload ? "reload" : "setup";
+    require_root(command);
     bool nftables = cfg_global.firewall_backend == FIREWALL_NFTABLES;
     if (cfg_global.firewall)
         require_tool(nftables ? "nft" : "iptables", nftables ? tool_path_nft() : tool_path_iptables());
@@ -1243,7 +1301,7 @@ void cmd_setup(void) {
      * here and leaves no bridge behind. */
     ensure_cgroup2_root();
 
-    print_str(STDOUT, "Setting up host networking...\n");
+    print_str(STDOUT, reload ? "Putting lightbox's host network in again...\n" : "Setting up host networking...\n");
 
     ensure_private_dir(cfg_global.lightbox_dir);
     ensure_private_dir(cfg_global.container_dir);
@@ -1253,6 +1311,7 @@ void cmd_setup(void) {
     /* one setup at a time, and no create while the bridge is being made */
     (void)store_lock();
     host_network_setup(&net);
+    int failed = reload ? put_back_running_links(NULL) : 0;
 
     if (!nftables && !bridge_traffic_is_filtered())
         print_str(STDOUT,
@@ -1261,7 +1320,21 @@ void cmd_setup(void) {
             "--link will not start until it does:\n"
             "  modprobe br_netfilter && sysctl -w net.bridge.bridge-nf-call-iptables=1\n");
 
+    if (failed) {
+        print_str(STDERR, "Error: the links of some running containers are not in again\n");
+        lc_kernel_exit(1);
+    }
     print_str(STDOUT, "Host networking ready\n");
+}
+
+void cmd_setup(void) {
+    setup_or_reload(false);
+}
+
+void cmd_reload(int argc, char **argv) {
+    if (argc > 0)
+        die2(argv[0][0] == '-' ? "Error: unknown option: " : "Error: unexpected argument: ", argv[0]);
+    setup_or_reload(true);
 }
 
 /* ─── After a reboot, and teardown ──────────────────────────────────────── */
@@ -1331,7 +1404,7 @@ const char *host_network_missing(void) {
     return missing[0] ? missing : NULL;
 }
 
-void ensure_host_network(void) {
+void ensure_host_network(const char *starting) {
     if (host_network_ready())
         return;
     container_network net;
@@ -1341,6 +1414,8 @@ void ensure_host_network(void) {
     if (!host_network_ready()) {
         print_str(STDOUT, "lightbox's host network is not all there, as after a reboot: making it again\n");
         host_network_setup(&net);
+        /* what took setup's rules took those of the links too */
+        (void)put_back_running_links(starting);     /* each has said why, if it could not */
     }
     if (lock >= 0)
         lc_kernel_close_file(lock);

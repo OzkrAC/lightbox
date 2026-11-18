@@ -112,6 +112,13 @@ This creates:
 
 The bridge, the firewall rules and forwarding live in the kernel only, and a reboot takes them. `start` looks for them, with one process, and makes them again as `setup` does when they are not all there, saying so: after a reboot, or after a firewall service loaded its own rules over lightbox's.
 
+A firewall's reload or flush (`firewall-cmd --reload`, `iptables -F`, a service that loads its own rules, `nft flush ruleset`) takes lightbox's rules while containers run, and with them the rules of their links. Until they are back, a container reaches nothing beyond this host, and what keeps containers apart is the bridge and the FORWARD policy only. Two containers without links still do not reach each other: their ports on the bridge are isolated, and an isolated port does not reach another. It does reach a port that is not isolated, which a linked container's is: with the policy at DROP, as `setup` leaves it when it turned forwarding on, nothing passes between them, links included; with ACCEPT, as a host that forwarded before keeps it, a linked container reaches and is reached by every container on the bridge. As with Podman, two things put them back:
+
+- `lightbox reload` puts in again what `setup` makes and the link rules of every running container, at once. Run it after the firewall's reload; it changes nothing that is there already. It leaves a container that another lightbox command is working on to that command, and says so.
+- The next `start` finds setup's rules gone, makes them again and puts back the links of the containers that run.
+
+lightbox has no daemon to hear of a reload by itself, as Docker's does of firewalld's; a hook of the firewall's own that runs `lightbox reload` after it does the same.
+
 To take lightbox off the host's network again, once no container runs:
 
 ```sh
@@ -387,6 +394,8 @@ Commands:
   base rm <id>...               Remove snapshots that no container uses
   setup                         Setup host networking
   setup --teardown              Take lightbox's host network away, when no container runs
+  reload                        Put lightbox's firewall rules and bridge in again, and the links
+                                of running containers, after a firewall's reload took them
 
   --config <path>                              The lightbox.conf to read (default:
                                                $LIGHTBOX_CONFIG, else /etc/lightbox/lightbox.conf)
