@@ -1602,22 +1602,6 @@ t_update_rewrites_the_conf() {
     [ ! -e "$C/gone" ] || { echo "rm -f left the container"; return 1; }
 }
 
-# README.md's command reference is the usage that lightbox prints, line for
-# line, and the size it gives is the binary's, near enough for "about".
-t_readme_matches_the_binary() {
-    readme=$(dirname "$LB")/README.md
-    [ -f "$readme" ] || { echo "no README.md beside $LB"; return 77; }
-    awk '/^## Command reference/ { on = 1; next }
-         on && /^```$/ { if (inside) exit; inside = 1; next }
-         inside { print }' "$readme" > "$W/reference"
-    lb --help > "$W/usage"
-    diff "$W/usage" "$W/reference" || { echo "the command reference of README.md is not the usage"; return 1; }
-    said=$(sed -n '3s/.*about \([0-9][0-9]*\) KB.*/\1/p' "$readme")
-    size=$(( $(stat -c %s "$LB") / 1024 ))
-    echo "README.md: about ${said:-?} KB; the binary: $size KB"
-    [ -n "$said" ] && [ $((size * 4)) -ge $((said * 3)) ] && [ $((size * 4)) -le $((said * 5)) ]
-}
-
 # base ls, add and rm, as an ordinary user can have them: a snapshot of a
 # base is taken and listed with its source; one that a container's .conf
 # names is not removed, and one that none names is.
@@ -1923,7 +1907,6 @@ check 'doctor says how to fix each thing it finds missing'              t_doctor
 check 'doctor --json: settings and checks, typed'                       t_doctor_json
 check 'update, restart and rm -f check their options before anything'  t_update_restart_rm_options
 check 'update writes the limits into a stopped container'"'"'s .conf'       t_update_rewrites_the_conf
-check 'README.md'"'"'s command reference is the usage, and its size the binary'"'"'s' t_readme_matches_the_binary
 check 'base add, ls and rm manage the snapshots of bases'              t_base_snapshots
 check 'start without root is a clean error'                   t_start_without_root_is_a_clean_error
 

@@ -16,8 +16,8 @@
 #
 #   BENCH_RUNS=10       how often each command is measured
 #
-# bench/baseline.txt holds the numbers of the tree as it stood before Phase 1
-# of ROADMAP.md. Later numbers are compared with it on the same kind of machine.
+# It compares nothing: numbers are worth comparing only from the same kind of
+# machine, and a shared runner's clock is rough.
 
 if [ -z "${LIFECYCLE_T:-}" ]; then
     # On the host. The lifecycle suite makes the namespaces and the fixture and

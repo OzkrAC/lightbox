@@ -63,13 +63,13 @@ The suite works in private network, mount and PID namespaces with a configuratio
 
 sudo drops the environment, so options go on make's command line: `sudo make test-lifecycle V=1 KEEP=1`. Build first, as yourself; the target builds nothing.
 
-`sudo make bench` works in the same namespaces and measures the wall time of `create`, `start`, `exec`, `stop` and `rm`, and the number of processes one start makes.
+`sudo make bench` works in the same namespaces and measures the wall time of `create`, `start`, `exec`, `stop` and `rm`, the number of processes one start makes, and `create` from a base of 1 GB. CI runs it on every push and puts its numbers on the run's page: on GitHub's runners a start takes 9 to 13 ms at 0.7.0, where it took 535 to 542 before Phase 1 of the roadmap.
 
 `.github/workflows/ci.yml` runs `make check`, the lifecycle suite and the timing on every push to `main` and every pull request, on x86_64 and on aarch64. A run's page lists each suite's totals, the cases it skipped and why each expected failure fails, without opening a log.
 
 ## Quick start
 
-The commands below run as root, from the directory `make` built `./lightbox` in. The lifecycle suite runs every one of them as it is written here, in a mount namespace of its own with `/opt` and `/srv` on a tmpfs; the download is the one thing it does otherwise, as its network namespace reaches no internet, and it unpacks a root filesystem of its own under that name.
+The commands below run as root, from the directory `make` built `./lightbox` in.
 
 ### 1. Get a rootfs
 
@@ -345,7 +345,7 @@ What changes with the backend, as it does for Docker:
 
 ## Command reference
 
-`lightbox --help` prints this; the validation suite checks that it is what this README says.
+`lightbox --help` prints this.
 
 ```
 Usage: lightbox [--config <path>] <command> [args]

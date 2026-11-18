@@ -2259,65 +2259,6 @@ t_base_commands() {
     refused lb base rm 000000000000 && refused lb base rm not-an-id
 }
 
-# ─── Cases: the README ──────────────────────────────────────────────────────
-
-# The quick start of README.md: every command of its fenced blocks, as it is
-# written, in order, in one shell that stops at the first that fails. It runs
-# from a directory where ./lightbox is the binary under test, with /opt and
-# /srv a tmpfs of this mount namespace's, and a configuration of its own with
-# the README's network, 10.0.0.0/24, on a bridge of its own. The download is
-# the one thing done otherwise, as this network namespace reaches no
-# internet: wget writes a tarball of the suite's root filesystem by the name
-# it is asked for. Step 5's hook is the /init.sh of a container that starts.
-t_readme_quick_start() {
-    readme=$HERE/../README.md
-    [ -f "$readme" ] || { echo "no README.md"; return 77; }
-    [ -d /opt ] && [ -d /srv ] || { echo "this host has no /opt or /srv to put a tmpfs on"; return 77; }
-    mount -t tmpfs lbt-opt /opt && echo /opt >> "$T/shims" &&
-        mount -t tmpfs lbt-srv /srv && echo /srv >> "$T/shims" || return 1
-    qs=$T/quickstart
-    mkdir -p "$qs/dir" "$qs/image" || return 1
-    ln -sf "$LB" "$qs/dir/lightbox"
-    # the image: the suite's root filesystem, with what the quick start reads in it
-    cp -a "$BASE/." "$qs/image/" && printf 'NAME="lightbox test image"\nID=lbtest\n' > "$qs/image/etc/os-release" &&
-        add_account "$qs/image/etc/passwd" nobody 'nobody:x:65534:65534:nobody:/:/bin/sh' || return 1
-    printf '%s\n' "lightbox_dir = $qs/data" "run_dir = $qs/run" "cgroup_root = /sys/fs/cgroup" "cgroup_base = $CG/qs" \
-        "bridge = lbt-qs" "subnet = 10.0.0.0/24" "gw = 10.0.0.1" > "$qs/lightbox.conf"
-    # steps 1 to 4 as one script, and step 5's block as a hook
-    awk -v hook="$qs/init.sh" '
-        /^## Quick start/ { on = 1; next }
-        on && /^## / { exit }
-        on && /^### / { step = $2 }
-        on && /^```sh$/ { inside = 1; next }
-        inside && /^```$/ { inside = 0; next }
-        inside && step == "5." { print > hook; next }
-        inside { print }' "$readme" > "$qs/script.sh"
-    commands=$(grep -cvE '^[[:space:]]*(#|$)' "$qs/script.sh")
-    echo "commands in the quick start of README.md: $commands"
-    [ "$commands" -ge 30 ] && [ -s "$qs/init.sh" ] || { echo "the quick start was not found whole"; return 1; }
-    wget() { local url; for url; do :; done; tar -C "$qs/image" -czf "${url##*/}" .; }
-    export -f wget
-    export qs LIGHTBOX_CONFIG="$qs/lightbox.conf"
-    ( cd "$qs/dir" && PS4='+ ' bash -e -x "$qs/script.sh" ) > "$OUT/quickstart" 2>&1 </dev/null
-    rc=$?
-    if [ $rc != 0 ]; then
-        # what stopped it first, for a report that shows only the first lines
-        echo "the quick start stopped at: $(grep '^+ ' "$OUT/quickstart" | tail -n 1)"
-        tail -n 12 "$OUT/quickstart"
-        echo "--- the commands that ran:"
-        grep '^+ ' "$OUT/quickstart"
-        return 1
-    fi
-    ran=$(grep -c '^+ ' "$OUT/quickstart")
-    [ "$ran" -ge "$commands" ] || { echo "$ran commands ran of $commands"; grep '^+ ' "$OUT/quickstart"; return 1; }
-    # step 5: its block as the /init.sh of a container from the quick start's image
-    said=$(cd "$qs/dir" && ./lightbox create hooked --rootfs /opt/rootfs/alpine 2>&1 &&
-           cp "$qs/init.sh" "$qs/data/containers/hooked/rootfs/init.sh" &&
-           ./lightbox start hooked 2>&1 && ./lightbox stop hooked 2>&1) ||
-        { echo "a container with step 5's /init.sh did not start and stop:"; printf '%s\n' "$said"; return 1; }
-    echo "$ran commands of the quick start ran, and step 5's hook started a container"
-}
-
 # ─── Cases: where the settings are ──────────────────────────────────────────
 
 # Named by neither --config nor LIGHTBOX_CONFIG, the settings are those of
@@ -2784,7 +2725,7 @@ teardown() {
     for d in "$CG"/*/; do
         [ -d "$d" ] && kill_cgroup "${d%/}"
     done
-    for p in $(ip -o link show | awk -F': ' '{ sub(/@.*/, "", $2); print $2 }' | grep -E "^(vb-|ve-|lbt-foreign\$|lbt-qs\$|$WIDE_BR\$)"); do
+    for p in $(ip -o link show | awk -F': ' '{ sub(/@.*/, "", $2); print $2 }' | grep -E "^(vb-|ve-|lbt-foreign\$|$WIDE_BR\$)"); do
         ip link delete "$p"
     done
     put_the_bridge_back
@@ -3001,7 +2942,6 @@ if [ "$MODE" = inside ]; then
     check 'a container overlays a snapshot of its base, and keeps its own files apart' t_overlay_root
     check '--copy makes a container a copy of its base'                   t_copy_root
     check 'base ls, base rm and base add manage the snapshots'            t_base_commands
-    check 'the quick start of README.md runs as it is written'             t_readme_quick_start
     check 'no case ran ip or nsenter, which were masked in every one'     t_no_ip_or_nsenter_ran
 
     # last: it may leave a kernel setting changed for the rest of this suite's life

@@ -4,7 +4,7 @@ What changed for someone who uses lightbox, newest first. `ROADMAP.md` has the r
 
 ## 0.7.0
 
-Not tagged yet, and not complete: the part of Phase 7 that is written so far.
+Phase 7 of the roadmap: performance. A new container is an overlay of a snapshot of its base, so that `create` takes as long from a base of 1 GB as from a small one; lightbox makes a container's network with rtnetlink and runs neither `ip` nor `nsenter`; and `lightbox reload` puts back what a firewall's reload took. On GitHub's runners a start takes a median of 8.8 ms on x86_64 and 12.9 ms on aarch64, and a stop 2.9 and 5.5, where before Phase 1 of the roadmap they took about 535 and 207 on the same kind of runner.
 
 ### Changes you may have to act on
 

@@ -202,9 +202,8 @@ test-lifecycle:
 	@$(REQUIRE_BUILT)
 	bash tests/lifecycle.sh ./lightbox
 
-# Wall time of create, start, exec, stop and rm, and the processes one start
-# makes. As root, in the lifecycle suite's namespaces. bench/baseline.txt holds
-# the numbers from before Phase 1 of ROADMAP.md.
+# Wall time of create, start, exec, stop and rm, the processes one start makes,
+# and creates from a base of 1 GB. As root, in the lifecycle suite's namespaces.
 bench:
 	@$(REQUIRE_BUILT)
 	bash bench/bench.sh ./lightbox
