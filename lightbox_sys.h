@@ -125,6 +125,15 @@
 #define LB_ST_NOSUID              2
 #define LB_ST_NODEV               4
 #define LB_ST_NOEXEC              8
+/* How a mount keeps access times: in statfs's f_flags, and as mount(2) takes
+ * them; noatime and nodiratime have the same bits in both, relatime not. */
+#define LB_ST_NOATIME             1024
+#define LB_ST_NODIRATIME          2048
+#define LB_ST_RELATIME            4096
+#define LB_MS_NOATIME             1024
+#define LB_MS_NODIRATIME          2048
+#define LB_MS_RELATIME            (1 << 21)
+#define LB_MS_STRICTATIME         (1 << 24)
 
 /* Terminals (asm-generic/ioctls.h, termbits.h, fcntl.h).
  *
@@ -178,8 +187,12 @@
 #define LB_F_SEAL_GROW                0x0004
 #define LB_F_SEAL_WRITE               0x0008
 
-/* mount_setattr(2), Linux 5.12 (linux/mount.h) */
+/* mount_setattr(2), Linux 5.12 (linux/mount.h): read-only, and the flags of
+ * an idmapped mount, whose files show the ids of a user namespace */
 #define LB_MOUNT_ATTR_RDONLY          0x00000001
+#define LB_MOUNT_ATTR_NOSUID          0x00000002
+#define LB_MOUNT_ATTR_NODEV           0x00000004
+#define LB_MOUNT_ATTR_IDMAP           0x00100000
 
 /* flock(2) (asm-generic/fcntl.h). A lock belongs to the open file, and is
  * gone when the last descriptor of that open file is closed. */

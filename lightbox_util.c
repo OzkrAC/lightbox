@@ -854,7 +854,9 @@ int loopback_up(void) {
  * that asks for nosuid would quietly take nodev away. Here such a call keeps
  * read-only, nosuid, nodev and noexec from what the mount has now: it can add
  * restrictions and never removes one. mount(8), which lightbox ran for every
- * mount until 0.2, behaved the same way.
+ * mount until 0.2, behaved the same way. It keeps how the mount keeps access
+ * times too, unless the call says: in a user namespace, a mount that came
+ * with the copy of the host's may not have that changed.
  */
 int do_mount(const char *source, const char *target,
              const char *fstype, uint64_t flags, const char *data) {
@@ -865,6 +867,11 @@ int do_mount(const char *source, const char *target,
         rc = lb_sys_statfs(target, &now);
         if (rc >= 0)
             flags |= (uint64_t)now.f_flags & MOUNT_KEPT_FLAGS;
+        if (rc >= 0 && !(flags & (LB_MS_NOATIME | LB_MS_RELATIME | LB_MS_STRICTATIME))) {
+            uint64_t f = (uint64_t)now.f_flags;
+            flags |= (f & LB_ST_NOATIME) ? LB_MS_NOATIME : (f & LB_ST_RELATIME) ? LB_MS_RELATIME : LB_MS_STRICTATIME;
+            flags |= (f & LB_ST_NODIRATIME) ? LB_MS_NODIRATIME : 0;
+        }
     }
     if (rc >= 0)
         rc = lc_kernel_mount(source, target, fstype, flags, data);

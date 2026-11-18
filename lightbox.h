@@ -18,7 +18,7 @@
 
 /* What --version says: the release, set when it is tagged, and "-dev" after
  * it on the way to the next one. */
-#define LIGHTBOX_VERSION "0.7.0"
+#define LIGHTBOX_VERSION "0.8.0-dev"
 
 #define MAX_PATH         512
 #define NAME_MAX_LEN     30
@@ -117,6 +117,9 @@ typedef struct {
     bool privileged;
     bool read_only;
     char base[13];              /* the snapshot it overlays; empty: a copy of its base */
+    bool userns;                /* uid and gid 0 are uid_start and gid_start on the host */
+    uint32_t uid_start;
+    uint32_t gid_start;
     int  nvols;
     volume_spec vols[MAX_VOLS];
     int  nlinks;
@@ -332,6 +335,48 @@ bool name_is_valid(const char *name);
 int list_containers(char names[][NAME_MAX_LEN + 1], int max, bool *more);
 /* The entries of a directory that valid takes, directories only, sorted. */
 int list_entries(const char *dir, bool (*valid)(const char *), char names[][NAME_MAX_LEN + 1], int max, bool *more);
+
+/* ─── User namespaces (lightbox_userns.c) ───────────────────────────────── */
+
+/* A container's own ids: USERNS_SIZE uids and gids from the ranges that
+ * /etc/subuid and /etc/subgid give USERNS_OWNER, as Podman's --userns=auto
+ * takes those of "containers". Its uid 0 is uid_start on the host. */
+#define USERNS_SIZE      65536u
+#define USERNS_OWNER     "lightbox"
+#define SUBUID_FILE      "/etc/subuid"
+#define SUBGID_FILE      "/etc/subgid"
+#define SUBID_RANGES_MAX 256
+typedef struct {
+    uint32_t start;
+    uint32_t count;
+} subid_range;
+/* A decimal number of at most 4294967295, without a zero in front. */
+[[nodiscard]] bool parse_u32_text(const char *text, uint32_t *out);
+/* A first id of a range: a number, not 0, whose range ends before 4294967295. */
+[[nodiscard]] bool userns_start_ok(const char *text, uint32_t *start);
+void format_u32(char out[11], uint32_t value);
+/* The ranges that a subid file's text gives owner: how many, or -1 for a
+ * line of owner's that is no usable range, whose number *line then has. */
+int subid_ranges(const char *text, const char *owner, subid_range *out, int max, int *line);
+/* The first range of USERNS_SIZE uids that overlaps none of the ntaken
+ * taken[i][0], and the first of gids that overlaps none of taken[i][1].
+ * NULL, or why there is none. */
+const char *userns_choose(const subid_range *uids, int nu, const subid_range *gids, int ng,
+                          const uint32_t taken[][2], int ntaken, uint32_t *uid_start, uint32_t *gid_start);
+/* How many ranges of USERNS_SIZE uids and gids the two files give lightbox,
+ * taken or not; -1 when one of them has a line that is no range. */
+int userns_range_count(void);
+/* The same from /etc/subuid, /etc/subgid and every container's .conf, under
+ * the store's lock. NULL, or why there is none. */
+const char *userns_allocate(uint32_t *uid_start, uint32_t *gid_start);
+/* uid_map and gid_map of a process in a new user namespace: 0, or minus an errno */
+[[nodiscard]] int userns_write_maps(int pid, uint32_t uid_start, uint32_t gid_start);
+/* A user namespace with those maps, for idmapped mounts: a descriptor, or minus an errno */
+[[nodiscard]] int userns_fd_with(uint32_t uid_start, uint32_t gid_start);
+/* An idmapped, nodev copy of the mount at path, attached nowhere; nosuid
+ * unless privileged. Its descriptor, or minus an errno and *step the call. */
+[[nodiscard]] int idmapped_tree(const char *path, int userns_fd, bool privileged, const char **step);
+[[nodiscard]] int attach_tree(int tree, const char *target);
 
 /* ─── Base snapshots (lightbox_base.c) ──────────────────────────────────── */
 

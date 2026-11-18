@@ -2202,6 +2202,7 @@ readonly 1
 io 8:0 rbps=1048576
 swap 1G
 base -
+userns -
 vol /srv/data -> /data rw
 vol /etc/app.conf -> /etc/app.conf ro
 link db
@@ -2212,19 +2213,66 @@ link cache'
 t_config_is_read_whole() { in_config_dir config_as_written; }
 
 # userns=0 and uid_start, which lightbox up to 0.5 could write, still read and
-# change nothing; userns=1 is refused with its line, as user namespaces are
-# not supported.
-config_old_userns_keys() {
-    printf 'version=1\nmem=64M\npids=32\ncpu=1\noom_score=0\nuserns=0\nuid_start=100000\n' > "$D/web/.conf"
-    got=$(config)
-    printf '%s\n' "$got"
-    printf '%s\n' "$got" | grep -qx 'mem 64M' || return 1
-    printf 'version=1\nmem=64M\npids=32\ncpu=1\noom_score=0\nuserns=1\nuid_start=100000\n' > "$D/web/.conf"
-    got=$(config)
-    printf '%s\n' "$got"
-    [ "$got" = "refused: $D/web/.conf: line 6: userns=1: user namespaces are not supported yet" ]
+# change nothing. userns=1 is read with a uid_start and a gid_start that start
+# a range of 65536 ids with neither host root nor 4294967295 in it, and
+# refused without them.
+config_userns_keys() {
+    head='version=1\nmem=64M\npids=32\ncpu=1\noom_score=0\n'
+    # shellcheck disable=SC2059     # the head is a format of its own
+    conf() { printf "$head$1" > "$D/web/.conf"; got=$(config); printf '%s\n' "$got"; }
+    conf 'userns=0\nuid_start=100000\n'
+    printf '%s\n' "$got" | grep -qx 'userns -' || return 1
+    conf 'userns=1\nuid_start=100000\ngid_start=2147483647\n'
+    printf '%s\n' "$got" | grep -qx 'userns 100000 2147483647' || return 1
+    conf 'userns=1\nuid_start=4294901759\ngid_start=1\n'
+    printf '%s\n' "$got" | grep -qx 'userns 4294901759 1' || return 1
+    for wrong in 'userns=1\nuid_start=100000\n' 'userns=1\ngid_start=100000\n' 'userns=1\n' \
+                 'userns=1\nuid_start=0\ngid_start=100000\n' 'userns=1\nuid_start=4294901760\ngid_start=100000\n'; do
+        conf "$wrong"
+        [ "$got" = "refused: $D/web/.conf: has userns=1 without a uid_start and a gid_start of a range of 65536 ids that has neither 0 nor 4294967295 in it" ] ||
+            return 1
+    done
+    for wrong in 'uid_start=4294967296\n' 'uid_start=-1\n' 'gid_start=0100\n' 'userns=2\n'; do
+        conf "$wrong"
+        case $got in "refused: $D/web/.conf: line 6: "*) ;; *) return 1 ;; esac
+    done
 }
-t_config_old_userns_keys() { in_config_dir config_old_userns_keys; }
+t_config_userns_keys() { in_config_dir config_userns_keys; }
+
+# The ranges /etc/subuid and /etc/subgid give lightbox, and the one a new
+# container gets: the first pair of 65536 that no container's overlaps, the
+# k-th of each file. Other names' lines, and lines of a range that has host
+# root or 4294967295 in it, are passed over and refused.
+t_userns_ranges() {
+    bad=0
+    expect() { # want, args...
+        local want=$1
+        shift
+        got=$("$UNIT" subid "$@" | paste -sd'|')
+        [ "$got" = "$want" ] || { echo "subid $*: $got, expected $want"; bad=1; }
+    }
+    expect 'uid range 2147483647 2147483648|chose 2147483647 2147483647' \
+        'lightbox:2147483647:2147483648' 'lightbox:2147483647:2147483648'
+    expect 'uid range 200000 131072|chose 265536 300000' \
+        $'someone:100000:65536\nlightbox:200000:131072\n' $'lightbox:300000:65536\nlightbox:400000:65536' 200000:400000
+    expect 'uid range 200000 65536|none: every range of 65536 ids is a container'"'"'s' \
+        'lightbox:200000:65536' 'lightbox:300000:65536' 200000:999999
+    expect 'uid range 200000 65535|none: no range of 65536 ids' 'lightbox:200000:65535' 'lightbox:300000:65536'
+    expect 'none: no range of 65536 ids' $'# nobody\nlightboxes:200000:65536\n' 'lightbox:300000:65536'
+    # a range that a container's overlaps, though it starts elsewhere
+    expect 'uid range 200000 196608|chose 331072 431072' 'lightbox:200000:196608' 'lightbox:300000:196608' 230000:330000
+    expect 'bad uid line 2' $'x:1:2\nlightbox:0:65536' 'lightbox:300000:65536'
+    expect 'bad uid line 1' 'lightbox:4294901760:65536' 'lightbox:300000:65536'
+    expect 'bad gid line 1' 'lightbox:200000:65536' 'lightbox:3e5:65536'
+    expect 'bad uid line 1' 'lightbox:200000' 'lightbox:300000:65536'
+    for start in 1 100000 4294901759; do
+        [ "$("$UNIT" userns-start "$start")" = "ok $start" ] || { echo "$start refused"; bad=1; }
+    done
+    for start in 0 4294901760 4294967295 4294967296 01 '' x -1; do
+        [ "$("$UNIT" userns-start "$start")" = refused ] || { echo "'$start' taken"; bad=1; }
+    done
+    return $bad
+}
 
 # base=, the snapshot a container overlays: twelve hex digits, read and
 # written back as they are; anything else is refused with its line.
@@ -2256,7 +2304,8 @@ privileged 0
 readonly 0
 io -
 swap -
-base -' ] || return 1
+base -
+userns -' ] || return 1
     # a default that cannot be used is no default: the file must have the limit
     got=$(config nodefaults)
     printf '%s\n' "$got"
@@ -2385,6 +2434,7 @@ readonly 0
 io -
 swap -
 base -
+userns -
 vol /srv/data -> /data rw
 vol /srv/other -> /data rw
 link db' ] || return 1
@@ -2418,7 +2468,7 @@ vol=/srv/data:/data
 link=db' ] || { echo "the file is not what was put in"; bad=1; }
     [ "$(stat -c %a "$D/web/.conf")" = 600 ] || { echo "the file's mode is $(stat -c %a "$D/web/.conf")"; bad=1; }
     got=$(config | tr '\n' ' ')
-    case $got in 'version 1 mem 1G pids max cpu 0.25 oom_score 500 '*'io 8:0 wbps=1024 swap 64M base - vol /srv/data -> /data rw link db ') ;;
+    case $got in 'version 1 mem 1G pids max cpu 0.25 oom_score 500 '*'io 8:0 wbps=1024 swap 64M base - userns - vol /srv/data -> /data rw link db ') ;;
         *) echo "read back: $got"; bad=1 ;; esac
 
     before=$(cat "$D/web/.conf")
@@ -2787,7 +2837,8 @@ check 'subnet and gw are one network, and an address on it is one a container ca
 check 'no prefix is written into the source: subnet gives it'      t_no_prefix_of_its_own
 check 'a .conf is read into one structure, whole'                t_config_is_read_whole
 check 'what a .conf leaves out is the default, if that is usable' t_config_defaults
-check 'userns=0 and uid_start of 0.5 are read, and userns=1 is refused' t_config_old_userns_keys
+check 'userns=1 is read with a uid_start and a gid_start, and refused without' t_config_userns_keys
+check 'a new container gets the first range of /etc/subuid and /etc/subgid that is free' t_userns_ranges
 check 'base= is a snapshot'"'"'s id, read as it is, or refused'          t_config_base_key
 check 'a .conf with a version is read strictly, by line'         t_config_is_read_strictly
 check 'a .conf from before the version line is still read'       t_config_from_before_the_version_line

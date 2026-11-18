@@ -220,6 +220,19 @@ static void report_number(struct report *r, const char *key, int value) {
     print_str(STDOUT, digits);
 }
 
+/* An id up to 4294967295, or none: "-" and null. */
+static void report_id(struct report *r, const char *key, bool have, uint32_t value) {
+    char digits[11];
+    format_u32(digits, value);
+    if (!r->json) {
+        print_kv(key, have ? digits : "-");
+        return;
+    }
+    json_key(key, r->first);
+    r->first = false;
+    print_str(STDOUT, have ? digits : "null");
+}
+
 static void report_flag(struct report *r, const char *key, bool value, const char *yes, const char *no) {
     if (!r->json) {
         print_kv(key, value ? yes : no);
@@ -356,6 +369,9 @@ void cmd_inspect(int argc, char **argv) {
         report_text(&r, "io", config.io[0] ? config.io : NULL);
         report_text(&r, "storage", config.base[0] ? "overlay" : "copy");
         report_text(&r, "base", config.base[0] ? config.base : NULL);
+        report_flag(&r, "userns", config.userns, "1", "0");
+        report_id(&r, "uid_start", config.userns, config.uid_start);
+        report_id(&r, "gid_start", config.userns, config.gid_start);
         report_number(&r, "oom_score", config.oom_score);
         report_flag(&r, "privileged", config.privileged, "1", "0");
         report_flag(&r, "readonly", config.read_only, "1", "0");
@@ -669,6 +685,20 @@ void cmd_doctor(int argc, char **argv) {
                        lc_string_contains(filesystems, lc_string_length(filesystems), "\toverlay\n", 9);
         doc_setting(d, "overlayfs", overlay ? "yes" : "no (a new container is a copy of its base, not an overlay)",
                     overlay ? "true" : "false");
+    }
+    /* told, not counted: only a container created with --userns needs one */
+    {
+        int ranges = userns_range_count();
+        char text[200], digits[16];
+        fmt_int(digits, ranges);
+        bool cut = false;
+        size_t pos = str_append(text, 0, ranges < 0 ? "unreadable" : digits, sizeof(text), &cut);
+        str_append(text, pos, ranges < 0 ? " (" SUBUID_FILE " or " SUBGID_FILE " has a line of " USERNS_OWNER "'s that is no range)"
+                              : ranges == 0 ? " (create --userns needs a line such as " USERNS_OWNER ":2147483647:2147483648 in "
+                                              SUBUID_FILE " and in " SUBGID_FILE ")"
+                              : " (ranges of 65536 ids; a container created with --userns takes one)",
+                   sizeof(text), &cut);
+        doc_setting(d, "userns_ranges", text, ranges < 0 ? "null" : digits);
     }
     /* told, not counted: start makes what is missing, as setup does */
     {

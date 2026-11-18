@@ -12,6 +12,11 @@
  *                                             "left open <n>": descriptors it left open
  *   unit names <name>                         host_port_name and link_chain_name, a line each
  *   unit owner <name> <alias>                 port_owner_of_alias: ours or foreign
+ *   unit subid <subuid text> <subgid text> [<uid>:<gid>...]
+ *                                             subid_ranges of lightbox's lines, "range <start> <count>"
+ *                                             each or "bad line <n>", then userns_choose with those
+ *                                             ranges taken: "chose <uid> <gid>" or "none: <why>"
+ *   unit userns-start <text>                  userns_start_ok: "ok <n>" or "refused"
  *   unit port owner|remove <ifname> <name>    host_port_owner: absent, ours, foreign or unknown;
  *                                             remove_own_port: "result <n>"
  *   unit rtnl <request> [args...]             one rtnetlink request, "result <n>" or what it found:
@@ -315,6 +320,16 @@ static void put_config(const container_config *config) {
     put_line("io ", config->io[0] ? config->io : "-");
     put_line("swap ", config->swap[0] ? config->swap : "-");
     put_line("base ", config->base[0] ? config->base : "-");
+    if (config->userns) {
+        char u[11], g[11];
+        format_u32(u, config->uid_start);
+        format_u32(g, config->gid_start);
+        put("userns ");
+        put(u);
+        put_line(" ", g);
+    } else {
+        put("userns -\n");
+    }
     for (int i = 0; i < config->nvols; i++) {
         put("vol ");
         put(config->vols[i].src);
@@ -718,6 +733,63 @@ int main(int argc, char **argv, char **envp) {
         int before = open_descriptors();
         put_result(run_cmd_input(argv[3], (const char *const *)(argv + 3), argv[2], false));
         put_number("left open", open_descriptors() - before);
+        return 0;
+    }
+    if (argc >= 4 && streq(argv[1], "subid")) {
+        static subid_range uids[SUBID_RANGES_MAX], gids[SUBID_RANGES_MAX];
+        static uint32_t taken[64][2];
+        int line = 0, nu, ng;
+        nu = subid_ranges(argv[2], USERNS_OWNER, uids, SUBID_RANGES_MAX, &line);
+        if (nu < 0) {
+            put_number("bad uid line", line);
+            return 0;
+        }
+        ng = subid_ranges(argv[3], USERNS_OWNER, gids, SUBID_RANGES_MAX, &line);
+        if (ng < 0) {
+            put_number("bad gid line", line);
+            return 0;
+        }
+        for (int i = 0; i < nu; i++) {
+            char s[11], c[11];
+            format_u32(s, uids[i].start);
+            format_u32(c, uids[i].count);
+            put("uid range ");
+            put(s);
+            put_line(" ", c);
+        }
+        int ntaken = 0;
+        for (int i = 4; i < argc && ntaken < 64; i++, ntaken++) {
+            char *colon = argv[i];
+            while (*colon && *colon != ':') colon++;
+            if (!*colon)
+                die("unit: subid ... <uid>:<gid>");
+            *colon = '\0';
+            if (!parse_u32_text(argv[i], &taken[ntaken][0]) || !parse_u32_text(colon + 1, &taken[ntaken][1]))
+                die("unit: subid ... <uid>:<gid>");
+        }
+        uint32_t u = 0, g = 0;
+        const char *why = userns_choose(uids, nu, gids, ng, (const uint32_t (*)[2])taken, ntaken, &u, &g);
+        if (why) {
+            put_line("none: ", why);
+        } else {
+            char su[11], sg[11];
+            format_u32(su, u);
+            format_u32(sg, g);
+            put("chose ");
+            put(su);
+            put_line(" ", sg);
+        }
+        return 0;
+    }
+    if (argc == 3 && streq(argv[1], "userns-start")) {
+        uint32_t start = 0;
+        if (userns_start_ok(argv[2], &start)) {
+            char s[11];
+            format_u32(s, start);
+            put_line("ok ", s);
+        } else {
+            put("refused\n");
+        }
         return 0;
     }
     if (argc == 4 && streq(argv[1], "owner")) {

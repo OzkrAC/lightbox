@@ -774,10 +774,59 @@ static bool overlay_dirs(const char *name, char work[MAX_PATH], char merged[MAX_
 
 static void say_with_number(const char *before, int number, const char *after);
 
-/* In a child, with a mount namespace of its own: the overlay mounted at
- * merged with these options, and then what write_etc_files writes, unless
- * name is NULL. 0, OVERLAY_CANNOT_MOUNT as said, or 1 as said. */
-static int in_overlay(const char *merged, const char *options, const char *name, const char *ip, const char *resolv);
+/* What in_overlay does: the overlay of these options mounted at merged; for
+ * a container with --userns, its lower layer first replaced by an idmapped
+ * mount of itself, and the files written as the container's root on the
+ * host; then what write_etc_files writes, unless name is NULL. */
+struct overlay_job {
+    const char *merged;
+    const char *options;
+    const char *lower;                  /* the layer to idmap; NULL: none */
+    uint32_t    uid_start, gid_start;
+    const char *name, *ip, *resolv;
+};
+
+/* In a child, with a mount namespace of its own. 0, OVERLAY_CANNOT_MOUNT as
+ * said, or 1 as said: a container with --userns has no copy to fall back on. */
+static int in_overlay(const struct overlay_job *job);
+
+/* "Error: <before><step>, errno <n><after>" */
+static void say_failed_step(const char *before, const char *step, int rc, const char *after) {
+    char digits[16];
+    fmt_int(digits, -rc);
+    print_str(STDERR, "Error: ");
+    print_str(STDERR, before);
+    print_str(STDERR, step);
+    print_str(STDERR, ", errno ");
+    print_str(STDERR, digits);
+    print_str(STDERR, after);
+}
+
+/* An idmapped copy of the mount at path put over path itself, in this
+ * process's mount namespace, with the ids of a container's range. 0, or -1
+ * as said. */
+static int idmap_in_place(const char *path, uint32_t uid_start, uint32_t gid_start, bool privileged) {
+    int ns = userns_fd_with(uid_start, gid_start);
+    if (ns < 0) {
+        say_failed_step("cannot make a user namespace for the container's ids (", "unshare", ns, ")\n");
+        return -1;
+    }
+    const char *step = "";
+    int tree = idmapped_tree(path, ns, privileged, &step);
+    lc_kernel_close_file(ns);
+    int rc = tree < 0 ? tree : attach_tree(tree, path);
+    if (tree >= 0)
+        lc_kernel_close_file(tree);
+    if (rc < 0) {
+        say_failed_step("the kernel or the filesystem cannot make an idmapped mount here (", tree < 0 ? step : "move_mount", rc,
+                        "): --userns needs Linux 5.12 and a filesystem with idmapped mounts\n");
+        print_str(STDERR, "  of: ");
+        print_str(STDERR, path);
+        lc_print_char(STDERR, '\n');
+        return -1;
+    }
+    return 0;
+}
 
 /*
  * Can an overlay with its upper layer where a container's would be be
@@ -785,7 +834,7 @@ static int in_overlay(const char *merged, const char *options, const char *name,
  * beside the container's, so that a host without overlayfs, or a command
  * without the right to mount, does not copy the base twice.
  */
-static int in_overlay(const char *merged, const char *options, const char *name, const char *ip, const char *resolv) {
+static int in_overlay(const struct overlay_job *job) {
     lc_sysret child = lc_kernel_fork();
     if (child < 0)
         return 1;
@@ -793,14 +842,33 @@ static int in_overlay(const char *merged, const char *options, const char *name,
         lc_sysret rc = lc_kernel_unshare(CLONE_NEWNS);
         if (rc == 0)
             rc = lc_kernel_mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+        if (rc == 0 && job->lower && idmap_in_place(job->lower, job->uid_start, job->gid_start, false) != 0)
+            lc_kernel_exit(1);
         if (rc == 0)
-            rc = lc_kernel_mount("overlay", merged, "overlay", MS_NODEV | MS_NOSUID, options);
+            rc = lc_kernel_mount("overlay", job->merged, "overlay", MS_NODEV | MS_NOSUID, job->options);
+        if (rc < 0 && job->lower) {
+            say_with_number("Error: an overlay cannot be put on an idmapped layer here (errno ", (int)-rc,
+                            "): that needs Linux 5.19; --copy makes a container with --userns that needs 5.12\n");
+            lc_kernel_exit(1);
+        }
         if (rc < 0) {
             say_with_number("Note: an overlay cannot be mounted here (errno ", (int)-rc,
                             "): the container is a copy of its base; lightbox doctor says why\n");
             lc_kernel_exit(OVERLAY_CANNOT_MOUNT);
         }
-        const char *wrong = name ? write_etc_files(merged, name, ip, resolv) : NULL;
+        /* The files of a container with --userns are its root's on the host:
+         * written as that uid, which cannot pass the directories of
+         * lightbox's above the overlay, so from inside it. */
+        if (job->name && lc_kernel_chdir(job->merged) < 0) {
+            print_str(STDERR, "Error: cannot enter the container's overlay\n");
+            lc_kernel_exit(1);
+        }
+        if (job->name && job->lower &&
+            (lc_kernel_setgroups(0, NULL) < 0 || lc_kernel_setgid(job->gid_start) < 0 || lc_kernel_setuid(job->uid_start) < 0)) {
+            print_str(STDERR, "Error: cannot write the container's files as its root\n");
+            lc_kernel_exit(1);
+        }
+        const char *wrong = job->name ? write_etc_files(".", job->name, job->ip, job->resolv) : NULL;
         if (wrong) {
             print_str(STDERR, "Error: ");
             print_str(STDERR, wrong);
@@ -817,7 +885,7 @@ static int in_overlay(const char *merged, const char *options, const char *name,
     return got == child ? exit_code_from_status(status) : 1;
 }
 
-static bool overlay_mounts_here(const char *name) {
+static bool overlay_mounts_here(const char *name, const container_config *userns) {
     char cdir[MAX_PATH], lower[MAX_PATH], upper[MAX_PATH], work[MAX_PATH], merged[MAX_PATH], options[4 * MAX_PATH];
     container_dir_path(cdir, name);
     if (!path_join(lower, sizeof(lower), cdir, ".try-lower") || !path_join(upper, sizeof(upper), cdir, ".try-upper") ||
@@ -834,7 +902,12 @@ static bool overlay_mounts_here(const char *name) {
     pos = str_append(options, pos, upper, sizeof(options), &cut);
     pos = str_append(options, pos, ",workdir=", sizeof(options), &cut);
     str_append(options, pos, work, sizeof(options), &cut);
-    bool mounts = made && !cut && in_overlay(merged, options, NULL, NULL, NULL) == 0;
+    struct overlay_job job = {
+        .merged = merged, .options = options,
+        .lower = userns ? lower : NULL,
+        .uid_start = userns ? userns->uid_start : 0, .gid_start = userns ? userns->gid_start : 0,
+    };
+    bool mounts = made && !cut && in_overlay(&job) == 0;
     for (size_t i = 0; i < 4; i++)
         if (path_exists(dirs[i]))
             require_rm_rf(dirs[i]);
@@ -850,20 +923,29 @@ static bool overlay_mounts_here(const char *name) {
  * where no overlay can be mounted here, as said; anything else when the
  * files could not be written, as said.
  */
-static int overlay_etc(const char *name, const char *base, const char *ip, const char *resolv) {
-    char upper[MAX_PATH], work[MAX_PATH], merged[MAX_PATH], options[3 * MAX_PATH + 48];
+static int overlay_etc(const char *name, const container_config *cfg, const char *ip, const char *resolv) {
+    const char *base = cfg->base;
+    char upper[MAX_PATH], work[MAX_PATH], merged[MAX_PATH], options[3 * MAX_PATH + 48], lower[MAX_PATH];
     container_root(upper, name);
-    if (!overlay_dirs(name, work, merged))
+    if (!overlay_dirs(name, work, merged) || !base_rootfs_path(lower, base))
         return 1;
     if (lc_kernel_mkdirat(AT_FDCWD, upper, 0755) < 0 || lc_kernel_mkdirat(AT_FDCWD, work, MODE_PRIVATE_DIR) < 0 ||
         lc_kernel_mkdirat(AT_FDCWD, merged, MODE_PRIVATE_DIR) < 0)
+        return 1;
+    /* the root of the merged tree is the upper layer's: the container's root's */
+    if (cfg->userns && lc_kernel_fchownat(AT_FDCWD, upper, cfg->uid_start, cfg->gid_start, 0) < 0)
         return 1;
     if (!overlay_options(options, sizeof(options), base, upper, work)) {
         print_str(STDERR, "Note: a path of lightbox's has a comma, a colon or a backslash, which an overlay's\n"
                           "options cannot carry: the container is a copy of its base\n");
         return OVERLAY_CANNOT_MOUNT;
     }
-    int code = in_overlay(merged, options, name, ip, resolv);
+    struct overlay_job job = {
+        .merged = merged, .options = options,
+        .lower = cfg->userns ? lower : NULL, .uid_start = cfg->uid_start, .gid_start = cfg->gid_start,
+        .name = name, .ip = ip, .resolv = resolv,
+    };
+    int code = in_overlay(&job);
     if (code == OVERLAY_CANNOT_MOUNT) {
         /* nothing was written: the copy goes where the upper layer was */
         (void)lc_kernel_unlinkat(AT_FDCWD, merged, AT_REMOVEDIR);
@@ -922,10 +1004,7 @@ static void cmd_create(int argc, char **argv) {
             if (why)
                 die_about("Error: --io-max: ", why, value);
         } else if (streq(opt, "--userns")) {
-            die("Error: --userns is not supported yet");
-        } else if (streq(opt, "--uid-start")) {
-            (void)option_value(argc, argv, &i);
-            die("Error: --uid-start is not supported yet");
+            cfg.userns = true;
         } else if (streq(opt, "--privileged")) {
             cfg.privileged = true;
         } else if (streq(opt, "--rootfs")) {
@@ -969,6 +1048,10 @@ static void cmd_create(int argc, char **argv) {
                       unusable);
     }
 
+    /* its own ids, and the right to give them out, which only root has */
+    if (cfg.userns)
+        require_root("create --userns");
+
     /* check if container already exists */
     char cdir[MAX_PATH], root[MAX_PATH];
     container_dir_path(cdir, name);
@@ -996,6 +1079,16 @@ static void cmd_create(int argc, char **argv) {
     store_lock();
     char ip[IPV4_TEXT_MAX];
     choose_address(&net, address_given ? &asked : NULL, ip);
+    if (cfg.userns) {
+        const char *why = userns_allocate(&cfg.uid_start, &cfg.gid_start);
+        if (why) {
+            print_str(STDERR, "Error: no range of host ids for the container's user namespace: ");
+            print_str(STDERR, why);
+            print_str(STDERR, "\nAdd one of at least 65536 ids for " USERNS_OWNER " to both " SUBUID_FILE " and " SUBGID_FILE
+                              ", such as:\n  " USERNS_OWNER ":2147483647:2147483648\n");
+            lc_kernel_exit(1);
+        }
+    }
 
     print_str(STDOUT,"Creating container '");
     print_str(STDOUT,name);
@@ -1063,13 +1156,16 @@ static void cmd_create(int argc, char **argv) {
      * snapshot is shared by every container of that base. Where an overlay
      * cannot be mounted, and with --copy, a copy of the base.
      */
-    if (!full_copy && overlay_mounts_here(name)) {
+    bool overlay_here = !full_copy && overlay_mounts_here(name, cfg.userns ? &cfg : NULL);
+    if (!full_copy && cfg.userns && !overlay_here)
+        goto fail_create;           /* said: nothing falls back to a copy */
+    if (overlay_here) {
         bool took = false;
         if (base_snapshot_for(cfg_global.rootfs, cfg.base, &took) != 0) {
             create_err = "failed to take a snapshot of the base";
             goto fail_create;
         }
-        int written = overlay_etc(name, cfg.base, ip, resolv);
+        int written = overlay_etc(name, &cfg, ip, resolv);
         if (written == OVERLAY_CANNOT_MOUNT) {
             cfg.base[0] = '\0';
         } else if (written != 0) {
@@ -1089,6 +1185,19 @@ static void cmd_create(int argc, char **argv) {
         }
         if (path_exists(root))
             require_rm_rf(root);
+        /* a copy for a container with --userns is idmapped when it starts:
+         * the filesystem has to have idmapped mounts, which is looked at
+         * before anything is copied */
+        if (cfg.userns) {
+            lc_sysret pid = lc_kernel_fork();
+            if (pid == 0)
+                lc_kernel_exit(lc_kernel_unshare(CLONE_NEWNS) == 0 &&
+                               lc_kernel_mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) == 0 &&
+                               idmap_in_place(cdir, cfg.uid_start, cfg.gid_start, false) == 0 ? 0 : 1);
+            int32_t status = 1;
+            if (pid < 0 || wait_child((int32_t)pid, &status) < 0 || exit_code_from_status(status) != 0)
+                goto fail_create;   /* said */
+        }
         const char *reflink[] = { "cp", "-a", "--reflink=auto", base_contents, root, NULL };
         const char *plain[] = { "cp", "-a", base_contents, root, NULL };
         if (run_cmd_quiet(tool_path_cp(), reflink) != 0) {
@@ -1174,7 +1283,8 @@ struct child_args {
     const char  *name;
     const container_config *config;         /* read by the command, before the clone */
     const char  *root;
-    const char  *overlay;                   /* the options of the root's overlay; NULL: the root is a copy */
+    const char  *overlay;                   /* the options of the overlay init mounts; NULL: none */
+    bool         userns;                    /* in a user namespace of its own, whose maps the command writes */
     const char  *hook;                      /* the script init runs when it is ready */
     uint32_t     address;                   /* eth0's, on the network of prefix bits */
     int          prefix;
@@ -2606,8 +2716,8 @@ static int finish_exec(int32_t worker, int32_t signal_fd, const struct lb_termio
 
 /* ─── exec: entering the container ──────────────────────────────────────── */
 
-static int exec_inside_container(const char *name, int target_pid,
-                                 int privileged, int oom_score, const struct exec_request *req) {
+static int exec_inside_container(const char *name, int target_pid, int privileged, bool userns,
+                                 int oom_score, const struct exec_request *req) {
     /* From here to the command's execve this process, and the child it
      * forks, are lightbox inside a container. Not dumpable, their memory and
      * their descriptors are closed to the container's processes, whatever
@@ -2619,6 +2729,9 @@ static int exec_inside_container(const char *name, int target_pid,
     if (rootfd < 0)
         die("Error: failed to open target root");
 
+    int userfd = userns ? open_target_path(target_pid, "/ns/user") : -1;
+    if (userns && userfd < 0)
+        die("Error: failed to open the container's user namespace");
     int mntfd = open_target_path(target_pid, "/ns/mnt");
     int utsfd = open_target_path(target_pid, "/ns/uts");
     int ipcfd = open_target_path(target_pid, "/ns/ipc");
@@ -2638,6 +2751,14 @@ static int exec_inside_container(const char *name, int target_pid,
             die("Error: failed to give the command the container's OOM score");
     }
 
+    /* The user namespace first, whose root then joins the others, which it
+     * owns, as the container's root: what it makes there is the container's,
+     * and the ids of its user are the container's ids. */
+    if (userns) {
+        require_setns_fd(userfd, CLONE_NEWUSER, "user");
+        if (lc_kernel_setgroups(0, NULL) < 0 || lc_kernel_setgid(0) < 0 || lc_kernel_setuid(0) < 0)
+            die("Error: failed to become the root of the container's user namespace");
+    }
     require_setns_fd(mntfd, CLONE_NEWNS, "mount");
     require_setns_fd(utsfd, CLONE_NEWUTS, "uts");
     require_setns_fd(ipcfd, CLONE_NEWIPC, "ipc");
@@ -3093,10 +3214,34 @@ static void build_container(const struct child_args *ca) {
     struct volume_mount volumes[MAX_VOLS];
     int nvolumes = open_volumes(ca->config, volumes);
 
+    /* The root, bound onto itself: a mount of this namespace's own, which
+     * pivot_root takes, where one that a user namespace got with its copy of
+     * the host's mounts is locked to its place and is not. A device node
+     * inside the image is not a device here: the devices a container may use
+     * are the ones bound into its /dev, which is a mount of its own. Without
+     * privileges, setuid bits in the image mean nothing either, as
+     * no_new_privs already has it. From here on the root is a descriptor,
+     * and the paths below are of it: the path to it may be closed to the
+     * container's root. */
+    require_mount(ca->root, ca->root, NULL, MS_BIND | MS_REC, NULL);
+    require_mount(NULL, ca->root, NULL,
+                  MS_REMOUNT | MS_BIND | MS_NODEV | (ca->privileged ? 0 : MS_NOSUID), NULL);
+    lc_sysret rootfd = lc_kernel_open_file(ca->root, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+    if (rootfd < 0)
+        die2("Error: cannot open the container's root: ", ca->root);
+
+    /* In a user namespace of its own, init is the container's root from
+     * here on, uid and gid 0 there and the first of its range on the host,
+     * and what it makes is the container's root's. */
+    if (ca->userns && (lc_kernel_setgroups(0, NULL) < 0 || lc_kernel_setgid(0) < 0 || lc_kernel_setuid(0) < 0))
+        die("Error: failed to become the root of the container's user namespace");
+    if (lb_sys_fchdir((int32_t)rootfd) < 0)
+        die2("Error: chdir to rootfs failed: ", ca->root);
+    lc_kernel_close_file((int32_t)rootfd);
+
     /* /dev: the host's devices, bound one by one onto empty files */
     {
-        char dev_path[MAX_PATH];
-        path_join_or_die(dev_path, MAX_PATH, ca->root, "dev");
+        const char *dev_path = "dev";
         lc_kernel_mkdirat(AT_FDCWD, dev_path, 0755);   /* a minimal image may not have it */
         require_mount("tmpfs", dev_path, "tmpfs", MS_NOSUID | MS_NOEXEC, "mode=755");
 
@@ -3133,20 +3278,10 @@ static void build_container(const struct child_args *ca) {
         lc_kernel_mkdirat(AT_FDCWD, shm, 0755);
     }
 
-    /* pivot_root */
-    require_mount(ca->root, ca->root, NULL, MS_BIND | MS_REC, NULL);
-    /* A device node inside the image is not a device here: the devices a
-     * container may use are the ones bound into its /dev, which is a mount of
-     * its own. Without privileges, setuid bits in the image mean nothing
-     * either, as no_new_privs already has it. */
-    require_mount(NULL, ca->root, NULL,
-                  MS_REMOUNT | MS_BIND | MS_NODEV | (ca->privileged ? 0 : MS_NOSUID), NULL);
-    if (lc_kernel_chdir(ca->root) < 0)
-        die2("Error: chdir to rootfs failed: ", ca->root);
+    /* pivot_root, into the root this process is in */
     lc_kernel_mkdirat(AT_FDCWD, ".old_root", 0755);
     if (lc_kernel_pivot_root(".", ".old_root") < 0)
         die("Error: pivot_root failed");
-    cleanup_old_root_or_die();
     lc_kernel_chdir("/");
 
     /* Ensure standard mountpoints exist inside the container rootfs. */
@@ -3157,10 +3292,12 @@ static void build_container(const struct child_args *ca) {
     lc_kernel_mkdirat(AT_FDCWD, "/var", 0755);
     lc_kernel_mkdirat(AT_FDCWD, "/var/tmp", 01777);
 
-    /* mount proc, sys */
+    /* proc and sys, while the host's are there under /.old_root: in a user
+     * namespace the kernel mounts them only where the host's are seen */
     require_mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL);
 
     require_mount("sysfs", "/sys", "sysfs", MS_RDONLY, NULL);
+    cleanup_old_root_or_die();
 
     /* devpts and shm inside container */
     require_mount("devpts", "/dev/pts", "devpts",
@@ -3489,6 +3626,31 @@ static void start_one(const char *name, int hook_wait) {
         }
     }
 
+    /* With --userns the root is made here, in a mount namespace of this
+     * command's own, which init's is copied from: the snapshot, or the copy,
+     * idmapped to the container's ids, which host root alone can do, and the
+     * overlay on it. Init finds it mounted; nothing changes on the host. */
+    if (config.userns) {
+        char lower[MAX_PATH];
+        if (lc_kernel_unshare(CLONE_NEWNS) < 0 || lc_kernel_mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) < 0) {
+            start_err = "failed to give the start a mount namespace of its own";
+            goto fail_start;
+        }
+        if (config.base[0] && !base_rootfs_path(lower, config.base)) {
+            start_err = "the path of the container's base snapshot is too long";
+            goto fail_start;
+        }
+        if (idmap_in_place(config.base[0] ? lower : root, config.uid_start, config.gid_start, privileged) != 0) {
+            start_err = "failed to idmap the container's root to its ids";
+            goto fail_start;
+        }
+        if (config.base[0] &&
+            do_mount("overlay", merged, "overlay", MS_NODEV | (privileged ? 0 : MS_NOSUID), overlay) != 0) {
+            start_err = "failed to mount the container's overlay on its idmapped snapshot";
+            goto fail_start;
+        }
+    }
+
     /* clone init; it waits for its first byte */
     struct child_args ca = {
         .starter_signals = signal_fd,
@@ -3498,7 +3660,8 @@ static void start_one(const char *name, int hook_wait) {
         .name = name,
         .config = &config,
         .root = start_root,
-        .overlay = config.base[0] ? overlay : NULL,
+        .overlay = config.base[0] && !config.userns ? overlay : NULL,
+        .userns = config.userns,
         .hook = "/init.sh",
         .address = addr,
         .prefix = net.prefix,
@@ -3507,7 +3670,8 @@ static void start_one(const char *name, int hook_wait) {
         .privileged = privileged,
         .read_only = read_only,
     };
-    int clone_flags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET;
+    int clone_flags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET |
+                      (config.userns ? CLONE_NEWUSER : 0);
 
     start_err = init_spawn(&init, &ca, clone_flags, container_child);
     close_container_streams(&null_fd, &log_fd);     /* init has its own copies */
@@ -3522,6 +3686,12 @@ static void start_one(const char *name, int hook_wait) {
      * byte. While it waits for that byte it is certainly there, so everything
      * that names its PID or its network namespace has something to name.
      */
+
+    /* its ids: uid and gid 0 there are the first of its range here */
+    if (config.userns && userns_write_maps(child_pid, config.uid_start, config.gid_start) != 0) {
+        start_err = "failed to write the maps of the container's user namespace";
+        goto fail_start;
+    }
 
     /* set up cgroup */
     start_err = cgroup_create(name, child_pid, &config);
@@ -4101,7 +4271,7 @@ static void cmd_exec(int argc, char **argv) {
 
     if (worker == 0) {
         lc_kernel_close_file(signal_fd);
-        int status = exec_inside_container(name, pid, privileged, config.oom_score, &req);
+        int status = exec_inside_container(name, pid, privileged, config.userns, config.oom_score, &req);
         lc_kernel_exit(exit_code_from_status(status));
     }
 
@@ -4164,8 +4334,8 @@ static const struct { const char *name; const char *text; } command_help[] = {
         "                                riops or wiops (default: none)\n"
         "         --vol  <src:dst[:ro]>  Bind mount (repeatable)\n"
         "         --rootfs <path>         Base rootfs to copy (default: $LIGHTBOX_ROOTFS or lightbox.conf)\n"
-        "         --userns               Future improvement; not supported yet\n"
-        "         --uid-start <n>        Future improvement; not supported yet\n"
+        "         --userns               A user namespace of its own: its root is an unprivileged uid\n"
+        "                                on the host, from the range of /etc/subuid; as root\n"
         "         --read-only            Read-only root filesystem\n"
         "         --copy                 A copy of the base, and not an overlay of its snapshot\n"
         "         --privileged           Disable security sandbox\n"

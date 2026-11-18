@@ -7,7 +7,7 @@ A minimal, secure Linux container runtime: one static binary of about 150 KB, wi
 - **Kernel:** Linux 5.10 or later, the floor lightc sets, with namespaces and cgroup v2 offering the `cpu`, `memory` and `pids` controllers, and `io` for `--io-max`. For the network: bridge and veth; with iptables, `iptables` with the conntrack, physdev and MASQUERADE matches and targets, and `br_netfilter` with `net.bridge.bridge-nf-call-iptables=1` for containers created with `--link`; with nftables, nf_tables with NAT, masquerading, conntrack and the bridge family (`CONFIG_NF_TABLES_BRIDGE`, `nft_meta_bridge`), and no `br_netfilter`
 - **Building:** GCC 13 or later, which CI builds with, make and ninja, which builds lightc
 - **Host tools:** `iptables` and `iptables-restore`, or with `firewall_backend = nftables` `nft`, and `cp` and `rm`. Since 0.7 lightbox runs neither `ip` nor `nsenter`
-- **Root:** `setup`, `start`, `stop`, `restart`, `update` and `exec` run as root. A container's root is the host's root, as lightbox has no user namespaces yet (see [Threat model](#threat-model))
+- **Root:** `setup`, `start`, `stop`, `restart`, `update` and `exec` run as root, and so does `create --userns`. A container's root is the host's root, unless it was created with `--userns` (see [User namespaces](#user-namespaces) and [Threat model](#threat-model))
 
 `lightbox doctor` checks all of this on the host it runs on: root, the kernel and the system calls lightbox makes, cgroup v2 and its controllers, the tools, the base root filesystem, and with nftables that forwarding is on. Each check that fails is followed by what fixes it, and `doctor` then exits 1; `doctor --json` gives the same to scripts.
 
@@ -361,8 +361,8 @@ Commands:
                                 riops or wiops (default: none)
          --vol  <src:dst[:ro]>  Bind mount (repeatable)
          --rootfs <path>         Base rootfs to copy (default: $LIGHTBOX_ROOTFS or lightbox.conf)
-         --userns               Future improvement; not supported yet
-         --uid-start <n>        Future improvement; not supported yet
+         --userns               A user namespace of its own: its root is an unprivileged uid
+                                on the host, from the range of /etc/subuid; as root
          --read-only            Read-only root filesystem
          --copy                 A copy of the base, and not an overlay of its snapshot
          --privileged           Disable security sandbox
@@ -418,8 +418,7 @@ A container's name is 1 to 30 characters of `a-z`, `A-Z`, `0-9`, `_` and `-`.
 | `--cpu <num>` | `1` | CPUs, 0.01 to 512, with up to two decimals: `2`, `0.5`, `1.25` |
 | `--io-max "<major>:<minor> <key>=<value>..."` | none | I/O limit for one whole disk of the host, as `io.max` takes it: `"8:0 wbps=10485760 riops=1000"`, with `rbps`, `wbps`, `riops` and `wiops`, each a number or `max` |
 | `--vol <src>:<dst>[:ro]` | — | Bind mount (repeatable, up to 16, one at a destination) |
-| `--userns` | — | Future improvement; not supported yet |
-| `--uid-start <n>` | — | Future improvement; not supported yet |
+| `--userns` | off | A user namespace of its own: its root is an unprivileged uid on the host (see [User namespaces](#user-namespaces)); `create` runs as root |
 | `--read-only` | off | Read-only root filesystem |
 | `--copy` | off | A full copy of the base, as before 0.7, and not an overlay of its snapshot |
 | `--privileged` | off | Disable security sandbox |
@@ -477,13 +476,13 @@ The sandbox covers everything in a container: init, the `/init.sh` hook and all 
 
 lightbox keeps what runs in a container away from the host and from the other containers, as far as the kernel's namespaces, the sandbox and the firewall can:
 
-- **The host from a container's processes:** their own PID, mount, UTS, IPC and network namespaces; 12 capabilities and a seccomp filter of Docker's kind, with no_new_privs; the paths of `/proc` and `/sys` that Docker masks, masked, and the rest of `/proc`'s system trees read-only; a root filesystem that is `nodev` and `nosuid`; and limits on memory, swap, processes, CPU and, with `--io-max`, I/O.
+- **The host from a container's processes:** their own PID, mount, UTS, IPC and network namespaces, and with `--userns` a user namespace in which root is an unprivileged uid of the host's; 12 capabilities and a seccomp filter of Docker's kind, with no_new_privs; the paths of `/proc` and `/sys` that Docker masks, masked, and the rest of `/proc`'s system trees read-only; a root filesystem that is `nodev` and `nosuid`; and limits on memory, swap, processes, CPU and, with `--io-max`, I/O.
 - **Containers from each other:** each on an isolated port of the bridge, and with `--link` kept to its links by firewall rules that lightbox owns and takes away with the container.
 - **The host's terminal and the installed binary from a container:** `exec` gives a command a terminal of the container's, not yours, and enters from a sealed copy of itself.
 
 What it does not keep out, and what to do about it:
 
-- **A container's root is the host's root.** There are no user namespaces yet. What keeps a container's root in is the namespaces and the sandbox; a flaw in the kernel past them would be a flaw on the host. Run as root in a container only what you would run as root on the host, and run the rest with `exec --user`.
+- **Without `--userns`, a container's root is the host's root.** What keeps it in is the namespaces and the sandbox; a flaw in the kernel past them would be a flaw on the host. Create a container with `--userns` (see [User namespaces](#user-namespaces)), or run as root in it only what you would run as root on the host, and the rest with `exec --user`.
 - **`--privileged` turns the sandbox off.** Such a container has all capabilities and no seccomp filter; give it only to what needs that, such as a hook that mounts filesystems.
 - **The host itself is in reach.** The firewall rules decide what the bridge forwards, not what a container sends to the host: services of the host that listen on the bridge's address, or on all addresses, answer containers. Keep them to the addresses they are for, or filter `INPUT` on the bridge in the host's firewall.
 - **Disk is not limited.** A container's copy of its image and its `console.log`, which is not rotated, take what the disk has.
@@ -492,7 +491,7 @@ What it does not keep out, and what to do about it:
 
 ## How it works
 
-- **Namespaces**: `clone()` with PID, mount, UTS, IPC and network namespace flags
+- **Namespaces**: `clone()` with PID, mount, UTS, IPC and network namespace flags, and with `--userns` a user namespace, whose maps `start` writes before init does anything. `start` makes the idmapped root in a mount namespace of its own, which init's is copied from, and init binds it onto itself, mounts `/proc` and `/sys` while the host's are still there, and becomes the container's root before it builds the rest
 - **Filesystem**: each container lives under `<container_dir>/<name>/` with `rootfs/` for its own files, `.conf` and `.ip` for what it is configured with and `console.log` for its output. Init mounts an overlay of the base's snapshot and `rootfs/` in the container's mount namespace, or takes `rootfs/` as it is for a copy, and `pivot_root`s into it (see [Storage](#storage))
 - **Runtime records**: what is known about a container while it runs is in `<run_dir>/<name>/`: `pid` and `pid_start` for its init, `state`, and `exit`, where init writes its exit status as the last thing it does. These are written without waiting for a disk, and a reboot takes them away with everything else in `/run`; a container without them is stopped. `start` makes the directory again when it is missing, for root alone
 - **States**: `ls` and `inspect` show `stopped`, `running`, `starting` and `stopping` while a command is at work, `exited` for a container that ended by itself, `failed` for one that was killed or whose start or hook failed, and `creating` for one that `create` did not finish. A half-made container is not started: remove it and create it again
@@ -518,6 +517,21 @@ A container's root is an overlay: a snapshot of its base, which containers of th
 - A file of the base that you change from the host has to be in `rootfs/` first: appending to `rootfs/etc/passwd` while the container has the base's makes a file of only what you appended. Change it inside the container, with `exec`, or copy it into `rootfs/` and change the copy.
 - `lightbox base ls` lists the snapshots, with their base and the containers on them. `lightbox base add <dir>` takes a new snapshot of a base, for the containers made after it, as after an update of the base; the containers made before keep theirs. `lightbox base rm <id>` removes a snapshot that no container uses.
 - `--copy` makes the container a full copy of its base in `rootfs/`, as every container was before 0.7. So does every `create` where an overlay cannot be mounted, without overlayfs in the kernel or without the right to mount, and it says so; `doctor` says whether the kernel has overlayfs. Containers made before 0.7 are copies, and stay as they are.
+
+## User namespaces
+
+A container created with `--userns` has a user namespace of its own, and its root is not the host's: uid 0 in it is an unprivileged uid on the host, and so are its other users. Its ids are a range of 65536 uids and 65536 gids that nothing else on the host has, taken, as rootful Podman's `--userns=auto` takes its own from the name `containers`, from the ranges that `/etc/subuid` and `/etc/subgid` give the name `lightbox`. Add one to both before the first such container, as large as you like:
+
+```bash
+echo lightbox:2147483647:2147483648 >> /etc/subuid
+echo lightbox:2147483647:2147483648 >> /etc/subgid
+```
+
+- `create --userns` runs as root, and gives the container the first range of 65536 of each file that no container has. Its `.conf` records it as `userns=1`, `uid_start` and `gid_start`, the host's uid and gid of its root, and `inspect` shows them. `doctor` says how many ranges the two files hold. Without a range for `lightbox`, `create --userns` says what to add, and makes nothing.
+- The container's root is an idmapped mount of its base, so that the base's files, owned by host root, are its root's and keep their other ids, and nothing is chowned. That needs Linux 5.12 and a filesystem with idmapped mounts, such as ext4, xfs, btrfs or tmpfs from 6.3 on; an overlay on an idmapped snapshot needs Linux 5.19. Where the kernel or the filesystem cannot, `create --userns` says so and makes nothing: there is no fallback that chowns.
+- An overlay container's own files, `rootfs/`, belong on the host to its range: what its root makes there is the first uid of the range's, and the snapshot stays host root's. A `--copy` container's files keep the base's ids on disk, root's included, as the copy is idmapped as it is; its directory is root's alone, as every container's is.
+- `exec` joins the user namespace first, and its command runs as the container's user, which is a uid of the range on the host.
+- A volume is bound as it is, and its files show in the container as owned by nobody unless their ids are in the range.
 
 ## Volume Notes
 

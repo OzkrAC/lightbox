@@ -1281,7 +1281,7 @@ want = {"name": "web", "ip": "10.0.0.2", "state": "stopped", "running": False, "
 bad = [k for k in want if c.get(k) != want[k]]
 assert not bad, "differ: " + ", ".join("%s=%r" % (k, c.get(k)) for k in bad)
 assert c["log_path"].endswith("/web/console.log") and c["host_interface"].startswith("vb-"), "paths"
-assert "userns" not in c and "uid_start" not in c, "user namespace keys"
+assert c["userns"] is False and c["uid_start"] is None and c["gid_start"] is None, "user namespace keys"
 ' "$W/vol" || return 1
     echo 'colour=blue' >> "$C/web/.conf"
     out=$(lb inspect web --json 2>"$W/err") && { echo "inspect --json of a configuration that cannot be used succeeded"; return 1; }
@@ -1602,6 +1602,31 @@ t_update_rewrites_the_conf() {
     [ ! -e "$C/gone" ] || { echo "rm -f left the container"; return 1; }
 }
 
+# create --userns gives out host ids, which root alone may do: an ordinary
+# user is refused before anything is made. A .conf with userns=1 and its
+# range is read, and inspect shows the range, as numbers in JSON. doctor says
+# how many ranges /etc/subuid and /etc/subgid give lightbox.
+t_userns_as_a_user_sees_it() {
+    [ "$(id -u)" -ne 0 ] || return 77
+    msg=$(lb create web 10.0.0.2 --userns 2>&1) && { echo "create --userns succeeded"; return 1; }
+    echo "$msg"
+    [ "$msg" = 'Error: lightbox create --userns must be run as root' ] && [ ! -e "$C/web" ] || return 1
+    lb create web 10.0.0.2 >/dev/null 2>&1 || return 1
+    printf 'userns=1\nuid_start=2147483647\ngid_start=2147549183\n' >> "$C/web/.conf"
+    report=$(lb inspect web) || { echo "inspect failed"; return 1; }
+    printf '%s\n' "$report" | grep -E '^(userns|uid_start|gid_start): '
+    [ "$(printf '%s\n' "$report" | grep -E '^(userns|uid_start|gid_start): ' | paste -sd'|')" = \
+      'userns: 1|uid_start: 2147483647|gid_start: 2147549183' ] || return 1
+    lb inspect web --json | python3 -c '
+import json, sys
+c = json.load(sys.stdin)[0]
+assert c["userns"] is True and c["uid_start"] == 2147483647 and c["gid_start"] == 2147549183, c
+' || return 1
+    said=$(lb doctor 2>&1 | grep '^userns_ranges: ')
+    echo "$said"
+    case $said in 'userns_ranges: '[0-9]*' ('*|'userns_ranges: unreadable ('*) ;; *) return 1 ;; esac
+}
+
 # base ls, add and rm, as an ordinary user can have them: a snapshot of a
 # base is taken and listed with its source; one that a container's .conf
 # names is not removed, and one that none names is.
@@ -1907,6 +1932,7 @@ check 'doctor says how to fix each thing it finds missing'              t_doctor
 check 'doctor --json: settings and checks, typed'                       t_doctor_json
 check 'update, restart and rm -f check their options before anything'  t_update_restart_rm_options
 check 'update writes the limits into a stopped container'"'"'s .conf'       t_update_rewrites_the_conf
+check 'create --userns is root'"'"'s, and inspect and doctor show the ranges' t_userns_as_a_user_sees_it
 check 'base add, ls and rm manage the snapshots of bases'              t_base_snapshots
 check 'start without root is a clean error'                   t_start_without_root_is_a_clean_error
 

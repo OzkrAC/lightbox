@@ -2392,6 +2392,87 @@ t_nft_reload() {
     reaches nrllinked "$(addr_of nrlpeer)" && reaches nrllinked "$OUTSIDE"
 }
 
+# ─── Cases: user namespaces ─────────────────────────────────────────────────
+
+# --userns on an overlay: the container's ids are the first range of the
+# suite's /etc/subuid and /etc/subgid, on record in its .conf; its init is that
+# uid on the host and root in it. The snapshot's files are its root's, and
+# keep their other ids (4711 stays 4711); what it makes is in its upper layer,
+# owned on the host by its range, and the snapshot stays host root's.
+t_userns_overlay() {
+    need_subids || return 77
+    box unover --userns || return 1
+    cat "$C/unover/.conf"
+    u=$(conf_value unover uid_start) g=$(conf_value unover gid_start)
+    [ "$(conf_value unover userns)" = 1 ] && [ "$u" = 2147483647 ] && [ "$g" = 2147483647 ] ||
+        { echo "the range on record is not the first of the suite's"; return 1; }
+    base=$(conf_value unover base)
+    [ -n "$base" ] || { echo "the container is not an overlay"; return 1; }
+    [ "$(stat -c %u:%g "$C/unover/rootfs")" = "$u:$g" ] && [ "$(stat -c %u:%g "$C/unover/rootfs/etc/hostname")" = "$u:$g" ] ||
+        { echo "the upper layer and the files create wrote are not the container root's: $(stat -c %u:%g "$C/unover/rootfs" "$C/unover/rootfs/etc/hostname" | paste -sd' ')"; return 1; }
+    start unover || return 1
+    pid=$(pid_of unover)
+    echo "init on the host: $(host_ids_of "$pid")"
+    [ "$(host_ids_of "$pid")" = "$u $g" ] || { echo "init is not the container's root on the host"; return 1; }
+    map=$(sh_in unover 'cat /proc/self/uid_map /proc/self/gid_map' | awk '{ print $1, $2, $3 }' | paste -sd'|')
+    echo "maps: $map"
+    [ "$map" = "0 $u 65536|0 $g 65536" ] || return 1
+    inside=$(sh_in unover 'id -u; id -g; stat -c %u:%g /bin /etc/hostname /home/lbuser' | paste -sd' ')
+    echo "in it: $inside"
+    [ "$inside" = '0 0 0:0 0:0 4711:4711' ] || return 1
+    sh_in unover 'echo made > /made && mkdir /dir && chown 4711:4712 /dir' || return 1
+    [ "$(stat -c %u:%g "$C/unover/rootfs/made")" = "$u:$g" ] &&
+        [ "$(stat -c %u:%g "$C/unover/rootfs/dir")" = "$((u + 4711)):$((g + 4712))" ] ||
+        { echo "what the container made is not its range's on the host: $(stat -c %u:%g "$C/unover/rootfs/made" "$C/unover/rootfs/dir" | paste -sd' ')"; return 1; }
+    [ "$(stat -c %u "$T/lb/bases/$base/rootfs/bin")" = 0 ] && [ ! -e "$T/lb/bases/$base/rootfs/made" ] ||
+        { echo "the snapshot changed"; return 1; }
+    [ "$(lb exec unover --user 4711 /bin/sh -c 'id -u' </dev/null)" = 4711 ] || { echo "exec --user is not that user in it"; return 1; }
+    lb stop unover >/dev/null && lb rm unover >/dev/null || return 1
+    nothing_left unover
+}
+
+# --userns with --copy: the copy is idmapped as it is, so its files are the
+# container's root's in it and keep the base's ids on the host, and what the
+# container makes is stored with the ids it has in the container.
+t_userns_copy() {
+    need_subids || return 77
+    box uncopy --userns --copy || return 1
+    [ -z "$(conf_value uncopy base)" ] && [ "$(conf_value uncopy userns)" = 1 ] || { echo "not a copy with --userns"; return 1; }
+    u=$(conf_value uncopy uid_start) g=$(conf_value uncopy gid_start)
+    start uncopy || return 1
+    [ "$(host_ids_of "$(pid_of uncopy)")" = "$u $g" ] || { echo "init is not the container's root on the host"; return 1; }
+    inside=$(sh_in uncopy 'id -u; stat -c %u:%g /bin /home/lbuser; echo made > /made' | paste -sd' ')
+    echo "in it: $inside"
+    [ "$inside" = '0 0:0 4711:4711' ] || return 1
+    [ "$(stat -c %u:%g "$C/uncopy/rootfs/made")" = 0:0 ] || { echo "/made is $(stat -c %u:%g "$C/uncopy/rootfs/made") on the host"; return 1; }
+    lb stop uncopy >/dev/null && lb rm uncopy >/dev/null || return 1
+    nothing_left uncopy
+}
+
+# Two containers with --userns get two ranges, the second after the first,
+# and one without it gets none.
+t_userns_ranges_apart() {
+    need_subids || return 77
+    box unone --userns && box untwo --userns && box unnone || return 1
+    echo "unone: $(conf_value unone uid_start) $(conf_value unone gid_start); untwo: $(conf_value untwo uid_start) $(conf_value untwo gid_start)"
+    [ "$(conf_value untwo uid_start)" = $(( $(conf_value unone uid_start) + 65536 )) ] &&
+        [ "$(conf_value untwo gid_start)" = $(( $(conf_value unone gid_start) + 65536 )) ] || return 1
+    [ -z "$(conf_value unnone userns)$(conf_value unnone uid_start)" ] || { echo "a container without --userns has a range"; return 1; }
+}
+
+# Without a range for lightbox, create --userns says what to add, and makes
+# nothing.
+t_userns_without_a_range() {
+    need_subids || return 77
+    printf 'someone:100000:65536\n' > "$T/norange"
+    mount --bind "$T/norange" /etc/subuid && echo /etc/subuid >> "$T/shims" || return 1
+    ip=$(next_ip) || return 1
+    said=$(lb create unrange "$ip" --userns 2>&1) && { echo "create --userns went ahead"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *"no range of host ids"*"lightbox:2147483647:2147483648"*) ;; *) return 1 ;; esac
+    [ ! -e "$C/unrange" ] || { echo "it left the container"; return 1; }
+}
+
 # setup --teardown does nothing while a container runs, and says which. With
 # none running it takes away all that setup and the containers made: the
 # interfaces are those there were before the first setup, no rule or chain of
@@ -2652,8 +2733,27 @@ EOF
     echo 1 > "$T/next_ip"
     : > "$T/shims"
     : > "$T/background"
-    build_rootfs && network && links_now > "$T/links.before" && mask_ip_and_nsenter
+    build_rootfs && network && links_now > "$T/links.before" && mask_ip_and_nsenter && subids
 }
+
+# The ranges a container with --userns takes its ids from: the suite's own
+# /etc/subuid and /etc/subgid over the host's, in this mount namespace only,
+# with one range for lightbox, as README says to add it. A host without the
+# two files has nothing to put them over, and the cases of --userns skip.
+SUBIDS='lightbox:2147483647:2147483648'
+subids() {
+    [ -e /etc/subuid ] && [ -e /etc/subgid ] || return 0
+    printf 'someone:100000:65536\n%s\n' "$SUBIDS" > "$T/subids" &&
+        mount --bind "$T/subids" /etc/subuid && mount --bind "$T/subids" /etc/subgid && : > "$T/have_subids"
+}
+
+need_subids() {
+    [ -e "$T/have_subids" ] || { echo "this host has no /etc/subuid and /etc/subgid for the suite's range"; return 77; }
+}
+
+# a process's uid and gid on the host
+host_ids_of() { awk '/^Uid:/ { u = $2 } /^Gid:/ { g = $2 } END { print u, g }' "/proc/$1/status"; }
+conf_value() { sed -n "s/^$2=//p" "$C/$1/.conf"; }  # name key
 
 # lightbox runs neither ip nor nsenter since 0.7 (ROADMAP 7.2). In this mount
 # namespace both are stand-ins that note who ran them and fail, so that a
@@ -2937,6 +3037,10 @@ if [ "$MODE" = inside ]; then
     check 'reload puts back what a flush took: setup'"'"'s rules and the links of running containers' t_reload_puts_back_what_a_flush_took
     check 'a start after a flush makes the rules again and puts back running containers'"'"' links' t_start_after_a_flush_puts_back_links
     check 'nftables: reload makes the tables again, with the links of running containers' t_nft_reload
+    check '--userns on an overlay: root in it is its range on the host, and its files are' t_userns_overlay
+    check '--userns with --copy: the copy is idmapped, and init is its range on the host' t_userns_copy
+    check 'containers with --userns get ranges apart, and one without gets none' t_userns_ranges_apart
+    check 'without a range for lightbox, create --userns says what to add'  t_userns_without_a_range
     check 'setup --teardown leaves the host as before the first setup'    t_setup_teardown
     check 'without --config or LIGHTBOX_CONFIG, /etc/lightbox/lightbox.conf is read' t_config_in_etc
     check 'a container overlays a snapshot of its base, and keeps its own files apart' t_overlay_root

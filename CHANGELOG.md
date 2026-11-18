@@ -2,9 +2,27 @@
 
 What changed for someone who uses lightbox, newest first. `ROADMAP.md` has the reasons and the finding each change closes.
 
+## 0.8.0
+
+Not tagged yet: the part of Phase 8 that is written so far.
+
+### Changes you may have to act on
+
+- **`create --uid-start` is gone.** It was refused before; a container created with `--userns` gets its range from `/etc/subuid` and `/etc/subgid`.
+- **`inspect` has three keys more**, `userns`, `uid_start` and `gid_start`, and `doctor` a setting `userns_ranges`, in text and in `--json`.
+
+### Added
+
+- **`create --userns`** gives a container a user namespace of its own: its root is an unprivileged uid on the host, the first of a range of 65536 uids and gids that `/etc/subuid` and `/etc/subgid` give the name `lightbox`, as rootful Podman's `--userns=auto` uses `containers`. Its root filesystem is an idmapped mount, so the base's files are its root's and nothing is chowned: Linux 5.12 for a `--copy` container, 5.19 for an overlay. An overlay container's own files belong on the host to its range. Without a range, or where the kernel or the filesystem cannot idmap, `create --userns` says why and makes nothing. `exec` joins the user namespace first.
+
+### Changed
+
+- **Init mounts `/proc` and `/sys` before it lets go of the host's root**, and builds a container's `/dev` and pivots from a descriptor of its root, for every container: a user namespace requires the first, and its root cannot reach the path to the container's directory.
+- **A change of a mount's flags keeps how it keeps access times**, as it kept read-only, nosuid, nodev and noexec: a user namespace may not change that of a mount it got from the host, such as one of `noatime`.
+
 ## 0.7.0
 
-Phase 7 of the roadmap: performance. A new container is an overlay of a snapshot of its base, so that `create` takes as long from a base of 1 GB as from a small one; lightbox makes a container's network with rtnetlink and runs neither `ip` nor `nsenter`; and `lightbox reload` puts back what a firewall's reload took. On GitHub's runners a start takes a median of 8.8 ms on x86_64 and 12.9 ms on aarch64, and a stop 2.9 and 5.5, where before Phase 1 of the roadmap they took about 535 and 207 on the same kind of runner.
+Tagged `v0.7.0`, at `1782616`, the merge of pull request 7. Phase 7 of the roadmap: performance. A new container is an overlay of a snapshot of its base, so that `create` takes as long from a base of 1 GB as from a small one; lightbox makes a container's network with rtnetlink and runs neither `ip` nor `nsenter`; and `lightbox reload` puts back what a firewall's reload took. On GitHub's runners a start takes a median of 8.8 ms on x86_64 and 12.9 ms on aarch64, and a stop 2.9 and 5.5, where before Phase 1 of the roadmap they took about 535 and 207 on the same kind of runner.
 
 ### Changes you may have to act on
 
