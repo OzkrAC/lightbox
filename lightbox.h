@@ -18,7 +18,7 @@
 
 /* What --version says: the release, set when it is tagged, and "-dev" after
  * it on the way to the next one. */
-#define LIGHTBOX_VERSION "0.6.0"
+#define LIGHTBOX_VERSION "0.7.0"
 
 #define MAX_PATH         512
 #define NAME_MAX_LEN     30
@@ -116,6 +116,7 @@ typedef struct {
     int  oom_score;
     bool privileged;
     bool read_only;
+    char base[13];              /* the snapshot it overlays; empty: a copy of its base */
     int  nvols;
     volume_spec vols[MAX_VOLS];
     int  nlinks;
@@ -307,13 +308,11 @@ int exit_code_from_status(int32_t status);
 /* the same, ending the process on failure */
 void require_mount(const char *source, const char *target,
                    const char *fstype, uint64_t flags, const char *data);
-const char *tool_path_ip(void);
 const char *tool_path_iptables(void);
 const char *tool_path_iptables_restore(void);
 const char *tool_path_nft(void);
 const char *tool_path_cp(void);
 const char *tool_path_rm(void);
-const char *tool_path_nsenter(void);
 bool tool_available(const char *path);
 void require_tool(const char *label, const char *path);
 /* a macro's value as a string literal */
@@ -331,6 +330,27 @@ bool name_is_valid(const char *name);
  * left out. Stores at most max names and returns how many; *more, if given,
  * says whether some did not fit. */
 int list_containers(char names[][NAME_MAX_LEN + 1], int max, bool *more);
+/* The entries of a directory that valid takes, directories only, sorted. */
+int list_entries(const char *dir, bool (*valid)(const char *), char names[][NAME_MAX_LEN + 1], int max, bool *more);
+
+/* ─── Base snapshots (lightbox_base.c) ──────────────────────────────────── */
+
+#define BASE_ID_LEN  12
+#define BASE_ID_TEXT (BASE_ID_LEN + 1)
+bool base_id_ok(const char *id);
+void bases_dir_path(char out[MAX_PATH]);
+/* <bases>/<id>/rootfs: false for an id that is not one */
+bool base_rootfs_path(char out[MAX_PATH], const char *id);
+/* A snapshot of a base directory taken now: 0, or -1 once said. */
+int base_take(const char *source, char id[BASE_ID_TEXT]);
+/* The newest snapshot of a base directory, or one taken now, which took
+ * says: 0, or -1 once said. */
+int base_snapshot_for(const char *source, char id[BASE_ID_TEXT], bool *took);
+int list_bases(char ids[][NAME_MAX_LEN + 1], int max);
+/* The mount options of an overlay of a snapshot with this upper and work
+ * directory, or false where a path cannot go into them. */
+bool overlay_options(char *out, size_t max, const char *id, const char *upper, const char *work);
+void cmd_base(int argc, char **argv);
 
 /*
  * What a container is made of is in <container_dir>/<name>/ and is written
@@ -473,12 +493,12 @@ int read_container_ip(const char *name, char *ip, size_t ipsz);
 void host_port_name(const char *name, char out[IFNAME_TEXT_MAX]);
 void link_chain_name(const char *name, char out[IFNAME_TEXT_MAX]);
 /* Whose an interface on the host is, by the alias lightbox gives what it
- * makes for a container: lightbox:<name>. One without it is not lightbox's. */
-typedef enum { PORT_ABSENT, PORT_OURS, PORT_FOREIGN } port_owner;
+ * makes for a container: lightbox:<name>. One without it is not lightbox's.
+ * PORT_UNKNOWN: the kernel could not be asked. */
+typedef enum { PORT_ABSENT, PORT_OURS, PORT_FOREIGN, PORT_UNKNOWN } port_owner;
 port_owner host_port_owner(const char *ifname, const char *name);
-/* The same from what "ip link show dev <interface>" printed, which this cuts
- * into lines where it stands. */
-port_owner port_owner_of_listing(char *shown, const char *name);
+/* The same from the interface's alias, "" when it has none. */
+port_owner port_owner_of_alias(const char *alias, const char *name);
 /* Is this a chain a record of link rules may name: LB- and what an iptables
  * chain name may hold, within its 28 characters? */
 bool link_chain_ok(const char *chain);
@@ -486,6 +506,40 @@ bool link_chain_ok(const char *chain);
  * container's is there afterwards, 1 when one of that name that is not
  * lightbox's was left alone, -1 when it could not be removed. */
 int remove_own_port(const char *ifname, const char *name);
+
+/* ─── rtnetlink (lightbox_netlink.c) ─────────────────────────────────────── */
+
+/*
+ * The kernel's configuration of interfaces, addresses and routes, asked over
+ * a netlink socket: what lightbox had ip and nsenter do until 0.7. Each call
+ * is one request: 0, or what it asks for, or minus the errno the kernel
+ * refused it with (-ENODEV for an interface that is not there).
+ */
+typedef struct {
+    int32_t  fd;
+    uint32_t seq;
+} rtnl;
+[[nodiscard]] int rtnl_open(rtnl *nl);
+void rtnl_close(rtnl *nl);
+/* The interface's index; with alias, its alias as well, "" when it has none. */
+[[nodiscard]] int rtnl_link_get(rtnl *nl, const char *ifname, char *alias, size_t alias_max);
+[[nodiscard]] int rtnl_link_name(rtnl *nl, int index, char out[IFNAME_TEXT_MAX]);
+/* A veth pair, its peer made in the network namespace of process peer_pid. */
+[[nodiscard]] int rtnl_veth_add(rtnl *nl, const char *ifname, const char *peer, int peer_pid);
+[[nodiscard]] int rtnl_bridge_add(rtnl *nl, const char *ifname);
+/* The alias, and then the bridge of that index as the interface's master. */
+[[nodiscard]] int rtnl_link_attach(rtnl *nl, const char *ifname, const char *alias, int master);
+/* A bridge's port that does not reach its other isolated ports. */
+[[nodiscard]] int rtnl_port_isolate(rtnl *nl, const char *ifname);
+[[nodiscard]] int rtnl_link_up(rtnl *nl, const char *ifname);
+[[nodiscard]] int rtnl_link_delete(rtnl *nl, const char *ifname);
+[[nodiscard]] int rtnl_addr_add(rtnl *nl, int index, uint32_t addr, int prefix);
+[[nodiscard]] int rtnl_default_route_add(rtnl *nl, uint32_t gateway, int index);
+/* The index of the interface of the main table's default route, 0 for none. */
+[[nodiscard]] int rtnl_default_route_index(rtnl *nl);
+/* Init, in the container's network namespace: eth0 up, with its address and
+ * the default route through the gateway. 0, or -1 once it has said why not. */
+[[nodiscard]] int container_interface_up(uint32_t addr, int prefix, uint32_t gateway);
 #define FIREWALL_TEXT_MAX 4096
 /* What iptables-restore is given: for a container's links, or for setup.
  * False when it does not fit. */
@@ -503,7 +557,7 @@ bool bridge_traffic_is_filtered(void);
  * is gone after a reboot: the bridge, the firewall rules and forwarding.
  * start makes it again when it is not all there, as setup makes it.
  */
-void ensure_host_network(void);
+void ensure_host_network(const char *starting);
 /* What of it is not there, as "the bridge, the firewall rules", or NULL
  * when all of it is. The firewall is looked at only by root. */
 const char *host_network_missing(void);
@@ -557,6 +611,12 @@ typedef enum {
 seal_method exec_seal_method(void);
 
 void cmd_setup(void);
+/* setup's part of the network again, and the link rules of the containers
+ * that run: what a firewall's reload took */
+void cmd_reload(int argc, char **argv);
+/* the link rules of the containers that run but except, put in again; how
+ * many could not be */
+int put_back_running_links(const char *except);
 void cmd_doctor(int argc, char **argv);
 void cmd_ls(int argc, char **argv);
 void cmd_inspect(int argc, char **argv);

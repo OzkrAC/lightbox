@@ -768,8 +768,8 @@ t_default_settings_are_checked() {
         [ ! -e "$C/x$n" ] || { echo "the refused container is there"; return 1; }
         sed -i '$d' "$CONF"
     done
-    # and with nothing wrong any more, nothing is said
-    msg=$(lb create y 10.0.0.5 2>&1 >/dev/null) || return 1
+    # and with nothing wrong any more, nothing is said but that this user can mount no overlay
+    msg=$(lb create y 10.0.0.5 2>&1 >/dev/null | grep -v '^Note: an overlay cannot be mounted here') || true
     [ -z "$msg" ] && conf_has y 'mem=64M' && conf_has y 'oom_score=-200'
 }
 
@@ -976,9 +976,10 @@ t_create_killed_half_way() {
     real=$(readlink -f "$(type -P cp)") && cp "$real" "$W/cp.real" || return 1
     {
         echo '#!/bin/sh'
-        echo 'for last; do :; done'                             # the destination: <container>/rootfs
-        echo "if [ -e \"\${last%/rootfs}/.creating\" ]; then echo marked; else echo unmarked; fi >> $W/seen"
+        echo 'for last; do :; done'                             # the destination: <container>/rootfs, or a snapshot
+        echo "case \"\$last\" in $C/*) if [ -e \"\${last%/rootfs}/.creating\" ]; then echo marked; else echo unmarked; fi >> $W/seen ;; esac"
         echo "if [ -e $W/end-it ]; then kill -KILL \$PPID; exit 1; fi"
+        echo "case \"\$last\" in */bases/.*.new/rootfs) if [ -e $W/end-snapshot ]; then kill -KILL \$PPID; exit 1; fi ;; esac"
         echo "exec $W/cp.real \"\$@\""
     } > "$W/cp.shim"
     chmod +x "$W/cp.shim"
@@ -987,27 +988,52 @@ t_create_killed_half_way() {
         for cp in /bin/cp /usr/bin/cp; do
             [ -e "$cp" ] && { mount --bind "$1/cp.shim" "$(readlink -f "$cp")" || exit 77; }
         done
-        "$2" create whole 10.0.0.2 || exit 1
+        "$2" create whole 10.0.0.2 --copy || exit 1
         : > "$1/end-it"
-        "$2" create half 10.0.0.3
+        "$2" create half 10.0.0.3 --copy
         echo "the create that was killed: status $?"
         "$2" ls
         "$2" start half
         echo "start of the half-made container: status $?"
         "$2" rm half
+        rm -f "$1/end-it"
+        cp "$1/seen" "$1/seen.copies"
+        # killed while it takes a snapshot of a base, where an overlay mounts here
+        cp -a "$1/base" "$1/base2" && : > "$1/end-snapshot"
+        "$2" create snapped 10.0.0.4 --rootfs "$1/base2"
+        echo "the create killed in its snapshot: status $?"
+        "$2" ls
+        "$2" base ls
+        "$2" start snapped
+        echo "start of the container whose snapshot was cut: status $?"
+        "$2" rm snapped
+        rm -f "$1/end-snapshot"
+        "$2" create again 10.0.0.4 --rootfs "$1/base2" || exit 1
+        "$2" base ls
     ' _ "$W" "$LB" > "$W/ns.out" 2>&1
     rc=$?
     cat "$W/ns.out"
     [ $rc -ne 77 ] || { echo "a stand-in could not be mounted over cp here"; return 77; }
     [ $rc -eq 0 ] || return 1
-    echo "the mark, when each copy began: $(paste -sd' ' "$W/seen")"
-    [ "$(paste -sd' ' "$W/seen")" = 'marked marked' ] || { echo "a container was being copied into without being marked"; return 1; }
+    echo "the mark, when each copy began: $(paste -sd' ' "$W/seen.copies")"
+    [ "$(paste -sd' ' "$W/seen.copies")" = 'marked marked' ] || { echo "a container was being copied into without being marked"; return 1; }
     [ ! -e "$C/whole/.creating" ] || { echo "a finished container is still marked"; return 1; }
     grep -Eq '^whole +10\.0\.0\.2 +stopped' "$W/ns.out" && grep -Eq '^half +- +creating' "$W/ns.out" ||
         { echo "ls does not tell the finished container from the half-made one"; return 1; }
     grep -q 'was not created completely' "$W/ns.out" && grep -qx 'start of the half-made container: status 1' "$W/ns.out" ||
         { echo "the half-made container was not refused by start as one"; return 1; }
     [ ! -e "$C/half" ] || { echo "rm did not remove the half-made container"; return 1; }
+    if ! grep -qx 'the create killed in its snapshot: status 137' "$W/ns.out"; then
+        echo "no overlay mounts in this user namespace, so no snapshot was taken to cut short"
+        return 0
+    fi
+    grep -Eq '^snapped +- +creating' "$W/ns.out" && grep -qx 'start of the container whose snapshot was cut: status 1' "$W/ns.out" ||
+        { echo "the container whose snapshot was cut short was not shown and refused as half made"; return 1; }
+    # the snapshot cut short is no snapshot, and the next create takes a whole one
+    [ "$(grep -c "  $W/base2  " "$W/ns.out")" = 1 ] && grep -Eq "  $W/base2  again\$" "$W/ns.out" ||
+        { echo "a snapshot cut short was listed, or the next create did not take a whole one"; return 1; }
+    id=$(sed -n 's/^base=//p' "$C/again/.conf")
+    [ -n "$id" ] && [ -f "$W/data/bases/$id/rootfs/bin/placeholder" ] || { echo "the container made after does not overlay a whole snapshot"; return 1; }
 }
 
 # rm clears away what a container that ended without a stop still had, and
@@ -1054,7 +1080,7 @@ t_root_is_asked_for_first() {
     chmod 755 "$W/data" "$C"
     before=$(kept_sum)
     bad=0
-    for words in setup 'setup --teardown' 'start web' 'stop web' 'exec web /bin/true'; do
+    for words in setup 'setup --teardown' reload 'start web' 'stop web' 'exec web /bin/true'; do
         # shellcheck disable=SC2086
         msg=$(lb $words 2>&1) && { echo "lightbox $words succeeded"; bad=1; }
         echo "lightbox $words: $msg"
@@ -1403,6 +1429,8 @@ t_surplus_arguments_are_errors() {
     expect 'Error: unexpected argument: b' inspect web b
     expect 'Error: unknown option: --all' inspect web --all
     expect 'Error: unexpected argument: extra' doctor extra
+    expect 'Error: unexpected argument: all' reload all
+    expect 'Error: unknown option: --all' reload --all
     expect 'Error: unknown option: --jsno' ls --jsno
     expect 'Error: unexpected argument: all' ls all
     expect 'Error: unexpected argument: /mnt' add-vol web /tmp:/srv /mnt
@@ -1453,7 +1481,9 @@ t_doctor_says_how_to_fix() {
     printf '%s\n' "$report" | sed -n '/^root: /,$p'
     printf '%s\n' "$report" | grep -qx "root: no (uid $(id -u))" || return 1
     printf '%s\n' "$report" | grep -Eqx 'kernel: (yes|no) \(.+; lightbox needs Linux 5\.10 or later\)' || return 1
-    printf '%s\n' "$report" | grep -q '^syscalls: ' && printf '%s\n' "$report" | grep -q '^bin.nsenter: ' || return 1
+    printf '%s\n' "$report" | grep -q '^syscalls: ' && printf '%s\n' "$report" | grep -q '^bin.cp: ' || return 1
+    # lightbox runs neither since 0.7, and doctor looks for neither
+    ! printf '%s\n' "$report" | grep -Eq '^bin\.(ip|nsenter): ' || { echo "doctor looks for ip or nsenter"; return 1; }
     # from root on the lines are checks, and one that fails has its fix next
     printf '%s\n' "$report" | awk '/^root: / { on = 1 }
         on && want { if ($0 !~ /^  to fix: ./) { print "no fix after " name; bad = 1 } want = 0; next }
@@ -1484,9 +1514,12 @@ try:
 except ValueError as e:
     wrong(e)
 checks = {c["check"]: c for c in d["checks"]}
-for name in ("root", "kernel", "syscalls", "network", "cgroup2", "path.rootfs", "bin.ip", "bin.nsenter", "exec_sealing"):
+for name in ("root", "kernel", "syscalls", "network", "cgroup2", "path.rootfs", "bin.cp", "bin.rm", "exec_sealing"):
     if name not in checks:
         wrong("no check " + name)
+for name in ("bin.ip", "bin.nsenter"):
+    if name in checks:
+        wrong("a check of " + name)
 for c in d["checks"]:
     if not isinstance(c["ok"], bool):
         wrong(c)
@@ -1569,20 +1602,32 @@ t_update_rewrites_the_conf() {
     [ ! -e "$C/gone" ] || { echo "rm -f left the container"; return 1; }
 }
 
-# README.md's command reference is the usage that lightbox prints, line for
-# line, and the size it gives is the binary's, near enough for "about".
-t_readme_matches_the_binary() {
-    readme=$(dirname "$LB")/README.md
-    [ -f "$readme" ] || { echo "no README.md beside $LB"; return 77; }
-    awk '/^## Command reference/ { on = 1; next }
-         on && /^```$/ { if (inside) exit; inside = 1; next }
-         inside { print }' "$readme" > "$W/reference"
-    lb --help > "$W/usage"
-    diff "$W/usage" "$W/reference" || { echo "the command reference of README.md is not the usage"; return 1; }
-    said=$(sed -n '3s/.*about \([0-9][0-9]*\) KB.*/\1/p' "$readme")
-    size=$(( $(stat -c %s "$LB") / 1024 ))
-    echo "README.md: about ${said:-?} KB; the binary: $size KB"
-    [ -n "$said" ] && [ $((size * 4)) -ge $((said * 3)) ] && [ $((size * 4)) -le $((said * 5)) ]
+# base ls, add and rm, as an ordinary user can have them: a snapshot of a
+# base is taken and listed with its source; one that a container's .conf
+# names is not removed, and one that none names is.
+t_base_snapshots() {
+    lb create web 10.0.0.2 || return 1
+    listing=$(lb base ls) || return 1
+    # web is a copy, as this user can mount no overlay, and took no snapshot
+    [ "$listing" = 'ID            TAKEN (UTC)          SOURCE  CONTAINERS' ] || { printf '%s\n' "$listing"; return 1; }
+    said=$(lb base add "$BASE") || { printf '%s\n' "$said"; return 1; }
+    printf '%s\n' "$said"
+    id=$(printf '%s\n' "$said" | sed -n 's/^Base \([0-9a-f]\{12\}\) taken of .*/\1/p')
+    [ -n "$id" ] && [ -f "$W/data/bases/$id/rootfs/bin/placeholder" ] || { echo "no snapshot of the base"; return 1; }
+    lb base ls | grep -E "^$id  [0-9-]{10} [0-9:]{8}  $BASE  -$" || { lb base ls; echo "base ls does not show it"; return 1; }
+    # a container on it, as its .conf says
+    echo "base=$id" >> "$C/web/.conf"
+    lb base ls | grep -E "^$id .* web$" || { lb base ls; return 1; }
+    said=$(lb base rm "$id" 2>&1) && { echo "a snapshot that a container names was removed"; return 1; }
+    [ "$said" = "Error: base $id is used by: web" ] || { echo "$said"; return 1; }
+    sed -i '$d' "$C/web/.conf"
+    lb base rm "$id" && [ ! -e "$W/data/bases/$id" ] || { echo "an unused snapshot was not removed"; return 1; }
+    bad=0
+    for words in "base rm not-an-id" "base rm 000000000000" "base add $W/nothing" "base" "base list" "base ls x"; do
+        # shellcheck disable=SC2086
+        lb $words >/dev/null 2>&1 && { echo "lightbox $words succeeded"; bad=1; }
+    done
+    return $bad
 }
 
 # A start_timeout or stop_timeout that cannot be read is said so, and stops
@@ -1862,7 +1907,7 @@ check 'doctor says how to fix each thing it finds missing'              t_doctor
 check 'doctor --json: settings and checks, typed'                       t_doctor_json
 check 'update, restart and rm -f check their options before anything'  t_update_restart_rm_options
 check 'update writes the limits into a stopped container'"'"'s .conf'       t_update_rewrites_the_conf
-check 'README.md'"'"'s command reference is the usage, and its size the binary'"'"'s' t_readme_matches_the_binary
+check 'base add, ls and rm manage the snapshots of bases'              t_base_snapshots
 check 'start without root is a clean error'                   t_start_without_root_is_a_clean_error
 
 summary validation

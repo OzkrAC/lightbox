@@ -6,8 +6,10 @@
 #   sudo tests/lifecycle.sh [path/to/lightbox]          default: ./lightbox
 #
 # Needs root, a kernel with bridge, veth and cgroup v2, the host tools lightbox
-# itself needs (iproute2, iptables, util-linux) and a statically linked busybox
-# to build the containers' root filesystem from.
+# needs (iptables, coreutils), those the suite looks with (iproute2,
+# util-linux) and a statically linked busybox to build the containers' root
+# filesystem from. lightbox runs neither ip nor nsenter: every case runs with
+# both masked, and the last but one looks that nothing ran them.
 #
 # The host is not used and nothing is left on it. The suite runs itself again
 # in private network, mount and PID namespaces with a throwaway configuration:
@@ -713,7 +715,8 @@ t_exec_user_is_strict() {
 # An account is found wherever it is in the container's passwd, and is the
 # container's: the file is read inside it, to its end.
 t_exec_finds_a_late_account() {
-    up late || return 1
+    # a copy: the accounts are added from the host to a file of the base
+    up late --copy || return 1
     {
         for i in $(seq 1 200); do echo "filler$i:x:$((20000 + i)):$((20000 + i)):an account to fill the file:/home/filler$i:/bin/sh"; done
         echo 'a-late-user-with-a-long-name:x:4800:4800::/home/late:/bin/sh'
@@ -919,7 +922,8 @@ t_rmvol_applies_at_next_start() {
 t_conf_from_before_starts() {
     mkdir -p "$T/vol/old"
     echo old > "$T/vol/old/in"
-    box before || return 1
+    # a copy, as every container from before 0.7 is: the .conf of then names no snapshot
+    box before --copy || return 1
     printf 'mem=32M\npids=40\ncpu=2\noom_score=200\nnote=by hand\nvol=%s:/old:ro\n' "$T/vol/old" > "$C/before/.conf"
     start before || return 1
     pid=$(pid_of before)
@@ -1147,7 +1151,7 @@ EOF
 # lightbox mounts by itself. With the host's mount turned into something that
 # only records being run, and none in the image, a container starts and stops.
 t_start_needs_no_mount_tool() {
-    box nomount || return 1
+    box nomount --copy || return 1      # a copy, as files of the base are taken out of it
     rm -f "$C/nomount/rootfs/bin/mount" "$C/nomount/rootfs/usr/bin/mount"
     tool=$(type -P mount) || { echo "this host has no mount to stand in for"; return 77; }
     shim "$tool" "echo \"\$*\" >> '$T/mount.ran'; exit 97" || return 1
@@ -1162,7 +1166,7 @@ t_start_needs_no_mount_tool() {
 }
 
 t_image_without_mount_points() {
-    box bare || return 1
+    box bare --copy || return 1         # a copy, as directories of the base are taken out of it
     for d in dev proc sys tmp run var; do rm -rf -- "$C/bare/rootfs/$d"; done
     start bare || return 1
     [ "$(sh_in bare 'echo x > /dev/null && cat /proc/1/comm > /dev/null && ls /sys > /dev/null && echo x > /tmp/a && echo fine')" = fine ]
@@ -1700,16 +1704,26 @@ EOF
     nothing_left survivor
 }
 
-# start stands still in nsenter, between the clone and the byte that releases
-# init. Killed there, it must not leave init behind.
+# start stands still in the firewall transaction of the container's links,
+# after init is built and before the byte that lets it run its hook. Killed
+# there, it must not leave init behind. (Until 0.7 it stood still in nsenter,
+# before the first byte; nothing is run there any more.)
 t_killed_start_leaves_no_container() {
-    box orphan || return 1
-    nsenter_path=$(first_existing /usr/bin/nsenter /bin/nsenter /usr/sbin/nsenter /sbin/nsenter)
-    shim "$nsenter_path" ": > '$T/nsenter.reached'; sleep 5; exec \"\$REAL\" \"\$@\"" || return 1
+    box orphanpeer && box orphan --link orphanpeer || return 1
+    restore=$(first_existing /usr/sbin/iptables-restore /sbin/iptables-restore /usr/bin/iptables-restore /bin/iptables-restore)
+    real=$(readlink -f "$restore")
+    cp "$real" "$T/real/iptables-program" || return 1
+    # iptables, iptables-save and iptables-restore may be one program that
+    # does what it is called: the stand-in passes the others on by their name
+    printf '#!/bin/bash\ncase ${0##*/} in *-restore) : > %s; sleep 5; exit 1 ;; esac\nexec -a "$0" %s "$@"\n' \
+        "'$T/restore.reached'" "'$T/real/iptables-program'" > "$T/shim/iptables-program" &&
+        chmod 755 "$T/shim/iptables-program" || return 1
+    mount --bind "$T/shim/iptables-program" "$real" && echo "$real" >> "$T/shims" || return 1
     "$LB" start orphan >"$OUT/orphan.start" 2>&1 </dev/null &
     starter=$!
     echo "$starter" >> "$T/background"
-    wait_until 10 test -e "$T/nsenter.reached" || { echo "start did not reach nsenter:"; cat "$OUT/orphan.start"; return 1; }
+    wait_until 10 test -e "$T/restore.reached" ||
+        { echo "start did not reach the firewall transaction:"; cat "$OUT/orphan.start"; return 1; }
     init=$(children_of "$starter" "$(basename "$LB" | cut -c1-15)")
     [ -n "$init" ] || { echo "the starter has no cloned child"; return 1; }
     kill -KILL "$starter"
@@ -1999,18 +2013,27 @@ t_start_spares_foreign_interface() {
     ip -d link show dev "$port" | grep -q 'veth' || { echo "the interface is not the container's veth"; return 1; }
 }
 
-# A start that fails after it made the container's interface takes it away,
-# though the interface has no alias yet: it gets one as it joins the bridge,
-# and here the ip that would do that refuses, before it changes anything.
+# A start that fails after it made the container's interface takes it away.
+# Here a veth has the bridge's name: it takes no ports, and the kernel refuses
+# the container's interface as one (EOPNOTSUPP).
 t_start_fails_at_the_bridge() {
-    ip_path=$(first_existing /sbin/ip /usr/sbin/ip /bin/ip /usr/bin/ip)
-    shim "$ip_path" 'case " $* " in *" alias lightbox:"*" master "*) echo "refused here" >&2; exit 2 ;; esac
-exec "$REAL" "$@"' || return 1
     box nobridge || return 1
-    said=$(lb start nobridge 2>&1 </dev/null) && { echo "start went ahead without its bridge"; return 1; }
+    ip link set dev "$BR" down && ip link set dev "$BR" name lbt-realbr || return 1
+    ip link add "$BR" type veth peer name lbt-notbr || { put_the_bridge_back; return 1; }
+    said=$(lb start nobridge 2>&1 </dev/null)
+    rc=$?
+    put_the_bridge_back || { echo "the bridge could not be put back"; return 1; }
     printf '%s\n' "$said"
-    case $said in *"failed to attach the container's interface to the bridge"*) ;; *) return 1 ;; esac
+    [ $rc -ne 0 ] || { echo "start went ahead without its bridge"; return 1; }
+    case $said in *"failed to attach the container's interface to the bridge (errno 95)"*) ;; *) return 1 ;; esac
     nothing_left nobridge
+}
+
+# what t_start_fails_at_the_bridge took away, back, wherever it stopped
+put_the_bridge_back() {
+    ip link show dev lbt-realbr >/dev/null 2>&1 || return 0
+    ip link delete "$BR" 2>/dev/null
+    ip link set dev lbt-realbr name "$BR" && ip link set dev "$BR" up
 }
 
 # The host's end of a container's interface carries lightbox's alias, and the
@@ -2094,15 +2117,12 @@ t_doctor_names_what_is_missing() {
             { echo "$check is not said to fail, with: $fix"; return 1; }
     }
     lb doctor >/dev/null || { lb doctor; echo "doctor finds something missing before anything is broken"; return 1; }
-    nsenter_path=$(first_existing /usr/bin/nsenter /bin/nsenter /usr/sbin/nsenter /sbin/nsenter)
-    mount --bind /dev/null "$nsenter_path" || return 1
-    breaks bin.nsenter 'install util-linux' lb doctor; rc=$?
-    umount "$nsenter_path" || return 1
+    cp_path=$(readlink -f "$(type -P cp)")
+    mount --bind /dev/null "$cp_path" || return 1
+    breaks bin.cp 'install coreutils' lb doctor; rc=$?
+    umount "$cp_path" || return 1
     [ $rc = 0 ] || return 1
-    ip_path=$(first_existing /sbin/ip /usr/sbin/ip /bin/ip /usr/bin/ip)
-    shim "$ip_path" 'case "$1" in -V) echo "ip: invalid option -- '"'"'V'"'"'"; echo "BusyBox v1.36.1 multi-call binary." ;; *) exec "$REAL" "$@" ;; esac' || return 1
-    breaks bin.ip 'install iproute2' lb doctor || return 1
-    umount -l "$ip_path" && : > "$T/shims"
+    lb doctor | grep -E '^bin\.(ip|nsenter): ' && { echo "doctor looks for a tool lightbox does not run"; return 1; }
     mkdir -p "$T/emptyroot" "$T/notcg"
     alt_conf docrootfs "rootfs = $T/emptyroot" || return 1
     breaks path.rootfs 'put a root filesystem there' alt_lb doctor || return 1
@@ -2173,63 +2193,70 @@ t_rm_force() {
     nothing_left rmf
 }
 
-# ─── Cases: the README ──────────────────────────────────────────────────────
+# ─── Cases: the root as an overlay of a snapshot ────────────────────────────
 
-# The quick start of README.md: every command of its fenced blocks, as it is
-# written, in order, in one shell that stops at the first that fails. It runs
-# from a directory where ./lightbox is the binary under test, with /opt and
-# /srv a tmpfs of this mount namespace's, and a configuration of its own with
-# the README's network, 10.0.0.0/24, on a bridge of its own. The download is
-# the one thing done otherwise, as this network namespace reaches no
-# internet: wget writes a tarball of the suite's root filesystem by the name
-# it is asked for. Step 5's hook is the /init.sh of a container that starts.
-t_readme_quick_start() {
-    readme=$HERE/../README.md
-    [ -f "$readme" ] || { echo "no README.md"; return 77; }
-    [ -d /opt ] && [ -d /srv ] || { echo "this host has no /opt or /srv to put a tmpfs on"; return 77; }
-    mount -t tmpfs lbt-opt /opt && echo /opt >> "$T/shims" &&
-        mount -t tmpfs lbt-srv /srv && echo /srv >> "$T/shims" || return 1
-    qs=$T/quickstart
-    mkdir -p "$qs/dir" "$qs/image" || return 1
-    ln -sf "$LB" "$qs/dir/lightbox"
-    # the image: the suite's root filesystem, with what the quick start reads in it
-    cp -a "$BASE/." "$qs/image/" && printf 'NAME="lightbox test image"\nID=lbtest\n' > "$qs/image/etc/os-release" &&
-        add_account "$qs/image/etc/passwd" nobody 'nobody:x:65534:65534:nobody:/:/bin/sh' || return 1
-    printf '%s\n' "lightbox_dir = $qs/data" "run_dir = $qs/run" "cgroup_root = /sys/fs/cgroup" "cgroup_base = $CG/qs" \
-        "bridge = lbt-qs" "subnet = 10.0.0.0/24" "gw = 10.0.0.1" > "$qs/lightbox.conf"
-    # steps 1 to 4 as one script, and step 5's block as a hook
-    awk -v hook="$qs/init.sh" '
-        /^## Quick start/ { on = 1; next }
-        on && /^## / { exit }
-        on && /^### / { step = $2 }
-        on && /^```sh$/ { inside = 1; next }
-        inside && /^```$/ { inside = 0; next }
-        inside && step == "5." { print > hook; next }
-        inside { print }' "$readme" > "$qs/script.sh"
-    commands=$(grep -cvE '^[[:space:]]*(#|$)' "$qs/script.sh")
-    echo "commands in the quick start of README.md: $commands"
-    [ "$commands" -ge 30 ] && [ -s "$qs/init.sh" ] || { echo "the quick start was not found whole"; return 1; }
-    wget() { local url; for url; do :; done; tar -C "$qs/image" -czf "${url##*/}" .; }
-    export -f wget
-    export qs LIGHTBOX_CONFIG="$qs/lightbox.conf"
-    ( cd "$qs/dir" && PS4='+ ' bash -e -x "$qs/script.sh" ) > "$OUT/quickstart" 2>&1 </dev/null
-    rc=$?
-    if [ $rc != 0 ]; then
-        # what stopped it first, for a report that shows only the first lines
-        echo "the quick start stopped at: $(grep '^+ ' "$OUT/quickstart" | tail -n 1)"
-        tail -n 12 "$OUT/quickstart"
-        echo "--- the commands that ran:"
-        grep '^+ ' "$OUT/quickstart"
-        return 1
-    fi
-    ran=$(grep -c '^+ ' "$OUT/quickstart")
-    [ "$ran" -ge "$commands" ] || { echo "$ran commands ran of $commands"; grep '^+ ' "$OUT/quickstart"; return 1; }
-    # step 5: its block as the /init.sh of a container from the quick start's image
-    said=$(cd "$qs/dir" && ./lightbox create hooked --rootfs /opt/rootfs/alpine 2>&1 &&
-           cp "$qs/init.sh" "$qs/data/containers/hooked/rootfs/init.sh" &&
-           ./lightbox start hooked 2>&1 && ./lightbox stop hooked 2>&1) ||
-        { echo "a container with step 5's /init.sh did not start and stop:"; printf '%s\n' "$said"; return 1; }
-    echo "$ran commands of the quick start ran, and step 5's hook started a container"
+base_of() { sed -n 's/^base=//p' "$C/$1/.conf"; }
+
+# Two containers of one base overlay one snapshot of it, and each has only
+# its own files in its rootfs/: what create wrote, and what it writes. The
+# base's files are there in the container, what it changes and takes out is
+# changed in rootfs/ only, and a change of the base afterwards reaches no
+# container.
+t_overlay_root() {
+    box ov1 && box ov2 || return 1
+    id=$(base_of ov1)
+    echo "base snapshot: $id; of ov2: $(base_of ov2)"
+    [ -n "$id" ] && [ "$(base_of ov2)" = "$id" ] || { echo "the two do not overlay one snapshot"; return 1; }
+    snap=$T/lb/bases/$id/rootfs
+    [ -x "$snap/bin/busybox" ] || { echo "the snapshot has no busybox"; return 1; }
+    lb inspect ov1 | grep -x 'storage: overlay' && lb inspect ov1 | grep -x "base: $id" || return 1
+    own=$(cd "$C/ov1/rootfs" && find . -type f | sort | paste -sd' ' -)
+    echo "ov1's own files: $own"
+    [ "$own" = './etc/hostname ./etc/hosts ./etc/resolv.conf' ] || { echo "rootfs/ has more than create wrote"; return 1; }
+    start ov1 || return 1
+    [ "$(sh_in ov1 'test -x /bin/busybox && cat /etc/hostname')" = ov1 ] || { echo "the base or the hostname is not there"; return 1; }
+    sh_in ov1 'echo mine > /made-here && rm /etc/group' || return 1
+    [ "$(cat "$C/ov1/rootfs/made-here")" = mine ] || { echo "what the container wrote is not in its rootfs/"; return 1; }
+    [ ! -e "$snap/made-here" ] && [ -e "$snap/etc/group" ] || { echo "the snapshot was changed"; return 1; }
+    sh_in ov1 'test ! -e /etc/group' || { echo "a file taken out in the container is still there"; return 1; }
+    echo later > "$BASE/added-later"
+    sh_in ov1 'test ! -e /added-later' || { rm -f "$BASE/added-later"; echo "a change of the base reached the container"; return 1; }
+    rm -f "$BASE/added-later"
+    lb stop ov1 >/dev/null && start ov1 || return 1
+    [ "$(sh_in ov1 'cat /made-here')" = mine ] || { echo "what the container wrote did not outlast a restart"; return 1; }
+}
+
+# --copy: a copy of the base, as before 0.7, with no snapshot of its own.
+t_copy_root() {
+    box cp1 --copy || return 1
+    [ -z "$(base_of cp1)" ] || { echo "a copy has a base snapshot: $(base_of cp1)"; return 1; }
+    [ -x "$C/cp1/rootfs/bin/busybox" ] || { echo "rootfs/ is not a copy of the base"; return 1; }
+    lb inspect cp1 | grep -x 'storage: copy' && lb inspect cp1 | grep -x 'base: -' || return 1
+    start cp1 && [ "$(sh_in cp1 'cat /etc/hostname')" = cp1 ]
+}
+
+# base ls names each snapshot, its base and the containers on it; base rm
+# refuses one that a container uses and removes one that none does; base add
+# takes a new snapshot, which the containers made after it overlay.
+t_base_commands() {
+    box bu1 || return 1
+    old=$(base_of bu1)
+    listing=$(lb base ls) || return 1
+    printf '%s\n' "$listing"
+    printf '%s\n' "$listing" | grep -E "^$old  [0-9-]{10} [0-9:]{8}  $BASE  .*bu1" || { echo "base ls does not show bu1 on $old"; return 1; }
+    said=$(lb base rm "$old" 2>&1) && { echo "a snapshot in use was removed"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *"is used by: "*bu1*) ;; *) return 1 ;; esac
+    said=$(lb base add "$BASE") || return 1
+    printf '%s\n' "$said"
+    new=$(printf '%s\n' "$said" | sed -n 's/^Base \([0-9a-f]\{12\}\) taken of .*/\1/p')
+    [ -n "$new" ] && [ "$new" != "$old" ] || { echo "base add took no new snapshot"; return 1; }
+    box bu2 || return 1
+    [ "$(base_of bu2)" = "$new" ] || { echo "a container made after base add does not overlay the new snapshot"; return 1; }
+    [ "$(base_of bu1)" = "$old" ] || return 1
+    lb rm bu1 >/dev/null && lb base rm "$old" || { echo "a snapshot that nothing uses was not removed"; return 1; }
+    [ ! -e "$T/lb/bases/$old" ] || return 1
+    refused lb base rm 000000000000 && refused lb base rm not-an-id
 }
 
 # ─── Cases: where the settings are ──────────────────────────────────────────
@@ -2298,6 +2325,71 @@ t_nft_start_after_the_tables_went() {
         { echo "the tables or the bridge are not there"; return 1; }
     LIGHTBOX_CONFIG="$ALT_CONF" start nrelinked || return 1
     reaches nrelinked "$(addr_of nrepeer)" && reaches nrelinked "$OUTSIDE"
+}
+
+# iptables as it is, without counters and comments
+saved_rules() { iptables-save | grep -v '^#' | sed -E 's/ \[[0-9]+:[0-9]+\]$//'; }
+
+# what a firewall's reload or flush does to lightbox's rules, its policy left
+flush_firewall() {
+    iptables -F && iptables -X && iptables -t nat -F && iptables -t nat -X
+}
+
+# A firewall's flush took lightbox's rules while containers ran, and the link
+# no longer holds. reload puts in again what setup made and the links of the
+# linked container that runs, as they were, and a second reload changes
+# nothing. A container without links has none to put back.
+t_reload_puts_back_what_a_flush_took() {
+    need_nc || return 77
+    up rlpeer && up rllinked --link rlpeer && up rlalone || return 1
+    reaches rllinked "$(addr_of rlpeer)" || { echo "the link did not hold before the flush"; return 1; }
+    before=$(saved_rules)
+    flush_firewall || return 1
+    ! reaches rllinked "$(addr_of rlpeer)" || { echo "the link held without its rules"; return 1; }
+    lb reload >"$OUT/reload" 2>&1 || { cat "$OUT/reload"; return 1; }
+    cat "$OUT/reload"
+    grep -qx "The links of container 'rllinked' are in again" "$OUT/reload" || return 1
+    ! grep -q "'rlalone'\|'rlpeer'" "$OUT/reload" || { echo "reload put in links of a container that has none"; return 1; }
+    [ "$(saved_rules)" = "$before" ] ||
+        { echo "the rules are not as they were:"; diff <(printf '%s\n' "$before") <(saved_rules); return 1; }
+    reaches rllinked "$(addr_of rlpeer)" && reaches rllinked "$OUTSIDE" || return 1
+    lb reload >"$OUT/reload2" 2>&1 || { cat "$OUT/reload2"; return 1; }
+    [ "$(saved_rules)" = "$before" ] ||
+        { echo "a second reload changed the rules:"; diff <(printf '%s\n' "$before") <(saved_rules); return 1; }
+    reaches rllinked "$(addr_of rlpeer)"
+}
+
+# The same flush, and then a start: it makes setup's rules again, puts back
+# the links of the linked container that runs, and leaves the rules as they
+# were before the flush.
+t_start_after_a_flush_puts_back_links() {
+    need_nc || return 77
+    up sfpeer && up sflinked --link sfpeer || return 1
+    before=$(saved_rules)
+    flush_firewall || return 1
+    up sfnew || return 1
+    grep -q 'making it again' "$OUT/sfnew.start" && grep -qx "The links of container 'sflinked' are in again" "$OUT/sfnew.start" ||
+        { echo "start did not make the network again and put back the links"; return 1; }
+    [ "$(saved_rules)" = "$before" ] ||
+        { echo "the rules are not as they were:"; diff <(printf '%s\n' "$before") <(saved_rules); return 1; }
+    reaches sflinked "$(addr_of sfpeer)"
+}
+
+# With nftables: the tables went while a linked container ran. reload makes
+# them again, with the container's link in the set.
+t_nft_reload() {
+    need_nc || return 77
+    nft_setup nftrl; rc=$?; [ $rc = 0 ] || return $rc
+    box nrlpeer && box nrllinked --link nrlpeer || return 1
+    LIGHTBOX_CONFIG="$ALT_CONF" start nrlpeer && LIGHTBOX_CONFIG="$ALT_CONF" start nrllinked || return 1
+    port=$(port_of nrllinked)
+    nft delete table ip lightbox && nft delete table bridge lightbox || return 1
+    alt_lb reload >"$OUT/nreload" 2>&1 || { cat "$OUT/nreload"; return 1; }
+    cat "$OUT/nreload"
+    grep -qx "The links of container 'nrllinked' are in again" "$OUT/nreload" || return 1
+    nft list set bridge lightbox links
+    nft list set bridge lightbox links | grep -qF "\"$port\"" || { echo "the link is not in the set"; return 1; }
+    reaches nrllinked "$(addr_of nrlpeer)" && reaches nrllinked "$OUTSIDE"
 }
 
 # setup --teardown does nothing while a container runs, and says which. With
@@ -2560,7 +2652,43 @@ EOF
     echo 1 > "$T/next_ip"
     : > "$T/shims"
     : > "$T/background"
-    build_rootfs && network && links_now > "$T/links.before"
+    build_rootfs && network && links_now > "$T/links.before" && mask_ip_and_nsenter
+}
+
+# lightbox runs neither ip nor nsenter since 0.7 (ROADMAP 7.2). In this mount
+# namespace both are stand-ins that note who ran them and fail, so that a
+# command of lightbox's that ran one fails where it ran it, and a case at the
+# end looks at the notes. The suite looks with the real ones, copied to
+# $T/bin, which is first in PATH.
+mask_ip_and_nsenter() {
+    local tool path real masked=" "
+    mkdir -p "$T/bin" "$T/mask" && : > "$T/masked.ran" || return 1
+    for tool in ip nsenter; do
+        path=$(type -P "$tool") && cp -L "$path" "$T/bin/$tool" || return 1
+        printf '#!/bin/sh\necho "%s $*" >> %s\nexit 127\n' "$tool" "'$T/masked.ran'" > "$T/mask/$tool" &&
+            chmod 755 "$T/mask/$tool" || return 1
+        for path in "/sbin/$tool" "/usr/sbin/$tool" "/bin/$tool" "/usr/bin/$tool"; do
+            [ -e "$path" ] || continue
+            real=$(readlink -f "$path")
+            case $masked in *" $real "*) continue ;; esac
+            mount --bind "$T/mask/$tool" "$real" || return 1
+            masked="$masked$real "
+        done
+    done
+    export PATH="$T/bin:$PATH"
+}
+
+# Every case ran with ip and nsenter masked: nothing ran either of them.
+t_no_ip_or_nsenter_ran() {
+    local tool path
+    [ -e "$T/masked.ran" ] || { echo "ip and nsenter were not masked"; return 1; }
+    for tool in ip nsenter; do
+        for path in "/sbin/$tool" "/usr/sbin/$tool" "/bin/$tool" "/usr/bin/$tool"; do
+            [ -e "$path" ] || continue
+            cmp -s "$path" "$T/mask/$tool" || { echo "$path is not the stand-in"; return 1; }
+        done
+    done
+    [ ! -s "$T/masked.ran" ] || { echo "ran with ip and nsenter masked:"; cat "$T/masked.ran"; return 1; }
 }
 
 kill_cgroup() { # directory, after every cgroup below it
@@ -2597,9 +2725,10 @@ teardown() {
     for d in "$CG"/*/; do
         [ -d "$d" ] && kill_cgroup "${d%/}"
     done
-    for p in $(ip -o link show | awk -F': ' '{ sub(/@.*/, "", $2); print $2 }' | grep -E "^(vb-|ve-|lbt-foreign\$|lbt-qs\$|$WIDE_BR\$)"); do
+    for p in $(ip -o link show | awk -F': ' '{ sub(/@.*/, "", $2); print $2 }' | grep -E "^(vb-|ve-|lbt-foreign\$|$WIDE_BR\$)"); do
         ip link delete "$p"
     done
+    put_the_bridge_back
     [ -s "$T/firewall" ] && iptables-restore < "$T/firewall"
     # what a case of firewall_backend = nftables made, and the forwarding
     # setup turned on, which a case may have turned off
@@ -2612,7 +2741,7 @@ teardown() {
     find "$C" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
     # and the records of the ones that ran; a case may have taken run_dir away
     [ -d "$RUN" ] && find "$RUN" -mindepth 1 -maxdepth 1 ! -name .forwarding -exec rm -rf -- {} +
-    rm -f "$T/nsenter.reached" "$T/mount.ran"
+    rm -f "$T/restore.reached" "$T/mount.ran"
 } 2>/dev/null
 
 # ─── Stage: one case ────────────────────────────────────────────────────────
@@ -2805,9 +2934,15 @@ if [ "$MODE" = inside ]; then
     check 'after a reboot took the network, start makes it again'         t_start_after_a_reboot_of_the_network
     check 'a start where the network is there makes nothing'              t_start_with_the_network_there
     check 'nftables: after the tables went, start makes them again'       t_nft_start_after_the_tables_went
+    check 'reload puts back what a flush took: setup'"'"'s rules and the links of running containers' t_reload_puts_back_what_a_flush_took
+    check 'a start after a flush makes the rules again and puts back running containers'"'"' links' t_start_after_a_flush_puts_back_links
+    check 'nftables: reload makes the tables again, with the links of running containers' t_nft_reload
     check 'setup --teardown leaves the host as before the first setup'    t_setup_teardown
     check 'without --config or LIGHTBOX_CONFIG, /etc/lightbox/lightbox.conf is read' t_config_in_etc
-    check 'the quick start of README.md runs as it is written'             t_readme_quick_start
+    check 'a container overlays a snapshot of its base, and keeps its own files apart' t_overlay_root
+    check '--copy makes a container a copy of its base'                   t_copy_root
+    check 'base ls, base rm and base add manage the snapshots'            t_base_commands
+    check 'no case ran ip or nsenter, which were masked in every one'     t_no_ip_or_nsenter_ran
 
     # last: it may leave a kernel setting changed for the rest of this suite's life
     check 'exec works where a memfd may not be executed'                  t_exec_where_memfds_may_not_be_executed

@@ -122,10 +122,10 @@ jobs:
       # sudo drops the environment, so the suite's options are make variables.
       - name: Lifecycle suite
         run: sudo make CC=gcc-14 test-lifecycle GITHUB_ACTIONS=true LIGHTBOX_TEST_MODPROBE=1
-      # Wall time of the basic commands and the processes one start makes, to
-      # set beside bench/baseline.txt. A shared runner's clock is rough, so
-      # this reports and compares nothing. The numbers are a notice on the
-      # run's page.
+      # Wall time of the basic commands, the processes one start makes and
+      # creates from a base of 1 GB. A shared runner's clock is rough, so this
+      # reports and compares nothing. The numbers are a notice on the run's
+      # page.
       - name: Timing
         run: sudo make CC=gcc-14 bench GITHUB_ACTIONS=true
       - name: Kernel log

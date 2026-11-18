@@ -11,7 +11,17 @@
  *   unit input   <text> <program> [args...]   run_cmd_input, with <text> as its input; then
  *                                             "left open <n>": descriptors it left open
  *   unit names <name>                         host_port_name and link_chain_name, a line each
- *   unit owner <name> <listing>               port_owner_of_listing: absent, ours or foreign
+ *   unit owner <name> <alias>                 port_owner_of_alias: ours or foreign
+ *   unit port owner|remove <ifname> <name>    host_port_owner: absent, ours, foreign or unknown;
+ *                                             remove_own_port: "result <n>"
+ *   unit rtnl <request> [args...]             one rtnetlink request, "result <n>" or what it found:
+ *                                             index <ifname>; alias <ifname>; name <index>;
+ *                                             veth <ifname> <peer> <pid>; bridge <ifname>;
+ *                                             attach <ifname> <alias> <bridge>; isolate <ifname>;
+ *                                             up <ifname>; delete <ifname>;
+ *                                             addr <ifname> <address> <prefix>; route <gateway> <ifname>;
+ *                                             wan (the default route's interface, or none);
+ *                                             inside <address> <prefix> <gateway> (container_interface_up)
  *   unit chain <text>                         link_chain_ok: ok or refused
  *   unit firewall links <name> [<link>...]    firewall_links_text for a container with those links;
  *                                             links-into-64 gives it 64 bytes to write into
@@ -225,6 +235,70 @@ static void put_line(const char *label, const char *text) {
     put("\n");
 }
 
+static uint32_t ipv4_arg(const char *text) {
+    uint32_t addr;
+    if (!parse_ipv4(text, &addr))
+        die2("unit: not an IPv4 address: ", text);
+    return addr;
+}
+
+/* "unit rtnl <request> [args...]" */
+static int unit_rtnl(int argc, char **argv) {
+    const char *op = argv[0];
+    if (argc == 4 && streq(op, "inside")) {
+        put_result(container_interface_up(ipv4_arg(argv[1]), number_arg(argv[2]), ipv4_arg(argv[3])));
+        return 0;
+    }
+    rtnl nl;
+    int rc = rtnl_open(&nl);
+    if (rc < 0) {
+        put_result(rc);
+        return 0;
+    }
+    char text[256];
+    if (argc == 2 && streq(op, "index")) {
+        rc = rtnl_link_get(&nl, argv[1], NULL, 0);
+        if (rc > 0) { put_number("index", rc); rc = 0; }
+    } else if (argc == 2 && streq(op, "alias")) {
+        rc = rtnl_link_get(&nl, argv[1], text, sizeof(text));
+        if (rc > 0) { put_line("alias ", text); rc = 0; }
+    } else if (argc == 2 && streq(op, "name")) {
+        char name[IFNAME_TEXT_MAX];
+        rc = rtnl_link_name(&nl, number_arg(argv[1]), name);
+        if (rc == 0) put_line("name ", name);
+    } else if (argc == 4 && streq(op, "veth")) {
+        rc = rtnl_veth_add(&nl, argv[1], argv[2], number_arg(argv[3]));
+    } else if (argc == 2 && streq(op, "bridge")) {
+        rc = rtnl_bridge_add(&nl, argv[1]);
+    } else if (argc == 4 && streq(op, "attach")) {
+        int master = rtnl_link_get(&nl, argv[3], NULL, 0);
+        rc = master < 0 ? master : rtnl_link_attach(&nl, argv[1], argv[2], master);
+    } else if (argc == 2 && streq(op, "isolate")) {
+        rc = rtnl_port_isolate(&nl, argv[1]);
+    } else if (argc == 2 && streq(op, "up")) {
+        rc = rtnl_link_up(&nl, argv[1]);
+    } else if (argc == 2 && streq(op, "delete")) {
+        rc = rtnl_link_delete(&nl, argv[1]);
+    } else if (argc == 4 && streq(op, "addr")) {
+        int index = rtnl_link_get(&nl, argv[1], NULL, 0);
+        rc = index < 0 ? index : rtnl_addr_add(&nl, index, ipv4_arg(argv[2]), number_arg(argv[3]));
+    } else if (argc == 3 && streq(op, "route")) {
+        int index = rtnl_link_get(&nl, argv[2], NULL, 0);
+        rc = index < 0 ? index : rtnl_default_route_add(&nl, ipv4_arg(argv[1]), index);
+    } else if (argc == 1 && streq(op, "wan")) {
+        char name[IFNAME_TEXT_MAX];
+        rc = rtnl_default_route_index(&nl);
+        if (rc == 0) put("wan none\n");
+        else if (rc > 0 && (rc = rtnl_link_name(&nl, rc, name)) == 0) put_line("wan ", name);
+    } else {
+        rtnl_close(&nl);
+        die("unit: rtnl index|alias|name|veth|bridge|attach|isolate|up|delete|addr|route|wan|inside ...");
+    }
+    rtnl_close(&nl);
+    put_result(rc);
+    return 0;
+}
+
 /* a text helper's verdict and what it left in the buffer */
 static void put_text(bool whole, const char *text) {
     put_line(whole ? "whole " : "cut ", text);
@@ -240,6 +314,7 @@ static void put_config(const container_config *config) {
     put_number("readonly", config->read_only);
     put_line("io ", config->io[0] ? config->io : "-");
     put_line("swap ", config->swap[0] ? config->swap : "-");
+    put_line("base ", config->base[0] ? config->base : "-");
     for (int i = 0; i < config->nvols; i++) {
         put("vol ");
         put(config->vols[i].src);
@@ -646,13 +721,22 @@ int main(int argc, char **argv, char **envp) {
         return 0;
     }
     if (argc == 4 && streq(argv[1], "owner")) {
-        static char listing[4096];
-        if (!str_copy(listing, argv[3], sizeof(listing)))
-            die("unit: owner <name> <listing>");
-        port_owner owner = port_owner_of_listing(listing, argv[2]);
-        put(owner == PORT_OURS ? "ours\n" : owner == PORT_FOREIGN ? "foreign\n" : "absent\n");
+        port_owner owner = port_owner_of_alias(argv[3], argv[2]);
+        put(owner == PORT_OURS ? "ours\n" : owner == PORT_FOREIGN ? "foreign\n" : "other\n");
         return 0;
     }
+    if (argc == 5 && streq(argv[1], "port") && streq(argv[2], "owner")) {
+        port_owner owner = host_port_owner(argv[3], argv[4]);
+        put(owner == PORT_OURS ? "ours\n" : owner == PORT_FOREIGN ? "foreign\n" :
+            owner == PORT_ABSENT ? "absent\n" : "unknown\n");
+        return 0;
+    }
+    if (argc == 5 && streq(argv[1], "port") && streq(argv[2], "remove")) {
+        put_result(remove_own_port(argv[3], argv[4]));
+        return 0;
+    }
+    if (argc >= 3 && streq(argv[1], "rtnl"))
+        return unit_rtnl(argc - 2, argv + 2);
     if (argc == 3 && streq(argv[1], "chain")) {
         put(link_chain_ok(argv[2]) ? "ok\n" : "refused\n");
         return 0;

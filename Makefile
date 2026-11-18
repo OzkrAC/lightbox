@@ -74,7 +74,7 @@ CFLAGS  = $(CSTD) -O2 -DNDEBUG $(WARN) $(HARDEN) $(ARCH_CFLAGS) \
 LDFLAGS = -static -no-pie -nostdlib -nostartfiles -nodefaultlibs \
           -T $(LIGHTC)/lightc.ld
 
-SRCS = lightbox.c lightbox_meta.c lightbox_state.c lightbox_container.c lightbox_net.c lightbox_config.c lightbox_util.c
+SRCS = lightbox.c lightbox_meta.c lightbox_state.c lightbox_container.c lightbox_net.c lightbox_config.c lightbox_util.c lightbox_base.c lightbox_netlink.c
 OBJS = $(SRCS:.c=.o)
 DEPS = $(OBJS:.o=.d)
 
@@ -202,9 +202,8 @@ test-lifecycle:
 	@$(REQUIRE_BUILT)
 	bash tests/lifecycle.sh ./lightbox
 
-# Wall time of create, start, exec, stop and rm, and the processes one start
-# makes. As root, in the lifecycle suite's namespaces. bench/baseline.txt holds
-# the numbers from before Phase 1 of ROADMAP.md.
+# Wall time of create, start, exec, stop and rm, the processes one start makes,
+# and creates from a base of 1 GB. As root, in the lifecycle suite's namespaces.
 bench:
 	@$(REQUIRE_BUILT)
 	bash bench/bench.sh ./lightbox

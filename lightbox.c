@@ -724,7 +724,157 @@ static bool limit_option(int argc, char **argv, int *i, container_config *cfg) {
     return true;
 }
 
+/*
+ * The container's name and how it finds names: resolv.conf, its hostname,
+ * and its own name added to the image's hosts. These go into the image as
+ * the container will see it, with root as its root, so a link in the image,
+ * of etc or of any of the three files, cannot put them anywhere else. NULL,
+ * or what failed.
+ */
+static const char *write_etc_files(const char *root, const char *name, const char *ip, const char *resolv) {
+    char text[4096];
+    bool cut = false;
+    /* inside the container's own filesystem, so readable by its users */
+    if (write_file_in_root(root, "etc", "resolv.conf", resolv, MODE_PUBLIC_FILE) < 0)
+        return "failed to write resolv.conf";
+    size_t pos = str_append(text, 0, name, sizeof(text), &cut);
+    str_append(text, pos, "\n", sizeof(text), &cut);
+    if (cut || write_file_in_root(root, "etc", "hostname", text, MODE_PUBLIC_FILE) < 0)
+        return "failed to write the container's hostname file";
+
+    /* the image's hosts file, with the container's name added to it */
+    int had = read_file_in_root(root, "etc", "hosts", text, sizeof(text) - 64);
+    if (had < 0) {
+        print_str(STDERR, "Warning: the image's /etc/hosts is not a file that can be added to; it is left as it is\n");
+        return NULL;
+    }
+    pos = (size_t)had;
+    if (had == 0)
+        pos = str_append(text, pos, "127.0.0.1\tlocalhost\n", sizeof(text), &cut);
+    else if (text[pos - 1] != '\n')
+        pos = str_append(text, pos, "\n", sizeof(text), &cut);
+    pos = str_append(text, pos, ip, sizeof(text), &cut);
+    pos = str_append(text, pos, "\t", sizeof(text), &cut);
+    pos = str_append(text, pos, name, sizeof(text), &cut);
+    str_append(text, pos, "\n", sizeof(text), &cut);
+    if (cut || write_file_in_root(root, "etc", "hosts", text, MODE_PUBLIC_FILE) < 0)
+        return "failed to write the container's hosts file";
+    return NULL;
+}
+
+/* <container_dir>/<name>/.work and .merged: the overlay's work directory,
+ * and where it is mounted in the container's mount namespace */
+static bool overlay_dirs(const char *name, char work[MAX_PATH], char merged[MAX_PATH]) {
+    char cdir[MAX_PATH];
+    container_dir_path(cdir, name);
+    return path_join(work, MAX_PATH, cdir, ".work") && path_join(merged, MAX_PATH, cdir, ".merged");
+}
+
+#define OVERLAY_CANNOT_MOUNT 3
+
+static void say_with_number(const char *before, int number, const char *after);
+
+/* In a child, with a mount namespace of its own: the overlay mounted at
+ * merged with these options, and then what write_etc_files writes, unless
+ * name is NULL. 0, OVERLAY_CANNOT_MOUNT as said, or 1 as said. */
+static int in_overlay(const char *merged, const char *options, const char *name, const char *ip, const char *resolv);
+
+/*
+ * Can an overlay with its upper layer where a container's would be be
+ * mounted here at all? Tried before a snapshot is taken, with empty layers
+ * beside the container's, so that a host without overlayfs, or a command
+ * without the right to mount, does not copy the base twice.
+ */
+static int in_overlay(const char *merged, const char *options, const char *name, const char *ip, const char *resolv) {
+    lc_sysret child = lc_kernel_fork();
+    if (child < 0)
+        return 1;
+    if (child == 0) {
+        lc_sysret rc = lc_kernel_unshare(CLONE_NEWNS);
+        if (rc == 0)
+            rc = lc_kernel_mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+        if (rc == 0)
+            rc = lc_kernel_mount("overlay", merged, "overlay", MS_NODEV | MS_NOSUID, options);
+        if (rc < 0) {
+            say_with_number("Note: an overlay cannot be mounted here (errno ", (int)-rc,
+                            "): the container is a copy of its base; lightbox doctor says why\n");
+            lc_kernel_exit(OVERLAY_CANNOT_MOUNT);
+        }
+        const char *wrong = name ? write_etc_files(merged, name, ip, resolv) : NULL;
+        if (wrong) {
+            print_str(STDERR, "Error: ");
+            print_str(STDERR, wrong);
+            lc_print_char(STDERR, '\n');
+            lc_kernel_exit(1);
+        }
+        lc_kernel_exit(0);
+    }
+    int32_t status = 0;
+    lc_sysret got;
+    do {
+        got = lc_kernel_wait_for_child((int32_t)child, &status, 0);
+    } while (got == -LB_EINTR);
+    return got == child ? exit_code_from_status(status) : 1;
+}
+
+static bool overlay_mounts_here(const char *name) {
+    char cdir[MAX_PATH], lower[MAX_PATH], upper[MAX_PATH], work[MAX_PATH], merged[MAX_PATH], options[4 * MAX_PATH];
+    container_dir_path(cdir, name);
+    if (!path_join(lower, sizeof(lower), cdir, ".try-lower") || !path_join(upper, sizeof(upper), cdir, ".try-upper") ||
+        !path_join(work, sizeof(work), cdir, ".try-work") || !path_join(merged, sizeof(merged), cdir, ".try-root"))
+        return false;
+    const char *dirs[] = { lower, upper, work, merged };
+    bool made = true;
+    for (size_t i = 0; i < 4; i++)
+        made = made && lc_kernel_mkdirat(AT_FDCWD, dirs[i], MODE_PRIVATE_DIR) == 0;
+    bool cut = false;
+    size_t pos = str_append(options, 0, "lowerdir=", sizeof(options), &cut);
+    pos = str_append(options, pos, lower, sizeof(options), &cut);
+    pos = str_append(options, pos, ",upperdir=", sizeof(options), &cut);
+    pos = str_append(options, pos, upper, sizeof(options), &cut);
+    pos = str_append(options, pos, ",workdir=", sizeof(options), &cut);
+    str_append(options, pos, work, sizeof(options), &cut);
+    bool mounts = made && !cut && in_overlay(merged, options, NULL, NULL, NULL) == 0;
+    for (size_t i = 0; i < 4; i++)
+        if (path_exists(dirs[i]))
+            require_rm_rf(dirs[i]);
+    return mounts;
+}
+
+
+/*
+ * The /etc files of a container that overlays a snapshot, written through
+ * the overlay as the container will see it, in a mount namespace of a child
+ * of this command's: the kernel copies up what they change, and a link in
+ * the image leads where it leads in the container. 0; OVERLAY_CANNOT_MOUNT
+ * where no overlay can be mounted here, as said; anything else when the
+ * files could not be written, as said.
+ */
+static int overlay_etc(const char *name, const char *base, const char *ip, const char *resolv) {
+    char upper[MAX_PATH], work[MAX_PATH], merged[MAX_PATH], options[3 * MAX_PATH + 48];
+    container_root(upper, name);
+    if (!overlay_dirs(name, work, merged))
+        return 1;
+    if (lc_kernel_mkdirat(AT_FDCWD, upper, 0755) < 0 || lc_kernel_mkdirat(AT_FDCWD, work, MODE_PRIVATE_DIR) < 0 ||
+        lc_kernel_mkdirat(AT_FDCWD, merged, MODE_PRIVATE_DIR) < 0)
+        return 1;
+    if (!overlay_options(options, sizeof(options), base, upper, work)) {
+        print_str(STDERR, "Note: a path of lightbox's has a comma, a colon or a backslash, which an overlay's\n"
+                          "options cannot carry: the container is a copy of its base\n");
+        return OVERLAY_CANNOT_MOUNT;
+    }
+    int code = in_overlay(merged, options, name, ip, resolv);
+    if (code == OVERLAY_CANNOT_MOUNT) {
+        /* nothing was written: the copy goes where the upper layer was */
+        (void)lc_kernel_unlinkat(AT_FDCWD, merged, AT_REMOVEDIR);
+        if (path_exists(work))
+            require_rm_rf(work);
+    }
+    return code;
+}
+
 static void cmd_create(int argc, char **argv) {
+    bool full_copy = false;     /* --copy: the container is a copy of its base, not an overlay */
     require_tool("cp", tool_path_cp());
     if (argc < 1) die("Usage: lightbox create <name> [<ip>] [options]");
     const char *name = argv[0];
@@ -780,6 +930,8 @@ static void cmd_create(int argc, char **argv) {
             cfg.privileged = true;
         } else if (streq(opt, "--rootfs")) {
             str_copy_or_die(cfg_global.rootfs, option_value(argc, argv, &i), MAX_PATH, "--rootfs");
+        } else if (streq(opt, "--copy")) {
+            full_copy = true;
         } else if (streq(opt, "--read-only")) {
             cfg.read_only = true;
         } else if (streq(opt, "--oom-score")) {
@@ -872,17 +1024,84 @@ static void cmd_create(int argc, char **argv) {
         create_err = "failed to mark the container as being created";
         goto fail_create;
     }
+    /*
+     * What the container asks for names: the ones --dns gave; or the dns
+     * setting; or the ones this host asks, without its own loopback; or two
+     * public ones.
+     */
+    char resolv[4096];
     {
-        /* Copy what is in the base ("<base>/."), not the path itself: given a
-         * link to the base, copying the path would make the container's rootfs
-         * that link, and everything written to it would land in the base. */
-        char base_contents[MAX_PATH + 4];
-        const char *cp_argv[] = { "cp", "-a", base_contents, root, NULL };
-        if (!path_join(base_contents, sizeof(base_contents), cfg_global.rootfs, ".") ||
-            run_cmd(tool_path_cp(), cp_argv) != 0) {
-            create_err = "failed to copy rootfs";
+        if (ndns == 0 && cfg_global.dns[0]) {
+            ndns = name_servers_listed(cfg_global.dns, dns);
+            if (ndns <= 0) {
+                create_err = "the dns setting in lightbox.conf is not a list of up to " STRINGIFY(MAX_DNS) " IPv4 addresses";
+                goto fail_create;
+            }
+        }
+        if (ndns == 0)
+            ndns = name_servers_of("/etc/resolv.conf", dns);
+        if (ndns == 0)      /* behind systemd-resolved's stub, the servers it asks */
+            ndns = name_servers_of("/run/systemd/resolve/resolv.conf", dns);
+        const char *const public_servers[] = { "1.1.1.1", "8.8.8.8" };
+        bool cut = false;
+        size_t pos = 0;
+        resolv[0] = '\0';
+        for (int i = 0; i < (ndns ? ndns : 2); i++) {
+            pos = str_append(resolv, pos, "nameserver ", sizeof(resolv), &cut);
+            pos = str_append(resolv, pos, ndns ? dns[i] : public_servers[i], sizeof(resolv), &cut);
+            pos = str_append(resolv, pos, "\n", sizeof(resolv), &cut);
+        }
+        if (cut) {
+            create_err = "the name servers do not fit in resolv.conf";
             goto fail_create;
         }
+    }
+
+    /*
+     * The container's root. An overlay of a snapshot of the base: the
+     * container's own files are its rootfs/, the upper layer, and the
+     * snapshot is shared by every container of that base. Where an overlay
+     * cannot be mounted, and with --copy, a copy of the base.
+     */
+    if (!full_copy && overlay_mounts_here(name)) {
+        bool took = false;
+        if (base_snapshot_for(cfg_global.rootfs, cfg.base, &took) != 0) {
+            create_err = "failed to take a snapshot of the base";
+            goto fail_create;
+        }
+        int written = overlay_etc(name, cfg.base, ip, resolv);
+        if (written == OVERLAY_CANNOT_MOUNT) {
+            cfg.base[0] = '\0';
+        } else if (written != 0) {
+            create_err = "failed to write the container's files in /etc";
+            goto fail_create;
+        }
+    }
+    if (!cfg.base[0]) {
+        /* Copy what is in the base ("<base>/."), not the path itself: given a
+         * link to the base, copying the path would make the container's rootfs
+         * that link, and everything written to it would land in the base. A
+         * reflink where the filesystem has them. */
+        char base_contents[MAX_PATH + 4];
+        if (!path_join(base_contents, sizeof(base_contents), cfg_global.rootfs, ".")) {
+            create_err = "the path of the base is too long";
+            goto fail_create;
+        }
+        if (path_exists(root))
+            require_rm_rf(root);
+        const char *reflink[] = { "cp", "-a", "--reflink=auto", base_contents, root, NULL };
+        const char *plain[] = { "cp", "-a", base_contents, root, NULL };
+        if (run_cmd_quiet(tool_path_cp(), reflink) != 0) {
+            if (path_exists(root))
+                require_rm_rf(root);
+            if (run_cmd(tool_path_cp(), plain) != 0) {
+                create_err = "failed to copy rootfs";
+                goto fail_create;
+            }
+        }
+        create_err = write_etc_files(root, name, ip, resolv);
+        if (create_err)
+            goto fail_create;
     }
 
     /* store IP */
@@ -897,73 +1116,6 @@ static void cmd_create(int argc, char **argv) {
     create_err = container_config_save(name, &cfg);
     if (create_err)
         goto fail_create;
-
-    /*
-     * What the container asks for names, what it is called, and that its name
-     * is its own address. These go into the copy of the image, which is the
-     * image's to shape: its etc may be a link, and so may any of the three
-     * files. They are written as the container will see them, with the new
-     * root as the root, so a link in the image cannot put them anywhere else.
-     *
-     * The name servers are the ones --dns gave; or the dns setting; or the
-     * ones this host asks, without its own loopback; or two public ones.
-     */
-    {
-        if (ndns == 0 && cfg_global.dns[0]) {
-            ndns = name_servers_listed(cfg_global.dns, dns);
-            if (ndns <= 0) {
-                create_err = "the dns setting in lightbox.conf is not a list of up to " STRINGIFY(MAX_DNS) " IPv4 addresses";
-                goto fail_create;
-            }
-        }
-        if (ndns == 0)
-            ndns = name_servers_of("/etc/resolv.conf", dns);
-        if (ndns == 0)      /* behind systemd-resolved's stub, the servers it asks */
-            ndns = name_servers_of("/run/systemd/resolve/resolv.conf", dns);
-        const char *const public_servers[] = { "1.1.1.1", "8.8.8.8" };
-
-        char text[4096];
-        bool cut = false;
-        size_t pos = 0;
-        text[0] = '\0';
-        for (int i = 0; i < (ndns ? ndns : 2); i++) {
-            pos = str_append(text, pos, "nameserver ", sizeof(text), &cut);
-            pos = str_append(text, pos, ndns ? dns[i] : public_servers[i], sizeof(text), &cut);
-            pos = str_append(text, pos, "\n", sizeof(text), &cut);
-        }
-        /* inside the container's own filesystem, so readable by its users */
-        if (cut || write_file_in_root(root, "etc", "resolv.conf", text, MODE_PUBLIC_FILE) < 0) {
-            create_err = "failed to write resolv.conf";
-            goto fail_create;
-        }
-
-        pos = str_append(text, 0, name, sizeof(text), &cut);
-        str_append(text, pos, "\n", sizeof(text), &cut);
-        if (cut || write_file_in_root(root, "etc", "hostname", text, MODE_PUBLIC_FILE) < 0) {
-            create_err = "failed to write the container's hostname file";
-            goto fail_create;
-        }
-
-        /* the image's hosts file, with the container's name added to it */
-        int had = read_file_in_root(root, "etc", "hosts", text, sizeof(text) - 64);
-        if (had < 0) {
-            print_str(STDERR, "Warning: the image's /etc/hosts is not a file that can be added to; it is left as it is\n");
-        } else {
-            pos = (size_t)had;
-            if (had == 0)
-                pos = str_append(text, pos, "127.0.0.1\tlocalhost\n", sizeof(text), &cut);
-            else if (text[pos - 1] != '\n')
-                pos = str_append(text, pos, "\n", sizeof(text), &cut);
-            pos = str_append(text, pos, ip, sizeof(text), &cut);
-            pos = str_append(text, pos, "\t", sizeof(text), &cut);
-            pos = str_append(text, pos, name, sizeof(text), &cut);
-            str_append(text, pos, "\n", sizeof(text), &cut);
-            if (cut || write_file_in_root(root, "etc", "hosts", text, MODE_PUBLIC_FILE) < 0) {
-                create_err = "failed to write the container's hosts file";
-                goto fail_create;
-            }
-        }
-    }
 
     /* made: and with no runtime record, stopped */
     if (remove_file_durably(creating) != 0) {
@@ -1022,7 +1174,11 @@ struct child_args {
     const char  *name;
     const container_config *config;         /* read by the command, before the clone */
     const char  *root;
+    const char  *overlay;                   /* the options of the root's overlay; NULL: the root is a copy */
     const char  *hook;                      /* the script init runs when it is ready */
+    uint32_t     address;                   /* eth0's, on the network of prefix bits */
+    int          prefix;
+    uint32_t     gateway;                   /* the bridge's, eth0's default route */
     int          stop_grace;                /* seconds the container gets to end, unless a stop says otherwise */
     int          privileged;
     int          read_only;
@@ -2740,8 +2896,11 @@ static void cleanup_start_failure(const char *name, const char *port, bool port_
      * an alias with an interface's creation, and a start that failed before
      * it gave the interface one has left it without. */
     if (port_made) {
-        const char *del[] = { "ip", "link", "delete", port, NULL };
-        (void)run_cmd_quiet(tool_path_ip(), del);   /* clean-up: best effort */
+        rtnl nl;
+        if (rtnl_open(&nl) == 0) {
+            (void)rtnl_link_delete(&nl, port);      /* clean-up: best effort */
+            rtnl_close(&nl);
+        }
     } else if (port && port[0])
         (void)remove_own_port(port, name);          /* clean-up: best effort */
 
@@ -2920,6 +3079,11 @@ static void build_container(const struct child_args *ca) {
      * the host's /proc) from propagating into the container */
     require_mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
 
+    /* the root: an overlay of the base's snapshot and the container's own
+     * files, in this mount namespace only */
+    if (ca->overlay)
+        require_mount("overlay", ca->root, "overlay", MS_NODEV | (ca->privileged ? 0 : MS_NOSUID), ca->overlay);
+
     /* set hostname */
     lc_kernel_sethostname(ca->name, lc_string_length(ca->name));
 
@@ -3031,9 +3195,11 @@ static void build_container(const struct child_args *ca) {
         require_mount(NULL, "/", NULL, MS_REMOUNT | MS_RDONLY | MS_BIND, NULL);
     }
 
-    /* Bring up loopback. From the pivot to the hook nothing of the image is
-     * run: its tools are not needed, and not trusted with what init may do. */
-    if (loopback_up() != 0)
+    /* Bring up loopback, and eth0, which the start put here: nothing enters
+     * the namespace from the host for it. From the pivot to the hook nothing
+     * of the image is run: its tools are not needed, and not trusted with
+     * what init may do. */
+    if (loopback_up() != 0 || container_interface_up(ca->address, ca->prefix, ca->gateway) != 0)
         lc_kernel_exit(1);
 }
 
@@ -3156,8 +3322,6 @@ typedef void (*per_container)(const char *name, int seconds);
 
 static void start_one(const char *name, int hook_wait) {
     require_root("start");
-    require_tool("ip", tool_path_ip());
-    require_tool("nsenter", tool_path_nsenter());
 
     /* from here to the end, no other command works on this container */
     container_lock(name);
@@ -3182,22 +3346,21 @@ static void start_one(const char *name, int hook_wait) {
     /* The bridge, the firewall rules and forwarding, made again when a
      * reboot took them. What makes them takes the store's lock; teardown,
      * which holds that, never waits for a container's. */
-    ensure_host_network();
+    ensure_host_network(name);
 
     /* The container's address, which has to be one of the network as it is
      * set now: with another subnet since the container was created, it would
      * start and reach nothing. */
-    char ip[IPV4_TEXT_MAX], ip_cidr[CIDR_TEXT_MAX];
+    char ip[IPV4_TEXT_MAX];
+    container_network net;
+    uint32_t addr;
+    container_network_load_or_die(&net);
+    if (read_container_ip(name, ip, sizeof(ip)) < 0 || !parse_ipv4(ip, &addr))
+        die2("Error: the container has no address on record; remove it and create it again: ", name);
     {
-        container_network net;
-        container_network_load_or_die(&net);
-        uint32_t addr;
-        if (read_container_ip(name, ip, sizeof(ip)) < 0 || !parse_ipv4(ip, &addr))
-            die2("Error: the container has no address on record; remove it and create it again: ", name);
         const char *why = address_unusable(&net, addr);
         if (why)
             die_about_address(ip, why);
-        address_with_prefix(ip_cidr, addr, &net);
     }
 
     /* What the container is configured with: read here, once, for the whole
@@ -3207,6 +3370,20 @@ static void start_one(const char *name, int hook_wait) {
     bool privileged = config.privileged;
     bool read_only = config.read_only;
     int oom_score = config.oom_score;
+
+    /* One that overlays a snapshot has its root where init mounts the
+     * overlay; the snapshot has to be there. */
+    static char overlay[3 * MAX_PATH + 48];
+    char merged[MAX_PATH];
+    const char *start_root = root;
+    if (config.base[0]) {
+        char lower[MAX_PATH], work[MAX_PATH];
+        if (!base_rootfs_path(lower, config.base) || !path_is_directory(lower))
+            die2("Error: the base snapshot that the container overlays is not there: ", config.base);
+        if (!overlay_dirs(name, work, merged) || !overlay_options(overlay, sizeof(overlay), config.base, root, work))
+            die2("Error: the paths of the container's overlay cannot go into its options: ", name);
+        start_root = merged;
+    }
 
     /* A container without links gets an isolated port on the bridge: it
      * reaches the host and, through it, the outside, and no other container.
@@ -3283,6 +3460,11 @@ static void start_one(const char *name, int hook_wait) {
             port[0] = '\0';         /* and nothing goes on to remove it */
             goto fail_start;
         }
+        if (owner == PORT_UNKNOWN) {
+            start_err = "failed to look for what an earlier run left of the container's interface";
+            port[0] = '\0';
+            goto fail_start;
+        }
         if (owner == PORT_OURS && remove_own_port(port, name) != 0) {
             start_err = "failed to remove what an earlier run left of the container's interface";
             goto fail_start;
@@ -3315,8 +3497,12 @@ static void start_one(const char *name, int hook_wait) {
         .exit_fd = exit_fd,
         .name = name,
         .config = &config,
-        .root = root,
+        .root = start_root,
+        .overlay = config.base[0] ? overlay : NULL,
         .hook = "/init.sh",
+        .address = addr,
+        .prefix = net.prefix,
+        .gateway = net.gateway,
         .stop_grace = cfg_global.stop_timeout,
         .privileged = privileged,
         .read_only = read_only,
@@ -3352,40 +3538,46 @@ static void start_one(const char *name, int hook_wait) {
      * container's, made in the container's namespace as eth0, so that no end
      * of it is on the host under a name of the container's. The kernel takes
      * no alias with the pair, so the host's end gets it as it joins the
-     * bridge, and until then only this start knows the interface is its own. */
+     * bridge, and until then only this start knows the interface is its own.
+     * Init brings eth0 up and gives it its address once it has its first byte. */
     {
-        char nsbuf[16];
-        fmt_int(nsbuf, child_pid);
-        const char *add[] = { "ip", "link", "add", port, "type", "veth",
-                              "peer", "name", CONTAINER_IFNAME, "netns", nsbuf, NULL };
-        if (run_cmd(tool_path_ip(), add) != 0) { start_err = "failed to create the container's interface"; goto fail_start; }
-        port_made = true;
-    }
-    {
+        rtnl nl;
+        int rc = rtnl_open(&nl);
+        if (rc < 0) {
+            start_err = text_with_number(err_buf, sizeof(err_buf),
+                                         "no netlink socket for the container's interface (errno ", -rc, ")");
+            goto fail_start;
+        }
+        const char *failed = NULL;
         char alias[64];
         bool cut = false;
         str_append(alias, str_append(alias, 0, "lightbox:", sizeof(alias), &cut), name, sizeof(alias), &cut);
-        const char *a[] = { "ip", "link", "set", "dev", port, "alias", alias, "master", cfg_global.bridge, NULL };
-        if (cut || run_cmd(tool_path_ip(), a) != 0) { start_err = "failed to attach the container's interface to the bridge"; goto fail_start; }
-    }
-    if (!linked) {
-        /* isolated ports do not reach each other, whatever the firewall does */
-        const char *a[] = { "ip", "link", "set", "dev", port, "type", "bridge_slave", "isolated", "on", NULL };
-        if (run_cmd(tool_path_ip(), a) != 0) { start_err = "failed to isolate the container's port on the bridge"; goto fail_start; }
-    }
-    { const char *a[] = { "ip", "link", "set", port, "up", NULL };
-      if (run_cmd(tool_path_ip(), a) != 0) { start_err = "failed to bring the container's interface up on the host"; goto fail_start; } }
-
-    /* configure networking inside the container */
-    {
-        char nsbuf[16]; fmt_int(nsbuf, child_pid);
-
-        const char *a1[] = { "nsenter", "-t", nsbuf, "-n", "--", "ip", "link", "set", CONTAINER_IFNAME, "up", NULL };
-        if (run_cmd(tool_path_nsenter(), a1) != 0) { start_err = "failed to bring container veth up"; goto fail_start; }
-        const char *a2[] = { "nsenter", "-t", nsbuf, "-n", "--", "ip", "addr", "add", ip_cidr, "dev", CONTAINER_IFNAME, NULL };
-        if (run_cmd(tool_path_nsenter(), a2) != 0) { start_err = "failed to assign container IP"; goto fail_start; }
-        const char *a3[] = { "nsenter", "-t", nsbuf, "-n", "--", "ip", "route", "add", "default", "via", cfg_global.gw, NULL };
-        if (run_cmd(tool_path_nsenter(), a3) != 0) { start_err = "failed to install default route"; goto fail_start; }
+        int bridge = rtnl_link_get(&nl, cfg_global.bridge, NULL, 0);
+        if (bridge < 0) {
+            rc = bridge;
+            failed = "failed to find the bridge (errno ";
+        } else if ((rc = rtnl_veth_add(&nl, port, CONTAINER_IFNAME, child_pid)) < 0) {
+            failed = "failed to create the container's interface (errno ";
+        } else {
+            port_made = true;
+            if (cut)
+                rc = -LB_EINVAL;
+            else
+                rc = rtnl_link_attach(&nl, port, alias, bridge);
+            if (rc < 0) {
+                failed = "failed to attach the container's interface to the bridge (errno ";
+            } else if (!linked && (rc = rtnl_port_isolate(&nl, port)) < 0) {
+                /* isolated ports do not reach each other, whatever the firewall does */
+                failed = "failed to isolate the container's port on the bridge (errno ";
+            } else if ((rc = rtnl_link_up(&nl, port)) < 0) {
+                failed = "failed to bring the container's interface up on the host (errno ";
+            }
+        }
+        rtnl_close(&nl);
+        if (failed) {
+            start_err = text_with_number(err_buf, sizeof(err_buf), failed, -rc, ")");
+            goto fail_start;
+        }
     }
 
     /* set OOM score */
@@ -3928,7 +4120,6 @@ static void cmd_exec(int argc, char **argv) {
  */
 static void cmd_teardown(void) {
     require_root("setup --teardown");
-    require_tool("ip", tool_path_ip());
     (void)store_lock();
 
     static char names[MAX_LISTED][NAME_MAX_LEN + 1];
@@ -3976,6 +4167,7 @@ static const struct { const char *name; const char *text; } command_help[] = {
         "         --userns               Future improvement; not supported yet\n"
         "         --uid-start <n>        Future improvement; not supported yet\n"
         "         --read-only            Read-only root filesystem\n"
+        "         --copy                 A copy of the base, and not an overlay of its snapshot\n"
         "         --privileged           Disable security sandbox\n"
         "         --oom-score <n>        OOM score adjustment (default: 500)\n"
         "         --link <name>          Allow network to another container\n"
@@ -4012,9 +4204,16 @@ static const struct { const char *name; const char *text; } command_help[] = {
         "                                is missing; --json as JSON\n" },
     { "ls",
         "  ls [--json]                   List all containers\n" },
+    { "base",
+        "  base ls                       List the snapshots of bases that containers overlay\n"
+        "  base add <dir>                Take a new snapshot of a base, for the containers made after it\n"
+        "  base rm <id>...               Remove snapshots that no container uses\n" },
     { "setup",
         "  setup                         Setup host networking\n"
         "  setup --teardown              Take lightbox's host network away, when no container runs\n" },
+    { "reload",
+        "  reload                        Put lightbox's firewall rules and bridge in again, and the links\n"
+        "                                of running containers, after a firewall's reload took them\n" },
 };
 #define COMMANDS (sizeof(command_help) / sizeof(command_help[0]))
 
@@ -4157,6 +4356,8 @@ int main(int argc, char **argv, char **envp) {
     else if (streq(cmd, "inspect")) cmd_inspect(sub_argc, sub_argv);
     else if (streq(cmd, "doctor")) cmd_doctor(sub_argc, sub_argv);
     else if (streq(cmd, "ls"))     cmd_ls(sub_argc, sub_argv);
+    else if (streq(cmd, "base"))   cmd_base(sub_argc, sub_argv);
+    else if (streq(cmd, "reload")) cmd_reload(sub_argc, sub_argv);
     else {
         print_str(STDERR, "Error: unknown command: ");
         print_str(STDERR, cmd);

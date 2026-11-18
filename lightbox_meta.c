@@ -354,6 +354,8 @@ void cmd_inspect(int argc, char **argv) {
         report_text(&r, "pids", config.pids);
         report_text(&r, "cpu", config.cpu);
         report_text(&r, "io", config.io[0] ? config.io : NULL);
+        report_text(&r, "storage", config.base[0] ? "overlay" : "copy");
+        report_text(&r, "base", config.base[0] ? config.base : NULL);
         report_number(&r, "oom_score", config.oom_score);
         report_flag(&r, "privileged", config.privileged, "1", "0");
         report_flag(&r, "readonly", config.read_only, "1", "0");
@@ -576,14 +578,6 @@ static void check_rootfs(struct doctor *d) {
              "put a root filesystem there, such as Alpine's minirootfs: tar -xzf alpine-minirootfs-*.tar.gz -C <rootfs>");
 }
 
-/* The full ip of iproute2: BusyBox's has none of veth, netns or bridge_slave. */
-static bool ip_is_iproute2(const char *path) {
-    char said[256];
-    const char *version[] = { "ip", "-V", NULL };
-    return run_cmd_capture_quiet(path, version, said, sizeof(said)) == 0 &&
-           lc_string_contains(said, lc_string_length(said), "iproute2", 8);
-}
-
 /* doctor: can exec run from a copy of the binary that cannot be written to? */
 static void check_exec_sealing(struct doctor *d) {
     switch (exec_seal_method()) {
@@ -618,8 +612,6 @@ void cmd_doctor(int argc, char **argv) {
         bool iptables;
         const char *fix;
     } bins[] = {
-        { "bin.ip", tool_path_ip, true, true, "install iproute2" },
-        { "bin.nsenter", tool_path_nsenter, true, true, "install util-linux" },
         { "bin.iptables", tool_path_iptables, false, true, "install iptables" },
         { "bin.iptables-restore", tool_path_iptables_restore, false, true, "install iptables" },
         { "bin.nft", tool_path_nft, true, false, "install nftables" },
@@ -669,6 +661,14 @@ void cmd_doctor(int argc, char **argv) {
             forward_drops_on_host(drops, sizeof(drops));
             doc_setting(d, "forward_drops", drops[0] ? drops : "none", NULL);
         }
+    }
+    /* told, not counted: without it a new container is a copy of its base */
+    {
+        static char filesystems[8192];
+        bool overlay = read_file("/proc/filesystems", filesystems, sizeof(filesystems)) > 0 &&
+                       lc_string_contains(filesystems, lc_string_length(filesystems), "\toverlay\n", 9);
+        doc_setting(d, "overlayfs", overlay ? "yes" : "no (a new container is a copy of its base, not an overlay)",
+                    overlay ? "true" : "false");
     }
     /* told, not counted: start makes what is missing, as setup does */
     {
@@ -728,15 +728,7 @@ void cmd_doctor(int argc, char **argv) {
         if (nftables ? !bins[i].nftables : !bins[i].iptables)
             continue;
         const char *path = bins[i].resolve();
-        bool ok = path_executable(path);
-        if (ok && streq(bins[i].key, "bin.ip") && !ip_is_iproute2(path)) {
-            char detail[MAX_PATH + 32];
-            bool cut = false;
-            str_append(detail, str_append(detail, 0, path, sizeof(detail), &cut), " is not iproute2's", sizeof(detail), &cut);
-            doc_file(d, bins[i].key, false, detail, "install iproute2: BusyBox's ip cannot make what start needs");
-            continue;
-        }
-        doc_file(d, bins[i].key, ok, path, bins[i].fix);
+        doc_file(d, bins[i].key, path_executable(path), path, bins[i].fix);
     }
 
     check_exec_sealing(d);

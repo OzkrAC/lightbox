@@ -9,6 +9,19 @@ static void require_cmd(const char *prog, const char *const argv[]) {
         die_cmd("Error: command failed: ", prog);
 }
 
+/* "Error: <before><what> (errno <n>)", for a request the kernel refused */
+[[noreturn]] static void die_errno(const char *before, const char *what, int rc) {
+    char digits[16];
+    fmt_int(digits, -rc);
+    print_str(STDERR, "Error: ");
+    print_str(STDERR, before);
+    print_str(STDERR, what);
+    print_str(STDERR, " (errno ");
+    print_str(STDERR, digits);
+    print_str(STDERR, ")\n");
+    lc_kernel_exit(1);
+}
+
 static int iptables_check(const char *const argv[]) {
     return run_cmd_quiet(tool_path_iptables(), argv);
 }
@@ -205,29 +218,24 @@ void host_port_name(const char *name, char out[IFNAME_TEXT_MAX]) { hashed_name("
 void link_chain_name(const char *name, char out[IFNAME_TEXT_MAX]) { hashed_name("LB-", name, out); }
 
 port_owner host_port_owner(const char *ifname, const char *name) {
-    static char shown[4096];
-    const char *show[] = { "ip", "link", "show", "dev", ifname, NULL };
-    if (run_cmd_capture_quiet(tool_path_ip(), show, shown, sizeof(shown)) != 0)
+    char alias[256];        /* the kernel's longest alias, and its end */
+    rtnl nl;
+    if (rtnl_open(&nl) < 0)
+        return PORT_UNKNOWN;
+    int rc = rtnl_link_get(&nl, ifname, alias, sizeof(alias));
+    rtnl_close(&nl);
+    if (rc == -LB_ENODEV)
         return PORT_ABSENT;
-    return port_owner_of_listing(shown, name);
+    if (rc < 0)
+        return PORT_UNKNOWN;
+    return port_owner_of_alias(alias, name);
 }
 
-port_owner port_owner_of_listing(char *shown, const char *name) {
+port_owner port_owner_of_alias(const char *alias, const char *name) {
     char want[64];
     bool cut = false;
     str_append(want, str_append(want, 0, "lightbox:", sizeof(want), &cut), name, sizeof(want), &cut);
-    /* "    alias lightbox:<name>", a line of its own */
-    for (char *line = shown; *line; ) {
-        char *end = line;
-        while (*end && *end != '\n') end++;
-        bool last = *end == '\0';
-        *end = '\0';
-        while (*line == ' ' || *line == '\t') line++;
-        if (lc_string_starts_with(line, lc_string_length(line), "alias ", 6))
-            return !cut && streq(line + 6, want) ? PORT_OURS : PORT_FOREIGN;
-        line = last ? end : end + 1;
-    }
-    return PORT_FOREIGN;
+    return !cut && streq(alias, want) ? PORT_OURS : PORT_FOREIGN;
 }
 
 /*
@@ -241,8 +249,12 @@ int remove_own_port(const char *ifname, const char *name) {
         return 0;
     if (owner == PORT_FOREIGN)
         return 1;
-    const char *del[] = { "ip", "link", "delete", ifname, NULL };
-    if (run_cmd_quiet(tool_path_ip(), del) == 0)
+    rtnl nl;
+    if (owner == PORT_UNKNOWN || rtnl_open(&nl) < 0)
+        return -1;
+    int rc = rtnl_link_delete(&nl, ifname);
+    rtnl_close(&nl);
+    if (rc == 0 || rc == -LB_ENODEV)
         return 0;
     return host_port_owner(ifname, name) == PORT_ABSENT ? 0 : -1;
 }
@@ -806,27 +818,14 @@ void forward_drops_on_host(char *text, size_t max) {
 
 /* The interface of the default route, if there is one. */
 static bool find_wan_interface(char *wan_if, size_t bufsz) {
-    char route_buf[256];
-    const char *argv[] = { "ip", "route", "show", "default", NULL };
-    if (run_cmd_capture(tool_path_ip(), argv, route_buf, sizeof(route_buf)) != 0 || !route_buf[0])
+    rtnl nl;
+    if (rtnl_open(&nl) < 0)
         return false;
-
-    const char *dev = NULL;
-    for (char *p = route_buf; *p; p++) {
-        if (p[0] == 'd' && p[1] == 'e' && p[2] == 'v' && p[3] == ' ') {
-            dev = p + 4;
-            break;
-        }
-    }
-    if (!dev)
-        return false;
-    size_t i = 0;
-    while (dev[i] && dev[i] != ' ' && dev[i] != '\n' && i < bufsz - 1) {
-        wan_if[i] = dev[i];
-        i++;
-    }
-    wan_if[i] = '\0';
-    return i > 0;
+    char name[IFNAME_TEXT_MAX];
+    int index = rtnl_default_route_index(&nl);
+    bool found = index > 0 && rtnl_link_name(&nl, index, name) == 0 && str_copy(wan_if, name, bufsz);
+    rtnl_close(&nl);
+    return found;
 }
 
 /*
@@ -1160,24 +1159,32 @@ static void host_network_setup(const container_network *net) {
     bool nftables = cfg_global.firewall_backend == FIREWALL_NFTABLES;
     require_forwarding_for_nftables();
     {
-        const char *show[] = { "ip", "link", "show", cfg_global.bridge, NULL };
-        if (run_cmd_quiet(tool_path_ip(), show) != 0) {
+        const char *br = cfg_global.bridge;
+        rtnl nl;
+        int rc = rtnl_open(&nl);
+        if (rc < 0)
+            die_errno("no netlink socket to make the bridge with", "", rc);
+        int index = rtnl_link_get(&nl, br, NULL, 0);
+        if (index == -LB_ENODEV) {
             print_str(STDOUT, "Creating bridge ");
-            print_str(STDOUT, cfg_global.bridge);
+            print_str(STDOUT, br);
             print_str(STDOUT, "...\n");
-            const char *add[] = { "ip", "link", "add", "name", cfg_global.bridge, "type", "bridge", NULL };
-            require_cmd(tool_path_ip(), add);
-            char gw_cidr[CIDR_TEXT_MAX];
-            address_with_prefix(gw_cidr, net->gateway, net);
-            const char *addr[] = { "ip", "addr", "add", gw_cidr, "dev", cfg_global.bridge, NULL };
-            require_cmd(tool_path_ip(), addr);
-            const char *up[] = { "ip", "link", "set", cfg_global.bridge, "up", NULL };
-            require_cmd(tool_path_ip(), up);
+            if ((rc = rtnl_bridge_add(&nl, br)) < 0)
+                die_errno("cannot make the bridge ", br, rc);
+            if ((index = rtnl_link_get(&nl, br, NULL, 0)) < 0)
+                die_errno("cannot find the bridge it made, ", br, index);
+            if ((rc = rtnl_addr_add(&nl, index, net->gateway, net->prefix)) < 0)
+                die_errno("cannot give its address to the bridge ", br, rc);
+            if ((rc = rtnl_link_up(&nl, br)) < 0)
+                die_errno("cannot bring up the bridge ", br, rc);
+        } else if (index < 0) {
+            die_errno("cannot look for the bridge ", br, index);
         } else {
             print_str(STDOUT, "Bridge ");
-            print_str(STDOUT, cfg_global.bridge);
+            print_str(STDOUT, br);
             print_str(STDOUT, " already exists, skipping\n");
         }
+        rtnl_close(&nl);
     }
 
     if (!cfg_global.firewall) {
@@ -1220,9 +1227,66 @@ static void host_network_setup(const container_network *net) {
     }
 }
 
-void cmd_setup(void) {
-    require_root("setup");
-    require_tool("ip", tool_path_ip());
+/*
+ * The link rules of every container that runs, put in again: after a
+ * firewall's reload or flush took them, as podman network reload puts back
+ * its containers' rules, or after a start made the network again. A
+ * container that a command is working on is left to it: a start puts its
+ * links in itself, and a stop takes them out. except: the container of the
+ * command that asks, NULL for none. How many could not be put back.
+ */
+int put_back_running_links(const char *except) {
+    if (!cfg_global.firewall)
+        return 0;           /* no container with links starts */
+    static char names[MAX_LISTED][NAME_MAX_LEN + 1];
+    static container_config config;
+    bool more = false;
+    int failed = 0;
+    int count = list_containers(names, MAX_LISTED, &more);
+    for (int i = 0; i < count; i++) {
+        if (except && streq(names[i], except))
+            continue;
+        int32_t lock = container_lock_try(names[i]);
+        if (lock < 0) {
+            print_str(STDERR, "Note: a lightbox command is working on container '");
+            print_str(STDERR, names[i]);
+            print_str(STDERR, "': its links are left to it; if they are not there when it is done,\n"
+                              "lightbox reload puts them back\n");
+            continue;
+        }
+        if (is_running(names[i])) {
+            const char *wrong = container_config_load(names[i], &config);
+            if (wrong) {
+                print_str(STDERR, "Error: the configuration of running container '");
+                print_str(STDERR, names[i]);
+                print_str(STDERR, "' cannot be read, so its links are not put back: ");
+                print_str(STDERR, wrong);
+                lc_print_char(STDERR, '\n');
+                failed++;
+            } else if (config.nlinks > 0) {
+                if (firewall_add_links(names[i], &config) == 0) {
+                    print_str(STDOUT, "The links of container '");
+                    print_str(STDOUT, names[i]);
+                    print_str(STDOUT, "' are in again\n");
+                } else {
+                    failed++;
+                }
+            }
+        }
+        lc_kernel_close_file(lock);
+    }
+    if (more) {
+        print_str(STDERR, "Error: there are more containers than lightbox can look at; the links of some are not put back\n");
+        failed++;
+    }
+    return failed;
+}
+
+/* setup, and with reload what a firewall's reload took: setup's part again,
+ * as setup makes it, and the links of the containers that run */
+static void setup_or_reload(bool reload) {
+    const char *command = reload ? "reload" : "setup";
+    require_root(command);
     bool nftables = cfg_global.firewall_backend == FIREWALL_NFTABLES;
     if (cfg_global.firewall)
         require_tool(nftables ? "nft" : "iptables", nftables ? tool_path_nft() : tool_path_iptables());
@@ -1237,7 +1301,7 @@ void cmd_setup(void) {
      * here and leaves no bridge behind. */
     ensure_cgroup2_root();
 
-    print_str(STDOUT, "Setting up host networking...\n");
+    print_str(STDOUT, reload ? "Putting lightbox's host network in again...\n" : "Setting up host networking...\n");
 
     ensure_private_dir(cfg_global.lightbox_dir);
     ensure_private_dir(cfg_global.container_dir);
@@ -1247,6 +1311,7 @@ void cmd_setup(void) {
     /* one setup at a time, and no create while the bridge is being made */
     (void)store_lock();
     host_network_setup(&net);
+    int failed = reload ? put_back_running_links(NULL) : 0;
 
     if (!nftables && !bridge_traffic_is_filtered())
         print_str(STDOUT,
@@ -1255,7 +1320,21 @@ void cmd_setup(void) {
             "--link will not start until it does:\n"
             "  modprobe br_netfilter && sysctl -w net.bridge.bridge-nf-call-iptables=1\n");
 
+    if (failed) {
+        print_str(STDERR, "Error: the links of some running containers are not in again\n");
+        lc_kernel_exit(1);
+    }
     print_str(STDOUT, "Host networking ready\n");
+}
+
+void cmd_setup(void) {
+    setup_or_reload(false);
+}
+
+void cmd_reload(int argc, char **argv) {
+    if (argc > 0)
+        die2(argv[0][0] == '-' ? "Error: unknown option: " : "Error: unexpected argument: ", argv[0]);
+    setup_or_reload(true);
 }
 
 /* ─── After a reboot, and teardown ──────────────────────────────────────── */
@@ -1325,7 +1404,7 @@ const char *host_network_missing(void) {
     return missing[0] ? missing : NULL;
 }
 
-void ensure_host_network(void) {
+void ensure_host_network(const char *starting) {
     if (host_network_ready())
         return;
     container_network net;
@@ -1335,6 +1414,8 @@ void ensure_host_network(void) {
     if (!host_network_ready()) {
         print_str(STDOUT, "lightbox's host network is not all there, as after a reboot: making it again\n");
         host_network_setup(&net);
+        /* what took setup's rules took those of the links too */
+        (void)put_back_running_links(starting);     /* each has said why, if it could not */
     }
     if (lock >= 0)
         lc_kernel_close_file(lock);
@@ -1370,8 +1451,14 @@ void teardown_host(void) {
     forget_nft_tables();
 
     if (bridge_present()) {
-        const char *del[] = { "ip", "link", "delete", cfg_global.bridge, NULL };
-        require_cmd(tool_path_ip(), del);
+        rtnl nl;
+        int rc = rtnl_open(&nl);
+        if (rc == 0) {
+            rc = rtnl_link_delete(&nl, cfg_global.bridge);
+            rtnl_close(&nl);
+        }
+        if (rc < 0 && rc != -LB_ENODEV)
+            die_errno("cannot remove the bridge ", cfg_global.bridge, rc);
         print_str(STDOUT, "Removed bridge ");
         print_str(STDOUT, cfg_global.bridge);
         lc_print_char(STDOUT, '\n');

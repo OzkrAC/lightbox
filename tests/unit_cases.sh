@@ -407,6 +407,121 @@ t_ipv6_failure_is_an_error() {
     [ "$out" = "result -1" ]
 }
 
+# ─── rtnetlink ──────────────────────────────────────────────────────────────
+
+# A network namespace of a user namespace, where this user may make
+# interfaces, and in it a process that holds another, a container's: what
+# start does on the host's side and init on the container's, request by
+# request, with ip and nsenter to look at what came of it. The script runs
+# there with the harness as $U, the holder's pid as $holder, and there()
+# running a command in the holder's namespace.
+in_two_namespaces() { # script
+    command -v ip >/dev/null 2>&1 && command -v nsenter >/dev/null 2>&1 || { echo "no ip and nsenter to look with"; return 77; }
+    unshare -r --net true 2>/dev/null || { echo "user namespaces are not available to this user"; return 77; }
+    unshare -r --net -- bash -c 'ip link add lbt-try type bridge' 2>/dev/null ||
+        { echo "a bridge cannot be made in a user namespace here"; return 77; }
+    unshare -r --net -- bash -c '
+        U=$1
+        unshare --net -- sleep 60 >/dev/null 2>&1 </dev/null &
+        holder=$!
+        i=0
+        until [ -n "$(readlink /proc/$holder/ns/net 2>/dev/null)" ] &&
+              [ "$(readlink /proc/$holder/ns/net)" != "$(readlink /proc/self/ns/net)" ]; do
+            i=$((i + 1)); [ $i -lt 50 ] || exit 1; sleep 0.1
+        done
+        there() { nsenter -t "$holder" -n "$@"; }
+        eval "$2"
+        rc=$?
+        kill "$holder"
+        exit $rc' _ "$UNIT" "$1"
+}
+
+# What setup and start ask for, and what init does in the container: the
+# bridge with its address, up; the pair with its peer as eth0 over there; the
+# alias, the bridge as master, the isolated port, up; eth0 up with its address
+# and the default route. Then the container reaches the bridge.
+t_rtnl_makes_what_ip_made() {
+    # shellcheck disable=SC2016     # the script is for the shell in the namespaces
+    in_two_namespaces '
+        bad=0
+        step() { got=$("$U" rtnl "$@" 2>&1); [ "$got" = "result 0" ] || { echo "rtnl $*: $got"; bad=1; }; }
+        step bridge lbt0 && step addr lbt0 10.9.0.1 24 && step up lbt0
+        step veth vb-x eth0 "$holder" && step attach vb-x lightbox:x lbt0 && step isolate vb-x && step up vb-x
+        inside=$(there "$U" rtnl inside 10.9.0.2 24 10.9.0.1 2>&1)
+        echo "the bridge: $(ip -o -4 addr show dev lbt0 | awk "{ print \$4 }"), $(ip -o link show dev lbt0 | grep -o "state [A-Z]*")"
+        echo "the port: $(ip -d link show dev vb-x | grep -o "veth\|master lbt0\|state [A-Z]*\|isolated on\|alias .*" | paste -sd" ")"
+        echo "init: $inside"
+        echo "eth0 there: $(there ip -o -4 addr show dev eth0 | awk "{ print \$4 }"), $(there ip -o link show dev eth0 | grep -o "state [A-Z]*")"
+        echo "routes there: $(there ip -4 route | paste -sd"|")"
+        [ "$(ip -o -4 addr show dev lbt0 | awk "{ print \$4 }")" = 10.9.0.1/24 ] &&
+            ip -o link show dev lbt0 | grep -q "[<,]UP[,>]" || { echo "the bridge is not as setup makes it"; bad=1; }
+        ip -d link show dev vb-x | grep -q "^ *veth" && ip -d link show dev vb-x | grep -q " master lbt0 " &&
+            ip -d link show dev vb-x | grep -q "isolated on" && ip -d link show dev vb-x | grep -q "^ *alias lightbox:x$" &&
+            ip -o link show dev vb-x | grep -q "[<,]UP[,>]" || { echo "the port is not as start makes it"; bad=1; }
+        ! ip link show dev eth0 >/dev/null 2>&1 || { echo "eth0 is on the host"; bad=1; }
+        [ "$inside" = "result 0" ] && [ "$(there ip -o -4 addr show dev eth0 | awk "{ print \$4 }")" = 10.9.0.2/24 ] &&
+            [ "$(there ip -4 route | paste -sd"|")" = "default via 10.9.0.1 dev eth0 |10.9.0.0/24 dev eth0 proto kernel scope link src 10.9.0.2 " ] ||
+            { echo "eth0 is not as init makes it"; bad=1; }
+        if command -v ping >/dev/null 2>&1; then
+            there ping -c 1 -W 2 10.9.0.1 >/dev/null 2>&1 || { echo "the container does not reach the bridge"; bad=1; }
+        fi
+        exit $bad'
+}
+
+# What stop, rm and start look at and take away: an interface by its alias,
+# its index and name, the default route''s interface; a pair goes with its
+# peer; and what the kernel refuses comes back as its errno.
+t_rtnl_reads_and_refuses() {
+    # shellcheck disable=SC2016     # the script is for the shell in the namespaces
+    in_two_namespaces '
+        bad=0
+        expect() { want=$1; shift; got=$("$U" "$@" 2>&1 | paste -sd"|"); [ "$got" = "$want" ] || { echo "$*: $got, expected $want"; bad=1; }; }
+        expect "result 0" rtnl bridge lbt0
+        expect "result 0" rtnl addr lbt0 10.9.0.1 24
+        expect "result 0" rtnl up lbt0
+        expect "result 0" rtnl veth vb-x eth0 "$holder"
+        expect "alias |result 0" rtnl alias vb-x
+        expect "absent" port owner vb-y x
+        expect "foreign" port owner vb-x x
+        expect "result 1" port remove vb-x x
+        expect "result 0" rtnl attach vb-x lightbox:x lbt0
+        expect "alias lightbox:x|result 0" rtnl alias vb-x
+        expect "ours" port owner vb-x x
+        expect "foreign" port owner vb-x xx
+        idx=$(ip -o link show dev lbt0 | cut -d: -f1)
+        expect "index $idx|result 0" rtnl index lbt0
+        expect "name lbt0|result 0" rtnl name "$idx"
+        expect "result -19" rtnl index nosuch
+        expect "result -19" rtnl alias nosuch
+        expect "result -19" rtnl name 2147483000
+        expect "result -17" rtnl veth vb-x eth1 "$holder"
+        expect "result -17" rtnl bridge lbt0
+        expect "result -17" rtnl addr lbt0 10.9.0.1 24
+        expect "result -19" rtnl attach vb-x lightbox:x nosuch
+        ip link add lbt-v0 type veth peer name lbt-v1
+        expect "result -95" rtnl attach lbt-v0 lightbox:v lbt-v1
+        expect "result -95" rtnl isolate lbt-v0
+        expect "result -19" rtnl up nosuch
+        ip route add default via 10.9.0.3 dev lbt0 onlink table 100    # not the main table: not the one
+        expect "wan none|result 0" rtnl wan
+        ip route add default via 10.9.0.2 dev lbt0
+        expect "wan lbt0|result 0" rtnl wan
+        expect "result -17" rtnl route 10.9.0.3 lbt0
+        expect "result 0" port remove vb-x x
+        expect "absent" port owner vb-x x
+        there ip link show dev eth0 >/dev/null 2>&1 && { echo "eth0 stayed when its peer went"; bad=1; }
+        expect "result 0" port remove vb-x x
+        expect "result -19" rtnl delete vb-x
+        # init without eth0, and with an address it has already
+        expect "Error: cannot find eth0 in the container (errno 19)|result -1" rtnl inside 10.9.0.2 24 10.9.0.1
+        expect "result 0" rtnl veth vb-x eth0 "$holder"
+        got=$(there "$U" rtnl inside 10.9.0.2 24 10.9.0.1 2>&1)
+        [ "$got" = "result 0" ] || { echo "init: $got"; bad=1; }
+        got=$(there "$U" rtnl inside 10.9.0.2 24 10.9.0.1 2>&1 | paste -sd"|")
+        [ "$got" = "Error: cannot give its address to eth0 in the container (errno 17)|result -1" ] || { echo "init again: $got"; bad=1; }
+        exit $bad'
+}
+
 # ─── The start handshake ────────────────────────────────────────────────────
 
 # Both sides of a start, without a container: "unit init" clones the init of
@@ -1660,33 +1775,24 @@ t_host_names() {
     return $bad
 }
 
-# Whose an interface is, from what "ip link show" prints: lightbox's for this
-# container only with the alias lightbox:<name>, exactly; without an alias,
-# or with another, not lightbox's to touch.
+# Whose an interface is, by its alias: lightbox's for this container only
+# with the alias lightbox:<name>, exactly; without an alias, or with another,
+# not lightbox's to touch.
 t_interface_owner() {
     bad=0
-    expect() { # name, listing, expected
+    expect() { # name, alias, expected
         got=$("$UNIT" owner "$1" "$2")
-        [ "$got" = "$3" ] || { echo "$1 with: $2"; echo "  $got, expected $3"; bad=1; }
+        [ "$got" = "$3" ] || { echo "$1 with the alias '$2': $got, expected $3"; bad=1; }
     }
-    head='7: vb-5ea0e1194872@if2: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue master br0 state UP mode DEFAULT group default qlen 1000
-    link/ether 2a:51:0c:7e:1b:93 brd ff:ff:ff:ff:ff:ff link-netnsid 1'
-    expect web "$head
-    alias lightbox:web" ours
-    expect web "$head
-    alias lightbox:web2" foreign
-    expect web "$head
-    alias lightbox:we" foreign
-    expect web "$head
-    alias lightbox:web " foreign
-    expect web "$head
-    alias something:web" foreign
-    expect web "$head" foreign
-    expect web "$head
-    altname enp0s31f6" foreign
-    expect web "$head
-    altname lightbox:web
-    alias lightbox:web" ours
+    expect web lightbox:web ours
+    expect web lightbox:web2 foreign
+    expect web lightbox:we foreign
+    expect web 'lightbox:web ' foreign
+    expect web ' lightbox:web' foreign
+    expect web something:web foreign
+    expect web lightbox: foreign
+    expect web '' foreign
+    expect abcdefghijklmnopqrstuvwxyz0123 lightbox:abcdefghijklmnopqrstuvwxyz0123 ours
     return $bad
 }
 
@@ -2095,6 +2201,7 @@ privileged 1
 readonly 1
 io 8:0 rbps=1048576
 swap 1G
+base -
 vol /srv/data -> /data rw
 vol /etc/app.conf -> /etc/app.conf ro
 link db
@@ -2119,6 +2226,21 @@ config_old_userns_keys() {
 }
 t_config_old_userns_keys() { in_config_dir config_old_userns_keys; }
 
+# base=, the snapshot a container overlays: twelve hex digits, read and
+# written back as they are; anything else is refused with its line.
+config_base_key() {
+    printf 'version=1\nmem=64M\npids=32\ncpu=1\noom_score=0\nbase=5ea0e1194872\n' > "$D/web/.conf"
+    got=$(config)
+    printf '%s\n' "$got" | grep -qx 'base 5ea0e1194872' || { printf '%s\n' "$got"; return 1; }
+    for wrong in 5ea0e119487 5ea0e11948720 5EA0E1194872 ../../etc/x ''; do
+        printf 'version=1\nmem=64M\npids=32\ncpu=1\noom_score=0\nbase=%s\n' "$wrong" > "$D/web/.conf"
+        got=$(config)
+        [ "$got" = "refused: $D/web/.conf: line 6: base is not the id of a base snapshot" ] ||
+            { echo "base=$wrong: $got"; return 1; }
+    done
+}
+t_config_base_key() { in_config_dir config_base_key; }
+
 # What a file does not say is what lightbox.conf says, and a file may say
 # nothing at all.
 config_defaults() {
@@ -2133,7 +2255,8 @@ oom_score 500
 privileged 0
 readonly 0
 io -
-swap -' ] || return 1
+swap -
+base -' ] || return 1
     # a default that cannot be used is no default: the file must have the limit
     got=$(config nodefaults)
     printf '%s\n' "$got"
@@ -2261,6 +2384,7 @@ privileged 1
 readonly 0
 io -
 swap -
+base -
 vol /srv/data -> /data rw
 vol /srv/other -> /data rw
 link db' ] || return 1
@@ -2294,7 +2418,7 @@ vol=/srv/data:/data
 link=db' ] || { echo "the file is not what was put in"; bad=1; }
     [ "$(stat -c %a "$D/web/.conf")" = 600 ] || { echo "the file's mode is $(stat -c %a "$D/web/.conf")"; bad=1; }
     got=$(config | tr '\n' ' ')
-    case $got in 'version 1 mem 1G pids max cpu 0.25 oom_score 500 '*'io 8:0 wbps=1024 swap 64M vol /srv/data -> /data rw link db ') ;;
+    case $got in 'version 1 mem 1G pids max cpu 0.25 oom_score 500 '*'io 8:0 wbps=1024 swap 64M base - vol /srv/data -> /data rw link db ') ;;
         *) echo "read back: $got"; bad=1 ;; esac
 
     before=$(cat "$D/web/.conf")
@@ -2585,6 +2709,8 @@ check 'paths of /proc and /sys are masked or made read-only'     t_paths_are_mas
 
 check 'IPv6 is switched off in another network namespace'        t_ipv6_switched_off
 check 'a namespace that cannot be joined is an error'            t_ipv6_failure_is_an_error
+check 'rtnetlink makes the bridge, the pair, the port and eth0 as ip made them' t_rtnl_makes_what_ip_made
+check 'rtnetlink finds interfaces by name and alias, and answers a refusal with its errno' t_rtnl_reads_and_refuses
 
 check 'init reports ready, then the end of a hook it does not have' t_handshake_without_hook
 check 'init does nothing until the command sends its first byte' t_handshake_first_byte
@@ -2662,6 +2788,7 @@ check 'no prefix is written into the source: subnet gives it'      t_no_prefix_o
 check 'a .conf is read into one structure, whole'                t_config_is_read_whole
 check 'what a .conf leaves out is the default, if that is usable' t_config_defaults
 check 'userns=0 and uid_start of 0.5 are read, and userns=1 is refused' t_config_old_userns_keys
+check 'base= is a snapshot'"'"'s id, read as it is, or refused'          t_config_base_key
 check 'a .conf with a version is read strictly, by line'         t_config_is_read_strictly
 check 'a .conf from before the version line is still read'       t_config_from_before_the_version_line
 check 'a .conf is written as it will be read, or not written'    t_config_is_written_as_it_will_be_read

@@ -453,10 +453,14 @@ static bool name_before(const char *a, const char *b) {
 }
 
 int list_containers(char names[][NAME_MAX_LEN + 1], int max, bool *more) {
+    return list_entries(cfg_global.container_dir, name_is_valid, names, max, more);
+}
+
+int list_entries(const char *dir, bool (*valid)(const char *), char names[][NAME_MAX_LEN + 1], int max, bool *more) {
     if (more)
         *more = false;
 
-    lc_sysret dirfd = lc_kernel_open_file(cfg_global.container_dir, O_RDONLY | O_DIRECTORY, 0);
+    lc_sysret dirfd = lc_kernel_open_file(dir, O_RDONLY | O_DIRECTORY, 0);
     if (dirfd < 0)
         return 0;
 
@@ -477,7 +481,7 @@ int list_containers(char names[][NAME_MAX_LEN + 1], int max, bool *more) {
             pos += reclen;
 
             /* "." and ".." are not valid names either */
-            if (!name_is_valid(entry))
+            if (!valid(entry))
                 continue;
             if (type != DIRENT_DIR &&
                 (type != DIRENT_UNKNOWN || !entry_is_directory((int32_t)dirfd, entry)))

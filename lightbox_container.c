@@ -379,14 +379,14 @@ static const char *config_problem(const char *path, int line, const char *what, 
 enum {
     KEY_MEM = 1 << 0, KEY_PIDS = 1 << 1, KEY_CPU = 1 << 2, KEY_OOM = 1 << 3,
     KEY_PRIVILEGED = 1 << 4, KEY_READONLY = 1 << 5, KEY_USERNS = 1 << 6,
-    KEY_UID_START = 1 << 7, KEY_IO = 1 << 8, KEY_SWAP = 1 << 9,
+    KEY_UID_START = 1 << 7, KEY_IO = 1 << 8, KEY_SWAP = 1 << 9, KEY_BASE = 1 << 10,
 };
 
 static unsigned key_bit(const char *key) {
     static const struct { const char *name; unsigned bit; } keys[] = {
         { "mem", KEY_MEM }, { "pids", KEY_PIDS }, { "cpu", KEY_CPU }, { "oom_score", KEY_OOM },
         { "privileged", KEY_PRIVILEGED }, { "readonly", KEY_READONLY }, { "userns", KEY_USERNS },
-        { "uid_start", KEY_UID_START }, { "io", KEY_IO }, { "swap", KEY_SWAP },
+        { "uid_start", KEY_UID_START }, { "io", KEY_IO }, { "swap", KEY_SWAP }, { "base", KEY_BASE },
     };
     for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
         if (streq(key, keys[i].name))
@@ -488,6 +488,9 @@ static const char *config_line(container_config *config, char *line, unsigned *s
                 return "userns is not 0 or 1";
             return userns ? "userns=1: user namespaces are not supported yet" : NULL;
         }
+        case KEY_BASE:
+            return base_id_ok(value) && str_copy(config->base, value, sizeof(config->base))
+                   ? NULL : "base is not the id of a base snapshot";
         case KEY_UID_START: {
             int uid_start;
             return parse_int_in(value, 0, INT32_MAX, &uid_start) ? NULL : "uid_start is not a number";
@@ -584,7 +587,7 @@ static void put_number(struct config_text *out, const char *key, int value) {
 static bool same_config(const container_config *a, const container_config *b) {
     if (!streq(a->mem, b->mem) || !streq(a->swap, b->swap) || !streq(a->pids, b->pids) ||
         !streq(a->cpu, b->cpu) ||
-        !streq(a->io, b->io) || a->oom_score != b->oom_score ||
+        !streq(a->io, b->io) || !streq(a->base, b->base) || a->oom_score != b->oom_score ||
         a->privileged != b->privileged || a->read_only != b->read_only ||
         a->nvols != b->nvols || a->nlinks != b->nlinks)
         return false;
@@ -616,6 +619,8 @@ const char *container_config_save(const char *name, const container_config *conf
     if (config->read_only)  put_line(&out, "readonly", "1");
     if (config->io[0])
         put_line(&out, "io", config->io);
+    if (config->base[0])
+        put_line(&out, "base", config->base);
 
     for (int i = 0; i < config->nvols; i++) {
         const volume_spec *vol = &config->vols[i];

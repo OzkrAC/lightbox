@@ -2,9 +2,31 @@
 
 What changed for someone who uses lightbox, newest first. `ROADMAP.md` has the reasons and the finding each change closes.
 
+## 0.7.0
+
+Phase 7 of the roadmap: performance. A new container is an overlay of a snapshot of its base, so that `create` takes as long from a base of 1 GB as from a small one; lightbox makes a container's network with rtnetlink and runs neither `ip` nor `nsenter`; and `lightbox reload` puts back what a firewall's reload took. On GitHub's runners a start takes a median of 8.8 ms on x86_64 and 12.9 ms on aarch64, and a stop 2.9 and 5.5, where before Phase 1 of the roadmap they took about 535 and 207 on the same kind of runner.
+
+### Changes you may have to act on
+
+- **A new container is an overlay of a snapshot of its base, not a copy of it.** The first `create` from a base takes a snapshot of it into `<lightbox_dir>/bases/`, and every container of that base shares it; `create` after the first takes no time or room of the base's size, and a change of the base directory afterwards changes no container. `<container_dir>/<name>/rootfs/` holds only the container's own files, and the base's are not there on the host: a script that reads or changes a file of the base there has to use `--copy`, or work in the container. A file of the base that is changed from the host has to be copied into `rootfs/` first. Containers made before 0.7 are copies, and stay so.
+- **Where an overlay cannot be mounted**, without overlayfs or without the right to mount, `create` makes a copy, as before, and says so.
+- **lightbox runs neither `ip` nor `nsenter`**, so iproute2 and util-linux are no longer needed on the host. `doctor` no longer has the checks `bin.ip` and `bin.nsenter`, in its text or in `--json`: a script that looked for them finds them gone.
+- **A failure in a container's network is said with the kernel's errno** where `ip` printed its own words before, as in `Error: failed to attach the container's interface to the bridge (errno 95)` or `Error: cannot make the bridge br0 (errno 1)`.
+
+### Changed
+
+- **`start`, `stop`, `rm`, `setup` and `setup --teardown` make and take away the bridge, the veth pair and the bridge's port with rtnetlink requests of their own**, and the container's init gives `eth0` its address and its default route from inside the container: nothing enters the container's network namespace from the host. A start makes 4 processes instead of 12, and the only tool it runs on the host is the firewall's: one `iptables` or `nft` to look whether lightbox's rules are there, and with links the transaction that adds theirs. On GitHub's runners it takes a median of 9.0 ms on x86_64 and 11.5 ms on aarch64, where it took 22.7 and 28.5.
+
+### Added
+
+- **`create --copy`** makes a container a full copy of its base, as before 0.7, a reflink first where the filesystem has them.
+- **`lightbox base ls`, `base add <dir>` and `base rm <id>`** list the snapshots with their bases and containers, take a new snapshot of a base for the containers made after it, and remove snapshots that no container uses.
+- `inspect` shows `storage`, overlay or copy, and the `base` snapshot; `doctor` says whether the kernel has overlayfs.
+- **`lightbox reload`** puts in again what a firewall's reload or flush took while containers ran, as `podman network reload` does: what `setup` makes, and the link rules of every running container. It changes nothing that is there already. A `start` that finds `setup`'s rules gone, which made them again before, now puts back the links of the running containers too.
+
 ## 0.6.0
 
-Not tagged yet. Phase 6 of the roadmap: a command line that gives help when it is asked for and refuses what it will not use, the configuration in `/etc/lightbox`, a `doctor` that checks what `start` needs and says how to fix it, `inspect` and `doctor` in JSON, `restart`, `update` and `rm -f`, and a README whose command reference and quick start the suites check.
+Tagged `v0.6.0`, at `fd702e8`, the merge of pull request 6. Phase 6 of the roadmap: a command line that gives help when it is asked for and refuses what it will not use, the configuration in `/etc/lightbox`, a `doctor` that checks what `start` needs and says how to fix it, `inspect` and `doctor` in JSON, `restart`, `update` and `rm -f`, and a README whose command reference and quick start the suites check.
 
 ### Changes you may have to act on
 

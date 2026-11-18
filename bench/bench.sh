@@ -6,7 +6,9 @@
 #   sudo bench/bench.sh [path/to/lightbox]          default: ./lightbox
 #
 # Measures the wall time of create, start, exec /bin/true, stop and rm, each on
-# a fresh container, and counts the processes that one start makes.
+# a fresh container, and counts the processes that one start makes. Then, on a
+# base of 1 GB: the first create, which takes its snapshot, and the creates
+# after it, with the most any of them added to the disk (ROADMAP 7.1).
 #
 # It needs what tests/lifecycle.sh needs, and it runs inside that suite's
 # private namespaces and fixture, so it uses nothing of the host's and leaves
@@ -14,8 +16,8 @@
 #
 #   BENCH_RUNS=10       how often each command is measured
 #
-# bench/baseline.txt holds the numbers of the tree as it stood before Phase 1
-# of ROADMAP.md. Later numbers are compared with it on the same kind of machine.
+# It compares nothing: numbers are worth comparing only from the same kind of
+# machine, and a shared runner's clock is rough.
 
 if [ -z "${LIFECYCLE_T:-}" ]; then
     # On the host. The lifecycle suite makes the namespaces and the fixture and
@@ -38,7 +40,8 @@ timed() { # label command...
     "$@" >/dev/null 2>"$BENCH_DIR/stderr" </dev/null
     rc=$?
     t1=${EPOCHREALTIME/[.,]/}
-    echo $((t1 - t0)) >> "$BENCH_DIR/$label"
+    echo $((t1 - t0)) >> "$BENCH_DIR/$label" ||
+        { echo "bench: the time of '$label' could not be recorded" >&2; return 1; }
     if [ $rc -ne 0 ]; then
         echo "bench: '$*' failed with status $rc:" >&2
         cat "$BENCH_DIR/stderr" >&2
@@ -76,6 +79,30 @@ bench_spawns() { # -> sets spawned
     spawned=$((after - before))
 }
 
+# The first create from a base of 1 GB, which takes its snapshot, and
+# BENCH_RUNS after it, which overlay that: each one's time, and the most room
+# one of those took. The base is the suite's with a file of 1 GB of zeros,
+# written out and not sparse, so that a copy of it is a copy of 1 GB. It is
+# not called by a label: timed appends a label's times to $BENCH_DIR/<label>.
+bench_big_base() { # -> sets big_kb
+    local i ip kb
+    big_kb=0
+    mkdir -p "$BENCH_DIR/base-1g" && cp -a "$BASE/." "$BENCH_DIR/base-1g/" &&
+        dd if=/dev/zero of="$BENCH_DIR/base-1g/gigabyte" bs=1M count=1024 status=none || return 1
+    ip=$(next_ip) || return 1
+    timed snapshot "$LB" create bigfirst "$ip" --rootfs "$BENCH_DIR/base-1g" || return 1
+    for i in $(seq 1 "$BENCH_RUNS"); do
+        ip=$(next_ip) || return 1
+        timed big "$LB" create "big$i" "$ip" --rootfs "$BENCH_DIR/base-1g" || return 1
+        kb=$(du -sk "$C/big$i" | cut -f1)
+        [ "$kb" -gt "$big_kb" ] && big_kb=$kb
+    done
+    grep -q '^base=' "$C/big1/.conf" || { echo "bench: the containers of the big base are copies, not overlays" >&2; return 1; }
+    for i in $(seq 1 "$BENCH_RUNS"); do "$LB" rm "big$i" >/dev/null 2>&1; done
+    "$LB" rm bigfirst >/dev/null 2>&1
+    return 0
+}
+
 bench_main() {
     local i ip label name line
     [ -n "${EPOCHREALTIME:-}" ] || { echo "bench: this needs bash 5 or later, for its clock" >&2; return 2; }
@@ -94,6 +121,7 @@ bench_main() {
     done
 
     bench_spawns || { echo "bench: the processes of one start could not be counted" >&2; teardown; return 1; }
+    bench_big_base || { echo "bench: the creates from a base of 1 GB did not complete" >&2; teardown; return 1; }
     teardown
 
     printf 'lightbox timing: %s runs of each command, wall time in milliseconds\n' "$BENCH_RUNS"
@@ -107,10 +135,15 @@ bench_main() {
         line="$line$label $(bench_stats "$label" '%.1f (%.1f to %.1f)'), "
     done
     printf '\nprocesses made by one start: %s\n' "$spawned"
+    printf '\non a base of 1 GB\n'
+    printf '%-16s %s\n' 'first create' "$(bench_stats snapshot '%9.1f')"
+    printf '%-16s %s\n' 'create after it' "$(bench_stats big '%9.1f %9.1f %9.1f')"
+    printf 'the most a create after the first added to the disk: %s KB\n' "$big_kb"
 
     if [ "${GITHUB_ACTIONS:-}" = true ]; then
-        printf '::notice title=timing::%sin ms as median (lowest to highest) of %s; %s processes per start; %s %s with %s processors\n' \
-            "$line" "$BENCH_RUNS" "$spawned" "$(uname -r)" "$(uname -m)" "$(nproc)"
+        printf '::notice title=timing::%sin ms as median (lowest to highest) of %s; %s processes per start; on a base of 1 GB the first create %s and those after it %s, each adding at most %s KB; %s %s with %s processors\n' \
+            "$line" "$BENCH_RUNS" "$spawned" "$(bench_stats snapshot '%.1f')" "$(bench_stats big '%.1f (%.1f to %.1f)')" \
+            "$big_kb" "$(uname -r)" "$(uname -m)" "$(nproc)"
     fi
 }
 
