@@ -57,7 +57,7 @@ One more suite starts real containers, so it needs root:
 sudo make test-lifecycle
 ```
 
-It covers `setup`, `create`, `start`, `exec`, `stop` and `rm`, volumes, limits, the init hook, the sandbox and the network between containers. It needs a kernel with bridge, veth and cgroup v2, a statically linked busybox to build the containers' root filesystem from (`busybox-static` on Debian, Ubuntu and Void), and iproute2's `ip` and util-linux's `nsenter`, which the suite looks with; for lightbox's own commands it masks both. `LIGHTBOX_TEST_ROOTFS=/path` uses a copy of a root filesystem of yours instead.
+It covers `setup`, `create`, `start`, `exec`, `stop` and `rm`, volumes, limits, the init hook, the sandbox and the network between containers. It needs a kernel with bridge, veth and cgroup v2, a statically linked busybox to build the containers' root filesystem from (`busybox-static` on Debian, Ubuntu and Void), and iproute2's `ip` and util-linux's `nsenter`, which the suite looks with; for lightbox's own commands it masks both. `LIGHTBOX_TEST_ROOTFS=/path` uses a copy of a root filesystem of yours instead. `LIGHTBOX_TEST_USERNS=overlay` makes every container of the suite with `--userns`, and `LIGHTBOX_TEST_USERNS=copy` with `--userns --copy`, but in the cases about overlays; the suite puts an `/etc/subuid` and an `/etc/subgid` of its own over the host's, in its mount namespace only.
 
 The suite works in private network, mount and PID namespaces with a configuration of its own, so your bridge, firewall rules and containers are not touched. Its cgroups live under `/sys/fs/cgroup/lightbox-test-<pid>` and are removed at the end, and the run fails if the host's virtual interfaces, firewall rules or cgroups differ afterwards. A network card that the machine itself gains or loses during the run, as a cloud VM can, is reported and does not count. Kernel modules that get loaded on the way stay loaded.
 
@@ -65,7 +65,7 @@ sudo drops the environment, so options go on make's command line: `sudo make tes
 
 `sudo make bench` works in the same namespaces and measures the wall time of `create`, `start`, `exec`, `stop` and `rm`, the number of processes one start makes, and `create` from a base of 1 GB. CI runs it on every push and puts its numbers on the run's page: on GitHub's runners a start takes 9 to 13 ms at 0.7.0, where it took 535 to 542 before Phase 1 of the roadmap.
 
-`.github/workflows/ci.yml` runs `make check`, the lifecycle suite and the timing on every push to `main` and every pull request, on x86_64 and on aarch64. A run's page lists each suite's totals, the cases it skipped and why each expected failure fails, without opening a log.
+`.github/workflows/ci.yml` runs `make check`, the lifecycle suite in its three ways and the timing on every push to `main` and every pull request, on x86_64 and on aarch64. A run's page lists each suite's totals, the cases it skipped and why each expected failure fails, without opening a log.
 
 ## Quick start
 
@@ -469,7 +469,7 @@ The sandbox covers everything in a container: init, the `/init.sh` hook and all 
 | Container isolation | A container without `--link` has an isolated port on the bridge: it reaches the host and the outside, and no other container. IPv6 is off inside containers. A container with `--link` shares the bridge, and is kept to its links by firewall rules that name the two ports of each link: with iptables it does not start unless `br_netfilter` lets iptables see bridged traffic, and with nftables a table of the bridge family sees it without. A link holds whichever of the two starts first, and a container's link rules go with it when it stops, is removed or is found dead |
 | The terminal of whoever runs `exec` | A command never holds it. Typed at a terminal, `exec` gives the command a pseudo-terminal of the container and carries the bytes; where only one of its streams is a terminal, a pipe stands in for it |
 | The binary `exec` enters with | `exec` executes itself again from a sealed copy in memory before it enters a container, so the processes it puts there are never the installed binary. Where the kernel refuses executable memfds (`vm.memfd_noexec=2`) it takes the binary through a read-only mount of its own instead. Its worker is not dumpable. `lightbox doctor` says which of the two is in use |
-| User namespaces | Not yet: a container's root is the host's root |
+| User namespaces | With `--userns`: a container's root is an unprivileged uid of the host's, from a range of `lightbox`'s in `/etc/subuid` and `/etc/subgid`, and its root filesystem an idmapped mount (see [User namespaces](#user-namespaces)). Without it, a container's root is the host's root |
 | OOM priority | Containers scored higher for OOM killer |
 
 ### Threat model

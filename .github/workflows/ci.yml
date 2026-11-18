@@ -68,18 +68,21 @@ jobs:
 
   # The suite that starts containers: tests/lifecycle.sh, as root. It works in
   # private network, mount and PID namespaces and fails if it leaves anything
-  # on the runner.
+  # on the runner. It runs three times on each architecture: as it is, with
+  # every container made with --userns, and with --userns --copy.
   lifecycle:
-    name: Lifecycle suite (${{ matrix.name }})
+    name: Lifecycle suite (${{ matrix.arch }}${{ matrix.userns && format(', userns {0}', matrix.userns) || '' }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
+        arch: [x86_64, aarch64]
+        userns: ['', overlay, copy]
         include:
-          - name: x86_64
+          - arch: x86_64
             runner: ubuntu-24.04
-          - name: aarch64
+          - arch: aarch64
             runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
@@ -121,12 +124,13 @@ jobs:
           echo "loaded: $(lsmod | awk '{ print $1 }' | grep -E '^(bridge|veth|br_netfilter|nf_tables|nft_compat|nf_nat|xt_.*)$' | sort | tr '\n' ' ')"
       # sudo drops the environment, so the suite's options are make variables.
       - name: Lifecycle suite
-        run: sudo make CC=gcc-14 test-lifecycle GITHUB_ACTIONS=true LIGHTBOX_TEST_MODPROBE=1
+        run: sudo make CC=gcc-14 test-lifecycle GITHUB_ACTIONS=true LIGHTBOX_TEST_MODPROBE=1 LIGHTBOX_TEST_USERNS=${{ matrix.userns }}
       # Wall time of the basic commands, the processes one start makes and
       # creates from a base of 1 GB. A shared runner's clock is rough, so this
       # reports and compares nothing. The numbers are a notice on the run's
       # page.
       - name: Timing
+        if: ${{ matrix.userns == '' }}
         run: sudo make CC=gcc-14 bench GITHUB_ACTIONS=true
       - name: Kernel log
         if: ${{ failure() }}

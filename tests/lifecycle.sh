@@ -22,6 +22,12 @@
 # loses meanwhile is reported and does not count.
 #
 #   LIGHTBOX_TEST_ROOTFS=/path  use a copy of this root filesystem (Alpine, Debian ...)
+#   LIGHTBOX_TEST_USERNS=overlay
+#                               make every container with --userns: every case is
+#                               then one of a container whose root is an
+#                               unprivileged uid of the host's (ROADMAP 8.1)
+#   LIGHTBOX_TEST_USERNS=copy   the same, and with --copy but in the cases about
+#                               overlays
 #   BUSYBOX=/path               the static busybox to build the root filesystem from
 #   LIGHTBOX_TEST_MODPROBE=1    load br_netfilter when it is not loaded (CI sets this;
 #                               on a workstation it changes how every bridge is filtered)
@@ -81,6 +87,7 @@ settings() { # after LIFECYCLE_T is known
     BB=${LIFECYCLE_BB:-}
     [ -n "$T" ] && [ -d "$T" ] || { echo "lifecycle: no work directory" >&2; exit 2; }
     C="$T/lb/containers"
+    USERNS_MODE=${LIGHTBOX_TEST_USERNS:-}
     RUN="$T/run"                # run_dir: the records of a container that runs are in $RUN/<name>/
     BASE="$T/base"
     OUT="$T/out"
@@ -134,8 +141,45 @@ box() { # name [create options] : create a container on the next free address
     local name=$1 ip
     shift
     ip=$(next_ip) || return 1
-    lb create "$name" "$ip" "$@" >"$OUT/$name.create" 2>&1 || { cat "$OUT/$name.create"; return 1; }
+    # shellcheck disable=SC2046  # options of one word each
+    lb create "$name" "$ip" "$@" $(mode_options "$@") >"$OUT/$name.create" 2>&1 || { cat "$OUT/$name.create"; return 1; }
     port_of "$name" >/dev/null
+}
+
+# What LIGHTBOX_TEST_USERNS adds to a create: --userns, and with copy --copy
+# too, where the case did not give them. A case about overlays sets OVERLAY=1,
+# which keeps --copy out; a container that is to have no range is made with
+# PLAIN=1 box ..., which adds nothing.
+mode_options() { # the options the case gives
+    local given=" $* "
+    [ -n "$USERNS_MODE" ] && [ -z "${PLAIN:-}" ] || return 0
+    case $given in *' --userns '*) ;; *) echo --userns ;; esac
+    if [ "$USERNS_MODE" = copy ] && [ -z "${OVERLAY:-}" ]; then
+        case $given in *' --copy '*) ;; *) echo --copy ;; esac
+    fi
+}
+
+conf_value() { sed -n "s/^$2=//p" "$C/$1/.conf"; }  # name key
+
+# What the suite puts in a container's rootfs/ from the host, made its root's,
+# as if the container had made it. In the upper layer of an overlay with
+# --userns that is the first uid and gid of its range. A --copy with --userns
+# is idmapped as it is, and there host root's files are its root's already.
+made_for() { # name path...
+    local name=$1
+    shift
+    [ "$(conf_value "$name" userns)" = 1 ] && [ -n "$(conf_value "$name" base)" ] || return 0
+    chown -hR "$(conf_value "$name" uid_start):$(conf_value "$name" gid_start)" "$@"
+}
+
+# A volume that a container writes in, made its root's on the host. With
+# --userns that is the first uid and gid of its range: host root's files are
+# not its root's.
+volume_for() { # name path...
+    local name=$1
+    shift
+    [ "$(conf_value "$name" userns)" = 1 ] || return 0
+    chown -R "$(conf_value "$name" uid_start):$(conf_value "$name" gid_start)" "$@"
 }
 
 # The end of a container's interface on the host, as inspect names it: kept,
@@ -871,7 +915,7 @@ t_exec_environment() {
 t_volume_directory() {
     mkdir -p "$T/vol/shared"
     echo from-the-host > "$T/vol/shared/in"
-    up vdir --vol "$T/vol/shared:/data" || return 1
+    box vdir --vol "$T/vol/shared:/data" && volume_for vdir "$T/vol/shared" && start vdir || return 1
     [ "$(sh_in vdir 'cat /data/in')" = from-the-host ] || return 1
     sh_in vdir 'echo from-the-container > /data/out' || return 1
     [ "$(cat "$T/vol/shared/out")" = from-the-container ]
@@ -1021,6 +1065,7 @@ t_volume_destination_is_inside() {
     mkdir -p "$C/vlink/rootfs/srv" "$C/vlink/rootfs$host"
     ln -s /srv "$C/vlink/rootfs/link"
     ln -s "$host" "$C/vlink/rootfs/away"
+    made_for vlink "$C/vlink/rootfs/srv" "$C/vlink/rootfs${host%/*}" "$C/vlink/rootfs/link" "$C/vlink/rootfs/away" || return 1
     start vlink || return 1
     [ "$(sh_in vlink 'cat /srv/data/in')" = through-a-link ] || { echo "the volume is not where the link leads in the container"; return 1; }
     [ "$(sh_in vlink 'cat /away/data/in')" = through-a-link ] || { echo "the second volume is not reachable through its link"; return 1; }
@@ -1030,7 +1075,7 @@ t_volume_destination_is_inside() {
 
     # the same link when the container has no such directory: it leads nowhere, and the start says so
     box vnowhere --vol "$T/vol/linked:/away/data" || return 1
-    ln -s "$host" "$C/vnowhere/rootfs/away"
+    ln -s "$host" "$C/vnowhere/rootfs/away" && made_for vnowhere "$C/vnowhere/rootfs/away" || return 1
     if said=$(start vnowhere); then
         printf '%s\n' "$said"
         echo "a volume was mounted through a link that leads nowhere in the container"
@@ -1046,7 +1091,8 @@ t_volume_under_tmp() {
     mkdir -p "$T/vol/cache"
     echo cached > "$T/vol/cache/in"
     echo 'one = 1' > "$T/vol/one.conf"
-    up vtmp --read-only --vol "$T/vol/cache:/tmp/cache" --vol "$T/vol/one.conf:/run/app/one.conf:ro" --vol "$T/vol/cache:/not/in/the/image" || return 1
+    box vtmp --read-only --vol "$T/vol/cache:/tmp/cache" --vol "$T/vol/one.conf:/run/app/one.conf:ro" --vol "$T/vol/cache:/not/in/the/image" &&
+        volume_for vtmp "$T/vol/cache" && start vtmp || return 1
     [ "$(sh_in vtmp 'cat /tmp/cache/in')" = cached ] || { echo "a volume under /tmp is not visible"; return 1; }
     [ "$(sh_in vtmp 'cat /run/app/one.conf')" = 'one = 1' ] || { echo "a file volume under /run is not visible"; return 1; }
     [ "$(sh_in vtmp 'cat /not/in/the/image/in')" = cached ] || { echo "a volume at a path the image lacks is not there, with a read-only root"; return 1; }
@@ -1176,7 +1222,7 @@ t_image_with_one_binary() {
     [ -n "$BB" ] || { echo "no static busybox to make the image from"; return 77; }
     mkdir -p "$T/base-one"
     cp "$BB" "$T/base-one/busybox"
-    lb create one "$(next_ip)" --rootfs "$T/base-one" || return 1
+    box one --rootfs "$T/base-one" || return 1
     start one || { echo "an image without mount, ip and sh did not start"; return 1; }
     [ "$(lb exec one /busybox echo runs </dev/null)" = runs ] && lb stop one
 }
@@ -1184,13 +1230,18 @@ t_image_with_one_binary() {
 t_start_runs_nothing_from_the_image() {
     [ -n "$BB" ] || { echo "the recording stand-ins are made for the busybox image"; return 77; }
     box record || return 1
+    # bin/ of the container's own, which the upper layer of an overlay lacks
+    mkdir -p "$C/record/rootfs/bin" || return 1
     for tool in mount ip; do
         rm -f "$C/record/rootfs/bin/$tool"
         printf '#!/bin/sh\necho %s >> /run-from-the-image\nexec /bin/busybox %s "$@"\n' "$tool" "$tool" \
-            > "$C/record/rootfs/bin/$tool"
-        chmod 755 "$C/record/rootfs/bin/$tool"
+            > "$C/record/rootfs/bin/$tool" && chmod 755 "$C/record/rootfs/bin/$tool" || return 1
     done
+    made_for record "$C/record/rootfs/bin" || return 1
     start record || return 1
+    # what the container has at /bin/mount and /bin/ip is the stand-ins
+    [ "$(sh_in record 'cat /bin/mount /bin/ip' | grep -c 'run-from-the-image')" = 2 ] ||
+        { echo "the stand-ins are not what the container has"; return 1; }
     log="$C/record/rootfs/run-from-the-image"
     if [ -s "$log" ]; then
         echo "run from the image during start: $(sort "$log" | uniq -c | tr -s ' \n' ' ')"
@@ -1880,7 +1931,8 @@ t_wide_subnet() {
     ip -o -4 addr show dev "$WIDE_BR"
     ip -o -4 addr show dev "$WIDE_BR" | grep -q ' 10\.9\.0\.1/16 ' || { echo "the bridge does not have 10.9.0.1/16"; return 1; }
     iptables -t nat -C LIGHTBOX-POSTROUTING -s 10.9.0.0/16 ! -o "$WIDE_BR" -j MASQUERADE || { echo "no address translation for 10.9.0.0/16"; return 1; }
-    lb create wide 10.9.5.2 >"$OUT/wide.create" 2>&1 || { cat "$OUT/wide.create"; return 1; }
+    # shellcheck disable=SC2046  # options of one word each
+    lb create wide 10.9.5.2 $(mode_options) >"$OUT/wide.create" 2>&1 || { cat "$OUT/wide.create"; return 1; }
     start wide || return 1
     said=$(sh_in wide 'ip addr; ip route')
     printf '%s\n' "$said"
@@ -2203,6 +2255,7 @@ base_of() { sed -n 's/^base=//p' "$C/$1/.conf"; }
 # changed in rootfs/ only, and a change of the base afterwards reaches no
 # container.
 t_overlay_root() {
+    OVERLAY=1
     box ov1 && box ov2 || return 1
     id=$(base_of ov1)
     echo "base snapshot: $id; of ov2: $(base_of ov2)"
@@ -2239,6 +2292,7 @@ t_copy_root() {
 # refuses one that a container uses and removes one that none does; base add
 # takes a new snapshot, which the containers made after it overlay.
 t_base_commands() {
+    OVERLAY=1
     box bu1 || return 1
     old=$(base_of bu1)
     listing=$(lb base ls) || return 1
@@ -2401,6 +2455,7 @@ t_nft_reload() {
 # owned on the host by its range, and the snapshot stays host root's.
 t_userns_overlay() {
     need_subids || return 77
+    OVERLAY=1
     box unover --userns || return 1
     cat "$C/unover/.conf"
     u=$(conf_value unover uid_start) g=$(conf_value unover gid_start)
@@ -2453,7 +2508,7 @@ t_userns_copy() {
 # and one without it gets none.
 t_userns_ranges_apart() {
     need_subids || return 77
-    box unone --userns && box untwo --userns && box unnone || return 1
+    box unone --userns && box untwo --userns && PLAIN=1 box unnone || return 1
     echo "unone: $(conf_value unone uid_start) $(conf_value unone gid_start); untwo: $(conf_value untwo uid_start) $(conf_value untwo gid_start)"
     [ "$(conf_value untwo uid_start)" = $(( $(conf_value unone uid_start) + 65536 )) ] &&
         [ "$(conf_value untwo gid_start)" = $(( $(conf_value unone gid_start) + 65536 )) ] || return 1
@@ -2739,7 +2794,8 @@ EOF
 # The ranges a container with --userns takes its ids from: the suite's own
 # /etc/subuid and /etc/subgid over the host's, in this mount namespace only,
 # with one range for lightbox, as README says to add it. A host without the
-# two files has nothing to put them over, and the cases of --userns skip.
+# two files has nothing to put them over: the cases of --userns skip, and
+# with LIGHTBOX_TEST_USERNS the suite does not run.
 SUBIDS='lightbox:2147483647:2147483648'
 subids() {
     [ -e /etc/subuid ] && [ -e /etc/subgid ] || return 0
@@ -2753,7 +2809,6 @@ need_subids() {
 
 # a process's uid and gid on the host
 host_ids_of() { awk '/^Uid:/ { u = $2 } /^Gid:/ { g = $2 } END { print u, g }' "/proc/$1/status"; }
-conf_value() { sed -n "s/^$2=//p" "$C/$1/.conf"; }  # name key
 
 # lightbox runs neither ip nor nsenter since 0.7 (ROADMAP 7.2). In this mount
 # namespace both are stand-ins that note who ran them and fail, so that a
@@ -2869,6 +2924,13 @@ if [ "$MODE" = inside ]; then
     else
         echo "lifecycle: root filesystem copied from $LIGHTBOX_TEST_ROOTFS"
     fi
+    SUITE=lifecycle
+    case $USERNS_MODE in
+        overlay) SUITE="lifecycle with --userns"
+                 echo "lifecycle: every container with --userns" ;;
+        copy)    SUITE="lifecycle with --userns --copy"
+                 echo "lifecycle: every container with --userns, and with --copy but in the cases about overlays" ;;
+    esac
     echo
 
     if [ -n "${LIFECYCLE_PROGRAM:-}" ]; then
@@ -2898,7 +2960,7 @@ if [ "$MODE" = inside ]; then
     if [ "$failed" -ne 0 ]; then
         echo
         echo "lifecycle: setup failed, and every other case needs it"
-        summary lifecycle
+        summary "$SUITE"
         exit 1
     fi
     iptables-save > "$T/firewall"
@@ -3051,7 +3113,7 @@ if [ "$MODE" = inside ]; then
     # last: it may leave a kernel setting changed for the rest of this suite's life
     check 'exec works where a memfd may not be executed'                  t_exec_where_memfds_may_not_be_executed
 
-    summary lifecycle
+    summary "$SUITE"
     exit $?
 fi
 
@@ -3111,6 +3173,14 @@ preflight() {
   Install busybox-static, or give one with BUSYBOX=/path, or a root filesystem with LIGHTBOX_TEST_ROOTFS=/path.
   (${TMPDIR:-/tmp} must not be mounted noexec either.)"
     fi
+
+    case ${LIGHTBOX_TEST_USERNS:-} in
+        '') ;;
+        overlay|copy)
+            [ -e /etc/subuid ] && [ -e /etc/subgid ] ||
+                stop_early "LIGHTBOX_TEST_USERNS needs an /etc/subuid and an /etc/subgid to put the suite's own over" ;;
+        *)  stop_early "LIGHTBOX_TEST_USERNS is overlay or copy, not: $LIGHTBOX_TEST_USERNS" ;;
+    esac
 
     if [ "${LIGHTBOX_TEST_MODPROBE:-0}" = 1 ] && [ ! -e "$BRNF" ]; then
         modprobe br_netfilter 2>/dev/null ||

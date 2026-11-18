@@ -14,6 +14,7 @@ Not tagged yet: the part of Phase 8 that is written so far.
 ### Added
 
 - **`create --userns`** gives a container a user namespace of its own: its root is an unprivileged uid on the host, the first of a range of 65536 uids and gids that `/etc/subuid` and `/etc/subgid` give the name `lightbox`, as rootful Podman's `--userns=auto` uses `containers`. Its root filesystem is an idmapped mount, so the base's files are its root's and nothing is chowned: Linux 5.12 for a `--copy` container, 5.19 for an overlay. An overlay container's own files belong on the host to its range. Without a range, or where the kernel or the filesystem cannot idmap, `create --userns` says why and makes nothing. `exec` joins the user namespace first.
+- **`sudo make test-lifecycle LIGHTBOX_TEST_USERNS=overlay`**, and `=copy`, run the lifecycle suite with every container made with `--userns`, the second with `--copy` too but in the cases about overlays. CI runs the suite in both ways and as it is, on each architecture.
 
 ### Changed
 
