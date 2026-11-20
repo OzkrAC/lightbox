@@ -2820,6 +2820,16 @@ reconcile_cases() {
 }
 t_reconcile() { in_records_dir reconcile_cases; }
 
+# The cgroup device program of lightbox_devices.h, interpreted (ROADMAP 8.4):
+# a program the verifier has no reason to refuse, and the verdict of every
+# kind of device, access and number it tries. Loading it needs root, which
+# the lifecycle suite has.
+t_device_program() {
+    prog="$(dirname "$UNIT")/devices_filter"
+    [ -x "$prog" ] || { echo "$prog was not built (no hosted compiler?)"; return 77; }
+    "$prog"
+}
+
 check 'a program that succeeds gives 0'                          t_success
 check 'a non-zero exit status is returned as it is'              t_exit_status
 check 'a program killed by a signal is a failure, and reported'  t_killed_by_signal
@@ -2948,5 +2958,6 @@ check 'a runtime record makes its directory when a reboot took it'  t_run_dir_is
 check 'a file is removed for good, or said not to be'             t_remove_durably
 check 'init says how it ends, and nothing it starts can look into it' t_init_reports_its_end
 check 'a container that ended without a stop is cleared away, and how it ended recorded' t_reconcile
+check 'the device program lets a container open its own devices and nothing else' t_device_program
 
 summary unit

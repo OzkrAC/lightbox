@@ -38,6 +38,7 @@
 #define LB_SYS_ppoll      271
 #define LB_SYS_memfd_create 319
 #define LB_SYS_execveat   322
+#define LB_SYS_bpf        321
 #define LB_SYS_statx      332
 #define LB_SYS_faccessat  269
 #define LB_SYS_pidfd_send_signal 424
@@ -61,6 +62,7 @@
 #define LB_SYS_geteuid    175
 #define LB_SYS_memfd_create 279
 #define LB_SYS_execveat   281
+#define LB_SYS_bpf        280
 #define LB_SYS_statx      291
 #define LB_SYS_faccessat  48
 #define LB_SYS_pidfd_send_signal 424
@@ -76,6 +78,7 @@
 
 /* ─── Kernel constants (the same on both architectures) ─────────────────── */
 
+#define LB_EPERM                  1
 #define LB_ENOENT                 2
 #define LB_ESRCH                  3
 #define LB_EINTR                  4
@@ -413,6 +416,29 @@ struct lb_mount_attr {
     uint64_t userns_fd;
 };
 
+/* union bpf_attr (linux/bpf.h) as BPF_PROG_LOAD reads it, to the program's
+ * name; the kernel takes the rest of the union as zero */
+struct lb_bpf_prog_load {
+    uint32_t prog_type;
+    uint32_t insn_cnt;
+    uint64_t insns;             /* the instructions' address */
+    uint64_t license;           /* a string's address */
+    uint32_t log_level;
+    uint32_t log_size;
+    uint64_t log_buf;
+    uint32_t kern_version;
+    uint32_t prog_flags;
+    char     prog_name[16];
+};
+
+/* union bpf_attr as BPF_PROG_ATTACH reads it, to its flags */
+struct lb_bpf_prog_attach {
+    uint32_t target_fd;         /* the cgroup's directory */
+    uint32_t attach_bpf_fd;     /* the program */
+    uint32_t attach_type;
+    uint32_t attach_flags;
+};
+
 /* struct open_how (linux/openat2.h) */
 struct lb_open_how {
     uint64_t flags;
@@ -584,6 +610,11 @@ static inline lc_sysret lb_sys_move_mount(int32_t from_dirfd, const char *from_p
                                           int32_t to_dirfd, const char *to_path, uint32_t flags) {
     return lc_syscall5(LB_SYS_move_mount, from_dirfd, (int64_t)from_path,
                        to_dirfd, (int64_t)to_path, flags);
+}
+
+/* bpf(2), with one of the two layouts above */
+static inline lc_sysret lb_sys_bpf(int32_t cmd, void *attr, uint32_t size) {
+    return lc_syscall3(LB_SYS_bpf, cmd, (int64_t)attr, size);
 }
 
 /* close_range(2), Linux 5.9: close every descriptor from first to last */

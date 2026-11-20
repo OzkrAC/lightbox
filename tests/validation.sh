@@ -1545,7 +1545,7 @@ try:
 except ValueError as e:
     wrong(e)
 checks = {c["check"]: c for c in d["checks"]}
-for name in ("root", "kernel", "syscalls", "network", "cgroup2", "path.rootfs", "bin.cp", "bin.rm", "exec_sealing"):
+for name in ("root", "kernel", "syscalls", "network", "cgroup2", "device_filter", "path.rootfs", "bin.cp", "bin.rm", "exec_sealing"):
     if name not in checks:
         wrong("no check " + name)
 for name in ("bin.ip", "bin.nsenter"):

@@ -1,4 +1,5 @@
 #include "lightbox.h"
+#include "lightbox_devices.h"
 
 void print_str(int32_t fd, const char *s) {
     lc_print_string(fd, s, lc_string_length(s));
@@ -886,4 +887,33 @@ void require_mount(const char *source, const char *target,
                    const char *fstype, uint64_t flags, const char *data) {
     if (do_mount(source, target, fstype, flags, data) != 0)
         lc_kernel_exit(1);      /* do_mount has said what failed */
+}
+
+/* ─── The device program ────────────────────────────────────────────────── */
+
+lc_sysret device_program_load(char *log, uint32_t log_size) {
+    static struct lb_ebpf_insn prog[LB_DEV_PROG_LEN];
+    if (log && log_size)
+        log[0] = '\0';
+    if (lb_devices_build(prog) != LB_DEV_PROG_LEN)
+        return -LB_EINVAL;
+    /* It calls no helper of the kernel's, which is all a license decides. */
+    struct lb_bpf_prog_load load = {
+        .prog_type = LB_BPF_PROG_TYPE_CGROUP_DEVICE,
+        .insn_cnt = LB_DEV_PROG_LEN,
+        .insns = (uint64_t)(uintptr_t)prog,
+        .license = (uint64_t)(uintptr_t)"",
+        .prog_name = "lightbox_dev",
+    };
+    lc_sysret fd = lb_sys_bpf(LB_BPF_PROG_LOAD, &load, sizeof(load));
+    if (fd < 0 && fd != -LB_EPERM && log && log_size > 1) {
+        load.log_level = 1;
+        load.log_size = log_size;
+        load.log_buf = (uint64_t)(uintptr_t)log;
+        lc_sysret again = lb_sys_bpf(LB_BPF_PROG_LOAD, &load, sizeof(load));
+        if (again >= 0)
+            lc_kernel_close_file((int32_t)again);
+        log[log_size - 1] = '\0';
+    }
+    return fd;
 }

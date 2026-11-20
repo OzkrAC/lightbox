@@ -1,6 +1,6 @@
 /*
- * Compile-only check of lightbox_sys.h and lightbox_seccomp.h against the
- * kernel's own headers.
+ * Compile-only check of lightbox_sys.h, lightbox_seccomp.h and
+ * lightbox_devices.h against the kernel's own headers.
  *
  * lightbox is freestanding and carries a few syscall numbers, constants and
  * structure layouts of its own, and its seccomp table lists numbers for two
@@ -31,10 +31,12 @@
 #include <asm/termios.h>
 #include <asm/unistd.h>
 #include <linux/audit.h>
+#include <linux/bpf.h>
 #include <linux/capability.h>
 #include <linux/fcntl.h>
 #include <linux/filter.h>
 #include <linux/magic.h>
+#include <linux/major.h>
 #include <linux/if_addr.h>
 #include <linux/if_link.h>
 #include <linux/memfd.h>
@@ -51,6 +53,7 @@
 
 #include "../lightbox_sys.h"
 #include "../lightbox_seccomp.h"
+#include "../lightbox_devices.h"
 
 #define SAME_NR(name) \
     _Static_assert(LB_SYS_##name == __NR_##name, \
@@ -78,10 +81,12 @@ SAME_NR(move_mount);
 SAME_NR(pidfd_send_signal);
 SAME_NR(statx);
 SAME_NR(faccessat);
+SAME_NR(bpf);
 
 #define SAME_VALUE(ours, kernels) \
     _Static_assert((ours) == (kernels), #ours " differs from the kernel's " #kernels)
 
+SAME_VALUE(LB_EPERM, EPERM);
 SAME_VALUE(LB_ENOENT, ENOENT);
 SAME_VALUE(LB_ENODEV, ENODEV);
 SAME_VALUE(LB_ESRCH, ESRCH);
@@ -465,3 +470,67 @@ SAME_FIELD(lb_sock_filter, sock_filter, k);
 SAME_SIZE(lb_sock_fprog, sock_fprog);
 SAME_FIELD(lb_sock_fprog, sock_fprog, len);
 SAME_FIELD(lb_sock_fprog, sock_fprog, filter);
+
+/* ─── The device program (lightbox_devices.h) and bpf(2) ────────────────── */
+
+SAME_VALUE(LB_BPF_PROG_LOAD, BPF_PROG_LOAD);
+SAME_VALUE(LB_BPF_PROG_ATTACH, BPF_PROG_ATTACH);
+SAME_VALUE(LB_BPF_PROG_TYPE_CGROUP_DEVICE, BPF_PROG_TYPE_CGROUP_DEVICE);
+SAME_VALUE(LB_BPF_CGROUP_DEVICE, BPF_CGROUP_DEVICE);
+SAME_VALUE(LB_BPF_OBJ_NAME_LEN, BPF_OBJ_NAME_LEN);
+
+SAME_VALUE(LB_DEVCG_ACC_MKNOD, BPF_DEVCG_ACC_MKNOD);
+SAME_VALUE(LB_DEVCG_ACC_READ, BPF_DEVCG_ACC_READ);
+SAME_VALUE(LB_DEVCG_ACC_WRITE, BPF_DEVCG_ACC_WRITE);
+SAME_VALUE(LB_DEVCG_DEV_BLOCK, BPF_DEVCG_DEV_BLOCK);
+SAME_VALUE(LB_DEVCG_DEV_CHAR, BPF_DEVCG_DEV_CHAR);
+SAME_VALUE(LB_DEVCG_CTX_ACCESS_TYPE, offsetof(struct bpf_cgroup_dev_ctx, access_type));
+SAME_VALUE(LB_DEVCG_CTX_MAJOR, offsetof(struct bpf_cgroup_dev_ctx, major));
+SAME_VALUE(LB_DEVCG_CTX_MINOR, offsetof(struct bpf_cgroup_dev_ctx, minor));
+SAME_VALUE(LB_DEVCG_CTX_MINOR + 4, sizeof(struct bpf_cgroup_dev_ctx));
+
+SAME_VALUE(LB_EBPF_LDX_MEM_W, BPF_LDX | BPF_MEM | BPF_W);
+SAME_VALUE(LB_EBPF_ALU64_MOV_K, BPF_ALU64 | BPF_MOV | BPF_K);
+SAME_VALUE(LB_EBPF_ALU64_MOV_X, BPF_ALU64 | BPF_MOV | BPF_X);
+SAME_VALUE(LB_EBPF_ALU64_AND_K, BPF_ALU64 | BPF_AND | BPF_K);
+SAME_VALUE(LB_EBPF_ALU64_RSH_K, BPF_ALU64 | BPF_RSH | BPF_K);
+SAME_VALUE(LB_EBPF_JMP_JNE_K, BPF_JMP | BPF_JNE | BPF_K);
+SAME_VALUE(LB_EBPF_JMP_JLT_K, BPF_JMP | BPF_JLT | BPF_K);
+SAME_VALUE(LB_EBPF_JMP_JGT_K, BPF_JMP | BPF_JGT | BPF_K);
+SAME_VALUE(LB_EBPF_JMP_JSET_K, BPF_JMP | BPF_JSET | BPF_K);
+SAME_VALUE(LB_EBPF_JMP_EXIT, BPF_JMP | BPF_EXIT);
+
+/* The registers' nibbles are bit-fields, which offsetof cannot see:
+ * tests/devices_filter.c reads them back through the kernel's struct. */
+SAME_SIZE(lb_ebpf_insn, bpf_insn);
+SAME_FIELD(lb_ebpf_insn, bpf_insn, code);
+SAME_FIELD(lb_ebpf_insn, bpf_insn, off);
+SAME_FIELD(lb_ebpf_insn, bpf_insn, imm);
+
+/* the two parts of union bpf_attr that lightbox fills */
+#define SAME_ATTR(ours, field) \
+    _Static_assert(offsetof(struct ours, field) == offsetof(union bpf_attr, field) && \
+                   sizeof(((struct ours *)0)->field) == sizeof(((union bpf_attr *)0)->field), \
+                   "struct " #ours "." #field " does not match the kernel's union bpf_attr")
+
+SAME_ATTR(lb_bpf_prog_load, prog_type);
+SAME_ATTR(lb_bpf_prog_load, insn_cnt);
+SAME_ATTR(lb_bpf_prog_load, insns);
+SAME_ATTR(lb_bpf_prog_load, license);
+SAME_ATTR(lb_bpf_prog_load, log_level);
+SAME_ATTR(lb_bpf_prog_load, log_size);
+SAME_ATTR(lb_bpf_prog_load, log_buf);
+SAME_ATTR(lb_bpf_prog_load, kern_version);
+SAME_ATTR(lb_bpf_prog_load, prog_flags);
+SAME_ATTR(lb_bpf_prog_load, prog_name);
+SAME_VALUE(sizeof(struct lb_bpf_prog_load), offsetof(union bpf_attr, prog_name) + BPF_OBJ_NAME_LEN);
+SAME_ATTR(lb_bpf_prog_attach, target_fd);
+SAME_ATTR(lb_bpf_prog_attach, attach_bpf_fd);
+SAME_ATTR(lb_bpf_prog_attach, attach_type);
+SAME_ATTR(lb_bpf_prog_attach, attach_flags);
+SAME_VALUE(sizeof(struct lb_bpf_prog_attach), offsetof(union bpf_attr, attach_flags) + 4);
+
+SAME_VALUE(LB_DEV_MEM_MAJOR, MEM_MAJOR);
+SAME_VALUE(LB_DEV_TTYAUX_MAJOR, TTYAUX_MAJOR);
+SAME_VALUE(LB_DEV_PTS_MAJOR, UNIX98_PTY_SLAVE_MAJOR);
+SAME_VALUE(LB_DEV_PTS_MAJORS, UNIX98_PTY_MAJOR_COUNT);

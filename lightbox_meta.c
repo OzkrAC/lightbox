@@ -577,6 +577,28 @@ static void check_cgroups(struct doctor *d) {
                "the kernel offers them in cgroup.controllers of cgroup_root unless its command line has cgroup_disable= for one");
 }
 
+/* The cgroup device program a container that is not privileged starts with
+ * (ROADMAP 8.4): loaded and let go, which only root may. */
+static void check_device_filter(struct doctor *d) {
+    if (lb_sys_geteuid() != 0) {
+        doc_yes_no(d, "device_filter", false, "not known: only root may load the program", "sudo lightbox doctor");
+        return;
+    }
+    static char log[2048];
+    lc_sysret fd = device_program_load(log, sizeof(log));
+    if (fd >= 0) {
+        lc_kernel_close_file((int32_t)fd);
+        doc_yes_no(d, "device_filter", true, "the kernel loads the cgroup device program", NULL);
+        return;
+    }
+    char text[96];
+    bool cut = false;
+    size_t pos = str_append(text, 0, "the kernel refuses the cgroup device program: errno ", sizeof(text), &cut);
+    fmt_int(text + pos, (int)-fd);
+    doc_yes_no(d, "device_filter", false, text,
+               "boot a kernel with CONFIG_CGROUP_BPF and CONFIG_BPF_SYSCALL; only a --privileged container starts without it");
+}
+
 /* The base root filesystem: a directory with something in it to copy. */
 static void check_rootfs(struct doctor *d) {
     const char *rootfs = cfg_global.rootfs;
@@ -736,6 +758,7 @@ void cmd_doctor(int argc, char **argv) {
         }
     }
     check_cgroups(d);
+    check_device_filter(d);
     if (nftables && cfg_global.ip_forward) {
         char forwarding[8];
         bool on = read_file("/proc/sys/net/ipv4/ip_forward", forwarding, sizeof(forwarding)) > 0 && forwarding[0] == '1';

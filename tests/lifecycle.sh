@@ -1952,6 +1952,52 @@ exit $bad
 EOF
 }
 
+# The cgroup device program (ROADMAP 8.4): a container opens the devices of
+# its /dev and no other. The suite makes nodes as host root in the
+# container's /dev, a tmpfs that is not nodev, and the program refuses them
+# by their numbers whatever their name: /dev/kmsg's, /dev/mem's and a block
+# device's. A node of /dev/null's numbers under another name opens, and
+# /dev/urandom is read and not written, which its read-only mount did not
+# keep it from. A block device in a volume is refused too, as volumes are
+# nodev. A privileged container has no program, and opens the same nodes. In
+# a user namespace of its own the container's /dev is nodev to nodes it did
+# not make: the kernel refuses them with EACCES before the program is asked.
+t_device_filter() {
+    mkdir -p "$T/vol/devs" && mknod -m 666 "$T/vol/devs/loop" b 7 0 || return 1
+    up devs --vol "$T/vol/devs:/devs" && PLAIN=1 up devpriv --privileged || return 1
+    for name in devs devpriv; do
+        dev=/proc/$(pid_of "$name")/root/dev
+        mknod -m 666 "$dev/lbt-kmsg" c 1 11 && mknod -m 666 "$dev/lbt-mem" c 1 1 &&
+        mknod -m 666 "$dev/lbt-loop" b 7 0 && mknod -m 666 "$dev/lbt-null" c 1 3 ||
+            { echo "the suite cannot make nodes in the /dev of $name"; return 1; }
+    done
+
+    said=$(sh_in devs ': < /dev/null && : < /dev/lbt-null && echo x > /dev/lbt-null &&
+                       head -c 8 /dev/zero | wc -c && head -c 8 /dev/urandom | wc -c' 2>&1)
+    said=$(printf '%s\n' "$said" | tr -d ' ' | paste -sd' ' -)
+    echo "its own devices: $said"
+    [ "$said" = '8 8' ] || { echo "a device of its own does not work"; return 1; }
+
+    for what in 'echo x > /dev/urandom' ': < /dev/lbt-kmsg' ': < /dev/lbt-mem' ': < /dev/lbt-loop' ': < /devs/loop'; do
+        said=$(sh_in devs "$what" 2>&1) && { echo "taken: $what"; return 1; }
+        echo "$what: $said"
+        case $what in
+            *urandom*) case $said in *'not permitted'*) continue ;; esac ;;
+            *'/devs/'*) case $said in *denied*) continue ;; esac ;;
+            *) case $said in
+                   *'not permitted'*) continue ;;
+                   *denied*) [ -n "$USERNS_MODE" ] && continue ;;
+               esac ;;
+        esac
+        echo "not refused as the device program or the volume's nodev refuses"
+        return 1
+    done
+
+    sh_in devpriv ': < /dev/lbt-kmsg && : < /dev/lbt-null && echo x > /dev/urandom' ||
+        { echo "the privileged container cannot open them"; return 1; }
+    echo "the privileged container opens /dev/kmsg's numbers and writes /dev/urandom"
+}
+
 t_storage_closed_to_others() {
     command -v setpriv >/dev/null 2>&1 || { echo "no setpriv to become another user with"; return 77; }
     as_nobody() { setpriv --reuid 65534 --regid 65534 --clear-groups "$@"; }
@@ -3189,6 +3235,7 @@ if [ "$MODE" = inside ]; then
     check 'a privileged container is not sandboxed and sees /proc as it is' t_privileged_is_not_sandboxed
     check '/proc is masked and its system trees are read-only'            t_proc_is_masked
     check 'the paths Docker masks are masked and show nothing'            t_docker_masks
+    check 'a container opens the devices of its /dev and no other'       t_device_filter
     check 'another user cannot reach container files'                     t_storage_closed_to_others
 
     check 'a container has loopback, its address and a default route'     t_network_inside

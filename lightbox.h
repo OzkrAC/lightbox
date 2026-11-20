@@ -254,6 +254,11 @@ void require_write_file(const char *path, const char *data);
  * Writing is atomic, and replaces a link of that name with the file. 0 or -1.
  * Reading gives the text and its length, 0 for a file that is not there, and
  * -1 for one that cannot be read, is not a regular file or does not fit. */
+/* The cgroup device program of lightbox_devices.h, loaded (ROADMAP 8.4): its
+ * descriptor, or -errno. A program the kernel refuses is loaded once more
+ * for the verifier to say why, into log, which is empty otherwise. */
+lc_sysret device_program_load(char *log, uint32_t log_size);
+
 [[nodiscard]] int write_file_in_root(const char *root, const char *dir, const char *name,
                                      const char *data, int32_t mode);
 [[nodiscard]] int read_file_in_root(const char *root, const char *dir, const char *name,

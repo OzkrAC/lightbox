@@ -24,6 +24,7 @@
 
 #include "lightbox.h"
 #include "lightbox_seccomp.h"
+#include "lightbox_devices.h"
 
 /* ─── Compile-time limits ───────────────────────────────────────────────── */
 
@@ -273,6 +274,59 @@ static bool cpu_max_text(const char *cpu, char *out, size_t max) {
     return !cut;
 }
 
+/* "<before><number><after>" in buf, for a message that names a number. */
+static const char *text_with_number(char *buf, size_t bufsz, const char *before, int number,
+                                    const char *after) {
+    char digits[16];
+    bool cut = false;       /* a message that lost its end is still the message */
+    fmt_int(digits, number);
+    size_t pos = str_append(buf, 0, before, bufsz, &cut);
+    pos = str_append(buf, pos, digits, bufsz, &cut);
+    str_append(buf, pos, after, bufsz, &cut);
+    return buf;
+}
+
+/*
+ * The device program of lightbox_devices.h, attached to a container's cgroup
+ * before init is in it (ROADMAP 8.4). Its processes then open the devices of
+ * its /dev and no other, wherever a node of another is, and make none. A
+ * program attached so is the cgroup's until the cgroup is removed, and no
+ * cgroup below it may have another. NULL, or what failed: a container that
+ * is not privileged does not start without it.
+ */
+static const char *device_filter_attach(const char *cg) {
+    static char err[200], log[4096];
+    lc_sysret prog = device_program_load(log, sizeof(log));
+    if (prog < 0) {
+        if (log[0]) {
+            print_str(STDERR, "The kernel's verifier said of the device program:\n");
+            print_str(STDERR, log);
+        }
+        return text_with_number(err, sizeof(err), "the kernel did not load the device program (errno ",
+                                (int)-prog, "); doctor says whether it can");
+    }
+    lc_sysret cgfd = lc_kernel_open_file(cg, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+    if (cgfd < 0) {
+        lc_kernel_close_file((int32_t)prog);
+        return text_with_number(err, sizeof(err), "cannot open the container's cgroup for its device program (errno ",
+                                (int)-cgfd, ")");
+    }
+    struct lb_bpf_prog_attach attach = {
+        .target_fd = (uint32_t)cgfd,
+        .attach_bpf_fd = (uint32_t)prog,
+        .attach_type = LB_BPF_CGROUP_DEVICE,
+        .attach_flags = 0,
+    };
+    lc_sysret rc = lb_sys_bpf(LB_BPF_PROG_ATTACH, &attach, sizeof(attach));
+    lc_kernel_close_file((int32_t)cgfd);
+    lc_kernel_close_file((int32_t)prog);
+    if (rc < 0)
+        return text_with_number(err, sizeof(err),
+                                "the kernel did not attach the device program to the container's cgroup (errno ",
+                                (int)-rc, ")");
+    return NULL;
+}
+
 static const char *cgroup_create(const char *name, int pid, const container_config *config) {
     char cg[MAX_PATH], path[MAX_PATH];
     if (!cgroup_path(cg, name) || !path_join(path, sizeof(path), cg, "cgroup.controllers"))
@@ -329,6 +383,13 @@ static const char *cgroup_create(const char *name, int pid, const container_conf
 
     if (config->io[0] && cgroup_write(cg, "io.max", config->io) < 0)
         return "failed to set the I/O limit; the kernel takes one for a disk that is there, and not for a partition";
+
+    /* the devices it may open, before anything of it runs in the cgroup */
+    if (!config->privileged) {
+        const char *failed = device_filter_attach(cg);
+        if (failed)
+            return failed;
+    }
 
     /* move container process into this cgroup */
     char pidbuf[16];
@@ -3359,14 +3420,13 @@ static void build_container(const struct child_args *ca) {
         lc_kernel_mkdirat(AT_FDCWD, dev_path, 0755);   /* a minimal image may not have it */
         require_mount("tmpfs", dev_path, "tmpfs", MS_NOSUID | MS_NOEXEC, "mode=755");
 
-        static const struct { const char *name; int mode; } devs[] = {
-            { "null",    0666 },
-            { "zero",    0666 },
-            { "full",    0666 },
-            { "random",  0444 },
-            { "urandom", 0444 },
-            { "tty",     0666 },
+        /* the nodes of LB_DEV_BOUND, which the device program lets a
+         * container open as they are bound here */
+#define LB_DEV_BIND(name, major, minor, mode, access) { #name, mode, (access) == LB_DEV_R },
+        static const struct { const char *name; int mode; bool read_only; } devs[] = {
+            LB_DEV_BOUND(LB_DEV_BIND)
         };
+#undef LB_DEV_BIND
 
         for (size_t i = 0; i < sizeof(devs) / sizeof(devs[0]); i++) {
             char host_dev[32], cont_dev[MAX_PATH];
@@ -3378,7 +3438,7 @@ static void build_container(const struct child_args *ca) {
             require_mount(host_dev, cont_dev, NULL, MS_BIND, NULL);
             if (!ca->privileged) {
                 uint64_t dev_flags = MS_REMOUNT | MS_BIND | MS_NOSUID | MS_NOEXEC;
-                if (streq(devs[i].name, "random") || streq(devs[i].name, "urandom"))
+                if (devs[i].read_only)
                     dev_flags |= MS_RDONLY;
                 require_mount(NULL, cont_dev, NULL, dev_flags, NULL);
             }
@@ -3482,18 +3542,6 @@ static int container_child(void *arg) {
 }
 
 /* ─── cmd_start ─────────────────────────────────────────────────────────── */
-
-/* "<before><number><after>" in buf, for a message that names a number. */
-static const char *text_with_number(char *buf, size_t bufsz, const char *before, int number,
-                                    const char *after) {
-    char digits[16];
-    bool cut = false;       /* a message that lost its end is still the message */
-    fmt_int(digits, number);
-    size_t pos = str_append(buf, 0, before, bufsz, &cut);
-    pos = str_append(buf, pos, digits, bufsz, &cut);
-    str_append(buf, pos, after, bufsz, &cut);
-    return buf;
-}
 
 /* ─── Several containers at once ────────────────────────────────────────── */
 
