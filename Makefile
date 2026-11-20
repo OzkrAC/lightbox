@@ -195,8 +195,10 @@ test: test-unit test-validation test-seccomp
 # the environment, so its options go on make's command line:
 #     sudo make test-lifecycle V=1 KEEP=1
 # LIGHTBOX_TEST_USERNS=overlay makes every container with --userns, and
-# LIGHTBOX_TEST_USERNS=copy with --userns --copy. LIGHTBOX_TEST_SECCOMP=allow
-# makes every container with --seccomp allow, alone or with either.
+# LIGHTBOX_TEST_USERNS=copy with --userns --copy. LIGHTBOX_TEST_SECCOMP=deny
+# makes every container with --seccomp deny, alone or with either, and
+# LIGHTBOX_TEST_ROOTFS=<dir> builds them from that root filesystem, such as
+# one that tests/fetch_image.sh unpacked.
 # It builds nothing, so that sudo leaves no file of root's in the tree.
 REQUIRE_BUILT = $(MAKE) -q --no-print-directory lightbox || { \
     echo "lightbox is missing or older than its sources: run make first, without sudo" >&2; exit 2; }

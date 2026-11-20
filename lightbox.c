@@ -987,6 +987,10 @@ static void cmd_create(int argc, char **argv) {
      * be found wrong when the container is started. */
     static container_config cfg;
     container_config_init(&cfg);
+    /* A new container has the allow-list unless it asks for the deny-list
+     * (ROADMAP 8.3). A .conf without the line is a container made before
+     * 0.8, which keeps the deny-list it was made with. */
+    cfg.seccomp_allow = true;
     char dns[MAX_DNS][16];
     int ndns = 0;
 
@@ -4466,7 +4470,7 @@ static const struct { const char *name; const char *text; } command_help[] = {
         "         --copy                 A copy of the base, and not an overlay of its snapshot\n"
         "         --privileged           Disable security sandbox\n"
         "         --seccomp allow|deny   The seccomp profile: the allow-list, or the deny-list\n"
-        "                                (default: deny)\n"
+        "                                (default: allow)\n"
         "         --oom-score <n>        OOM score adjustment (default: 500)\n"
         "         --link <name>          Allow network to another container\n"
         "         --dns <address>        A name server for the container (up to 3; default: the host's)\n" },

@@ -28,20 +28,21 @@
  *       The two directories have to exist and be empty.
  *
  * It prints one line per table row, then what the x32 range (x86_64 only), a
- * clone with a namespace flag and a plain clone returned:
+ * clone with a namespace flag, a plain clone, and socket and socketpair of
+ * some families returned:
  *
  *   deny <nr> <documented errno> <returned before> <returned after>
  *   x32 <returned before> <returned after>
  *   clone_newuser <returned before> <returned after>
  *   clone_plain <returned before> <returned after>
+ *   socket <family> <returned before> <returned after>
+ *   socketpair <family> <returned before> <returned after>
  *
- * and with --allow, for a call the allow-list does not name (vhangup), a
- * number past every table, and socket and socketpair of some families:
+ * and with --allow, for a call the allow-list does not name (vhangup) and a
+ * number past every table:
  *
  *   unlisted <returned before> <returned after>
  *   past <returned before> <returned after>
- *   socket <family> <returned before> <returned after>
- *   socketpair <family> <returned before> <returned after>
  *
  * Probes pass -1 for every argument. A denied syscall never runs, and one that
  * does run (before the profile, or because the profile missed it) fails on the
@@ -128,7 +129,7 @@ static void install_profile(void) {
     apply_seccomp(allow_list);
 }
 
-/* ─── What only the allow-list does ─────────────────────────────────────── */
+/* ─── The families of a socket, and what only the allow-list does ──────── */
 
 #if defined(__x86_64__)
 #define NR_VHANGUP     153
@@ -381,10 +382,6 @@ static void cmd_probe(void) {
     put("clone_plain ");    put_num(plain_before);
     put(" ");               put_num(in_child(probe_clone_plain));
     put("\n");
-    if (!allow_list)
-        return;
-    put_pair("unlisted", unlisted_before, lc_syscall6(NR_VHANGUP, 0, 0, 0, 0, 0, 0));
-    put_pair("past", past_before, lc_syscall6(NR_PAST, 0, 0, 0, 0, 0, 0));
     char what[32];
     for (int i = 0; i < NSOCKET_FAMILIES; i++) {
         char digits[16];
@@ -400,6 +397,10 @@ static void cmd_probe(void) {
         str_append(what, str_append(what, 0, "socketpair ", sizeof(what), &cut), digits, sizeof(what), &cut);
         put_pair(what, socketpair_before[i], probe_socketpair(SOCKETPAIR_FAMILIES[i]));
     }
+    if (!allow_list)
+        return;
+    put_pair("unlisted", unlisted_before, lc_syscall6(NR_VHANGUP, 0, 0, 0, 0, 0, 0));
+    put_pair("past", past_before, lc_syscall6(NR_PAST, 0, 0, 0, 0, 0, 0));
 }
 
 int main(int argc, char **argv, char **envp) {

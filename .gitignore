@@ -6,3 +6,4 @@ tests/unit
 tests/seccomp_thread
 tests/seccomp_filter_x86_64
 tests/seccomp_filter_aarch64
+__pycache__/

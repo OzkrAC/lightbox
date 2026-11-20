@@ -76,25 +76,25 @@ jobs:
 
   # The suite that starts containers: tests/lifecycle.sh, as root. It works in
   # private network, mount and PID namespaces and fails if it leaves anything
-  # on the runner. It runs four times on each architecture: as it is, with
-  # every container made with --userns, with --userns --copy, and with
-  # --seccomp allow.
+  # on the runner. It runs six times on each architecture: on the suite's own
+  # image as it is, with every container made with --userns, with --userns
+  # --copy and with --seccomp deny; and on the Alpine and the Debian image
+  # that the allow-list, the default, is fitted to.
   lifecycle:
-    name: Lifecycle suite (${{ matrix.arch }}${{ matrix.userns && format(', userns {0}', matrix.userns) || '' }}${{ matrix.seccomp && format(', seccomp {0}', matrix.seccomp) || '' }})
+    name: Lifecycle suite (${{ matrix.arch }}${{ matrix.mode.name && format(', {0}', matrix.mode.name) || '' }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         arch: [x86_64, aarch64]
-        userns: ['', overlay, copy]
-        seccomp: ['', allow]
-        # the allow-list once on each architecture, with the suite's own image
-        exclude:
-          - userns: overlay
-            seccomp: allow
-          - userns: copy
-            seccomp: allow
+        mode:
+          - { name: '',             userns: '',      seccomp: '',   image: '' }
+          - { name: userns overlay, userns: overlay, seccomp: '',   image: '' }
+          - { name: userns copy,    userns: copy,    seccomp: '',   image: '' }
+          - { name: seccomp deny,   userns: '',      seccomp: deny, image: '' }
+          - { name: Alpine,         userns: '',      seccomp: '',   image: alpine }
+          - { name: Debian,         userns: '',      seccomp: '',   image: debian }
         include:
           - arch: x86_64
             runner: ubuntu-24.04
@@ -138,17 +138,23 @@ jobs:
           busybox | head -n 1
           unshare --version
           echo "loaded: $(lsmod | awk '{ print $1 }' | grep -E '^(bridge|veth|br_netfilter|nf_tables|nft_compat|nf_nat|xt_.*)$' | sort | tr '\n' ' ')"
+      # The image, pinned by its SHA-256 in the script, which fails the job if
+      # the file it gets is another.
+      - name: Fetch the image
+        if: ${{ matrix.mode.image != '' }}
+        run: sudo tests/fetch_image.sh ${{ matrix.mode.image }} "$RUNNER_TEMP/image"
       # sudo drops the environment, so the suite's options are make variables.
       - name: Lifecycle suite
         run: >-
           sudo make CC=gcc-14 test-lifecycle GITHUB_ACTIONS=true LIGHTBOX_TEST_MODPROBE=1
-          LIGHTBOX_TEST_USERNS=${{ matrix.userns }} LIGHTBOX_TEST_SECCOMP=${{ matrix.seccomp }}
+          LIGHTBOX_TEST_USERNS=${{ matrix.mode.userns }} LIGHTBOX_TEST_SECCOMP=${{ matrix.mode.seccomp }}
+          LIGHTBOX_TEST_ROOTFS=${{ matrix.mode.image && format('{0}/image', runner.temp) || '' }}
       # Wall time of the basic commands, the processes one start makes and
       # creates from a base of 1 GB. A shared runner's clock is rough, so this
       # reports and compares nothing. The numbers are a notice on the run's
       # page.
       - name: Timing
-        if: ${{ matrix.userns == '' && matrix.seccomp == '' }}
+        if: ${{ matrix.mode.name == '' }}
         run: sudo make CC=gcc-14 bench GITHUB_ACTIONS=true
       - name: Kernel log
         if: ${{ failure() }}

@@ -5,9 +5,10 @@
  * row of the deny table names a syscall, gives its number on x86_64 and on
  * aarch64, and the errno a sandboxed caller gets. A second table names the
  * syscalls that set a file's mode, which are refused when the mode has the
- * setuid or setgid bit. The deny-list allows everything else. The allow-list
- * has the same two tables, then the families a socket may be of and the
- * syscalls it allows, and answers every other one with ENOSYS.
+ * setuid or setgid bit. Both keep socket and socketpair to the families a
+ * container uses. The deny-list allows everything else. The allow-list has
+ * the same rules, then the syscalls it allows, and answers every other one
+ * with ENOSYS.
  * lb_seccomp_build() and lb_seccomp_build_allow() turn the rows for the
  * target architecture into the program lightbox installs.
  *
@@ -124,6 +125,12 @@ struct lb_sock_fprog {
  * behind a pointer, and a program that uses it falls back to openat, whose
  * mode the filter can read (see LB_SECCOMP_MODE).
  *
+ * pidfd_getfd, process_madvise and set_mempolicy_home_node are refused as
+ * Docker refuses them to a container without CAP_SYS_PTRACE or CAP_SYS_NICE,
+ * which no container here has. The kernel asks pidfd_getfd only for the right
+ * to trace the process whose descriptor it takes, and set_mempolicy_home_node
+ * for nothing; ptrace and the other NUMA calls have rows of their own.
+ *
  * Not in the table on purpose: mount and pivot_root, which container setup
  * uses before the capabilities that permit them are dropped.
  *
@@ -157,6 +164,8 @@ struct lb_sock_fprog {
     X(open_tree,          428,  428, LB_SC_EPERM) \
     X(perf_event_open,    298,  241, LB_SC_EPERM) \
     X(personality,        135,   92, LB_SC_EPERM) \
+    X(pidfd_getfd,        438,  438, LB_SC_EPERM) \
+    X(process_madvise,    440,  440, LB_SC_EPERM) \
     X(process_vm_readv,   310,  270, LB_SC_EPERM) \
     X(process_vm_writev,  311,  271, LB_SC_EPERM) \
     X(ptrace,             101,  117, LB_SC_EPERM) \
@@ -164,6 +173,7 @@ struct lb_sock_fprog {
     X(reboot,             169,  142, LB_SC_EPERM) \
     X(request_key,        249,  218, LB_SC_EPERM) \
     X(set_mempolicy,      238,  237, LB_SC_EPERM) \
+    X(set_mempolicy_home_node, 450, 450, LB_SC_EPERM) \
     X(setns,              308,  268, LB_SC_EPERM) \
     X(settimeofday,       164,  170, LB_SC_EPERM) \
     X(swapon,             167,  224, LB_SC_EPERM) \
@@ -530,13 +540,13 @@ struct lb_sock_fprog {
     X(vfork,                    58)
 
 /*
- * socket and socketpair are allowed for the families agents use, and answer
- * any other with EAFNOSUPPORT, as a kernel without that family would. AF_UNIX,
- * AF_INET, AF_INET6 and AF_NETLINK, which C libraries use to learn a host's
- * addresses, and for socketpair AF_UNIX. Out are, among others, AF_PACKET and
- * AF_XDP, which need CAP_NET_RAW; AF_VSOCK, which no network namespace
- * confines; AF_ALG and the families of old and rare protocols, much of the
- * kernel that a container needs none of.
+ * In both profiles, socket and socketpair are allowed for the families agents
+ * use, and answer any other with EAFNOSUPPORT, as a kernel without that family
+ * would. AF_UNIX, AF_INET, AF_INET6 and AF_NETLINK, which C libraries use to
+ * learn a host's addresses, and for socketpair AF_UNIX. Out are, among others,
+ * AF_PACKET and AF_XDP, which need CAP_NET_RAW; AF_VSOCK, which no network
+ * namespace confines; AF_ALG and the families of old and rare protocols, much
+ * of the kernel that a container needs none of.
  */
 #define LB_SECCOMP_SOCKET_FAMILIES(X) \
     X(LB_SECCOMP_AF_UNIX) X(LB_SECCOMP_AF_INET) X(LB_SECCOMP_AF_INET6) X(LB_SECCOMP_AF_NETLINK)
@@ -626,17 +636,21 @@ static const uint32_t LB_SECCOMP_SOCKETPAIR_FAMILY_TABLE[] = { LB_SECCOMP_SOCKET
 #define LB_SECCOMP_SOCKETPAIR_FAMILY_LEN \
     (sizeof(LB_SECCOMP_SOCKETPAIR_FAMILY_TABLE) / sizeof(LB_SECCOMP_SOCKETPAIR_FAMILY_TABLE[0]))
 
-/* Instructions in the deny-list: the head, two per row, those of the mode
- * rows, four for clone and the final allow. lb_seccomp_build() writes
- * exactly this many. */
-#define LB_SECCOMP_PROG_LEN (LB_SECCOMP_PROG_HEAD + 2 * LB_SECCOMP_TABLE_LEN + LB_SECCOMP_MODE_PROG_LEN + 5)
+/* four and one per family for socket and for socketpair, in both */
+#define LB_SECCOMP_SOCKET_PROG_LEN \
+    (4 + LB_SECCOMP_SOCKET_FAMILY_LEN + 4 + LB_SECCOMP_SOCKETPAIR_FAMILY_LEN)
 
-/* In the allow-list: the same head and rows, four and one per family for
- * socket and for socketpair, five for clone, two per call it allows and the
- * final ENOSYS. lb_seccomp_build_allow() writes exactly this many. */
+/* Instructions in the deny-list: the head, two per row, those of the mode
+ * rows and of socket and socketpair, four for clone and the final allow.
+ * lb_seccomp_build() writes exactly this many. */
+#define LB_SECCOMP_PROG_LEN \
+    (LB_SECCOMP_PROG_HEAD + 2 * LB_SECCOMP_TABLE_LEN + LB_SECCOMP_MODE_PROG_LEN + LB_SECCOMP_SOCKET_PROG_LEN + 5)
+
+/* In the allow-list: the same, but five for clone, then two per call it
+ * allows and the final ENOSYS. lb_seccomp_build_allow() writes exactly this
+ * many. */
 #define LB_SECCOMP_ALLOW_PROG_LEN \
-    (LB_SECCOMP_PROG_HEAD + 2 * LB_SECCOMP_TABLE_LEN + LB_SECCOMP_MODE_PROG_LEN + \
-     4 + LB_SECCOMP_SOCKET_FAMILY_LEN + 4 + LB_SECCOMP_SOCKETPAIR_FAMILY_LEN + 5 + \
+    (LB_SECCOMP_PROG_HEAD + 2 * LB_SECCOMP_TABLE_LEN + LB_SECCOMP_MODE_PROG_LEN + LB_SECCOMP_SOCKET_PROG_LEN + 5 + \
      2 * LB_SECCOMP_ALLOW_TABLE_LEN + 1)
 
 /* room for either */
@@ -698,6 +712,22 @@ static inline size_t lb_seccomp_program(struct lb_sock_filter *prog, int allow) 
         LB_STMT(LB_BPF_RET_K, LB_SECCOMP_RET_ALLOW);
     }
 
+    /* socket and socketpair: one of their families, which is the first
+     * argument, or EAFNOSUPPORT */
+    static const struct { uint32_t nr; const uint32_t *af; size_t naf; } sockets[] = {
+        { LB_SECCOMP_NR_SOCKET, LB_SECCOMP_SOCKET_FAMILY_TABLE, LB_SECCOMP_SOCKET_FAMILY_LEN },
+        { LB_SECCOMP_NR_SOCKETPAIR, LB_SECCOMP_SOCKETPAIR_FAMILY_TABLE, LB_SECCOMP_SOCKETPAIR_FAMILY_LEN },
+    };
+    for (size_t s = 0; s < 2; s++) {
+        uint8_t naf = (uint8_t)sockets[s].naf;
+        LB_JUMP(LB_BPF_JEQ_K, sockets[s].nr, 0, (uint8_t)(naf + 3));
+        LB_STMT(LB_BPF_LD_W_ABS, LB_SECCOMP_DATA_ARG0_LO);
+        for (uint8_t f = 0; f < naf; f++)
+            LB_JUMP(LB_BPF_JEQ_K, sockets[s].af[f], (uint8_t)(naf - f), 0);
+        LB_STMT(LB_BPF_RET_K, LB_SECCOMP_RET_ERRNO | LB_SC_EAFNOSUPPORT);
+        LB_STMT(LB_BPF_RET_K, LB_SECCOMP_RET_ALLOW);
+    }
+
     if (!allow) {
         /* clone may create processes and threads but not namespaces, which
          * is what denying unshare, setns and clone3 above is for. Its flags
@@ -709,22 +739,6 @@ static inline size_t lb_seccomp_program(struct lb_sock_filter *prog, int allow) 
 
         LB_STMT(LB_BPF_RET_K, LB_SECCOMP_RET_ALLOW);
     } else {
-        /* socket and socketpair: one of their families, which is the first
-         * argument, or EAFNOSUPPORT */
-        static const struct { uint32_t nr; const uint32_t *af; size_t naf; } sockets[] = {
-            { LB_SECCOMP_NR_SOCKET, LB_SECCOMP_SOCKET_FAMILY_TABLE, LB_SECCOMP_SOCKET_FAMILY_LEN },
-            { LB_SECCOMP_NR_SOCKETPAIR, LB_SECCOMP_SOCKETPAIR_FAMILY_TABLE, LB_SECCOMP_SOCKETPAIR_FAMILY_LEN },
-        };
-        for (size_t s = 0; s < 2; s++) {
-            uint8_t naf = (uint8_t)sockets[s].naf;
-            LB_JUMP(LB_BPF_JEQ_K, sockets[s].nr, 0, (uint8_t)(naf + 3));
-            LB_STMT(LB_BPF_LD_W_ABS, LB_SECCOMP_DATA_ARG0_LO);
-            for (uint8_t f = 0; f < naf; f++)
-                LB_JUMP(LB_BPF_JEQ_K, sockets[s].af[f], (uint8_t)(naf - f), 0);
-            LB_STMT(LB_BPF_RET_K, LB_SECCOMP_RET_ERRNO | LB_SC_EAFNOSUPPORT);
-            LB_STMT(LB_BPF_RET_K, LB_SECCOMP_RET_ALLOW);
-        }
-
         /* clone, as in the deny-list, and allowed at once without a
          * namespace flag */
         LB_JUMP(LB_BPF_JEQ_K, LB_SECCOMP_NR_CLONE, 0, 4);

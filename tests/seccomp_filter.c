@@ -3,7 +3,7 @@
  * allow-list, and checks their verdict for every syscall number (ROADMAP 2.4
  * and 8.3); for the calls that set a mode, their verdict for every bit of the
  * mode and for the flags of an open (8.2); and for socket and socketpair,
- * the allow-list's for every family.
+ * both programs' for every family.
  *
  * The program is built for the architecture named at compile time,
  *
@@ -148,10 +148,10 @@ static uint32_t verdict_without_arguments(uint32_t nr) {
     uint32_t err = table_errno(nr);
     if (err)
         return DENY(err);
-    if (!allow_mode || mode_row(nr) || nr == LB_SECCOMP_NR_CLONE || in_allow_table(nr))
-        return LB_SECCOMP_RET_ALLOW;
     if (is_socket_call(nr))
         return DENY(LB_SC_EAFNOSUPPORT);     /* family 0, AF_UNSPEC */
+    if (!allow_mode || mode_row(nr) || nr == LB_SECCOMP_NR_CLONE || in_allow_table(nr))
+        return LB_SECCOMP_RET_ALLOW;
     return DENY(LB_SC_ENOSYS);
 }
 
@@ -240,8 +240,8 @@ static void check_program(int allow) {
         d = (struct data){ .nr = nr, .arch = LB_SECCOMP_AUDIT_ARCH };
         expect("a syscall", &d, want_verdict);
         /* arguments do not change the answer, except for clone, the mode
-         * rows and, in the allow-list, socket and socketpair below */
-        if (nr != LB_SECCOMP_NR_CLONE && !mode_row(nr) && !(allow_mode && is_socket_call(nr))) {
+         * rows, and socket and socketpair below */
+        if (nr != LB_SECCOMP_NR_CLONE && !mode_row(nr) && !is_socket_call(nr)) {
             for (int i = 0; i < 6; i++)
                 d.args[i] = UINT64_MAX;
             expect("a syscall with arguments", &d, want_verdict);
@@ -339,9 +339,9 @@ static void check_program(int allow) {
         }
     }
 
-    /* the allow-list's socket and socketpair: their families, the first
-     * argument and its low word, and EAFNOSUPPORT for any other */
-    if (allow_mode) {
+    /* socket and socketpair, in both: their families, the first argument and
+     * its low word, and EAFNOSUPPORT for any other */
+    {
         static const struct { uint32_t nr; const uint32_t *af; size_t naf; } sockets[] = {
             { LB_SECCOMP_NR_SOCKET, LB_SECCOMP_SOCKET_FAMILY_TABLE, LB_SECCOMP_SOCKET_FAMILY_LEN },
             { LB_SECCOMP_NR_SOCKETPAIR, LB_SECCOMP_SOCKETPAIR_FAMILY_TABLE, LB_SECCOMP_SOCKETPAIR_FAMILY_LEN },
@@ -372,9 +372,10 @@ static void check_program(int allow) {
         }
     }
 
-    printf("  %s %s: %zu instructions, %zu table rows, %zu mode rows%s, %lu verdicts checked, %lu wrong\n",
+    printf("  %s %s: %zu instructions, %zu table rows, %zu mode rows, the families of a socket%s, "
+           "%lu verdicts checked, %lu wrong\n",
            TARGET, which, prog_len, (size_t)LB_SECCOMP_TABLE_LEN, (size_t)LB_SECCOMP_MODE_TABLE_LEN,
-           allow ? ", the allowed calls and the families of a socket" : "",
+           allow ? " and the allowed calls" : "",
            verdicts - verdicts_before, failures - failures_before);
 }
 

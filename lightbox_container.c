@@ -641,7 +641,8 @@ const char *container_config_save(const char *name, const container_config *conf
     put_number(&out, "oom_score", config->oom_score);
     if (config->privileged) put_line(&out, "privileged", "1");
     if (config->read_only)  put_line(&out, "readonly", "1");
-    /* without the line, the deny-list: what every container had before 0.8 */
+    /* without the line, the deny-list: what create --seccomp deny makes, and
+     * what every container had before 0.8 */
     if (config->seccomp_allow) put_line(&out, "seccomp", "allow");
     if (config->userns) {
         char digits[11];

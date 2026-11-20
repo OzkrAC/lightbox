@@ -209,20 +209,23 @@ t_allow_unlisted_enosys() {
     [ "$1" != "-$ENOSYS" ] && [ "$2" = "-$ENOSYS" ] && [ "$4" = "-$ENOSYS" ]
 }
 
-# socket takes AF_UNIX, AF_INET, AF_INET6 and AF_NETLINK, and socketpair
-# AF_UNIX, as without the profile; any other family is EAFNOSUPPORT, as the
-# kernel says of one it does not have: AF_PACKET, AF_ALG and AF_VSOCK here.
-t_allow_socket_families() {
-    printf '%s\n' "$PROBE_ALLOW" | awk -v eafnosupport=97 '
+# Under both profiles socket takes AF_UNIX, AF_INET, AF_INET6 and AF_NETLINK,
+# and socketpair AF_UNIX, as without a profile; any other family is
+# EAFNOSUPPORT, as the kernel says of one it does not have: AF_PACKET, AF_ALG
+# and AF_VSOCK here.
+socket_families() { # the probe's output, the profile's name
+    printf '%s\n' "$1" | awk -v eafnosupport=97 -v profile="$2" '
         $1 == "socket" || $1 == "socketpair" {
             n++
             taken = $1 == "socket" ? ($2 == 1 || $2 == 2 || $2 == 10 || $2 == 16) : ($2 == 1)
-            printf "%s of family %s: %s before, %s under the allow-list\n", $1, $2, $3, $4
+            printf "%s of family %s: %s before, %s under the %s\n", $1, $2, $3, $4, profile
             if (taken && $4 != $3) bad++
             if (!taken && $4 != -eafnosupport) bad++
         }
         END { exit (bad > 0 || n < 9) }'
 }
+t_socket_families()       { socket_families "$PROBE" deny-list; }
+t_allow_socket_families() { socket_families "$PROBE_ALLOW" allow-list; }
 
 # x32, clone with a namespace flag and a plain clone answer as in the deny-list.
 t_allow_same_rules() {
@@ -299,6 +302,7 @@ check 'x32 syscall numbers are refused'                         t_x32_refused
 check 'clone with a namespace flag is refused'                  t_clone_namespace_flag_refused
 check 'clone without a namespace flag still works'              t_plain_clone_allowed
 check 'no call makes a file setuid or setgid, and a plain mode is taken' t_mode_bits_refused
+check 'a socket is of a family agents use'                       t_socket_families
 
 check 'the harness installs the allow-list and probes it'       t_allow_probe_ran
 check 'an ordinary program runs under the allow-list'           t_allow_program_runs

@@ -11,6 +11,12 @@
 # filesystem from. lightbox runs neither ip nor nsenter: every case runs with
 # both masked, and the last but one looks that nothing ran them.
 #
+# Every image, the suite's own or one of LIGHTBOX_TEST_ROOTFS, gets that busybox
+# at /lbt/busybox too, and a case that looks at the network from inside a
+# container runs its nc, ip and hostname from there. What an image has of its
+# own differs: Debian's has none of the three, and Alpine's nc says nothing of
+# a refusal. Everything else a case runs in a container is the image's own.
+#
 # The host is not used and nothing is left on it. The suite runs itself again
 # in private network, mount and PID namespaces with a throwaway configuration:
 # its bridge, firewall rules, interfaces and mounts exist only there, and every
@@ -28,10 +34,13 @@
 #                               unprivileged uid of the host's (ROADMAP 8.1)
 #   LIGHTBOX_TEST_USERNS=copy   the same, and with --copy but in the cases about
 #                               overlays
-#   LIGHTBOX_TEST_SECCOMP=allow make every container with --seccomp allow, but where
+#   LIGHTBOX_TEST_SECCOMP=deny  make every container with --seccomp deny, but where
 #                               a case chooses the profile (ROADMAP 8.3); with
-#                               either of the two above, or alone
-#   BUSYBOX=/path               the static busybox to build the root filesystem from
+#                               either of the two above, or alone. Without it a
+#                               container has the default, the allow-list, which
+#                               =allow names
+#   BUSYBOX=/path               the static busybox to build the root filesystem from,
+#                               and to put in every image at /lbt/busybox
 #   LIGHTBOX_TEST_MODPROBE=1    load br_netfilter when it is not loaded (CI sets this;
 #                               on a workstation it changes how every bridge is filtered)
 #   CASE_TIMEOUT=90             seconds one case may take
@@ -82,6 +91,7 @@ GW=10.199.0.1
 WAN=lbt-wan                 # the interface the default route leaves by
 OUTSIDE=192.0.2.1           # an address beyond it, in a namespace that stands for the internet
 ALLOWED_CAPS=00000000200405fb   # ALLOWED_CAPS of lightbox.c as /proc/<pid>/status prints a set
+KIT=/lbt/busybox            # in every image: the suite's own busybox, to look at the network with
 BRNF=/proc/sys/net/bridge/bridge-nf-call-iptables
 
 settings() { # after LIFECYCLE_T is known
@@ -153,12 +163,12 @@ box() { # name [create options] : create a container on the next free address
 # What LIGHTBOX_TEST_USERNS adds to a create: --userns, and with copy --copy
 # too, where the case did not give them. A case about overlays sets OVERLAY=1,
 # which keeps --copy out; a container that is to have no range is made with
-# PLAIN=1 box ..., which adds nothing of the two. LIGHTBOX_TEST_SECCOMP=allow
-# adds --seccomp allow where the case gives no --seccomp.
+# PLAIN=1 box ..., which adds nothing of the two. LIGHTBOX_TEST_SECCOMP adds
+# --seccomp with its profile where the case gives no --seccomp.
 mode_options() { # the options the case gives
     local given=" $* "
-    if [ "$SECCOMP_MODE" = allow ]; then
-        case $given in *' --seccomp '*) ;; *) echo --seccomp allow ;; esac
+    if [ -n "$SECCOMP_MODE" ]; then
+        case $given in *' --seccomp '*) ;; *) echo --seccomp "$SECCOMP_MODE" ;; esac
     fi
     [ -n "$USERNS_MODE" ] && [ -z "${PLAIN:-}" ] || return 0
     case $given in *' --userns '*) ;; *) echo --userns ;; esac
@@ -269,14 +279,14 @@ nothing_left() { # name
     return $bad
 }
 
-need_nc() { [ -e "$T/have_nc" ] || { echo "this image has no nc to open connections with"; return 77; }; }
+need_nc() { [ -e "$T/have_nc" ] || { echo "the suite's busybox has no nc to open connections with"; return 77; }; }
 
 # Does a TCP connection from the container get an answer from that address?
 # Nothing listens on the port, so the answer is a refusal. Traffic that is
 # filtered or not routed gets none, and the attempt times out.
 reaches() { # name address
     local answer
-    answer=$(sh_in "$1" "nc -w 3 $2 9 </dev/null" 2>&1)
+    answer=$(sh_in "$1" "$KIT nc -w 3 $2 9 </dev/null" 2>&1)
     printf '%s -> %s: %s\n' "$1" "$2" "${answer:-no answer}"
     case $answer in *[Rr]efused*) return 0 ;; *) return 1 ;; esac
 }
@@ -737,16 +747,20 @@ lbuser" ] || return 1
 
 # The groups of a command are what the container's files give its user, and
 # none for a uid the container has no account for. The groups of whoever runs
-# lightbox are not among them, with --user or without.
+# lightbox are not among them, with --user or without. Root's are 0 and those
+# the image's /etc/group lists it in, which Alpine's does in ten.
 t_exec_unknown_uid_drops_groups() {
     command -v setpriv >/dev/null 2>&1 || { echo "no setpriv to put the caller in a group with"; return 77; }
     up nogroups || return 1
     said=$(setpriv --groups 4242 timeout -k 5 60 "$LB" exec nogroups --user 1234 /bin/sh -c 'id -G' </dev/null) || return 1
     echo "groups of uid 1234 in the container: $said (the caller was in group 4242)"
     [ "$said" = 1234 ] || return 1
-    said=$(setpriv --groups 4242 timeout -k 5 60 "$LB" exec nogroups /bin/sh -c 'id -u; id -G' </dev/null | tr '\n' ' ') || return 1
-    echo "uid and groups without --user: $said"
-    [ "$said" = "0 0 " ]
+    uid=$(setpriv --groups 4242 timeout -k 5 60 "$LB" exec nogroups /bin/sh -c 'id -u' </dev/null) &&
+    said=$(setpriv --groups 4242 timeout -k 5 60 "$LB" exec nogroups /bin/sh -c 'id -G' </dev/null) || return 1
+    said=$(printf '%s\n' "$said" | tr ' ' '\n' | sort -n -u | paste -sd' ' -)
+    want=$(awk -F: '$3 == 0 || ("," $4 ",") ~ /,root,/ { print $3 }' "$BASE/etc/group" | sort -n -u | paste -sd' ' -)
+    echo "uid and groups without --user: $uid, $said; the image gives root $want"
+    [ "$uid" = 0 ] && [ "$said" = "$want" ]
 }
 
 t_exec_user_is_strict() {
@@ -1176,15 +1190,16 @@ t_no_setuid_or_setgid_bits() {
 # --seccomp allow (ROADMAP 8.3): the .conf and inspect say so, and what exec
 # runs is under the allow-list: a call it does not name answers ENOSYS, as
 # sethostname does, which the deny-list lets through to be refused for want
-# of CAP_SYS_ADMIN; and the rest works. --seccomp deny is the deny-list.
+# of CAP_SYS_ADMIN; and the rest works. --seccomp deny is the deny-list, which
+# a .conf without the line has, as one made before 0.8 does.
 t_seccomp_profiles() {
     box sallow --seccomp allow && box sdeny --seccomp deny && start sallow && start sdeny || return 1
     [ "$(conf_value sallow seccomp)" = allow ] && [ -z "$(conf_value sdeny seccomp)" ] ||
         { echo "the .conf of each: $(conf_value sallow seccomp), $(conf_value sdeny seccomp)"; return 1; }
     lb inspect sallow | grep -qx 'seccomp: allow' && lb inspect sdeny | grep -qx 'seccomp: deny' ||
         { echo "inspect does not say which profile each has"; return 1; }
-    said_allow=$(sh_in sallow 'hostname another' 2>&1) && { echo "the allow-list took sethostname"; return 1; }
-    said_deny=$(sh_in sdeny 'hostname another' 2>&1) && { echo "the deny-list container set its hostname"; return 1; }
+    said_allow=$(sh_in sallow "$KIT hostname another" 2>&1) && { echo "the allow-list took sethostname"; return 1; }
+    said_deny=$(sh_in sdeny "$KIT hostname another" 2>&1) && { echo "the deny-list container set its hostname"; return 1; }
     echo "allow-list: $said_allow"
     echo "deny-list:  $said_deny"
     case $said_allow in *'not implemented'*) ;; *) echo "the allow-list did not answer ENOSYS"; return 1 ;; esac
@@ -1278,16 +1293,21 @@ t_image_with_one_binary() {
 }
 
 t_start_runs_nothing_from_the_image() {
-    [ -n "$BB" ] || { echo "the recording stand-ins are made for the busybox image"; return 77; }
     box record || return 1
-    # bin/ of the container's own, which the upper layer of an overlay lacks
-    mkdir -p "$C/record/rootfs/bin" || return 1
+    # Where the image's /bin is: /usr/bin in an image of merged /usr, such as
+    # Debian's, in which /bin is a link. A directory bin/ in the upper layer
+    # would hide that link, and with it the image's /bin/sh.
+    bin=$(chroot "$BASE" "$KIT" readlink -f /bin) && [ -n "$bin" ] || return 1
+    # that directory of the container's own, which the upper layer of an
+    # overlay lacks
+    mkdir -p "$C/record/rootfs$bin" || return 1
     for tool in mount ip; do
-        rm -f "$C/record/rootfs/bin/$tool"
-        printf '#!/bin/sh\necho %s >> /run-from-the-image\nexec /bin/busybox %s "$@"\n' "$tool" "$tool" \
-            > "$C/record/rootfs/bin/$tool" && chmod 755 "$C/record/rootfs/bin/$tool" || return 1
+        rm -f "$C/record/rootfs$bin/$tool"
+        printf '#!/bin/sh\necho %s >> /run-from-the-image\nexec %s %s "$@"\n' "$tool" "$KIT" "$tool" \
+            > "$C/record/rootfs$bin/$tool" && chmod 755 "$C/record/rootfs$bin/$tool" || return 1
     done
-    made_for record "$C/record/rootfs/bin" || return 1
+    top=${bin#/}
+    made_for record "$C/record/rootfs/${top%%/*}" || return 1
     start record || return 1
     # what the container has at /bin/mount and /bin/ip is the stand-ins
     [ "$(sh_in record 'cat /bin/mount /bin/ip' | grep -c 'run-from-the-image')" = 2 ] ||
@@ -1946,7 +1966,7 @@ t_storage_closed_to_others() {
 
 t_network_inside() {
     up net || return 1
-    said=$(sh_in net 'ip addr; ip route')
+    said=$(sh_in net "$KIT ip addr; $KIT ip route")
     printf '%s\n' "$said"
     printf '%s\n' "$said" | grep -q 'inet 127\.0\.0\.1/8' &&
     printf '%s\n' "$said" | grep -q "inet $(addr_of net)/24" &&
@@ -1984,14 +2004,14 @@ t_wide_subnet() {
     # shellcheck disable=SC2046  # options of one word each
     lb create wide 10.9.5.2 $(mode_options) >"$OUT/wide.create" 2>&1 || { cat "$OUT/wide.create"; return 1; }
     start wide || return 1
-    said=$(sh_in wide 'ip addr; ip route')
+    said=$(sh_in wide "$KIT ip addr; $KIT ip route")
     printf '%s\n' "$said"
     printf '%s\n' "$said" | grep -q 'inet 10\.9\.5\.2/16' && printf '%s\n' "$said" | grep -q '^default via 10\.9\.0\.1 ' ||
         { echo "the container does not have 10.9.5.2/16 and a route by 10.9.0.1"; return 1; }
     if [ -e "$T/have_nc" ]; then
         reaches wide 10.9.0.1 || return 1
     else
-        echo "this image has no nc: whether the gateway answers is not tried"
+        echo "the suite's busybox has no nc: whether the gateway answers is not tried"
     fi
     lb stop wide >/dev/null || return 1
     # on the suite's network that address is no container's, and start says so
@@ -2164,7 +2184,7 @@ t_interface_is_eth0() {
     printf '%s\n' "$said" | sed '1,2d' | awk -F: '{ gsub(/ /, "", $1); printf "%s ", $1 } END { print "" }'
     printf '%s\n' "$said" | grep -q '^ *eth0:' || return 1
     ! printf '%s\n' "$said" | grep -q '^ *ve-' || { echo "the container has a ve- interface"; return 1; }
-    printf '%s\n' "$(sh_in ifname 'ip -4 addr show dev eth0')" | grep -q "inet $(addr_of ifname)/"
+    printf '%s\n' "$(sh_in ifname "$KIT ip -4 addr show dev eth0")" | grep -q "inet $(addr_of ifname)/"
 }
 
 t_no_ipv6_in_container() {
@@ -2311,13 +2331,13 @@ t_overlay_root() {
     echo "base snapshot: $id; of ov2: $(base_of ov2)"
     [ -n "$id" ] && [ "$(base_of ov2)" = "$id" ] || { echo "the two do not overlay one snapshot"; return 1; }
     snap=$T/lb/bases/$id/rootfs
-    [ -x "$snap/bin/busybox" ] || { echo "the snapshot has no busybox"; return 1; }
+    [ -x "$snap$KIT" ] || { echo "the snapshot has no $KIT"; return 1; }
     lb inspect ov1 | grep -x 'storage: overlay' && lb inspect ov1 | grep -x "base: $id" || return 1
     own=$(cd "$C/ov1/rootfs" && find . -type f | sort | paste -sd' ' -)
     echo "ov1's own files: $own"
     [ "$own" = './etc/hostname ./etc/hosts ./etc/resolv.conf' ] || { echo "rootfs/ has more than create wrote"; return 1; }
     start ov1 || return 1
-    [ "$(sh_in ov1 'test -x /bin/busybox && cat /etc/hostname')" = ov1 ] || { echo "the base or the hostname is not there"; return 1; }
+    [ "$(sh_in ov1 "test -x $KIT && cat /etc/hostname")" = ov1 ] || { echo "the base or the hostname is not there"; return 1; }
     sh_in ov1 'echo mine > /made-here && rm /etc/group' || return 1
     [ "$(cat "$C/ov1/rootfs/made-here")" = mine ] || { echo "what the container wrote is not in its rootfs/"; return 1; }
     [ ! -e "$snap/made-here" ] && [ -e "$snap/etc/group" ] || { echo "the snapshot was changed"; return 1; }
@@ -2333,7 +2353,7 @@ t_overlay_root() {
 t_copy_root() {
     box cp1 --copy || return 1
     [ -z "$(base_of cp1)" ] || { echo "a copy has a base snapshot: $(base_of cp1)"; return 1; }
-    [ -x "$C/cp1/rootfs/bin/busybox" ] || { echo "rootfs/ is not a copy of the base"; return 1; }
+    [ -x "$C/cp1/rootfs$KIT" ] || { echo "rootfs/ is not a copy of the base"; return 1; }
     lb inspect cp1 | grep -x 'storage: copy' && lb inspect cp1 | grep -x 'base: -' || return 1
     start cp1 && [ "$(sh_in cp1 'cat /etc/hostname')" = cp1 ]
 }
@@ -2406,7 +2426,7 @@ t_start_after_a_reboot_of_the_network() {
     if [ -e "$T/have_nc" ]; then
         reaches rebuilt "$GW" && reaches rebuilt "$OUTSIDE"
     else
-        echo "this image has no nc: whether the container reaches anything is not tried"
+        echo "the suite's busybox has no nc: whether the container reaches anything is not tried"
     fi
 }
 
@@ -2844,7 +2864,8 @@ build_rootfs() {
         echo "  It must be statically linked or come with its libraries, and ${TMPDIR:-/tmp} must not be mounted noexec." >&2
         return 1
     fi
-    if chroot "$BASE" /bin/sh -c 'command -v nc' >/dev/null 2>&1; then : > "$T/have_nc"; fi
+    mkdir -p "$BASE${KIT%/*}" && cp "$BB" "$BASE$KIT" && chmod 755 "$BASE$KIT" || return 1
+    if "$BB" --list | grep -qx nc; then : > "$T/have_nc"; fi
 }
 
 network() {
@@ -3017,10 +3038,10 @@ if [ "$MODE" = inside ]; then
 
     if [ -e "$BRNF" ]; then filtering="br_netfilter is loaded"; else filtering="br_netfilter is not loaded"; fi
     echo "lifecycle: $(uname -sr) on $(uname -m); $(iptables --version 2>&1 | head -n 1); $filtering"
-    if [ -n "$BB" ]; then
+    if [ -z "${LIGHTBOX_TEST_ROOTFS:-}" ]; then
         echo "lifecycle: root filesystem from $BB ($("$BB" 2>&1 | head -n 1))"
     else
-        echo "lifecycle: root filesystem copied from $LIGHTBOX_TEST_ROOTFS"
+        echo "lifecycle: root filesystem copied from $LIGHTBOX_TEST_ROOTFS ($(chroot "$BASE" "$KIT" sed -n 's/^PRETTY_NAME=//p' /etc/os-release 2>/dev/null | tr -d '"')), and $BB at $KIT"
     fi
     SUITE=lifecycle
     case $USERNS_MODE in
@@ -3029,9 +3050,9 @@ if [ "$MODE" = inside ]; then
         copy)    SUITE="lifecycle with --userns --copy"
                  echo "lifecycle: every container with --userns, and with --copy but in the cases about overlays" ;;
     esac
-    if [ "$SECCOMP_MODE" = allow ]; then
-        SUITE="$SUITE under the allow-list"
-        echo "lifecycle: every container with --seccomp allow, but where a case chooses"
+    if [ -n "$SECCOMP_MODE" ]; then
+        SUITE="$SUITE under the $SECCOMP_MODE-list"
+        echo "lifecycle: every container with --seccomp $SECCOMP_MODE, but where a case chooses"
     fi
     echo
 
@@ -3273,12 +3294,13 @@ preflight() {
     if [ -n "${LIGHTBOX_TEST_ROOTFS:-}" ]; then
         [ -e "$LIGHTBOX_TEST_ROOTFS/bin/sh" ] || [ -L "$LIGHTBOX_TEST_ROOTFS/bin/sh" ] ||
             stop_early "LIGHTBOX_TEST_ROOTFS=$LIGHTBOX_TEST_ROOTFS has no /bin/sh"
-        LIFECYCLE_BB=
-    else
-        LIFECYCLE_BB=$(find_busybox) || stop_early "no statically linked busybox was found${BUSYBOX:+ at $BUSYBOX}.
-  Install busybox-static, or give one with BUSYBOX=/path, or a root filesystem with LIGHTBOX_TEST_ROOTFS=/path.
-  (${TMPDIR:-/tmp} must not be mounted noexec either.)"
+        [ ! -e "$LIGHTBOX_TEST_ROOTFS${KIT%/*}" ] ||
+            stop_early "LIGHTBOX_TEST_ROOTFS=$LIGHTBOX_TEST_ROOTFS has a ${KIT%/*} of its own, where the suite puts its busybox"
     fi
+    # with an image of yours too, to put in it at /lbt/busybox
+    LIFECYCLE_BB=$(find_busybox) || stop_early "no statically linked busybox was found${BUSYBOX:+ at $BUSYBOX}.
+  Install busybox-static, or give one with BUSYBOX=/path.
+  (${TMPDIR:-/tmp} must not be mounted noexec either.)"
 
     case ${LIGHTBOX_TEST_USERNS:-} in
         '') ;;
@@ -3288,8 +3310,8 @@ preflight() {
         *)  stop_early "LIGHTBOX_TEST_USERNS is overlay or copy, not: $LIGHTBOX_TEST_USERNS" ;;
     esac
     case ${LIGHTBOX_TEST_SECCOMP:-} in
-        ''|allow) ;;
-        *) stop_early "LIGHTBOX_TEST_SECCOMP is allow, not: $LIGHTBOX_TEST_SECCOMP" ;;
+        ''|allow|deny) ;;
+        *) stop_early "LIGHTBOX_TEST_SECCOMP is allow or deny, not: $LIGHTBOX_TEST_SECCOMP" ;;
     esac
 
     if [ "${LIGHTBOX_TEST_MODPROBE:-0}" = 1 ] && [ ! -e "$BRNF" ]; then
