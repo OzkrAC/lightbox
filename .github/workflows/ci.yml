@@ -52,12 +52,20 @@ jobs:
       - name: Install the toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build ${{ matrix.packages }}
+          sudo apt-get install -y ninja-build uidmap ${{ matrix.packages }}
       # Ubuntu's AppArmor keeps unprivileged processes from using user
       # namespaces. The seccomp suite makes one to watch the filter refuse
       # the next; with the restriction on, it skips that case.
       - name: Allow unprivileged user namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      # The unit suite's case of a --userns volume needs a user namespace with
+      # ids besides its root's: newuidmap, from uidmap, and a range of the
+      # runner's in /etc/subuid and /etc/subgid. Without them it skips.
+      - name: Give the runner a range of ids
+        run: |
+          for f in /etc/subuid /etc/subgid; do
+              grep -q "^$(id -un):" "$f" 2>/dev/null || echo "$(id -un):100000:65536" | sudo tee -a "$f" >/dev/null
+          done
       - name: Build
         run: make CC=${{ matrix.cc }}
       - name: Check

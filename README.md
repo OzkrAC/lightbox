@@ -47,7 +47,7 @@ runs everything that needs no root:
 | `make analyze` | Compiles every file with `-fanalyzer` and a strict warning set; any diagnostic is an error |
 | `make test-unit` | Runs lightbox's own helpers from the command line. The one that starts programs: exit statuses, signals, missing programs, quiet and captured output. The ones that mount, make directories and bring up loopback: in a user namespace of their own |
 | `make test-validation` | Runs the built binary as an ordinary user against a temporary directory tree |
-| `make test-seccomp` | Installs lightbox's real seccomp profile and probes every syscall in its deny table; also interprets the x86_64 and the aarch64 filter program for every syscall number |
+| `make test-seccomp` | Installs lightbox's real seccomp profile and probes every syscall in its deny table, and every call that sets a file's mode with the setuid or setgid bit and without; also interprets the x86_64 and the aarch64 filter program for every syscall number and every bit of a mode |
 
 In the test suites an open finding from `ROADMAP.md` is an expected failure that names its ledger id. When a fix makes one pass, the suite fails until the case is changed from `xfail` to `check`.
 
@@ -461,7 +461,7 @@ The sandbox covers everything in a container: init, the `/init.sh` hook and all 
 | Feature | Implementation |
 |---------|---------------|
 | Capability dropping | The bounding, effective and permitted sets are reduced to 12 capabilities: Docker's default 14 without `NET_RAW` and `MKNOD`. The inheritable and ambient sets are emptied |
-| Seccomp | BPF filter denying 56 syscalls on x86_64 (47 on aarch64), the x32 range, and `clone` with namespace flags |
+| Seccomp | BPF filter denying 57 syscalls on x86_64 (48 on aarch64), the x32 range, `clone` with namespace flags, and a mode with the setuid or setgid bit in `chmod`, `fchmod`, `fchmodat`, `fchmodat2`, `mknod`, `mknodat`, `creat`, and `open` and `openat` that make a file; `openat2`, whose mode it cannot read, answers ENOSYS so that callers use `openat` |
 | no_new_privs | Prevents SUID escalation |
 | /proc and /sys masking | The paths Docker masks by default are covered, files with `/dev/null` and directories with an empty read-only tmpfs. A mask that cannot be made fails the start |
 | /proc read-only | Remounts /proc/sys, /proc/bus, /proc/fs, /proc/irq read-only |
@@ -469,7 +469,7 @@ The sandbox covers everything in a container: init, the `/init.sh` hook and all 
 | Container isolation | A container without `--link` has an isolated port on the bridge: it reaches the host and the outside, and no other container. IPv6 is off inside containers. A container with `--link` shares the bridge, and is kept to its links by firewall rules that name the two ports of each link: with iptables it does not start unless `br_netfilter` lets iptables see bridged traffic, and with nftables a table of the bridge family sees it without. A link holds whichever of the two starts first, and a container's link rules go with it when it stops, is removed or is found dead |
 | The terminal of whoever runs `exec` | A command never holds it. Typed at a terminal, `exec` gives the command a pseudo-terminal of the container and carries the bytes; where only one of its streams is a terminal, a pipe stands in for it |
 | The binary `exec` enters with | `exec` executes itself again from a sealed copy in memory before it enters a container, so the processes it puts there are never the installed binary. Where the kernel refuses executable memfds (`vm.memfd_noexec=2`) it takes the binary through a read-only mount of its own instead. Its worker is not dumpable. `lightbox doctor` says which of the two is in use |
-| User namespaces | With `--userns`: a container's root is an unprivileged uid of the host's, from a range of `lightbox`'s in `/etc/subuid` and `/etc/subgid`, and its root filesystem an idmapped mount (see [User namespaces](#user-namespaces)). Without it, a container's root is the host's root |
+| User namespaces | With `--userns`: a container's root is an unprivileged uid of the host's, from a range of `lightbox`'s in `/etc/subuid` and `/etc/subgid`, and its root filesystem and its volumes idmapped mounts, a volume to its source's owner and never to host root (see [User namespaces](#user-namespaces)). Without it, a container's root is the host's root |
 | OOM priority | Containers scored higher for OOM killer |
 
 ### Threat model
@@ -477,6 +477,7 @@ The sandbox covers everything in a container: init, the `/init.sh` hook and all 
 lightbox keeps what runs in a container away from the host and from the other containers, as far as the kernel's namespaces, the sandbox and the firewall can:
 
 - **The host from a container's processes:** their own PID, mount, UTS, IPC and network namespaces, and with `--userns` a user namespace in which root is an unprivileged uid of the host's; 12 capabilities and a seccomp filter of Docker's kind, with no_new_privs; the paths of `/proc` and `/sys` that Docker masks, masked, and the rest of `/proc`'s system trees read-only; a root filesystem that is `nodev` and `nosuid`; and limits on memory, swap, processes, CPU and, with `--io-max`, I/O.
+- **The host from what a container leaves in a volume:** nothing in a container that is not privileged gives a file the setuid or the setgid bit, so no program it leaves in a volume, or in its own files, runs on the host with the rights of their owner, the volume's owner or root. Inside the container the bits would mean nothing, as its root is `nosuid` and no_new_privs is set. A package that installs such a program, such as `passwd`, `mount` or `sudo`, fails to install in a container: update it in the base on the host, or give the container `--privileged`.
 - **Containers from each other:** each on an isolated port of the bridge, and with `--link` kept to its links by firewall rules that lightbox owns and takes away with the container.
 - **The host's terminal and the installed binary from a container:** `exec` gives a command a terminal of the container's, not yours, and enters from a sealed copy of itself.
 
@@ -531,7 +532,9 @@ echo lightbox:2147483647:2147483648 >> /etc/subgid
 - The container's root is an idmapped mount of its base, so that the base's files, owned by host root, are its root's and keep their other ids, and nothing is chowned. That needs Linux 5.12 and a filesystem with idmapped mounts, such as ext4, xfs, btrfs or tmpfs from 6.3 on; an overlay on an idmapped snapshot needs Linux 5.19. Where the kernel or the filesystem cannot, `create --userns` says so and makes nothing: there is no fallback that chowns.
 - An overlay container's own files, `rootfs/`, belong on the host to its range: what its root makes there is the first uid of the range's, and the snapshot stays host root's. A `--copy` container's files keep the base's ids on disk, root's included, as the copy is idmapped as it is; its directory is root's alone, as every container's is.
 - `exec` joins the user namespace first, and its command runs as the container's user, which is a uid of the range on the host.
-- A volume is bound as it is, and its files show in the container as owned by nobody unless their ids are in the range.
+- A volume is an idmapped mount of its source, for the source's owner: the container's root stands for the owner and group of the source on the host, and no other id is mapped. A file the container's root makes in it belongs on the host to that owner and group, and theirs are root's in the container. Files of other ids show as owned by nobody, the container's other users make nothing in it, and its root cannot give a file another id, nor the setuid or setgid bit (see [Security](#security)).
+- A volume whose source is host root's, by its uid or by its gid, is bound as it is: no container stands for root. Its files show as nobody's, and the container writes in it only where anyone on the host may.
+- `start` takes the volumes itself, as host root, and init attaches them. An idmapped volume needs a filesystem with idmapped mounts, as the root does: where the source's has none, `start` says so and the container does not start.
 
 ## Volume Notes
 

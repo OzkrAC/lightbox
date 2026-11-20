@@ -11,6 +11,10 @@
  * root, are its root's, and nothing is chowned. An overlay container's
  * snapshot is idmapped and becomes the overlay's lower layer (Linux 5.19);
  * its own files, the upper layer, are owned by its range on the host.
+ *
+ * Its volumes (ROADMAP 8.2) are idmapped too, each to its source's owner:
+ * the container's root stands for the owner and group of the source on the
+ * host, and no other id is mapped. Host root's are never mapped.
  */
 
 /* ─── Ranges ────────────────────────────────────────────────────────────── */
@@ -217,33 +221,67 @@ const char *userns_allocate(uint32_t *uid_start, uint32_t *gid_start) {
 
 /* ─── Maps and idmapped mounts ──────────────────────────────────────────── */
 
-/* "0 <start> 65536\n" into /proc/<pid>/<file> */
-static int write_map(int pid, const char *file, uint32_t start) {
-    char path[64], line[48], digits[11], size[11];
+void id_map_line(char out[ID_MAP_LINE_MAX], const id_map *map) {
+    char inside[11], outside[11], count[11];
+    format_u32(inside, map->inside);
+    format_u32(outside, map->outside);
+    format_u32(count, map->count);
+    bool cut = false;
+    size_t pos = str_append(out, 0, inside, ID_MAP_LINE_MAX, &cut);
+    pos = str_append(out, pos, " ", ID_MAP_LINE_MAX, &cut);
+    pos = str_append(out, pos, outside, ID_MAP_LINE_MAX, &cut);
+    pos = str_append(out, pos, " ", ID_MAP_LINE_MAX, &cut);
+    pos = str_append(out, pos, count, ID_MAP_LINE_MAX, &cut);
+    str_append(out, pos, "\n", ID_MAP_LINE_MAX, &cut);
+}
+
+bool volume_maps(uint32_t owner_uid, uint32_t owner_gid, uint32_t uid_start, uint32_t gid_start,
+                 id_map *uids, id_map *gids) {
+    if (owner_uid == 0 || owner_gid == 0)
+        return false;
+    *uids = (id_map){ .inside = owner_uid, .outside = uid_start, .count = 1 };
+    *gids = (id_map){ .inside = owner_gid, .outside = gid_start, .count = 1 };
+    return true;
+}
+
+/* the line of map into /proc/<pid>/<file> */
+static int write_map(int pid, const char *file, const id_map *map) {
+    char path[64], line[ID_MAP_LINE_MAX];
     if (!proc_pid_path(path, sizeof(path), pid, file))
         return -LB_EINVAL;
-    format_u32(digits, start);
-    format_u32(size, USERNS_SIZE);
-    bool cut = false;
-    size_t pos = str_append(line, 0, "0 ", sizeof(line), &cut);
-    pos = str_append(line, pos, digits, sizeof(line), &cut);
-    pos = str_append(line, pos, " ", sizeof(line), &cut);
-    pos = str_append(line, pos, size, sizeof(line), &cut);
-    str_append(line, pos, "\n", sizeof(line), &cut);
+    id_map_line(line, map);
     return write_file(path, line) < 0 ? -LB_EINVAL : 0;
 }
 
+static int write_maps(int pid, const id_map *uids, const id_map *gids) {
+    int rc = write_map(pid, "/uid_map", uids);
+    return rc ? rc : write_map(pid, "/gid_map", gids);
+}
+
+/* a container's: its uid and gid 0 and the USERNS_SIZE ids after them */
+static void container_maps(uint32_t uid_start, uint32_t gid_start, id_map *uids, id_map *gids) {
+    *uids = (id_map){ .inside = 0, .outside = uid_start, .count = USERNS_SIZE };
+    *gids = (id_map){ .inside = 0, .outside = gid_start, .count = USERNS_SIZE };
+}
+
 int userns_write_maps(int pid, uint32_t uid_start, uint32_t gid_start) {
-    int rc = write_map(pid, "/uid_map", uid_start);
-    return rc ? rc : write_map(pid, "/gid_map", gid_start);
+    id_map uids, gids;
+    container_maps(uid_start, gid_start, &uids, &gids);
+    return write_maps(pid, &uids, &gids);
+}
+
+int userns_fd_with(uint32_t uid_start, uint32_t gid_start) {
+    id_map uids, gids;
+    container_maps(uid_start, gid_start, &uids, &gids);
+    return userns_fd_mapped(&uids, &gids);
 }
 
 /*
- * A user namespace with the maps of a container's, held by a descriptor: the
- * one an idmapped mount is made with. A child makes it and holds it until
- * the descriptor is open. The descriptor, or minus an errno.
+ * A user namespace with those maps, held by a descriptor: the one an
+ * idmapped mount is made with. A child makes it and holds it until the
+ * descriptor is open. The descriptor, or minus an errno.
  */
-int userns_fd_with(uint32_t uid_start, uint32_t gid_start) {
+int userns_fd_mapped(const id_map *uids, const id_map *gids) {
     int32_t ready[2], hold[2];
     if (lc_kernel_create_pipe(ready, O_CLOEXEC) < 0)
         return -LB_EINVAL;
@@ -268,7 +306,7 @@ int userns_fd_with(uint32_t uid_start, uint32_t gid_start) {
     if (child > 0) {
         char said = 'n';
         if (lc_kernel_read_retry(ready[0], &said, 1) == 1 && said == 'y') {
-            fd = userns_write_maps((int)child, uid_start, gid_start);
+            fd = write_maps((int)child, uids, gids);
             if (fd == 0) {
                 char path[64];
                 fd = proc_pid_path(path, sizeof(path), (int)child, "/ns/user")

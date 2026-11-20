@@ -17,6 +17,13 @@
  *                                             each or "bad line <n>", then userns_choose with those
  *                                             ranges taken: "chose <uid> <gid>" or "none: <why>"
  *   unit userns-start <text>                  userns_start_ok: "ok <n>" or "refused"
+ *   unit volume-maps <uid> <gid> <uid_start> <gid_start>
+ *                                             volume_maps for a source of uid and gid: its two lines,
+ *                                             "uid_map <line>" and "gid_map <line>", or "plain"
+ *   unit userns-volume <uid_start> <gid_start> <src:dst>
+ *                                             open_userns_volume of a container with that range, as
+ *                                             start takes it, attached at dst in this mount namespace:
+ *                                             "attached", or "refused: <why>"
  *   unit port owner|remove <ifname> <name>    host_port_owner: absent, ours, foreign or unknown;
  *                                             remove_own_port: "result <n>"
  *   unit rtnl <request> [args...]             one rtnetlink request, "result <n>" or what it found:
@@ -790,6 +797,48 @@ int main(int argc, char **argv, char **envp) {
         } else {
             put("refused\n");
         }
+        return 0;
+    }
+    if (argc == 6 && streq(argv[1], "volume-maps")) {
+        uint32_t ids[4];
+        for (int i = 0; i < 4; i++)
+            if (!parse_u32_text(argv[2 + i], &ids[i]))
+                die2("unit: not a number: ", argv[2 + i]);
+        id_map uids, gids;
+        if (!volume_maps(ids[0], ids[1], ids[2], ids[3], &uids, &gids)) {
+            put("plain\n");
+            return 0;
+        }
+        char line[ID_MAP_LINE_MAX];
+        id_map_line(line, &uids);
+        put("uid_map ");
+        put(line);
+        id_map_line(line, &gids);
+        put("gid_map ");
+        put(line);
+        return 0;
+    }
+    if (argc == 5 && streq(argv[1], "userns-volume")) {
+        uint32_t uid_start, gid_start;
+        static volume_spec spec;
+        if (!parse_u32_text(argv[2], &uid_start) || !parse_u32_text(argv[3], &gid_start))
+            die("unit: a first uid and gid are numbers");
+        if (parse_volume_spec(argv[4], &spec) != NULL)
+            die2("unit: not a volume: ", argv[4]);
+        struct volume_mount vol;
+        const char *wrong = open_userns_volume(&spec, uid_start, gid_start, &vol);
+        if (wrong) {
+            put_line("refused: ", wrong);
+            return 0;
+        }
+        int rc = attach_tree(vol.tree, spec.dst);
+        if (rc < 0) {
+            char digits[16];
+            fmt_int(digits, -rc);
+            put_line("not attached, errno ", digits);
+            return 1;
+        }
+        put("attached\n");
         return 0;
     }
     if (argc == 4 && streq(argv[1], "owner")) {

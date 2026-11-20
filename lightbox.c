@@ -1274,6 +1274,14 @@ struct start_report {
     int32_t status;     /* START_HOOK_DONE: the hook's exit status, as a shell gives it */
 };
 
+/* A volume on its way into a container. */
+struct volume_mount {
+    int32_t tree;               /* a clone of the source's mount, attached nowhere yet */
+    bool    is_dir;
+    bool    ro;
+    const char *dst;            /* where it goes, in the configuration it is from */
+};
+
 struct child_args {
     int32_t      go_rd, go_wr;              /* init reads the first */
     int32_t      report_rd, report_wr;      /* init writes the second */
@@ -1285,6 +1293,8 @@ struct child_args {
     const char  *root;
     const char  *overlay;                   /* the options of the overlay init mounts; NULL: none */
     bool         userns;                    /* in a user namespace of its own, whose maps the command writes */
+    const struct volume_mount *volumes;     /* taken by the command, nvolumes of them; NULL: init takes them */
+    int          nvolumes;
     const char  *hook;                      /* the script init runs when it is ready */
     uint32_t     address;                   /* eth0's, on the network of prefix bits */
     int          prefix;
@@ -1385,8 +1395,12 @@ static void init_begin(const struct child_args *ca) {
     lc_kernel_close_file(ca->report_rd);
     if (ca->starter_signals >= 0)
         lc_kernel_close_file(ca->starter_signals);
-    const int32_t keep[] = { ca->go_rd, ca->report_wr, ca->null_fd, ca->log_fd, ca->exit_fd };
-    close_all_but(keep, sizeof(keep) / sizeof(keep[0]));
+    /* and the volumes the command took, which build_container attaches */
+    int32_t keep[5 + MAX_VOLS] = { ca->go_rd, ca->report_wr, ca->null_fd, ca->log_fd, ca->exit_fd };
+    size_t nkeep = 5;
+    for (int i = 0; ca->volumes && i < ca->nvolumes; i++)
+        keep[nkeep++] = ca->volumes[i].tree;
+    close_all_but(keep, nkeep);
 
     if (!go_received(ca->go_rd))
         lc_kernel_exit(1);
@@ -3105,14 +3119,6 @@ static bool reconcile(const char *name) {
     return true;
 }
 
-/* A volume on its way into a container. */
-struct volume_mount {
-    int32_t tree;               /* a clone of the source's mount, attached nowhere yet */
-    bool    is_dir;
-    bool    ro;
-    const char *dst;            /* where it goes, in the configuration it is from */
-};
-
 /*
  * Clone the mount of a volume's source: a copy of it that hangs nowhere, and
  * that stays good when the host's filesystems are taken out of the
@@ -3141,6 +3147,94 @@ static int open_volumes(const container_config *config, struct volume_mount *out
     for (int i = 0; i < config->nvols; i++)
         open_volume(&config->vols[i], &out[i]);
     return config->nvols;
+}
+
+/* "<before><errno><after><path>", for start_err */
+static const char *volume_failure(const char *before, int rc, const char *after, const char *path) {
+    static char text[MAX_PATH + 160];
+    char digits[16];
+    fmt_int(digits, rc < 0 ? -rc : rc);
+    bool cut = false;
+    size_t pos = str_append(text, 0, before, sizeof(text), &cut);
+    pos = str_append(text, pos, digits, sizeof(text), &cut);
+    pos = str_append(text, pos, after, sizeof(text), &cut);
+    str_append(text, pos, path, sizeof(text), &cut);
+    return text;
+}
+
+/*
+ * A volume of a container with --userns, taken by the command, as host root
+ * and before init is cloned: init could not make it, as an idmapped mount
+ * needs CAP_SYS_ADMIN over the source's filesystem, which a user namespace
+ * never has. The clone of the source's mount is idmapped to the source's
+ * owner and group, which the container's root then stands for, and no other
+ * id is mapped (ROADMAP 8.2). A source of host root's, uid 0 or gid 0, is
+ * cloned as it is: its files are nobody's to the container, which makes
+ * nothing there that is root's on the host. NULL, or why not.
+ */
+static const char *open_userns_volume(const volume_spec *vol, uint32_t uid_start, uint32_t gid_start,
+                                      struct volume_mount *out) {
+    lc_sysret tree = lb_sys_open_tree(AT_FDCWD, vol->src, LB_OPEN_TREE_CLONE | LB_OPEN_TREE_CLOEXEC);
+    if (tree == -LB_ENOENT) {
+        static char missing[MAX_PATH + 48];
+        bool cut = false;
+        str_append(missing, str_append(missing, 0, "volume source does not exist: ", sizeof(missing), &cut),
+                   vol->src, sizeof(missing), &cut);
+        return missing;
+    }
+    struct lb_statx stx = {0};
+    lc_sysret rc = tree < 0 ? tree
+                 : lb_sys_statx((int32_t)tree, "", LB_AT_EMPTY_PATH, LB_STATX_TYPE | LB_STATX_UID | LB_STATX_GID, &stx);
+    if (rc < 0 || (stx.stx_mask & (LB_STATX_TYPE | LB_STATX_UID | LB_STATX_GID)) != (LB_STATX_TYPE | LB_STATX_UID | LB_STATX_GID)) {
+        if (tree >= 0)
+            lc_kernel_close_file((int32_t)tree);
+        return volume_failure("cannot take the volume's source (errno ", (int)rc, "): ", vol->src);
+    }
+
+    id_map uids, gids;
+    if (volume_maps(stx.stx_uid, stx.stx_gid, uid_start, gid_start, &uids, &gids)) {
+        int ns = userns_fd_mapped(&uids, &gids);
+        if (ns < 0) {
+            lc_kernel_close_file((int32_t)tree);
+            return volume_failure("cannot make a user namespace for the volume's owner (errno ", ns, "): ", vol->src);
+        }
+        struct lb_mount_attr attr = {
+            .attr_set = LB_MOUNT_ATTR_IDMAP | LB_MOUNT_ATTR_NODEV | LB_MOUNT_ATTR_NOSUID,
+            .userns_fd = (uint64_t)ns,
+        };
+        rc = lb_sys_mount_setattr((int32_t)tree, "", LB_AT_EMPTY_PATH, &attr);
+        lc_kernel_close_file(ns);
+        if (rc < 0) {
+            lc_kernel_close_file((int32_t)tree);
+            return volume_failure("the kernel or the filesystem cannot idmap the volume (mount_setattr, errno ", (int)rc,
+                                  "); a volume of a container with --userns needs a filesystem with idmapped mounts: ",
+                                  vol->src);
+        }
+    }
+
+    out->tree = (int32_t)tree;
+    out->is_dir = (stx.stx_mode & LB_S_IFMT) == LB_S_IFDIR;
+    out->ro = vol->ro;
+    out->dst = vol->dst;
+    return NULL;
+}
+
+static void close_volumes(const struct volume_mount *vols, int count) {
+    for (int i = 0; i < count; i++)
+        lc_kernel_close_file(vols[i].tree);
+}
+
+/* Every volume of a container with --userns, so, config->nvols of them; on a
+ * failure none is left open. NULL, or why not. */
+static const char *open_userns_volumes(const container_config *config, struct volume_mount *out) {
+    for (int i = 0; i < config->nvols; i++) {
+        const char *wrong = open_userns_volume(&config->vols[i], config->uid_start, config->gid_start, &out[i]);
+        if (wrong) {
+            close_volumes(out, i);
+            return wrong;
+        }
+    }
+    return NULL;
 }
 
 /*
@@ -3210,9 +3304,15 @@ static void build_container(const struct child_args *ca) {
 
     /* The volumes: taken now, while the host's paths mean what they mean on
      * the host, and attached later, when the container's paths mean what
-     * they mean in the container. */
-    struct volume_mount volumes[MAX_VOLS];
-    int nvolumes = open_volumes(ca->config, volumes);
+     * they mean in the container. With --userns the command took them, as
+     * host root, and init has its copies of them. */
+    struct volume_mount own_volumes[MAX_VOLS];
+    const struct volume_mount *volumes = ca->volumes;
+    int nvolumes = ca->nvolumes;
+    if (!volumes) {
+        nvolumes = open_volumes(ca->config, own_volumes);
+        volumes = own_volumes;
+    }
 
     /* The root, bound onto itself: a mount of this namespace's own, which
      * pivot_root takes, where one that a user namespace got with its copy of
@@ -3651,6 +3751,17 @@ static void start_one(const char *name, int hook_wait) {
         }
     }
 
+    /* and its volumes, each idmapped to its source's owner; init has copies
+     * of them when it is cloned, and these go then */
+    static struct volume_mount userns_volumes[MAX_VOLS];
+    int nuserns_volumes = 0;
+    if (config.userns) {
+        start_err = open_userns_volumes(&config, userns_volumes);
+        if (start_err)
+            goto fail_start;
+        nuserns_volumes = config.nvols;
+    }
+
     /* clone init; it waits for its first byte */
     struct child_args ca = {
         .starter_signals = signal_fd,
@@ -3662,6 +3773,8 @@ static void start_one(const char *name, int hook_wait) {
         .root = start_root,
         .overlay = config.base[0] && !config.userns ? overlay : NULL,
         .userns = config.userns,
+        .volumes = config.userns ? userns_volumes : NULL,
+        .nvolumes = nuserns_volumes,
         .hook = "/init.sh",
         .address = addr,
         .prefix = net.prefix,
@@ -3675,6 +3788,7 @@ static void start_one(const char *name, int hook_wait) {
 
     start_err = init_spawn(&init, &ca, clone_flags, container_child);
     close_container_streams(&null_fd, &log_fd);     /* init has its own copies */
+    close_volumes(userns_volumes, nuserns_volumes);
     lc_kernel_close_file(exit_fd);
     exit_fd = -1;
     if (start_err)

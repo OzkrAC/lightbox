@@ -1145,6 +1145,26 @@ t_run_mode() {
     case $said in drwxr-xr-x*) ;; *) return 1 ;; esac
 }
 
+# Nothing in a container gives a file the setuid or the setgid bit, in its own
+# files or in a volume, which are on the host too (ROADMAP 8.2): chmod asks for
+# either and is refused, and a plain mode is taken.
+t_no_setuid_or_setgid_bits() {
+    mkdir -p "$T/vol/bits" || return 1
+    box bits --vol "$T/vol/bits:/bits" && volume_for bits "$T/vol/bits" && start bits || return 1
+    sh_in bits 'echo x > /bits/file && echo x > /file && chmod 750 /bits/file /file' || return 1
+    for change in 'u+s /bits/file' 'g+s /bits/file' '4755 /file' '2755 /file' '6755 /bits/file'; do
+        if said=$(sh_in bits "chmod $change" 2>&1); then
+            echo "chmod $change was taken"
+            return 1
+        fi
+        echo "chmod $change: $said"
+        case $said in *'not permitted'*) ;; *) echo "refused for another reason than the bits"; return 1 ;; esac
+    done
+    modes=$(stat -c %a "$T/vol/bits/file" "$C/bits/rootfs/file" | paste -sd' ')
+    echo "on the host: $modes"
+    [ "$modes" = '750 750' ]
+}
+
 t_rootfs_mount_flags() {
     up flags || return 1
     script_in flags <<'EOF'
@@ -2528,6 +2548,54 @@ t_userns_without_a_range() {
     [ ! -e "$C/unrange" ] || { echo "it left the container"; return 1; }
 }
 
+# A volume of a --userns container is idmapped to its source's owner
+# (ROADMAP 8.2): the container's root is uid 1000 and gid 1001 there, a file of
+# theirs is root's in it, and what it makes is theirs on the host. No other id
+# is mapped: a file of 2000's is nobody's in it, its root cannot give a file
+# another id, and its uid 4711 makes nothing in it, though the directory lets
+# anyone write. A file volume is idmapped too, and a read-only one stays so.
+t_userns_volume_owner() {
+    need_subids || return 77
+    mkdir -p "$T/vol/work" && echo theirs > "$T/vol/work/theirs" && echo other > "$T/vol/work/other" &&
+        chown 1000:1001 "$T/vol/work" "$T/vol/work/theirs" && chown 2000:2000 "$T/vol/work/other" &&
+        chmod 777 "$T/vol/work" || return 1
+    up unvol --userns --vol "$T/vol/work:/work" --vol "$T/vol/work/theirs:/etc/theirs" --vol "$T/vol/work:/fixed:ro" ||
+        return 1
+    inside=$(sh_in unvol 'stat -c %u:%g /work /work/theirs /work/other /etc/theirs /fixed' | paste -sd' ')
+    echo "in it: $inside"
+    [ "$inside" = '0:0 0:0 65534:65534 0:0 0:0' ] || return 1
+    sh_in unvol 'echo made > /work/made && mkdir /work/dir && echo more >> /etc/theirs' || return 1
+    made=$(stat -c %u:%g "$T/vol/work/made" "$T/vol/work/dir" "$T/vol/work/theirs" | paste -sd' ')
+    echo "on the host: $made"
+    [ "$made" = '1000:1001 1000:1001 1000:1001' ] && [ "$(tail -n 1 "$T/vol/work/theirs")" = more ] || return 1
+    sh_in unvol 'chown 4711 /work/made' && { echo "the container gave a file an id that is not mapped"; return 1; }
+    said=$(lb exec unvol --user 4711 /bin/sh -c 'echo x > /work/by4711' 2>&1 </dev/null) &&
+        { echo "uid 4711 made a file"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *'too large'*) ;; *) echo "uid 4711 is refused for another reason than its id"; return 1 ;; esac
+    sh_in unvol 'echo x > /fixed/x' && { echo "the read-only volume took a file"; return 1; }
+    # what is 1000's on the host is never setuid or setgid
+    sh_in unvol 'chmod u+s /work/made' && { echo "the container made a file of 1000's setuid"; return 1; }
+    [ ! -e "$T/vol/work/by4711" ] && [ ! -e "$T/vol/work/x" ] && [ "$(stat -c %u "$T/vol/work/made")" = 1000 ] &&
+        [ -z "$(find "$T/vol/work/made" -perm /6000)" ]
+}
+
+# A volume whose source is host root's, by its uid or by its gid, is bound as
+# it is: host uid 0 and gid 0 are never mapped, its files are nobody's in the
+# container, and the container's root makes nothing in it.
+t_userns_volume_of_root() {
+    need_subids || return 77
+    mkdir -p "$T/vol/root-uid" "$T/vol/root-gid" && echo root > "$T/vol/root-uid/file" &&
+        chown 1000:0 "$T/vol/root-gid" && chmod 775 "$T/vol/root-gid" || return 1
+    up unrootvol --userns --vol "$T/vol/root-uid:/a" --vol "$T/vol/root-gid:/b" || return 1
+    inside=$(sh_in unrootvol 'stat -c %u:%g /a /a/file /b; cat /a/file' | paste -sd' ')
+    echo "in it: $inside"
+    [ "$inside" = '65534:65534 65534:65534 65534:65534 root' ] || return 1
+    sh_in unrootvol 'echo x > /a/new' && { echo "the container made a file in a volume of host uid 0's"; return 1; }
+    sh_in unrootvol 'echo x > /b/new' && { echo "the container made a file in a volume of host gid 0's"; return 1; }
+    [ ! -e "$T/vol/root-uid/new" ] && [ ! -e "$T/vol/root-gid/new" ]
+}
+
 # setup --teardown does nothing while a container runs, and says which. With
 # none running it takes away all that setup and the containers made: the
 # interfaces are those there were before the first setup, no rule or chain of
@@ -3024,6 +3092,7 @@ if [ "$MODE" = inside ]; then
     check 'init mounts everything with the restrictions it should have'   t_mount_table
     check 'a container starts and stops without any mount tool'           t_start_needs_no_mount_tool
     check 'the root filesystem is mounted nodev and nosuid'               t_rootfs_mount_flags
+    check 'nothing in a container makes a file setuid or setgid'          t_no_setuid_or_setgid_bits
     check 'an image without /dev, /proc, /sys, /tmp and /run starts'      t_image_without_mount_points
     check 'an image of one static binary starts'                          t_image_with_one_binary
     check 'start runs nothing from the image'                             t_start_runs_nothing_from_the_image
@@ -3103,6 +3172,8 @@ if [ "$MODE" = inside ]; then
     check '--userns with --copy: the copy is idmapped, and init is its range on the host' t_userns_copy
     check 'containers with --userns get ranges apart, and one without gets none' t_userns_ranges_apart
     check 'without a range for lightbox, create --userns says what to add'  t_userns_without_a_range
+    check '--userns: a volume is its source'"'"'s owner'"'"'s, whom the container'"'"'s root stands for, and no other id' t_userns_volume_owner
+    check '--userns: a volume of host root'"'"'s is bound as it is, and the container makes nothing in it' t_userns_volume_of_root
     check 'setup --teardown leaves the host as before the first setup'    t_setup_teardown
     check 'without --config or LIGHTBOX_CONFIG, /etc/lightbox/lightbox.conf is read' t_config_in_etc
     check 'a container overlays a snapshot of its base, and keeps its own files apart' t_overlay_root

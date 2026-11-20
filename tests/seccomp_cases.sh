@@ -15,6 +15,10 @@
 #   clone_plain <returned before> <returned after>
 #
 # where a return is the raw value (a negative errno on failure) or "killed".
+# "modes <dir>" makes the calls that set a file's mode, with the setuid or
+# setgid bit and without, before and under the profile, and prints
+#
+#   mode <call> refused|allowed <returned before> <returned after>
 #
 # Next to the harness, seccomp_filter_x86_64 and seccomp_filter_aarch64 hold the
 # program of each architecture and interpret it, so both are checked here
@@ -38,7 +42,8 @@ EPERM=1 ENOSYS=38
 MACHINE=$(uname -m)
 
 # The program of one architecture, interpreted: every syscall number, the
-# foreign ABIs, the x32 range and clone with and without namespace flags.
+# foreign ABIs, the x32 range, clone with and without namespace flags, and
+# every bit of the mode of the calls that set one.
 t_interpreted() {
     prog="$(dirname "$HARNESS")/seccomp_filter_$1"
     [ -x "$prog" ] || { echo "$prog was not built (no hosted compiler?)"; return 77; }
@@ -129,6 +134,32 @@ t_plain_clone_allowed() {
     [ "$1" = 1 ] && [ "$2" = 1 ]
 }
 
+# The calls that set a mode refuse the setuid and setgid bits with EPERM, and
+# take a mode without them; an open that makes nothing uses no mode, and the
+# kernel takes neither bit from a mkdir's, so both are allowed with either
+# (ROADMAP 8.2). Nothing made under the profile has either bit. Before it,
+# fchmodat2 may be missing (ENOSYS) and O_TMPFILE unsupported (EOPNOTSUPP);
+# the profile answers before the kernel looks, so they are refused all the same.
+t_mode_bits_refused() {
+    local dir out bad made n
+    dir=$(mktemp -d "${TMPDIR:-/tmp}/lightbox-seccomp.XXXXXX") || return 1
+    mkdir "$dir/before" "$dir/after" || return 1
+    out=$("$HARNESS" modes "$dir" 2>&1)
+    printf '%s\n' "$out"
+    bad=$(printf '%s\n' "$out" | awk '
+        $1 != "mode"                       { print "not a line of the probe: " $0; next }
+        $4 != 0 && $4 != -38 && $4 != -95  { print $2 " failed before the profile: " $4; next }
+        $3 == "refused" && $5 != -1        { print $2 " with a bit returned " $5 " under the profile, -1 is needed" }
+        $3 == "allowed" && $5 != $4        { print $2 " returned " $4 " before the profile and " $5 " under it" }')
+    made=$(find "$dir/after" -perm /6000)
+    n=$(printf '%s\n' "$out" | grep -c '^mode ')
+    rm -rf -- "$dir"
+    [ -n "$made" ] && echo "made with a setuid or setgid bit under the profile: $made"
+    [ -n "$bad" ] && printf '%s\n' "$bad"
+    echo "$n calls made"
+    [ -z "$bad" ] && [ -z "$made" ] && [ "$n" -ge 16 ]
+}
+
 check 'the x86_64 program gives the right verdict for every syscall number'  t_interpreted_x86_64
 check 'the aarch64 program gives the right verdict for every syscall number' t_interpreted_aarch64
 
@@ -142,6 +173,7 @@ check 'a program that starts a thread runs under the profile'  t_threaded_progra
 check 'x32 syscall numbers are refused'                         t_x32_refused
 check 'clone with a namespace flag is refused'                  t_clone_namespace_flag_refused
 check 'clone without a namespace flag still works'              t_plain_clone_allowed
+check 'no call makes a file setuid or setgid, and a plain mode is taken' t_mode_bits_refused
 
 if [ "${V:-0}" = 1 ]; then
     printf '\nprobe output (number, name, documented errno, before, after):\n'

@@ -190,6 +190,26 @@ in_mount_namespace() { # script
     return $rc
 }
 
+# The same in a user namespace with 65536 ids besides its root, from this
+# user's range in /etc/subuid and /etc/subgid, for what needs more than one.
+in_namespace_with_ids() { # script
+    local who uids gids dir rc
+    who=$(id -un)
+    uids=$(awk -F: -v a="$who" -v b="$(id -u)" '($1 == a || $1 == b) && $3 >= 65536 { print $2; exit }' /etc/subuid 2>/dev/null)
+    gids=$(awk -F: -v a="$who" -v b="$(id -g)" '($1 == a || $1 == b) && $3 >= 65536 { print $2; exit }' /etc/subgid 2>/dev/null)
+    [ -n "$uids" ] && [ -n "$gids" ] && command -v newuidmap >/dev/null && command -v setpriv >/dev/null &&
+        unshare --map-root-user --map-users="1:$uids:65536" --map-groups="1:$gids:65536" --mount true 2>/dev/null ||
+        { echo "this user has no range of 65536 ids to map, or no newuidmap and setpriv"; return 77; }
+    dir=$(mktemp -d "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    unshare --map-root-user --map-users="1:$uids:65536" --map-groups="1:$gids:65536" --mount -- bash -c '
+        m()    { r=$("$UNIT" mount "$@" 2>&1); [ "$r" = "result 0" ] || { echo "mount $*: $r"; exit 1; }; }
+        UNIT=$1; D=$2
+        '"$1" _ "$UNIT" "$dir"
+    rc=$?
+    rm -rf -- "$dir"
+    return $rc
+}
+
 t_mount_with_flags_and_data() {
     in_mount_namespace '
         mkdir "$D/t"
@@ -997,6 +1017,39 @@ t_volume_through_a_dangling_link() {
         echo "$out"
         [ -z "$(ls -A "$D/named-on-the-host")" ] || { echo "something was made on the host: $(ls -A "$D/named-on-the-host")"; exit 1; }
         [ "$(ls -A "$D/root")" = away ] || { echo "something was made in the new root: $(ls -A "$D/root")"; exit 1; }'
+}
+
+# A volume of a container with --userns as start takes it (ROADMAP 8.2), for
+# a container whose root is 2000:2000 here. A source of 1000:1001 is idmapped
+# to it: the files of 1000's are 2000's through it, and what 2000 makes there
+# is 1000's and 1001's. No other id is mapped: a file of 3000's is nobody's,
+# and 2001 makes nothing there though anyone may write. A file is idmapped
+# too. A source of uid 0's or gid 0's is cloned as it is.
+t_userns_volume_taken() {
+    in_namespace_with_ids '
+        m tmpfs "$D" tmpfs - -
+        mkdir "$D/src" "$D/dst" "$D/root" "$D/root-dst" "$D/gid0" "$D/gid0-dst" && : > "$D/file-dst" &&
+            echo theirs > "$D/src/theirs" && echo other > "$D/src/other" &&
+            chown 1000:1001 "$D/src" "$D/src/theirs" && chown 3000:3000 "$D/src/other" && chmod 777 "$D/src" &&
+            chown 1000:0 "$D/gid0" || exit 1
+        for vol in "$D/src:$D/dst" "$D/src/theirs:$D/file-dst" "$D/root:$D/root-dst" "$D/gid0:$D/gid0-dst"; do
+            out=$("$UNIT" userns-volume 2000 2000 "$vol" 2>&1)
+            [ "$out" = attached ] || { echo "$vol: $out"; exit 1; }
+        done
+        got=$(stat -c %u:%g "$D/dst" "$D/dst/theirs" "$D/dst/other" "$D/file-dst" "$D/root-dst" "$D/gid0-dst" | paste -sd" ")
+        echo "through the volumes: $got"
+        [ "$got" = "2000:2000 2000:2000 65534:65534 2000:2000 0:0 1000:0" ] || exit 1
+        setpriv --reuid=2000 --regid=2000 --clear-groups sh -c "echo made > \"$D/dst/made\" && mkdir \"$D/dst/dir\"" || exit 1
+        got=$(stat -c %u:%g "$D/src/made" "$D/src/dir" | paste -sd" ")
+        echo "made by 2000: $got"
+        [ "$got" = "1000:1001 1000:1001" ] || exit 1
+        said=$(setpriv --reuid=2001 --regid=2000 --clear-groups sh -c "echo x > \"$D/dst/x\"" 2>&1) &&
+            { echo "2001 made a file"; exit 1; }
+        echo "2001: $said"
+        case $said in *"too large"*) ;; *) exit 1 ;; esac
+        [ ! -e "$D/src/x" ]
+        out=$("$UNIT" userns-volume 2000 2000 "$D/missing:$D/dst" 2>&1)
+        [ "$out" = "refused: volume source does not exist: $D/missing" ] || { echo "$out"; exit 1; }'
 }
 
 t_volume_that_cannot_be_had() {
@@ -2274,6 +2327,26 @@ t_userns_ranges() {
     return $bad
 }
 
+# The maps of a volume of a container with --userns (ROADMAP 8.2): one line
+# each, its source's owner and group as the container's root and nothing
+# else; a source of host uid 0 or gid 0 is bound as it is.
+t_volume_maps() {
+    bad=0
+    expect() { # want, args...
+        local want=$1
+        shift
+        got=$("$UNIT" volume-maps "$@" | paste -sd'|')
+        [ "$got" = "$want" ] || { echo "volume-maps $*: $got, expected $want"; bad=1; }
+    }
+    expect 'uid_map 1000 2147483647 1|gid_map 1001 2147483647 1' 1000 1001 2147483647 2147483647
+    expect 'uid_map 4294967294 100000 1|gid_map 1 165536 1' 4294967294 1 100000 165536
+    expect 'uid_map 2147483647 2147483647 1|gid_map 2147483647 2147483647 1' 2147483647 2147483647 2147483647 2147483647
+    expect plain 0 0 2147483647 2147483647
+    expect plain 0 1000 2147483647 2147483647
+    expect plain 1000 0 2147483647 2147483647
+    return $bad
+}
+
 # base=, the snapshot a container overlays: twelve hex digits, read and
 # written back as they are; anything else is refused with its line.
 config_base_key() {
@@ -2787,6 +2860,7 @@ check 'a volume is src:dst[:ro], with paths that mean what they say' t_volume_sp
 check 'volumes are attached after the pivot, inside the new root' t_volumes_are_attached_inside
 check 'a volume through a link that leads nowhere ends the start' t_volume_through_a_dangling_link
 check 'a volume that cannot be had ends the start'               t_volume_that_cannot_be_had
+check 'with --userns a volume is idmapped to its owner, and one of root'"'"'s is not' t_userns_volume_taken
 
 check 'the name servers of a host are the ones a container can ask' t_name_servers_of_the_host
 
@@ -2839,6 +2913,7 @@ check 'a .conf is read into one structure, whole'                t_config_is_rea
 check 'what a .conf leaves out is the default, if that is usable' t_config_defaults
 check 'userns=1 is read with a uid_start and a gid_start, and refused without' t_config_userns_keys
 check 'a new container gets the first range of /etc/subuid and /etc/subgid that is free' t_userns_ranges
+check "a volume's maps make the container's root its source's owner, and never host root" t_volume_maps
 check 'base= is a snapshot'"'"'s id, read as it is, or refused'          t_config_base_key
 check 'a .conf with a version is read strictly, by line'         t_config_is_read_strictly
 check 'a .conf from before the version line is still read'       t_config_from_before_the_version_line

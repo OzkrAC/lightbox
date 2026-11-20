@@ -1,6 +1,7 @@
 /*
  * Interprets lightbox's seccomp program and checks its verdict for every
- * syscall number (ROADMAP 2.4).
+ * syscall number (ROADMAP 2.4), and for the calls that set a mode, its
+ * verdict for every bit of the mode and for the flags of an open (8.2).
  *
  * The program is built for the architecture named at compile time,
  *
@@ -35,6 +36,15 @@
 #define AUDIT_ARCH_ARM   0x40000028U
 
 #define NR_LIMIT 1024   /* well above the highest syscall number of either target */
+
+#if defined(LB_SECCOMP_TARGET_X86_64)
+#define O_DIRECTORY_BIT 0200000U
+#else
+#define O_DIRECTORY_BIT 040000U
+#endif
+#define O_CREAT_BIT     0100U
+#define O_EXCL_BIT      0200U
+#define O_TMPFILE_BITS  (020000000U | O_DIRECTORY_BIT)
 
 /* What the kernel hands a filter; the layout of struct seccomp_data. */
 struct data {
@@ -89,6 +99,26 @@ static void expect(const char *what, const struct data *d, uint32_t want) {
         fail(what, d, got, want);
 }
 
+/* The row of the mode table for nr, or NULL. */
+static const struct lb_seccomp_mode *mode_row(uint32_t nr) {
+    for (size_t i = 0; i < LB_SECCOMP_MODE_TABLE_LEN; i++)
+        if (LB_SECCOMP_MODE_TABLE[i].nr == nr)
+            return &LB_SECCOMP_MODE_TABLE[i];
+    return NULL;
+}
+
+/* A call of a mode row: the mode in its argument, flags in its flags
+ * argument when it has one, and fill in every other argument. */
+static struct data mode_call(const struct lb_seccomp_mode *row, uint64_t mode, uint64_t flags, uint64_t fill) {
+    struct data d = { .nr = row->nr, .arch = LB_SECCOMP_AUDIT_ARCH };
+    for (int i = 0; i < 6; i++)
+        d.args[i] = fill;
+    d.args[row->mode_arg] = mode;
+    if (row->flags_arg >= 0)
+        d.args[row->flags_arg] = flags;
+    return d;
+}
+
 /* The errno the table documents for nr, or 0 when it has no row. */
 static uint32_t table_errno(uint32_t nr) {
     for (size_t i = 0; i < LB_SECCOMP_TABLE_LEN; i++)
@@ -125,6 +155,26 @@ int main(void) {
             }
     }
 
+    /* the mode table: numbers apart from every other row, arguments that are */
+    for (size_t i = 0; i < LB_SECCOMP_MODE_TABLE_LEN; i++) {
+        const struct lb_seccomp_mode *row = &LB_SECCOMP_MODE_TABLE[i];
+        if (row->nr >= NR_LIMIT || row->mode_arg > 5 || row->flags_arg > 5 || row->flags_arg < -1 ||
+            row->flags_arg == (int8_t)row->mode_arg) {
+            printf("  mode row %zu (nr %u, mode argument %u, flags argument %d) is out of range\n",
+                   i, row->nr, row->mode_arg, row->flags_arg);
+            failures++;
+        }
+        if (row->nr == LB_SECCOMP_NR_CLONE || table_errno(row->nr)) {
+            printf("  number %u is in the mode table and in another row\n", row->nr);
+            failures++;
+        }
+        for (size_t j = 0; j < i; j++)
+            if (LB_SECCOMP_MODE_TABLE[j].nr == row->nr) {
+                printf("  number %u is in the mode table twice\n", row->nr);
+                failures++;
+            }
+    }
+
     struct data d;
 
     /* another ABI: killed, whatever the number */
@@ -140,9 +190,11 @@ int main(void) {
         uint32_t err = table_errno(nr);
         d = (struct data){ .nr = nr, .arch = LB_SECCOMP_AUDIT_ARCH };
         expect(err ? "table row" : "allowed syscall", &d, err ? DENY(err) : LB_SECCOMP_RET_ALLOW);
-        /* arguments do not change the answer, except for clone below */
-        if (nr != LB_SECCOMP_NR_CLONE) {
-            d.args[0] = UINT64_MAX;
+        /* arguments do not change the answer, except for clone and the
+         * mode rows below */
+        if (nr != LB_SECCOMP_NR_CLONE && !mode_row(nr)) {
+            for (int i = 0; i < 6; i++)
+                d.args[i] = UINT64_MAX;
             expect(err ? "table row with arguments" : "allowed syscall with arguments", &d,
                    err ? DENY(err) : LB_SECCOMP_RET_ALLOW);
         }
@@ -192,7 +244,54 @@ int main(void) {
                        .args = { 17, LB_SECCOMP_CLONE_NS_FLAGS, UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX } };
     expect("clone with namespace bits in other arguments", &d, LB_SECCOMP_RET_ALLOW);
 
-    printf("  %s: %zu instructions, %zu table rows, %lu verdicts checked, %lu wrong\n",
-           TARGET, prog_len, (size_t)LB_SECCOMP_TABLE_LEN, verdicts, failures);
+    /* the calls that set a mode: refused for the setuid or the setgid bit, by
+     * itself or with others, in the mode argument and nowhere else */
+    for (size_t i = 0; i < LB_SECCOMP_MODE_TABLE_LEN; i++) {
+        const struct lb_seccomp_mode *row = &LB_SECCOMP_MODE_TABLE[i];
+        const uint64_t create = O_CREAT_BIT;
+        for (uint32_t bit = 0; bit < 64; bit++) {
+            d = mode_call(row, 1ULL << bit, create, 0);
+            /* the kernel reads 16 bits of a mode; the filter its low word */
+            expect(bit == 10 || bit == 11 ? "mode bit refused" : "mode bit allowed", &d,
+                   bit == 10 || bit == 11 ? DENY(LB_SC_EPERM) : LB_SECCOMP_RET_ALLOW);
+        }
+        static const uint64_t refused[] = { 04000, 02000, 06000, 04755, 02755, 06755, 07777,
+                                            0x100000000ULL | 04000, UINT64_MAX };
+        static const uint64_t allowed[] = { 0, 0644, 0755, 01777, 0777 | 01000 | 0170000,
+                                            0xffffffff00000000ULL | 0755, UINT64_MAX & ~06000ULL };
+        for (size_t m = 0; m < sizeof(refused) / sizeof(refused[0]); m++) {
+            d = mode_call(row, refused[m], create, 0);
+            expect("a mode with a setuid or setgid bit", &d, DENY(LB_SC_EPERM));
+        }
+        for (size_t m = 0; m < sizeof(allowed) / sizeof(allowed[0]); m++) {
+            d = mode_call(row, allowed[m], create, 0);
+            expect("a mode without either bit", &d, LB_SECCOMP_RET_ALLOW);
+        }
+        /* the bits in every other argument do not count */
+        d = mode_call(row, 0755, create, UINT64_MAX);
+        expect("the bits in other arguments", &d, LB_SECCOMP_RET_ALLOW);
+
+        if (row->flags_arg < 0)
+            continue;
+        /* an open uses its mode only with O_CREAT or O_TMPFILE */
+        static const uint64_t making[] = { O_CREAT_BIT, O_CREAT_BIT | O_EXCL_BIT | 1, O_TMPFILE_BITS | 1,
+                                           020000000U, 0xffffffffU, UINT64_MAX };
+        static const uint64_t not_making[] = { 0, 1, 2, 01000 | 1, O_DIRECTORY_BIT, 04000,
+                                               0xffffffffU & ~LB_SECCOMP_CREATE_FLAGS,
+                                               (uint64_t)O_CREAT_BIT << 32, (uint64_t)020000000U << 32 };
+        for (size_t f = 0; f < sizeof(making) / sizeof(making[0]); f++) {
+            d = mode_call(row, 04755, making[f], 0);
+            expect("an open that makes a file, with a setuid mode", &d, DENY(LB_SC_EPERM));
+            d = mode_call(row, 0644, making[f], 0);
+            expect("an open that makes a file, with a plain mode", &d, LB_SECCOMP_RET_ALLOW);
+        }
+        for (size_t f = 0; f < sizeof(not_making) / sizeof(not_making[0]); f++) {
+            d = mode_call(row, 07777, not_making[f], UINT64_MAX);
+            expect("an open that makes nothing, whatever the mode", &d, LB_SECCOMP_RET_ALLOW);
+        }
+    }
+
+    printf("  %s: %zu instructions, %zu table rows and %zu mode rows, %lu verdicts checked, %lu wrong\n",
+           TARGET, prog_len, (size_t)LB_SECCOMP_TABLE_LEN, (size_t)LB_SECCOMP_MODE_TABLE_LEN, verdicts, failures);
     return failures ? 1 : 0;
 }

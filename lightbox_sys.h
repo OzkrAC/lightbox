@@ -114,6 +114,8 @@
 #define LB_STATX_TYPE             0x00000001U
 #define LB_STATX_INO              0x00000100U
 #define LB_STATX_MODE             0x00000002U
+#define LB_STATX_UID              0x00000008U
+#define LB_STATX_GID              0x00000010U
 #define LB_STATX_ATTR_MOUNT_ROOT  0x00002000U   /* reported since Linux 5.8 */
 
 #define LB_CGROUP_SUPER_MAGIC     0x0027e0eb    /* a cgroup v1 hierarchy */

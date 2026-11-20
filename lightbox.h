@@ -369,10 +369,31 @@ int userns_range_count(void);
 /* The same from /etc/subuid, /etc/subgid and every container's .conf, under
  * the store's lock. NULL, or why there is none. */
 const char *userns_allocate(uint32_t *uid_start, uint32_t *gid_start);
+/* One line of a uid_map or gid_map: count ids from inside, in the
+ * namespace, are the ids from outside in the one it was made in. To an
+ * idmapped mount, inside is the id a file has on its filesystem and outside
+ * the one it shows. */
+typedef struct {
+    uint32_t inside;
+    uint32_t outside;
+    uint32_t count;
+} id_map;
+#define ID_MAP_LINE_MAX 36
+/* "<inside> <outside> <count>\n" */
+void id_map_line(char out[ID_MAP_LINE_MAX], const id_map *map);
+/* The maps of a volume of a container with --userns whose source is owned
+ * by owner_uid and owner_gid on the host: they are its root, uid_start and
+ * gid_start, and no other id is mapped. False for a source of host root's,
+ * uid 0 or gid 0, which no container may stand for. */
+[[nodiscard]] bool volume_maps(uint32_t owner_uid, uint32_t owner_gid, uint32_t uid_start, uint32_t gid_start,
+                               id_map *uids, id_map *gids);
 /* uid_map and gid_map of a process in a new user namespace: 0, or minus an errno */
 [[nodiscard]] int userns_write_maps(int pid, uint32_t uid_start, uint32_t gid_start);
-/* A user namespace with those maps, for idmapped mounts: a descriptor, or minus an errno */
+/* A user namespace with a container's maps, for idmapped mounts: a
+ * descriptor, or minus an errno */
 [[nodiscard]] int userns_fd_with(uint32_t uid_start, uint32_t gid_start);
+/* The same with the maps given, a line each */
+[[nodiscard]] int userns_fd_mapped(const id_map *uids, const id_map *gids);
 /* An idmapped, nodev copy of the mount at path, attached nowhere; nosuid
  * unless privileged. Its descriptor, or minus an errno and *step the call. */
 [[nodiscard]] int idmapped_tree(const char *path, int userns_fd, bool privileged, const char **step);

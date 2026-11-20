@@ -162,6 +162,8 @@ SAME_VALUE(LB_S_IFDIR, S_IFDIR);
 SAME_VALUE(LB_STATX_TYPE, STATX_TYPE);
 SAME_VALUE(LB_STATX_INO, STATX_INO);
 SAME_VALUE(LB_STATX_MODE, STATX_MODE);
+SAME_VALUE(LB_STATX_UID, STATX_UID);
+SAME_VALUE(LB_STATX_GID, STATX_GID);
 SAME_VALUE(LB_STATX_ATTR_MOUNT_ROOT, STATX_ATTR_MOUNT_ROOT);
 SAME_VALUE(LB_CGROUP_SUPER_MAGIC, CGROUP_SUPER_MAGIC);
 SAME_VALUE(LB_CGROUP2_SUPER_MAGIC, CGROUP2_SUPER_MAGIC);
@@ -218,6 +220,8 @@ SAME_FIELD(lb_statfs, statfs, f_flags);
 SAME_SIZE(lb_statx, statx);
 SAME_FIELD(lb_statx, statx, stx_mask);
 SAME_FIELD(lb_statx, statx, stx_attributes);
+SAME_FIELD(lb_statx, statx, stx_uid);
+SAME_FIELD(lb_statx, statx, stx_gid);
 SAME_FIELD(lb_statx, statx, stx_mode);
 SAME_FIELD(lb_statx, statx, stx_attributes_mask);
 SAME_FIELD(lb_statx, statx, stx_dev_major);
@@ -389,6 +393,14 @@ LB_SECCOMP_DENY(CHECK_ROW)
 #endif
 LB_SECCOMP_DENY_X86_64(CHECK_ROW_X86_64)
 
+/* the mode table, as the deny table */
+#define CHECK_MODE_ROW(name, x86_64, aarch64, mode, flags) CHECK_ROW(name, x86_64, aarch64, 0)
+LB_SECCOMP_MODE(CHECK_MODE_ROW)
+#define CHECK_MODE_ROW_X86_64(name, nr, mode, flags) CHECK_ROW_X86_64(name, nr, 0)
+LB_SECCOMP_MODE_X86_64(CHECK_MODE_ROW_X86_64)
+SAME_VALUE(LB_SECCOMP_SUID_SGID, S_ISUID | S_ISGID);
+SAME_VALUE(LB_SECCOMP_CREATE_FLAGS, O_CREAT | __O_TMPFILE);
+
 SAME_VALUE(LB_SECCOMP_NR_CLONE, __NR_clone);
 SAME_VALUE(LB_SC_EPERM, EPERM);
 SAME_VALUE(LB_SC_ENOSYS, ENOSYS);
@@ -418,6 +430,9 @@ SAME_VALUE(LB_BPF_RET_K, BPF_RET | BPF_K);
 SAME_VALUE(LB_SECCOMP_DATA_NR, offsetof(struct seccomp_data, nr));
 SAME_VALUE(LB_SECCOMP_DATA_ARCH, offsetof(struct seccomp_data, arch));
 SAME_VALUE(LB_SECCOMP_DATA_ARG0_LO, offsetof(struct seccomp_data, args));
+SAME_VALUE(LB_SECCOMP_DATA_ARG_LO(1), offsetof(struct seccomp_data, args[1]));
+SAME_VALUE(LB_SECCOMP_DATA_ARG_LO(2), offsetof(struct seccomp_data, args[2]));
+SAME_VALUE(LB_SECCOMP_DATA_ARG_LO(3), offsetof(struct seccomp_data, args[3]));
 
 SAME_VALUE(LB_SECCOMP_CLONE_NS_FLAGS,
            CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWIPC |

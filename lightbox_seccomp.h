@@ -2,9 +2,10 @@
  * lightbox_seccomp.h: the seccomp profile, as one table and one BPF program.
  *
  * The profile is a deny-list. Each row of the table names a syscall, gives its
- * number on x86_64 and on aarch64, and the errno a sandboxed caller gets.
- * lb_seccomp_build() turns the rows for the target architecture into the
- * program lightbox installs.
+ * number on x86_64 and on aarch64, and the errno a sandboxed caller gets. A
+ * second table names the syscalls that set a file's mode, which are refused
+ * when the mode has the setuid or setgid bit. lb_seccomp_build() turns the
+ * rows for the target architecture into the program lightbox installs.
  *
  * Nothing here is taken on trust:
  *   tests/sys_check.c       compares every number and constant below with the
@@ -63,6 +64,7 @@ _Static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
 #define LB_SECCOMP_DATA_NR           0
 #define LB_SECCOMP_DATA_ARCH         4
 #define LB_SECCOMP_DATA_ARG0_LO      16     /* low 32 bits of args[0] */
+#define LB_SECCOMP_DATA_ARG_LO(i)    (LB_SECCOMP_DATA_ARG0_LO + 8 * (i))
 
 /* x86_64 only: x32 calls report AUDIT_ARCH_X86_64 and carry this bit. */
 #define LB_X32_SYSCALL_BIT           0x40000000U
@@ -70,6 +72,12 @@ _Static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
 /* CLONE_NEWNS, NEWCGROUP, NEWUTS, NEWIPC, NEWUSER, NEWPID and NEWNET.
  * CLONE_NEWTIME is not a clone() flag: its bit belongs to the exit signal. */
 #define LB_SECCOMP_CLONE_NS_FLAGS    0x7e020000U
+
+/* S_ISUID | S_ISGID, in the mode of the calls of LB_SECCOMP_MODE */
+#define LB_SECCOMP_SUID_SGID         06000U
+/* O_CREAT | __O_TMPFILE, the same on both targets: an open with either sets
+ * the mode of what it makes */
+#define LB_SECCOMP_CREATE_FLAGS      (0100U | 020000000U)
 
 #define LB_SECCOMP_NR_CLONE_X86_64   56
 #define LB_SECCOMP_NR_CLONE_AARCH64  220
@@ -96,6 +104,9 @@ struct lb_sock_fprog {
  * ENOSYS: its flags sit behind a pointer the filter cannot read, so it cannot
  * be allowed selectively, and ENOSYS is the one answer that makes a C library
  * fall back to clone. With EPERM, glibc 2.34 and later cannot create a thread.
+ * openat2 answers ENOSYS for the same reason: the mode of what it makes is
+ * behind a pointer, and a program that uses it falls back to openat, whose
+ * mode the filter can read (see LB_SECCOMP_MODE).
  *
  * Not in the table on purpose: mount and pivot_root, which container setup
  * uses before the capabilities that permit them are dropped.
@@ -145,6 +156,7 @@ struct lb_sock_fprog {
     X(unshare,            272,   97, LB_SC_EPERM) \
     X(userfaultfd,        323,  282, LB_SC_EPERM) \
     X(clone3,             435,  435, LB_SC_ENOSYS) \
+    X(openat2,            437,  437, LB_SC_ENOSYS) \
     X(mount_setattr,      442,  442, LB_SC_EPERM) \
     X(fsopen,             430,  430, LB_SC_EPERM) \
     X(fsconfig,           431,  431, LB_SC_EPERM) \
@@ -168,6 +180,36 @@ struct lb_sock_fprog {
     X(uselib,             134, LB_SC_EPERM) \
     X(ustat,              136, LB_SC_EPERM)
 
+/*
+ * The calls that set the mode of a file or directory, with the argument the
+ * mode is in. One that would give it the setuid or the setgid bit is refused
+ * with EPERM (ROADMAP 8.2): a file a container makes in a volume is on the
+ * host too, with that bit and its owner there, as systemd's RestrictSUIDSGID=
+ * refuses it a service. Inside the container the bits would mean nothing, as
+ * its root is nosuid and no_new_privs is set. An open makes a file, and uses
+ * its mode, only with O_CREAT or O_TMPFILE, which is in the flags argument;
+ * without either it is allowed whatever the mode says. mkdir and mkdirat are
+ * not here: the kernel drops both bits from their mode, and a directory gets
+ * the setgid bit only from its parent. These calls are in no other row, so
+ * the program allows the rest of them at once.
+ *
+ *   X(name, number on x86_64, number on aarch64, mode argument, flags argument or -1)
+ */
+#define LB_SECCOMP_MODE(X) \
+    X(fchmod,             91,   52, 1, -1) \
+    X(fchmodat,          268,   53, 2, -1) \
+    X(fchmodat2,         452,  452, 2, -1) \
+    X(mknodat,           259,   33, 2, -1) \
+    X(openat,            257,   56, 3,  2)
+
+/* The same calls that only x86_64 has:
+ *   X(name, number on x86_64, mode argument, flags argument or -1) */
+#define LB_SECCOMP_MODE_X86_64(X) \
+    X(chmod,              90, 1, -1) \
+    X(creat,              85, 1, -1) \
+    X(mknod,             133, 1, -1) \
+    X(open,                2, 2,  1)
+
 /* ─── The rows and the program for the target ───────────────────────────── */
 
 struct lb_seccomp_deny {
@@ -175,18 +217,35 @@ struct lb_seccomp_deny {
     uint16_t err;   /* the errno the caller sees */
 };
 
+struct lb_seccomp_mode {
+    uint32_t nr;
+    uint8_t  mode_arg;
+    int8_t   flags_arg;     /* -1: the call always sets the mode */
+};
+
+/* the instructions of a row of LB_SECCOMP_MODE: five, and two for its flags */
+#define LB_SC_MODE_INSNS(flags) (5 + ((flags) >= 0 ? 2 : 0))
+
 #if defined(LB_SECCOMP_TARGET_X86_64)
 #  define LB_SECCOMP_AUDIT_ARCH   LB_AUDIT_ARCH_X86_64
 #  define LB_SECCOMP_NR_CLONE     LB_SECCOMP_NR_CLONE_X86_64
 #  define LB_SECCOMP_PROG_HEAD    6
 #  define LB_SC_ROW(name, x86_64, aarch64, err)  { x86_64, err },
 #  define LB_SC_ROW_X86_64(name, nr, err)        { nr, err },
+#  define LB_SC_MODE_ROW(name, x86_64, aarch64, mode, flags)  { x86_64, mode, flags },
+#  define LB_SC_MODE_ROW_X86_64(name, nr, mode, flags)        { nr, mode, flags },
+#  define LB_SC_MODE_LEN(name, x86_64, aarch64, mode, flags)  + LB_SC_MODE_INSNS(flags)
+#  define LB_SC_MODE_LEN_X86_64(name, nr, mode, flags)        + LB_SC_MODE_INSNS(flags)
 #else
 #  define LB_SECCOMP_AUDIT_ARCH   LB_AUDIT_ARCH_AARCH64
 #  define LB_SECCOMP_NR_CLONE     LB_SECCOMP_NR_CLONE_AARCH64
 #  define LB_SECCOMP_PROG_HEAD    4
 #  define LB_SC_ROW(name, x86_64, aarch64, err)  { aarch64, err },
 #  define LB_SC_ROW_X86_64(name, nr, err)
+#  define LB_SC_MODE_ROW(name, x86_64, aarch64, mode, flags)  { aarch64, mode, flags },
+#  define LB_SC_MODE_ROW_X86_64(name, nr, mode, flags)
+#  define LB_SC_MODE_LEN(name, x86_64, aarch64, mode, flags)  + LB_SC_MODE_INSNS(flags)
+#  define LB_SC_MODE_LEN_X86_64(name, nr, mode, flags)
 #endif
 
 static const struct lb_seccomp_deny LB_SECCOMP_TABLE[] = {
@@ -194,21 +253,32 @@ static const struct lb_seccomp_deny LB_SECCOMP_TABLE[] = {
     LB_SECCOMP_DENY_X86_64(LB_SC_ROW_X86_64)
 };
 
+static const struct lb_seccomp_mode LB_SECCOMP_MODE_TABLE[] = {
+    LB_SECCOMP_MODE(LB_SC_MODE_ROW)
+    LB_SECCOMP_MODE_X86_64(LB_SC_MODE_ROW_X86_64)
+};
+
+#define LB_SECCOMP_MODE_PROG_LEN (0 LB_SECCOMP_MODE(LB_SC_MODE_LEN) LB_SECCOMP_MODE_X86_64(LB_SC_MODE_LEN_X86_64))
+
 #undef LB_SC_ROW
 #undef LB_SC_ROW_X86_64
+#undef LB_SC_MODE_ROW
+#undef LB_SC_MODE_ROW_X86_64
 
 #define LB_SECCOMP_TABLE_LEN (sizeof(LB_SECCOMP_TABLE) / sizeof(LB_SECCOMP_TABLE[0]))
+#define LB_SECCOMP_MODE_TABLE_LEN (sizeof(LB_SECCOMP_MODE_TABLE) / sizeof(LB_SECCOMP_MODE_TABLE[0]))
 
-/* Instructions in the program: the head, two per row, five for clone and the
- * final allow. lb_seccomp_build() writes exactly this many. */
-#define LB_SECCOMP_PROG_LEN (LB_SECCOMP_PROG_HEAD + 2 * LB_SECCOMP_TABLE_LEN + 5)
+/* Instructions in the program: the head, two per row, those of the mode
+ * rows, five for clone and the final allow. lb_seccomp_build() writes
+ * exactly this many. */
+#define LB_SECCOMP_PROG_LEN (LB_SECCOMP_PROG_HEAD + 2 * LB_SECCOMP_TABLE_LEN + LB_SECCOMP_MODE_PROG_LEN + 5)
 
 _Static_assert(LB_SECCOMP_PROG_LEN <= 4096, "the kernel accepts at most 4096 BPF instructions");
 
 /*
  * Write the program into prog, which holds LB_SECCOMP_PROG_LEN instructions,
- * and return how many were written. No jump is longer than three instructions,
- * so the table can grow without any offset overflowing its 8 bits.
+ * and return how many were written. No jump is longer than six instructions,
+ * so the tables can grow without any offset overflowing its 8 bits.
  */
 static inline size_t lb_seccomp_build(struct lb_sock_filter *prog) {
     size_t n = 0;
@@ -236,6 +306,24 @@ static inline size_t lb_seccomp_build(struct lb_sock_filter *prog) {
     for (size_t i = 0; i < LB_SECCOMP_TABLE_LEN; i++) {
         LB_JUMP(LB_BPF_JEQ_K, LB_SECCOMP_TABLE[i].nr, 0, 1);
         LB_STMT(LB_BPF_RET_K, LB_SECCOMP_RET_ERRNO | LB_SECCOMP_TABLE[i].err);
+    }
+
+    /* The calls that set a mode: refused with the setuid or setgid bit in
+     * it, and allowed at once without, as they are in no other row. Until a
+     * row matches, A still holds the number. */
+    for (size_t i = 0; i < LB_SECCOMP_MODE_TABLE_LEN; i++) {
+        const struct lb_seccomp_mode *row = &LB_SECCOMP_MODE_TABLE[i];
+        int flags = row->flags_arg >= 0;
+        LB_JUMP(LB_BPF_JEQ_K, row->nr, 0, flags ? 6 : 4);
+        if (flags) {
+            /* neither O_CREAT nor O_TMPFILE: no mode is used */
+            LB_STMT(LB_BPF_LD_W_ABS, LB_SECCOMP_DATA_ARG_LO((uint32_t)row->flags_arg));
+            LB_JUMP(LB_BPF_JSET_K, LB_SECCOMP_CREATE_FLAGS, 0, 3);
+        }
+        LB_STMT(LB_BPF_LD_W_ABS, LB_SECCOMP_DATA_ARG_LO((uint32_t)row->mode_arg));
+        LB_JUMP(LB_BPF_JSET_K, LB_SECCOMP_SUID_SGID, 0, 1);
+        LB_STMT(LB_BPF_RET_K, LB_SECCOMP_RET_ERRNO | LB_SC_EPERM);
+        LB_STMT(LB_BPF_RET_K, LB_SECCOMP_RET_ALLOW);
     }
 
     /* clone may create processes and threads but not namespaces, which is
