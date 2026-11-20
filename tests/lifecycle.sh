@@ -1959,38 +1959,46 @@ EOF
 # device's. A node of /dev/null's numbers under another name opens, and
 # /dev/urandom is read and not written, which its read-only mount did not
 # keep it from. A block device in a volume is refused too, as volumes are
-# nodev. A privileged container has no program, and opens the same nodes. In
-# a user namespace of its own the container's /dev is nodev to nodes it did
-# not make: the kernel refuses them with EACCES before the program is asked.
+# nodev. A privileged container has no program, and opens the same nodes. The
+# /dev of a container with a user namespace of its own is that namespace's,
+# in which host root has no id: the suite cannot make a node there at all.
 t_device_filter() {
     mkdir -p "$T/vol/devs" && mknod -m 666 "$T/vol/devs/loop" b 7 0 || return 1
     up devs --vol "$T/vol/devs:/devs" && PLAIN=1 up devpriv --privileged || return 1
-    for name in devs devpriv; do
-        dev=/proc/$(pid_of "$name")/root/dev
+    plant() { # name
+        local dev
+        dev=/proc/$(pid_of "$1")/root/dev
         mknod -m 666 "$dev/lbt-kmsg" c 1 11 && mknod -m 666 "$dev/lbt-mem" c 1 1 &&
-        mknod -m 666 "$dev/lbt-loop" b 7 0 && mknod -m 666 "$dev/lbt-null" c 1 3 ||
-            { echo "the suite cannot make nodes in the /dev of $name"; return 1; }
-    done
+        mknod -m 666 "$dev/lbt-loop" b 7 0 && mknod -m 666 "$dev/lbt-null" c 1 3
+    }
+    plant devpriv || { echo "the suite cannot make nodes in the /dev of devpriv"; return 1; }
+    refusals=('echo x > /dev/urandom' ': < /devs/loop')
+    if [ "$(conf_value devs userns)" = 1 ]; then
+        said=$(plant devs 2>&1) && { echo "host root made a node in the /dev of a container with --userns"; return 1; }
+        echo "in the /dev of a container with --userns: $said"
+        [ ! -e "/proc/$(pid_of devs)/root/dev/lbt-kmsg" ] || { echo "a node was left there"; return 1; }
+    else
+        plant devs || { echo "the suite cannot make nodes in the /dev of devs"; return 1; }
+        refusals+=(': < /dev/lbt-kmsg' ': < /dev/lbt-mem' ': < /dev/lbt-loop')
+        sh_in devs ': < /dev/lbt-null && echo x > /dev/lbt-null' ||
+            { echo "a node of /dev/null's numbers under another name does not open"; return 1; }
+    fi
 
-    said=$(sh_in devs ': < /dev/null && : < /dev/lbt-null && echo x > /dev/lbt-null &&
+    said=$(sh_in devs ': < /dev/null && echo x > /dev/null &&
                        head -c 8 /dev/zero | wc -c && head -c 8 /dev/urandom | wc -c' 2>&1)
     said=$(printf '%s\n' "$said" | tr -d ' ' | paste -sd' ' -)
     echo "its own devices: $said"
     [ "$said" = '8 8' ] || { echo "a device of its own does not work"; return 1; }
 
-    for what in 'echo x > /dev/urandom' ': < /dev/lbt-kmsg' ': < /dev/lbt-mem' ': < /dev/lbt-loop' ': < /devs/loop'; do
+    # the volume's nodev refuses first, with EACCES; the program refuses with EPERM
+    for what in "${refusals[@]}"; do
         said=$(sh_in devs "$what" 2>&1) && { echo "taken: $what"; return 1; }
         echo "$what: $said"
-        case $what in
-            *urandom*) case $said in *'not permitted'*) continue ;; esac ;;
-            *'/devs/'*) case $said in *denied*) continue ;; esac ;;
-            *) case $said in
-                   *'not permitted'*) continue ;;
-                   *denied*) [ -n "$USERNS_MODE" ] && continue ;;
-               esac ;;
+        case $what:$said in
+            *'/devs/'*:*denied*) ;;
+            *'/dev/'*:*'not permitted'*) ;;
+            *) echo "not refused as the device program or the volume's nodev refuses"; return 1 ;;
         esac
-        echo "not refused as the device program or the volume's nodev refuses"
-        return 1
     done
 
     sh_in devpriv ': < /dev/lbt-kmsg && : < /dev/lbt-null && echo x > /dev/urandom' ||
