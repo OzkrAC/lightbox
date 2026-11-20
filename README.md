@@ -43,11 +43,11 @@ runs everything that needs no root:
 
 | Target | What it does |
 | --- | --- |
-| `make check-sys` | Compiles `tests/sys_check.c` and `tests/sys_check_net.c`, which compare every private syscall number, constant and structure in `lightbox_sys.h`, and every number in the seccomp table of `lightbox_seccomp.h`, with the kernel's headers, for x86_64 and aarch64 |
+| `make check-sys` | Compiles `tests/sys_check.c` and `tests/sys_check_net.c`, which compare every private syscall number, constant and structure in `lightbox_sys.h`, and every number in the seccomp tables of `lightbox_seccomp.h`, with the kernel's headers, for x86_64 and aarch64 |
 | `make analyze` | Compiles every file with `-fanalyzer` and a strict warning set; any diagnostic is an error |
 | `make test-unit` | Runs lightbox's own helpers from the command line. The one that starts programs: exit statuses, signals, missing programs, quiet and captured output. The ones that mount, make directories and bring up loopback: in a user namespace of their own |
 | `make test-validation` | Runs the built binary as an ordinary user against a temporary directory tree |
-| `make test-seccomp` | Installs lightbox's real seccomp profile and probes every syscall in its deny table, and every call that sets a file's mode with the setuid or setgid bit and without; also interprets the x86_64 and the aarch64 filter program for every syscall number and every bit of a mode |
+| `make test-seccomp` | Installs each of lightbox's real seccomp profiles and probes every syscall in its deny table, every call that sets a file's mode with the setuid or setgid bit and without, and for the allow-list a call it does not name and `socket` of families it takes and does not; runs git, Python, Node.js and a C compiler under each, where the host has them; and interprets the x86_64 and the aarch64 program of each profile for every syscall number, every bit of a mode and every family of a socket |
 
 In the test suites an open finding from `ROADMAP.md` is an expected failure that names its ledger id. When a fix makes one pass, the suite fails until the case is changed from `xfail` to `check`.
 
@@ -57,7 +57,7 @@ One more suite starts real containers, so it needs root:
 sudo make test-lifecycle
 ```
 
-It covers `setup`, `create`, `start`, `exec`, `stop` and `rm`, volumes, limits, the init hook, the sandbox and the network between containers. It needs a kernel with bridge, veth and cgroup v2, a statically linked busybox to build the containers' root filesystem from (`busybox-static` on Debian, Ubuntu and Void), and iproute2's `ip` and util-linux's `nsenter`, which the suite looks with; for lightbox's own commands it masks both. `LIGHTBOX_TEST_ROOTFS=/path` uses a copy of a root filesystem of yours instead. `LIGHTBOX_TEST_USERNS=overlay` makes every container of the suite with `--userns`, and `LIGHTBOX_TEST_USERNS=copy` with `--userns --copy`, but in the cases about overlays; the suite puts an `/etc/subuid` and an `/etc/subgid` of its own over the host's, in its mount namespace only.
+It covers `setup`, `create`, `start`, `exec`, `stop` and `rm`, volumes, limits, the init hook, the sandbox and the network between containers. It needs a kernel with bridge, veth and cgroup v2, a statically linked busybox to build the containers' root filesystem from (`busybox-static` on Debian, Ubuntu and Void), and iproute2's `ip` and util-linux's `nsenter`, which the suite looks with; for lightbox's own commands it masks both. `LIGHTBOX_TEST_ROOTFS=/path` uses a copy of a root filesystem of yours instead. `LIGHTBOX_TEST_USERNS=overlay` makes every container of the suite with `--userns`, and `LIGHTBOX_TEST_USERNS=copy` with `--userns --copy`, but in the cases about overlays; the suite puts an `/etc/subuid` and an `/etc/subgid` of its own over the host's, in its mount namespace only. `LIGHTBOX_TEST_SECCOMP=allow` makes every container with `--seccomp allow`, but where a case chooses the profile, alone or with either of the two.
 
 The suite works in private network, mount and PID namespaces with a configuration of its own, so your bridge, firewall rules and containers are not touched. Its cgroups live under `/sys/fs/cgroup/lightbox-test-<pid>` and are removed at the end, and the run fails if the host's virtual interfaces, firewall rules or cgroups differ afterwards. A network card that the machine itself gains or loses during the run, as a cloud VM can, is reported and does not count. Kernel modules that get loaded on the way stay loaded.
 
@@ -366,6 +366,8 @@ Commands:
          --read-only            Read-only root filesystem
          --copy                 A copy of the base, and not an overlay of its snapshot
          --privileged           Disable security sandbox
+         --seccomp allow|deny   The seccomp profile: the allow-list, or the deny-list
+                                (default: deny)
          --oom-score <n>        OOM score adjustment (default: 500)
          --link <name>          Allow network to another container
          --dns <address>        A name server for the container (up to 3; default: the host's)
@@ -422,6 +424,7 @@ A container's name is 1 to 30 characters of `a-z`, `A-Z`, `0-9`, `_` and `-`.
 | `--read-only` | off | Read-only root filesystem |
 | `--copy` | off | A full copy of the base, as before 0.7, and not an overlay of its snapshot |
 | `--privileged` | off | Disable security sandbox |
+| `--seccomp allow\|deny` | `deny` | The seccomp profile: `allow` for the allow-list, which answers every syscall it does not name with ENOSYS, or `deny` for the deny-list (see [Security](#security)) |
 | `--oom-score <n>` | `500` | OOM score adjustment, -1000 to 1000 |
 | `--link <name>` | — | Allow network to another container (repeatable) |
 | `--dns <address>` | the host's | A name server for the container (IPv4, up to 3) |
@@ -461,7 +464,7 @@ The sandbox covers everything in a container: init, the `/init.sh` hook and all 
 | Feature | Implementation |
 |---------|---------------|
 | Capability dropping | The bounding, effective and permitted sets are reduced to 11 capabilities: Docker's default 14 without `NET_RAW`, `MKNOD` and `SETFCAP`. The inheritable and ambient sets are emptied |
-| Seccomp | BPF filter denying 57 syscalls on x86_64 (48 on aarch64), the x32 range, `clone` with namespace flags, and a mode with the setuid or setgid bit in `chmod`, `fchmod`, `fchmodat`, `fchmodat2`, `mknod`, `mknodat`, `creat`, and `open` and `openat` that make a file; `openat2`, whose mode it cannot read, answers ENOSYS so that callers use `openat` |
+| Seccomp | One of two profiles, chosen with `create --seccomp` and shown by `inspect`. The deny-list, the default, is a BPF filter denying 57 syscalls on x86_64 (48 on aarch64), the x32 range, `clone` with namespace flags, and a mode with the setuid or setgid bit in `chmod`, `fchmod`, `fchmodat`, `fchmodat2`, `mknod`, `mknodat`, `creat`, and `open` and `openat` that make a file; `openat2`, whose mode it cannot read, answers ENOSYS so that callers use `openat`. The allow-list refuses the same, and allows 247 syscalls more on both architectures and 34 on x86_64 alone, Docker's list fitted to what agents run: a shell, git, Python, Node.js, a C compiler and a package manager. It answers every syscall it does not name with ENOSYS, as an older kernel would, so a program falls back: among them `mount`, `pivot_root`, `sethostname` and `syslog`, which need a capability a container does not have, `modify_ldt`, and every call newer than Linux 6.8 or than the list. `socket` takes `AF_UNIX`, `AF_INET`, `AF_INET6` and `AF_NETLINK`, and `socketpair` `AF_UNIX`; another family answers EAFNOSUPPORT, as one the kernel lacks would: `AF_PACKET`, `AF_ALG`, `AF_VSOCK`, which no network namespace confines, and the families of old and rare protocols |
 | no_new_privs | Prevents SUID escalation |
 | /proc and /sys masking | The paths Docker masks by default are covered, files with `/dev/null` and directories with an empty read-only tmpfs. A mask that cannot be made fails the start |
 | /proc read-only | Remounts /proc/sys, /proc/bus, /proc/fs, /proc/irq read-only |

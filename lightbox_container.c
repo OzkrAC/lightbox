@@ -170,6 +170,13 @@ bool parse_oom_score(const char *text, int *out) {
     return parse_int_in(text, OOM_SCORE_MIN, OOM_SCORE_MAX, out);
 }
 
+bool parse_seccomp_profile(const char *text, bool *allow) {
+    if (!streq(text, "allow") && !streq(text, "deny"))
+        return false;
+    *allow = streq(text, "allow");
+    return true;
+}
+
 /* ─── Volumes ───────────────────────────────────────────────────────────── */
 
 /*
@@ -382,7 +389,7 @@ enum {
     KEY_MEM = 1 << 0, KEY_PIDS = 1 << 1, KEY_CPU = 1 << 2, KEY_OOM = 1 << 3,
     KEY_PRIVILEGED = 1 << 4, KEY_READONLY = 1 << 5, KEY_USERNS = 1 << 6,
     KEY_UID_START = 1 << 7, KEY_IO = 1 << 8, KEY_SWAP = 1 << 9, KEY_BASE = 1 << 10,
-    KEY_GID_START = 1 << 11,
+    KEY_GID_START = 1 << 11, KEY_SECCOMP = 1 << 12,
 };
 
 static unsigned key_bit(const char *key) {
@@ -390,7 +397,7 @@ static unsigned key_bit(const char *key) {
         { "mem", KEY_MEM }, { "pids", KEY_PIDS }, { "cpu", KEY_CPU }, { "oom_score", KEY_OOM },
         { "privileged", KEY_PRIVILEGED }, { "readonly", KEY_READONLY }, { "userns", KEY_USERNS },
         { "uid_start", KEY_UID_START }, { "io", KEY_IO }, { "swap", KEY_SWAP }, { "base", KEY_BASE },
-        { "gid_start", KEY_GID_START },
+        { "gid_start", KEY_GID_START }, { "seccomp", KEY_SECCOMP },
     };
     for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
         if (streq(key, keys[i].name))
@@ -496,6 +503,8 @@ static const char *config_line(container_config *config, char *line, unsigned *s
             return parse_u32_text(value, &config->uid_start) ? NULL : "uid_start is not a number";
         case KEY_GID_START:
             return parse_u32_text(value, &config->gid_start) ? NULL : "gid_start is not a number";
+        case KEY_SECCOMP:
+            return parse_seccomp_profile(value, &config->seccomp_allow) ? NULL : "seccomp is not allow or deny";
         default:    /* KEY_IO */
             return io_limit_ok(value) && str_copy(config->io, value, sizeof(config->io))
                    ? NULL : "io is not <major>:<minor> with rbps, wbps, riops or wiops =<number> or =max";
@@ -632,6 +641,8 @@ const char *container_config_save(const char *name, const container_config *conf
     put_number(&out, "oom_score", config->oom_score);
     if (config->privileged) put_line(&out, "privileged", "1");
     if (config->read_only)  put_line(&out, "readonly", "1");
+    /* without the line, the deny-list: what every container had before 0.8 */
+    if (config->seccomp_allow) put_line(&out, "seccomp", "allow");
     if (config->userns) {
         char digits[11];
         put_line(&out, "userns", "1");

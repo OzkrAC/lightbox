@@ -28,6 +28,9 @@
 #                               unprivileged uid of the host's (ROADMAP 8.1)
 #   LIGHTBOX_TEST_USERNS=copy   the same, and with --copy but in the cases about
 #                               overlays
+#   LIGHTBOX_TEST_SECCOMP=allow make every container with --seccomp allow, but where
+#                               a case chooses the profile (ROADMAP 8.3); with
+#                               either of the two above, or alone
 #   BUSYBOX=/path               the static busybox to build the root filesystem from
 #   LIGHTBOX_TEST_MODPROBE=1    load br_netfilter when it is not loaded (CI sets this;
 #                               on a workstation it changes how every bridge is filtered)
@@ -88,6 +91,7 @@ settings() { # after LIFECYCLE_T is known
     [ -n "$T" ] && [ -d "$T" ] || { echo "lifecycle: no work directory" >&2; exit 2; }
     C="$T/lb/containers"
     USERNS_MODE=${LIGHTBOX_TEST_USERNS:-}
+    SECCOMP_MODE=${LIGHTBOX_TEST_SECCOMP:-}
     RUN="$T/run"                # run_dir: the records of a container that runs are in $RUN/<name>/
     BASE="$T/base"
     OUT="$T/out"
@@ -149,9 +153,13 @@ box() { # name [create options] : create a container on the next free address
 # What LIGHTBOX_TEST_USERNS adds to a create: --userns, and with copy --copy
 # too, where the case did not give them. A case about overlays sets OVERLAY=1,
 # which keeps --copy out; a container that is to have no range is made with
-# PLAIN=1 box ..., which adds nothing.
+# PLAIN=1 box ..., which adds nothing of the two. LIGHTBOX_TEST_SECCOMP=allow
+# adds --seccomp allow where the case gives no --seccomp.
 mode_options() { # the options the case gives
     local given=" $* "
+    if [ "$SECCOMP_MODE" = allow ]; then
+        case $given in *' --seccomp '*) ;; *) echo --seccomp allow ;; esac
+    fi
     [ -n "$USERNS_MODE" ] && [ -z "${PLAIN:-}" ] || return 0
     case $given in *' --userns '*) ;; *) echo --userns ;; esac
     if [ "$USERNS_MODE" = copy ] && [ -z "${OVERLAY:-}" ]; then
@@ -1163,6 +1171,28 @@ t_no_setuid_or_setgid_bits() {
     modes=$(stat -c %a "$T/vol/bits/file" "$C/bits/rootfs/file" | paste -sd' ')
     echo "on the host: $modes"
     [ "$modes" = '750 750' ]
+}
+
+# --seccomp allow (ROADMAP 8.3): the .conf and inspect say so, and what exec
+# runs is under the allow-list: a call it does not name answers ENOSYS, as
+# sethostname does, which the deny-list lets through to be refused for want
+# of CAP_SYS_ADMIN; and the rest works. --seccomp deny is the deny-list.
+t_seccomp_profiles() {
+    box sallow --seccomp allow && box sdeny --seccomp deny && start sallow && start sdeny || return 1
+    [ "$(conf_value sallow seccomp)" = allow ] && [ -z "$(conf_value sdeny seccomp)" ] ||
+        { echo "the .conf of each: $(conf_value sallow seccomp), $(conf_value sdeny seccomp)"; return 1; }
+    lb inspect sallow | grep -qx 'seccomp: allow' && lb inspect sdeny | grep -qx 'seccomp: deny' ||
+        { echo "inspect does not say which profile each has"; return 1; }
+    said_allow=$(sh_in sallow 'hostname another' 2>&1) && { echo "the allow-list took sethostname"; return 1; }
+    said_deny=$(sh_in sdeny 'hostname another' 2>&1) && { echo "the deny-list container set its hostname"; return 1; }
+    echo "allow-list: $said_allow"
+    echo "deny-list:  $said_deny"
+    case $said_allow in *'not implemented'*) ;; *) echo "the allow-list did not answer ENOSYS"; return 1 ;; esac
+    case $said_deny in *'not permitted'*) ;; *) echo "the deny-list did not leave it to the kernel"; return 1 ;; esac
+    for name in sallow sdeny; do
+        sh_in "$name" 'grep -q "^Seccomp:.2" /proc/self/status && echo works' | grep -qx works ||
+            { echo "$name: a command does not run under a filter"; return 1; }
+    done
 }
 
 t_rootfs_mount_flags() {
@@ -2999,6 +3029,10 @@ if [ "$MODE" = inside ]; then
         copy)    SUITE="lifecycle with --userns --copy"
                  echo "lifecycle: every container with --userns, and with --copy but in the cases about overlays" ;;
     esac
+    if [ "$SECCOMP_MODE" = allow ]; then
+        SUITE="$SUITE under the allow-list"
+        echo "lifecycle: every container with --seccomp allow, but where a case chooses"
+    fi
     echo
 
     if [ -n "${LIFECYCLE_PROGRAM:-}" ]; then
@@ -3093,6 +3127,7 @@ if [ "$MODE" = inside ]; then
     check 'a container starts and stops without any mount tool'           t_start_needs_no_mount_tool
     check 'the root filesystem is mounted nodev and nosuid'               t_rootfs_mount_flags
     check 'nothing in a container makes a file setuid or setgid'          t_no_setuid_or_setgid_bits
+    check '--seccomp allow gives the allow-list, and --seccomp deny the deny-list' t_seccomp_profiles
     check 'an image without /dev, /proc, /sys, /tmp and /run starts'      t_image_without_mount_points
     check 'an image of one static binary starts'                          t_image_with_one_binary
     check 'start runs nothing from the image'                             t_start_runs_nothing_from_the_image
@@ -3251,6 +3286,10 @@ preflight() {
             [ -e /etc/subuid ] && [ -e /etc/subgid ] ||
                 stop_early "LIGHTBOX_TEST_USERNS needs an /etc/subuid and an /etc/subgid to put the suite's own over" ;;
         *)  stop_early "LIGHTBOX_TEST_USERNS is overlay or copy, not: $LIGHTBOX_TEST_USERNS" ;;
+    esac
+    case ${LIGHTBOX_TEST_SECCOMP:-} in
+        ''|allow) ;;
+        *) stop_early "LIGHTBOX_TEST_SECCOMP is allow, not: $LIGHTBOX_TEST_SECCOMP" ;;
     esac
 
     if [ "${LIGHTBOX_TEST_MODPROBE:-0}" = 1 ] && [ ! -e "$BRNF" ]; then

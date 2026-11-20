@@ -2252,6 +2252,7 @@ cpu 0.5
 oom_score -300
 privileged 1
 readonly 1
+seccomp deny
 io 8:0 rbps=1048576
 swap 1G
 base -
@@ -2291,6 +2292,27 @@ config_userns_keys() {
     done
 }
 t_config_userns_keys() { in_config_dir config_userns_keys; }
+
+# seccomp=, the profile (ROADMAP 8.3): allow or deny, and without the line the
+# deny-list; anything else is refused with its line, and so is a second one.
+config_seccomp_key() {
+    head='version=1\nmem=64M\npids=32\ncpu=1\noom_score=0\n'
+    # shellcheck disable=SC2059     # the head is a format of its own
+    conf() { printf "$head$1" > "$D/web/.conf"; got=$(config); printf '%s\n' "$got"; }
+    conf 'seccomp=allow\n'
+    printf '%s\n' "$got" | grep -qx 'seccomp allow' || return 1
+    conf 'seccomp=deny\n'
+    printf '%s\n' "$got" | grep -qx 'seccomp deny' || return 1
+    conf ''
+    printf '%s\n' "$got" | grep -qx 'seccomp deny' || return 1
+    for wrong in allowed ALLOW 1 ''; do
+        conf "seccomp=$wrong\\n"
+        [ "$got" = "refused: $D/web/.conf: line 6: seccomp is not allow or deny" ] || return 1
+    done
+    conf 'seccomp=allow\nseccomp=deny\n'
+    case $got in "refused: $D/web/.conf: line 7: "*) ;; *) return 1 ;; esac
+}
+t_config_seccomp_key() { in_config_dir config_seccomp_key; }
 
 # The ranges /etc/subuid and /etc/subgid give lightbox, and the one a new
 # container gets: the first pair of 65536 that no container's overlaps, the
@@ -2375,6 +2397,7 @@ cpu 1
 oom_score 500
 privileged 0
 readonly 0
+seccomp deny
 io -
 swap -
 base -
@@ -2504,6 +2527,7 @@ cpu 2
 oom_score 100
 privileged 1
 readonly 0
+seccomp deny
 io -
 swap -
 base -
@@ -2541,7 +2565,7 @@ vol=/srv/data:/data
 link=db' ] || { echo "the file is not what was put in"; bad=1; }
     [ "$(stat -c %a "$D/web/.conf")" = 600 ] || { echo "the file's mode is $(stat -c %a "$D/web/.conf")"; bad=1; }
     got=$(config | tr '\n' ' ')
-    case $got in 'version 1 mem 1G pids max cpu 0.25 oom_score 500 '*'io 8:0 wbps=1024 swap 64M base - userns - vol /srv/data -> /data rw link db ') ;;
+    case $got in 'version 1 mem 1G pids max cpu 0.25 oom_score 500 '*'seccomp deny io 8:0 wbps=1024 swap 64M base - userns - vol /srv/data -> /data rw link db ') ;;
         *) echo "read back: $got"; bad=1 ;; esac
 
     before=$(cat "$D/web/.conf")
@@ -2912,6 +2936,7 @@ check 'no prefix is written into the source: subnet gives it'      t_no_prefix_o
 check 'a .conf is read into one structure, whole'                t_config_is_read_whole
 check 'what a .conf leaves out is the default, if that is usable' t_config_defaults
 check 'userns=1 is read with a uid_start and a gid_start, and refused without' t_config_userns_keys
+check 'seccomp= is allow or deny, and the deny-list without it' t_config_seccomp_key
 check 'a new container gets the first range of /etc/subuid and /etc/subgid that is free' t_userns_ranges
 check "a volume's maps make the container's root its source's owner, and never host root" t_volume_maps
 check 'base= is a snapshot'"'"'s id, read as it is, or refused'          t_config_base_key

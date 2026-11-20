@@ -524,18 +524,19 @@ static void drop_capabilities(void) {
 /* ─── Security: seccomp ─────────────────────────────────────────────────── */
 
 /*
- * Install the profile: the deny table of lightbox_seccomp.h for this
- * architecture, a refusal of the x32 range on x86_64, and clone without
- * namespace flags. The caller has set no_new_privs or holds CAP_SYS_ADMIN.
+ * Install a profile of lightbox_seccomp.h for this architecture: the
+ * deny-list, or with allow the allow-list (ROADMAP 8.3). Both refuse the x32
+ * range on x86_64, clone with namespace flags and a mode with the setuid or
+ * setgid bit. The caller has set no_new_privs or holds CAP_SYS_ADMIN.
  */
-static void apply_seccomp(void) {
-    struct lb_sock_filter filter[LB_SECCOMP_PROG_LEN];
+static void apply_seccomp(bool allow) {
+    struct lb_sock_filter filter[LB_SECCOMP_PROG_MAX];
     struct lb_sock_fprog prog = {
-        .len = (uint16_t)lb_seccomp_build(filter),
+        .len = (uint16_t)(allow ? lb_seccomp_build_allow(filter) : lb_seccomp_build(filter)),
         .filter = filter,
     };
 
-    if (prog.len != LB_SECCOMP_PROG_LEN)
+    if (prog.len != (allow ? LB_SECCOMP_ALLOW_PROG_LEN : LB_SECCOMP_PROG_LEN))
         die("Error: seccomp program has an unexpected length");
     if (lc_kernel_prctl(LB_PR_SET_SECCOMP, LB_SECCOMP_MODE_FILTER, (uint64_t)&prog, 0, 0) < 0)
         die("Error: failed to install seccomp filter");
@@ -547,11 +548,11 @@ static void apply_seccomp(void) {
  * before its hook, so the hook and all it starts inherit it; exec applies it
  * to the command it runs. Any step that fails ends the process.
  */
-static void apply_sandbox(void) {
+static void apply_sandbox(bool allow_list) {
     drop_capabilities();
     if (lc_kernel_prctl(LB_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
         die("Error: failed to enable no_new_privs");
-    apply_seccomp();
+    apply_seccomp(allow_list);
 }
 
 /* ─── Security: /proc masking ───────────────────────────────────────────── */
@@ -1011,6 +1012,10 @@ static void cmd_create(int argc, char **argv) {
             cfg.userns = true;
         } else if (streq(opt, "--privileged")) {
             cfg.privileged = true;
+        } else if (streq(opt, "--seccomp")) {
+            const char *value = option_value(argc, argv, &i);
+            if (!parse_seccomp_profile(value, &cfg.seccomp_allow))
+                die2("Error: --seccomp takes allow or deny, not: ", value);
         } else if (streq(opt, "--rootfs")) {
             str_copy_or_die(cfg_global.rootfs, option_value(argc, argv, &i), MAX_PATH, "--rootfs");
         } else if (streq(opt, "--copy")) {
@@ -1306,6 +1311,7 @@ struct child_args {
     int          stop_grace;                /* seconds the container gets to end, unless a stop says otherwise */
     int          privileged;
     int          read_only;
+    bool         seccomp_allow;             /* the allow-list profile; false: the deny-list */
 };
 
 static uint64_t sigmask_from_signal(int signum) {
@@ -1582,7 +1588,7 @@ static int init_main(const struct child_args *ca) {
      * the hook, reads its signals, reaps and exits. A hook that mounts or
      * configures the network needs a privileged container. */
     if (!ca->privileged)
-        apply_sandbox();
+        apply_sandbox(ca->seccomp_allow);
 
     uint64_t mask = supervisor_signal_mask();
     lc_sysret sfd = lc_kernel_create_signal_fd(-1, &mask, SFD_CLOEXEC);
@@ -2735,7 +2741,7 @@ static int finish_exec(int32_t worker, int32_t signal_fd, const struct lb_termio
 /* ─── exec: entering the container ──────────────────────────────────────── */
 
 static int exec_inside_container(const char *name, int target_pid, int privileged, bool userns,
-                                 int oom_score, const struct exec_request *req) {
+                                 bool seccomp_allow, int oom_score, const struct exec_request *req) {
     /* From here to the command's execve this process, and the child it
      * forks, are lightbox inside a container. Not dumpable, their memory and
      * their descriptors are closed to the container's processes, whatever
@@ -2814,7 +2820,7 @@ static int exec_inside_container(const char *name, int target_pid, int privilege
         take_streams(&streams);
 
         if (!privileged)
-            apply_sandbox();
+            apply_sandbox(seccomp_allow);
         become(&id);
         run_command(req, &id);
     }
@@ -3786,6 +3792,7 @@ static void start_one(const char *name, int hook_wait) {
         .stop_grace = cfg_global.stop_timeout,
         .privileged = privileged,
         .read_only = read_only,
+        .seccomp_allow = config.seccomp_allow,
     };
     int clone_flags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET |
                       (config.userns ? CLONE_NEWUSER : 0);
@@ -4389,7 +4396,8 @@ static void cmd_exec(int argc, char **argv) {
 
     if (worker == 0) {
         lc_kernel_close_file(signal_fd);
-        int status = exec_inside_container(name, pid, privileged, config.userns, config.oom_score, &req);
+        int status = exec_inside_container(name, pid, privileged, config.userns, config.seccomp_allow,
+                                           config.oom_score, &req);
         lc_kernel_exit(exit_code_from_status(status));
     }
 
@@ -4457,6 +4465,8 @@ static const struct { const char *name; const char *text; } command_help[] = {
         "         --read-only            Read-only root filesystem\n"
         "         --copy                 A copy of the base, and not an overlay of its snapshot\n"
         "         --privileged           Disable security sandbox\n"
+        "         --seccomp allow|deny   The seccomp profile: the allow-list, or the deny-list\n"
+        "                                (default: deny)\n"
         "         --oom-score <n>        OOM score adjustment (default: 500)\n"
         "         --link <name>          Allow network to another container\n"
         "         --dns <address>        A name server for the container (up to 3; default: the host's)\n" },

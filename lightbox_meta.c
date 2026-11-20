@@ -375,6 +375,7 @@ void cmd_inspect(int argc, char **argv) {
         report_number(&r, "oom_score", config.oom_score);
         report_flag(&r, "privileged", config.privileged, "1", "0");
         report_flag(&r, "readonly", config.read_only, "1", "0");
+        report_text(&r, "seccomp", config.privileged ? NULL : config.seccomp_allow ? "allow" : "deny");
         report_volumes(&r, &config);
         report_links(&r, &config);
     }

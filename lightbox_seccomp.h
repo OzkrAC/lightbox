@@ -1,18 +1,22 @@
 /*
  * lightbox_seccomp.h: the seccomp profile, as one table and one BPF program.
  *
- * The profile is a deny-list. Each row of the table names a syscall, gives its
- * number on x86_64 and on aarch64, and the errno a sandboxed caller gets. A
- * second table names the syscalls that set a file's mode, which are refused
- * when the mode has the setuid or setgid bit. lb_seccomp_build() turns the
- * rows for the target architecture into the program lightbox installs.
+ * There are two profiles, a deny-list and an allow-list (ROADMAP 8.3). Each
+ * row of the deny table names a syscall, gives its number on x86_64 and on
+ * aarch64, and the errno a sandboxed caller gets. A second table names the
+ * syscalls that set a file's mode, which are refused when the mode has the
+ * setuid or setgid bit. The deny-list allows everything else. The allow-list
+ * has the same two tables, then the families a socket may be of and the
+ * syscalls it allows, and answers every other one with ENOSYS.
+ * lb_seccomp_build() and lb_seccomp_build_allow() turn the rows for the
+ * target architecture into the program lightbox installs.
  *
  * Nothing here is taken on trust:
  *   tests/sys_check.c       compares every number and constant below with the
  *                           kernel's headers, for both architectures
  *   tests/seccomp_filter.c  interprets the program of each architecture and
  *                           checks its verdict for every syscall number
- *   tests/seccomp_profile.c installs the program and calls the syscalls
+ *   tests/seccomp_profile.c installs each program and calls the syscalls
  *
  * This header needs no lightc and no C library, so the tests can include it.
  */
@@ -84,6 +88,18 @@ _Static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
 
 #define LB_SC_EPERM                  1
 #define LB_SC_ENOSYS                 38
+#define LB_SC_EAFNOSUPPORT           97
+
+#define LB_SECCOMP_NR_SOCKET_X86_64       41
+#define LB_SECCOMP_NR_SOCKET_AARCH64      198
+#define LB_SECCOMP_NR_SOCKETPAIR_X86_64   53
+#define LB_SECCOMP_NR_SOCKETPAIR_AARCH64  199
+
+/* AF_UNIX, AF_INET, AF_INET6 and AF_NETLINK, the same on both targets */
+#define LB_SECCOMP_AF_UNIX           1
+#define LB_SECCOMP_AF_INET           2
+#define LB_SECCOMP_AF_INET6          10
+#define LB_SECCOMP_AF_NETLINK        16
 
 struct lb_sock_filter {
     uint16_t code;
@@ -210,6 +226,323 @@ struct lb_sock_fprog {
     X(mknod,             133, 1, -1) \
     X(open,                2, 2,  1)
 
+/*
+ * The allow-list: what agents and the Alpine and Debian images run, a shell,
+ * git, Python, Node.js, a C compiler and a package manager, taken from
+ * Docker's default profile. Docker's list without the rows of the two tables
+ * above and without clone, which is filtered by its flags; with chroot, as a
+ * container keeps CAP_SYS_CHROOT, and arch_prctl. Left out on purpose:
+ * modify_ldt, which only 16-bit and 32-bit code needs; mount, pivot_root,
+ * sethostname and the other calls that need a capability a container does not
+ * have; and calls newer than Linux 6.8, the oldest headers this table is
+ * checked with (mseal, uretprobe and the *xattrat calls). Each of them, and any
+ * call a later kernel adds, answers ENOSYS, so that a program falls back as it
+ * would on an older kernel (ROADMAP 2.3).
+ *
+ *   X(name, number on x86_64, number on aarch64)
+ */
+#define LB_SECCOMP_ALLOW(X) \
+    X(accept,                   43,  202) \
+    X(accept4,                 288,  242) \
+    X(adjtimex,                159,  171) \
+    X(bind,                     49,  200) \
+    X(brk,                      12,  214) \
+    X(cachestat,               451,  451) \
+    X(capget,                  125,   90) \
+    X(capset,                  126,   91) \
+    X(chdir,                    80,   49) \
+    X(chroot,                  161,   51) \
+    X(clock_getres,            229,  114) \
+    X(clock_gettime,           228,  113) \
+    X(clock_nanosleep,         230,  115) \
+    X(close,                     3,   57) \
+    X(close_range,             436,  436) \
+    X(connect,                  42,  203) \
+    X(copy_file_range,         326,  285) \
+    X(dup,                      32,   23) \
+    X(dup3,                    292,   24) \
+    X(epoll_create1,           291,   20) \
+    X(epoll_ctl,               233,   21) \
+    X(epoll_pwait,             281,   22) \
+    X(epoll_pwait2,            441,  441) \
+    X(eventfd2,                290,   19) \
+    X(execve,                   59,  221) \
+    X(execveat,                322,  281) \
+    X(exit,                     60,   93) \
+    X(exit_group,              231,   94) \
+    X(faccessat,               269,   48) \
+    X(faccessat2,              439,  439) \
+    X(fadvise64,               221,  223) \
+    X(fallocate,               285,   47) \
+    X(fanotify_mark,           301,  263) \
+    X(fchdir,                   81,   50) \
+    X(fchown,                   93,   55) \
+    X(fchownat,                260,   54) \
+    X(fcntl,                    72,   25) \
+    X(fdatasync,                75,   83) \
+    X(fgetxattr,               193,   10) \
+    X(flistxattr,              196,   13) \
+    X(flock,                    73,   32) \
+    X(fremovexattr,            199,   16) \
+    X(fsetxattr,               190,    7) \
+    X(fstat,                     5,   80) \
+    X(fstatfs,                 138,   44) \
+    X(fsync,                    74,   82) \
+    X(ftruncate,                77,   46) \
+    X(futex,                   202,   98) \
+    X(futex_requeue,           456,  456) \
+    X(futex_wait,              455,  455) \
+    X(futex_waitv,             449,  449) \
+    X(futex_wake,              454,  454) \
+    X(get_robust_list,         274,  100) \
+    X(getcpu,                  309,  168) \
+    X(getcwd,                   79,   17) \
+    X(getdents64,              217,   61) \
+    X(getegid,                 108,  177) \
+    X(geteuid,                 107,  175) \
+    X(getgid,                  104,  176) \
+    X(getgroups,               115,  158) \
+    X(getitimer,                36,  102) \
+    X(getpeername,              52,  205) \
+    X(getpgid,                 121,  155) \
+    X(getpid,                   39,  172) \
+    X(getppid,                 110,  173) \
+    X(getpriority,             140,  141) \
+    X(getrandom,               318,  278) \
+    X(getresgid,               120,  150) \
+    X(getresuid,               118,  148) \
+    X(getrlimit,                97,  163) \
+    X(getrusage,                98,  165) \
+    X(getsid,                  124,  156) \
+    X(getsockname,              51,  204) \
+    X(getsockopt,               55,  209) \
+    X(gettid,                  186,  178) \
+    X(gettimeofday,             96,  169) \
+    X(getuid,                  102,  174) \
+    X(getxattr,                191,    8) \
+    X(inotify_add_watch,       254,   27) \
+    X(inotify_init1,           294,   26) \
+    X(inotify_rm_watch,        255,   28) \
+    X(io_cancel,               210,    3) \
+    X(io_destroy,              207,    1) \
+    X(io_getevents,            208,    4) \
+    X(io_pgetevents,           333,  292) \
+    X(io_setup,                206,    0) \
+    X(io_submit,               209,    2) \
+    X(ioctl,                    16,   29) \
+    X(ioprio_get,              252,   31) \
+    X(ioprio_set,              251,   30) \
+    X(kill,                     62,  129) \
+    X(landlock_add_rule,       445,  445) \
+    X(landlock_create_ruleset, 444,  444) \
+    X(landlock_restrict_self,  446,  446) \
+    X(lgetxattr,               192,    9) \
+    X(linkat,                  265,   37) \
+    X(listen,                   50,  201) \
+    X(listmount,               458,  458) \
+    X(listxattr,               194,   11) \
+    X(llistxattr,              195,   12) \
+    X(lremovexattr,            198,   15) \
+    X(lseek,                     8,   62) \
+    X(lsetxattr,               189,    6) \
+    X(madvise,                  28,  233) \
+    X(map_shadow_stack,        453,  453) \
+    X(membarrier,              324,  283) \
+    X(memfd_create,            319,  279) \
+    X(memfd_secret,            447,  447) \
+    X(mincore,                  27,  232) \
+    X(mkdirat,                 258,   34) \
+    X(mlock,                   149,  228) \
+    X(mlock2,                  325,  284) \
+    X(mlockall,                151,  230) \
+    X(mmap,                      9,  222) \
+    X(mprotect,                 10,  226) \
+    X(mq_getsetattr,           245,  185) \
+    X(mq_notify,               244,  184) \
+    X(mq_open,                 240,  180) \
+    X(mq_timedreceive,         243,  183) \
+    X(mq_timedsend,            242,  182) \
+    X(mq_unlink,               241,  181) \
+    X(mremap,                   25,  216) \
+    X(msgctl,                   71,  187) \
+    X(msgget,                   68,  186) \
+    X(msgrcv,                   70,  188) \
+    X(msgsnd,                   69,  189) \
+    X(msync,                    26,  227) \
+    X(munlock,                 150,  229) \
+    X(munlockall,              152,  231) \
+    X(munmap,                   11,  215) \
+    X(nanosleep,                35,  101) \
+    X(newfstatat,              262,   79) \
+    X(pidfd_open,              434,  434) \
+    X(pidfd_send_signal,       424,  424) \
+    X(pipe2,                   293,   59) \
+    X(pkey_alloc,              330,  289) \
+    X(pkey_free,               331,  290) \
+    X(pkey_mprotect,           329,  288) \
+    X(ppoll,                   271,   73) \
+    X(prctl,                   157,  167) \
+    X(pread64,                  17,   67) \
+    X(preadv,                  295,   69) \
+    X(preadv2,                 327,  286) \
+    X(prlimit64,               302,  261) \
+    X(process_mrelease,        448,  448) \
+    X(pselect6,                270,   72) \
+    X(pwrite64,                 18,   68) \
+    X(pwritev,                 296,   70) \
+    X(pwritev2,                328,  287) \
+    X(read,                      0,   63) \
+    X(readahead,               187,  213) \
+    X(readlinkat,              267,   78) \
+    X(readv,                    19,   65) \
+    X(recvfrom,                 45,  207) \
+    X(recvmmsg,                299,  243) \
+    X(recvmsg,                  47,  212) \
+    X(remap_file_pages,        216,  234) \
+    X(removexattr,             197,   14) \
+    X(renameat,                264,   38) \
+    X(renameat2,               316,  276) \
+    X(restart_syscall,         219,  128) \
+    X(rseq,                    334,  293) \
+    X(rt_sigaction,             13,  134) \
+    X(rt_sigpending,           127,  136) \
+    X(rt_sigprocmask,           14,  135) \
+    X(rt_sigqueueinfo,         129,  138) \
+    X(rt_sigreturn,             15,  139) \
+    X(rt_sigsuspend,           130,  133) \
+    X(rt_sigtimedwait,         128,  137) \
+    X(rt_tgsigqueueinfo,       297,  240) \
+    X(sched_get_priority_max,  146,  125) \
+    X(sched_get_priority_min,  147,  126) \
+    X(sched_getaffinity,       204,  123) \
+    X(sched_getattr,           315,  275) \
+    X(sched_getparam,          143,  121) \
+    X(sched_getscheduler,      145,  120) \
+    X(sched_rr_get_interval,   148,  127) \
+    X(sched_setaffinity,       203,  122) \
+    X(sched_setattr,           314,  274) \
+    X(sched_setparam,          142,  118) \
+    X(sched_setscheduler,      144,  119) \
+    X(sched_yield,              24,  124) \
+    X(seccomp,                 317,  277) \
+    X(semctl,                   66,  191) \
+    X(semget,                   64,  190) \
+    X(semop,                    65,  193) \
+    X(semtimedop,              220,  192) \
+    X(sendfile,                 40,   71) \
+    X(sendmmsg,                307,  269) \
+    X(sendmsg,                  46,  211) \
+    X(sendto,                   44,  206) \
+    X(set_robust_list,         273,   99) \
+    X(set_tid_address,         218,   96) \
+    X(setfsgid,                123,  152) \
+    X(setfsuid,                122,  151) \
+    X(setgid,                  106,  144) \
+    X(setgroups,               116,  159) \
+    X(setitimer,                38,  103) \
+    X(setpgid,                 109,  154) \
+    X(setpriority,             141,  140) \
+    X(setregid,                114,  143) \
+    X(setresgid,               119,  149) \
+    X(setresuid,               117,  147) \
+    X(setreuid,                113,  145) \
+    X(setrlimit,               160,  164) \
+    X(setsid,                  112,  157) \
+    X(setsockopt,               54,  208) \
+    X(setuid,                  105,  146) \
+    X(setxattr,                188,    5) \
+    X(shmat,                    30,  196) \
+    X(shmctl,                   31,  195) \
+    X(shmdt,                    67,  197) \
+    X(shmget,                   29,  194) \
+    X(shutdown,                 48,  210) \
+    X(sigaltstack,             131,  132) \
+    X(signalfd4,               289,   74) \
+    X(splice,                  275,   76) \
+    X(statfs,                  137,   43) \
+    X(statmount,               457,  457) \
+    X(statx,                   332,  291) \
+    X(symlinkat,               266,   36) \
+    X(sync,                    162,   81) \
+    X(sync_file_range,         277,   84) \
+    X(syncfs,                  306,  267) \
+    X(sysinfo,                  99,  179) \
+    X(tee,                     276,   77) \
+    X(tgkill,                  234,  131) \
+    X(timer_create,            222,  107) \
+    X(timer_delete,            226,  111) \
+    X(timer_getoverrun,        225,  109) \
+    X(timer_gettime,           224,  108) \
+    X(timer_settime,           223,  110) \
+    X(timerfd_create,          283,   85) \
+    X(timerfd_gettime,         287,   87) \
+    X(timerfd_settime,         286,   86) \
+    X(times,                   100,  153) \
+    X(tkill,                   200,  130) \
+    X(truncate,                 76,   45) \
+    X(umask,                    95,  166) \
+    X(uname,                    63,  160) \
+    X(unlinkat,                263,   35) \
+    X(utimensat,               280,   88) \
+    X(vmsplice,                278,   75) \
+    X(wait4,                    61,  260) \
+    X(waitid,                  247,   95) \
+    X(write,                     1,   64) \
+    X(writev,                   20,   66)
+
+/* The calls of the allow-list that only x86_64 has, the old spellings of
+ * calls aarch64 has with an "at" (open is a mode row):
+ *   X(name, number on x86_64) */
+#define LB_SECCOMP_ALLOW_X86_64(X) \
+    X(access,                   21) \
+    X(alarm,                    37) \
+    X(arch_prctl,              158) \
+    X(chown,                    92) \
+    X(dup2,                     33) \
+    X(epoll_create,            213) \
+    X(epoll_wait,              232) \
+    X(eventfd,                 284) \
+    X(fork,                     57) \
+    X(futimesat,               261) \
+    X(get_thread_area,         211) \
+    X(getdents,                 78) \
+    X(getpgrp,                 111) \
+    X(inotify_init,            253) \
+    X(lchown,                   94) \
+    X(link,                     86) \
+    X(lstat,                     6) \
+    X(mkdir,                    83) \
+    X(pause,                    34) \
+    X(pipe,                     22) \
+    X(poll,                      7) \
+    X(readlink,                 89) \
+    X(rename,                   82) \
+    X(rmdir,                    84) \
+    X(select,                   23) \
+    X(set_thread_area,         205) \
+    X(signalfd,                282) \
+    X(stat,                      4) \
+    X(symlink,                  88) \
+    X(time,                    201) \
+    X(unlink,                   87) \
+    X(utime,                   132) \
+    X(utimes,                  235) \
+    X(vfork,                    58)
+
+/*
+ * socket and socketpair are allowed for the families agents use, and answer
+ * any other with EAFNOSUPPORT, as a kernel without that family would. AF_UNIX,
+ * AF_INET, AF_INET6 and AF_NETLINK, which C libraries use to learn a host's
+ * addresses, and for socketpair AF_UNIX. Out are, among others, AF_PACKET and
+ * AF_XDP, which need CAP_NET_RAW; AF_VSOCK, which no network namespace
+ * confines; AF_ALG and the families of old and rare protocols, much of the
+ * kernel that a container needs none of.
+ */
+#define LB_SECCOMP_SOCKET_FAMILIES(X) \
+    X(LB_SECCOMP_AF_UNIX) X(LB_SECCOMP_AF_INET) X(LB_SECCOMP_AF_INET6) X(LB_SECCOMP_AF_NETLINK)
+#define LB_SECCOMP_SOCKETPAIR_FAMILIES(X) \
+    X(LB_SECCOMP_AF_UNIX)
+
 /* ─── The rows and the program for the target ───────────────────────────── */
 
 struct lb_seccomp_deny {
@@ -229,6 +562,8 @@ struct lb_seccomp_mode {
 #if defined(LB_SECCOMP_TARGET_X86_64)
 #  define LB_SECCOMP_AUDIT_ARCH   LB_AUDIT_ARCH_X86_64
 #  define LB_SECCOMP_NR_CLONE     LB_SECCOMP_NR_CLONE_X86_64
+#  define LB_SECCOMP_NR_SOCKET    LB_SECCOMP_NR_SOCKET_X86_64
+#  define LB_SECCOMP_NR_SOCKETPAIR LB_SECCOMP_NR_SOCKETPAIR_X86_64
 #  define LB_SECCOMP_PROG_HEAD    6
 #  define LB_SC_ROW(name, x86_64, aarch64, err)  { x86_64, err },
 #  define LB_SC_ROW_X86_64(name, nr, err)        { nr, err },
@@ -236,9 +571,13 @@ struct lb_seccomp_mode {
 #  define LB_SC_MODE_ROW_X86_64(name, nr, mode, flags)        { nr, mode, flags },
 #  define LB_SC_MODE_LEN(name, x86_64, aarch64, mode, flags)  + LB_SC_MODE_INSNS(flags)
 #  define LB_SC_MODE_LEN_X86_64(name, nr, mode, flags)        + LB_SC_MODE_INSNS(flags)
+#  define LB_SC_ALLOW_ROW(name, x86_64, aarch64)              x86_64,
+#  define LB_SC_ALLOW_ROW_X86_64(name, nr)                    nr,
 #else
 #  define LB_SECCOMP_AUDIT_ARCH   LB_AUDIT_ARCH_AARCH64
 #  define LB_SECCOMP_NR_CLONE     LB_SECCOMP_NR_CLONE_AARCH64
+#  define LB_SECCOMP_NR_SOCKET    LB_SECCOMP_NR_SOCKET_AARCH64
+#  define LB_SECCOMP_NR_SOCKETPAIR LB_SECCOMP_NR_SOCKETPAIR_AARCH64
 #  define LB_SECCOMP_PROG_HEAD    4
 #  define LB_SC_ROW(name, x86_64, aarch64, err)  { aarch64, err },
 #  define LB_SC_ROW_X86_64(name, nr, err)
@@ -246,6 +585,8 @@ struct lb_seccomp_mode {
 #  define LB_SC_MODE_ROW_X86_64(name, nr, mode, flags)
 #  define LB_SC_MODE_LEN(name, x86_64, aarch64, mode, flags)  + LB_SC_MODE_INSNS(flags)
 #  define LB_SC_MODE_LEN_X86_64(name, nr, mode, flags)
+#  define LB_SC_ALLOW_ROW(name, x86_64, aarch64)              aarch64,
+#  define LB_SC_ALLOW_ROW_X86_64(name, nr)
 #endif
 
 static const struct lb_seccomp_deny LB_SECCOMP_TABLE[] = {
@@ -260,27 +601,58 @@ static const struct lb_seccomp_mode LB_SECCOMP_MODE_TABLE[] = {
 
 #define LB_SECCOMP_MODE_PROG_LEN (0 LB_SECCOMP_MODE(LB_SC_MODE_LEN) LB_SECCOMP_MODE_X86_64(LB_SC_MODE_LEN_X86_64))
 
+static const uint32_t LB_SECCOMP_ALLOW_TABLE[] = {
+    LB_SECCOMP_ALLOW(LB_SC_ALLOW_ROW)
+    LB_SECCOMP_ALLOW_X86_64(LB_SC_ALLOW_ROW_X86_64)
+};
+
+#define LB_SC_FAMILY(af) af,
+static const uint32_t LB_SECCOMP_SOCKET_FAMILY_TABLE[] = { LB_SECCOMP_SOCKET_FAMILIES(LB_SC_FAMILY) };
+static const uint32_t LB_SECCOMP_SOCKETPAIR_FAMILY_TABLE[] = { LB_SECCOMP_SOCKETPAIR_FAMILIES(LB_SC_FAMILY) };
+#undef LB_SC_FAMILY
+
 #undef LB_SC_ROW
 #undef LB_SC_ROW_X86_64
 #undef LB_SC_MODE_ROW
 #undef LB_SC_MODE_ROW_X86_64
+#undef LB_SC_ALLOW_ROW
+#undef LB_SC_ALLOW_ROW_X86_64
 
 #define LB_SECCOMP_TABLE_LEN (sizeof(LB_SECCOMP_TABLE) / sizeof(LB_SECCOMP_TABLE[0]))
 #define LB_SECCOMP_MODE_TABLE_LEN (sizeof(LB_SECCOMP_MODE_TABLE) / sizeof(LB_SECCOMP_MODE_TABLE[0]))
+#define LB_SECCOMP_ALLOW_TABLE_LEN (sizeof(LB_SECCOMP_ALLOW_TABLE) / sizeof(LB_SECCOMP_ALLOW_TABLE[0]))
+#define LB_SECCOMP_SOCKET_FAMILY_LEN \
+    (sizeof(LB_SECCOMP_SOCKET_FAMILY_TABLE) / sizeof(LB_SECCOMP_SOCKET_FAMILY_TABLE[0]))
+#define LB_SECCOMP_SOCKETPAIR_FAMILY_LEN \
+    (sizeof(LB_SECCOMP_SOCKETPAIR_FAMILY_TABLE) / sizeof(LB_SECCOMP_SOCKETPAIR_FAMILY_TABLE[0]))
 
-/* Instructions in the program: the head, two per row, those of the mode
- * rows, five for clone and the final allow. lb_seccomp_build() writes
+/* Instructions in the deny-list: the head, two per row, those of the mode
+ * rows, four for clone and the final allow. lb_seccomp_build() writes
  * exactly this many. */
 #define LB_SECCOMP_PROG_LEN (LB_SECCOMP_PROG_HEAD + 2 * LB_SECCOMP_TABLE_LEN + LB_SECCOMP_MODE_PROG_LEN + 5)
 
+/* In the allow-list: the same head and rows, four and one per family for
+ * socket and for socketpair, five for clone, two per call it allows and the
+ * final ENOSYS. lb_seccomp_build_allow() writes exactly this many. */
+#define LB_SECCOMP_ALLOW_PROG_LEN \
+    (LB_SECCOMP_PROG_HEAD + 2 * LB_SECCOMP_TABLE_LEN + LB_SECCOMP_MODE_PROG_LEN + \
+     4 + LB_SECCOMP_SOCKET_FAMILY_LEN + 4 + LB_SECCOMP_SOCKETPAIR_FAMILY_LEN + 5 + \
+     2 * LB_SECCOMP_ALLOW_TABLE_LEN + 1)
+
+/* room for either */
+#define LB_SECCOMP_PROG_MAX \
+    (LB_SECCOMP_ALLOW_PROG_LEN > LB_SECCOMP_PROG_LEN ? LB_SECCOMP_ALLOW_PROG_LEN : LB_SECCOMP_PROG_LEN)
+
 _Static_assert(LB_SECCOMP_PROG_LEN <= 4096, "the kernel accepts at most 4096 BPF instructions");
+_Static_assert(LB_SECCOMP_ALLOW_PROG_LEN <= 4096, "the kernel accepts at most 4096 BPF instructions");
 
 /*
- * Write the program into prog, which holds LB_SECCOMP_PROG_LEN instructions,
- * and return how many were written. No jump is longer than six instructions,
- * so the tables can grow without any offset overflowing its 8 bits.
+ * Write a program into prog, the allow-list if allow and the deny-list if
+ * not, and return how many instructions were written. No jump is longer than
+ * a socket's families and three, so the tables can grow without any offset
+ * overflowing its 8 bits.
  */
-static inline size_t lb_seccomp_build(struct lb_sock_filter *prog) {
+static inline size_t lb_seccomp_program(struct lb_sock_filter *prog, int allow) {
     size_t n = 0;
 
 #define LB_STMT(op, value) \
@@ -326,20 +698,63 @@ static inline size_t lb_seccomp_build(struct lb_sock_filter *prog) {
         LB_STMT(LB_BPF_RET_K, LB_SECCOMP_RET_ALLOW);
     }
 
-    /* clone may create processes and threads but not namespaces, which is
-     * what denying unshare, setns and clone3 above is for. Its flags are the
-     * first argument on both targets. */
-    LB_JUMP(LB_BPF_JEQ_K, LB_SECCOMP_NR_CLONE, 0, 3);
-    LB_STMT(LB_BPF_LD_W_ABS, LB_SECCOMP_DATA_ARG0_LO);
-    LB_JUMP(LB_BPF_JSET_K, LB_SECCOMP_CLONE_NS_FLAGS, 0, 1);
-    LB_STMT(LB_BPF_RET_K, LB_SECCOMP_RET_ERRNO | LB_SC_EPERM);
+    if (!allow) {
+        /* clone may create processes and threads but not namespaces, which
+         * is what denying unshare, setns and clone3 above is for. Its flags
+         * are the first argument on both targets. */
+        LB_JUMP(LB_BPF_JEQ_K, LB_SECCOMP_NR_CLONE, 0, 3);
+        LB_STMT(LB_BPF_LD_W_ABS, LB_SECCOMP_DATA_ARG0_LO);
+        LB_JUMP(LB_BPF_JSET_K, LB_SECCOMP_CLONE_NS_FLAGS, 0, 1);
+        LB_STMT(LB_BPF_RET_K, LB_SECCOMP_RET_ERRNO | LB_SC_EPERM);
 
-    LB_STMT(LB_BPF_RET_K, LB_SECCOMP_RET_ALLOW);
+        LB_STMT(LB_BPF_RET_K, LB_SECCOMP_RET_ALLOW);
+    } else {
+        /* socket and socketpair: one of their families, which is the first
+         * argument, or EAFNOSUPPORT */
+        static const struct { uint32_t nr; const uint32_t *af; size_t naf; } sockets[] = {
+            { LB_SECCOMP_NR_SOCKET, LB_SECCOMP_SOCKET_FAMILY_TABLE, LB_SECCOMP_SOCKET_FAMILY_LEN },
+            { LB_SECCOMP_NR_SOCKETPAIR, LB_SECCOMP_SOCKETPAIR_FAMILY_TABLE, LB_SECCOMP_SOCKETPAIR_FAMILY_LEN },
+        };
+        for (size_t s = 0; s < 2; s++) {
+            uint8_t naf = (uint8_t)sockets[s].naf;
+            LB_JUMP(LB_BPF_JEQ_K, sockets[s].nr, 0, (uint8_t)(naf + 3));
+            LB_STMT(LB_BPF_LD_W_ABS, LB_SECCOMP_DATA_ARG0_LO);
+            for (uint8_t f = 0; f < naf; f++)
+                LB_JUMP(LB_BPF_JEQ_K, sockets[s].af[f], (uint8_t)(naf - f), 0);
+            LB_STMT(LB_BPF_RET_K, LB_SECCOMP_RET_ERRNO | LB_SC_EAFNOSUPPORT);
+            LB_STMT(LB_BPF_RET_K, LB_SECCOMP_RET_ALLOW);
+        }
+
+        /* clone, as in the deny-list, and allowed at once without a
+         * namespace flag */
+        LB_JUMP(LB_BPF_JEQ_K, LB_SECCOMP_NR_CLONE, 0, 4);
+        LB_STMT(LB_BPF_LD_W_ABS, LB_SECCOMP_DATA_ARG0_LO);
+        LB_JUMP(LB_BPF_JSET_K, LB_SECCOMP_CLONE_NS_FLAGS, 0, 1);
+        LB_STMT(LB_BPF_RET_K, LB_SECCOMP_RET_ERRNO | LB_SC_EPERM);
+        LB_STMT(LB_BPF_RET_K, LB_SECCOMP_RET_ALLOW);
+
+        /* what it allows, and ENOSYS for everything else */
+        for (size_t i = 0; i < LB_SECCOMP_ALLOW_TABLE_LEN; i++) {
+            LB_JUMP(LB_BPF_JEQ_K, LB_SECCOMP_ALLOW_TABLE[i], 0, 1);
+            LB_STMT(LB_BPF_RET_K, LB_SECCOMP_RET_ALLOW);
+        }
+        LB_STMT(LB_BPF_RET_K, LB_SECCOMP_RET_ERRNO | LB_SC_ENOSYS);
+    }
 
 #undef LB_STMT
 #undef LB_JUMP
 
     return n;
+}
+
+/* The deny-list into prog, which holds LB_SECCOMP_PROG_LEN instructions. */
+static inline size_t lb_seccomp_build(struct lb_sock_filter *prog) {
+    return lb_seccomp_program(prog, 0);
+}
+
+/* The allow-list into prog, which holds LB_SECCOMP_ALLOW_PROG_LEN instructions. */
+static inline size_t lb_seccomp_build_allow(struct lb_sock_filter *prog) {
+    return lb_seccomp_program(prog, 1);
 }
 
 #endif /* LIGHTBOX_SECCOMP_H */

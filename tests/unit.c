@@ -324,6 +324,7 @@ static void put_config(const container_config *config) {
     put_number("oom_score", config->oom_score);
     put_number("privileged", config->privileged);
     put_number("readonly", config->read_only);
+    put_line("seccomp ", config->seccomp_allow ? "allow" : "deny");
     put_line("io ", config->io[0] ? config->io : "-");
     put_line("swap ", config->swap[0] ? config->swap : "-");
     put_line("base ", config->base[0] ? config->base : "-");
@@ -1000,7 +1001,7 @@ int main(int argc, char **argv, char **envp) {
         return 0;
     }
     if (argc >= 3 && streq(argv[1], "sandbox")) {
-        apply_sandbox();
+        apply_sandbox(false);
         exec_program(argv[2], (const char *const *)(argv + 2), TOOL_ENV);
         die2("unit: cannot execute ", argv[2]);
     }

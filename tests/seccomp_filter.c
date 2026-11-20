@@ -1,7 +1,9 @@
 /*
- * Interprets lightbox's seccomp program and checks its verdict for every
- * syscall number (ROADMAP 2.4), and for the calls that set a mode, its
- * verdict for every bit of the mode and for the flags of an open (8.2).
+ * Interprets lightbox's two seccomp programs, the deny-list and the
+ * allow-list, and checks their verdict for every syscall number (ROADMAP 2.4
+ * and 8.3); for the calls that set a mode, their verdict for every bit of the
+ * mode and for the flags of an open (8.2); and for socket and socketpair,
+ * the allow-list's for every family.
  *
  * The program is built for the architecture named at compile time,
  *
@@ -54,8 +56,9 @@ struct data {
     uint64_t args[6];
 };
 
-static struct lb_sock_filter prog[LB_SECCOMP_PROG_LEN];
+static struct lb_sock_filter prog[LB_SECCOMP_PROG_MAX];
 static size_t prog_len;
+static int allow_mode;          /* the program being checked is the allow-list */
 static unsigned long verdicts, failures;
 
 static void fail(const char *what, const struct data *d, uint32_t got, uint32_t want) {
@@ -129,15 +132,31 @@ static uint32_t table_errno(uint32_t nr) {
 
 #define DENY(err) (LB_SECCOMP_RET_ERRNO | (err))
 
-int main(void) {
-    prog_len = lb_seccomp_build(prog);
-    if (prog_len != LB_SECCOMP_PROG_LEN) {
-        printf("  %s: built %zu instructions, LB_SECCOMP_PROG_LEN says %zu\n",
-               TARGET, prog_len, (size_t)LB_SECCOMP_PROG_LEN);
-        return 1;
-    }
+static int in_allow_table(uint32_t nr) {
+    for (size_t i = 0; i < LB_SECCOMP_ALLOW_TABLE_LEN; i++)
+        if (LB_SECCOMP_ALLOW_TABLE[i] == nr)
+            return 1;
+    return 0;
+}
 
-    /* the table itself: no number twice, every errno a real one */
+static int is_socket_call(uint32_t nr) {
+    return nr == LB_SECCOMP_NR_SOCKET || nr == LB_SECCOMP_NR_SOCKETPAIR;
+}
+
+/* What the program answers nr with when every argument is 0. */
+static uint32_t verdict_without_arguments(uint32_t nr) {
+    uint32_t err = table_errno(nr);
+    if (err)
+        return DENY(err);
+    if (!allow_mode || mode_row(nr) || nr == LB_SECCOMP_NR_CLONE || in_allow_table(nr))
+        return LB_SECCOMP_RET_ALLOW;
+    if (is_socket_call(nr))
+        return DENY(LB_SC_EAFNOSUPPORT);     /* family 0, AF_UNSPEC */
+    return DENY(LB_SC_ENOSYS);
+}
+
+/* The tables, once: no number twice or in two of them, every errno a real one. */
+static void check_tables(void) {
     for (size_t i = 0; i < LB_SECCOMP_TABLE_LEN; i++) {
         const struct lb_seccomp_deny *row = &LB_SECCOMP_TABLE[i];
         if (row->nr >= NR_LIMIT || row->err == 0 || row->err > 4095) {
@@ -175,6 +194,34 @@ int main(void) {
             }
     }
 
+    /* the allow table: none of the calls that have rules of their own */
+    for (size_t i = 0; i < LB_SECCOMP_ALLOW_TABLE_LEN; i++) {
+        uint32_t nr = LB_SECCOMP_ALLOW_TABLE[i];
+        if (nr >= NR_LIMIT || table_errno(nr) || mode_row(nr) || nr == LB_SECCOMP_NR_CLONE || is_socket_call(nr)) {
+            printf("  number %u of the allow table is out of range or has a rule of its own\n", nr);
+            failures++;
+        }
+        for (size_t j = 0; j < i; j++)
+            if (LB_SECCOMP_ALLOW_TABLE[j] == nr) {
+                printf("  number %u is in the allow table twice\n", nr);
+                failures++;
+            }
+    }
+}
+
+/* One of the two programs, built and interpreted. */
+static void check_program(int allow) {
+    allow_mode = allow;
+    const char *which = allow ? "allow-list" : "deny-list";
+    size_t want = allow ? LB_SECCOMP_ALLOW_PROG_LEN : LB_SECCOMP_PROG_LEN;
+    prog_len = allow ? lb_seccomp_build_allow(prog) : lb_seccomp_build(prog);
+    if (prog_len != want) {
+        printf("  %s %s: built %zu instructions, its length says %zu\n", TARGET, which, prog_len, want);
+        failures++;
+        return;
+    }
+    unsigned long verdicts_before = verdicts, failures_before = failures;
+
     struct data d;
 
     /* another ABI: killed, whatever the number */
@@ -185,18 +232,19 @@ int main(void) {
             expect("foreign architecture", &d, LB_SECCOMP_RET_KILL_PROCESS);
         }
 
-    /* this ABI: a row answers its errno, everything else is allowed */
+    /* this ABI: a row answers its errno; everything else is allowed by
+     * the deny-list, and by the allow-list if it names it, and answered
+     * ENOSYS if not */
     for (uint32_t nr = 0; nr < NR_LIMIT; nr++) {
-        uint32_t err = table_errno(nr);
+        uint32_t want_verdict = verdict_without_arguments(nr);
         d = (struct data){ .nr = nr, .arch = LB_SECCOMP_AUDIT_ARCH };
-        expect(err ? "table row" : "allowed syscall", &d, err ? DENY(err) : LB_SECCOMP_RET_ALLOW);
-        /* arguments do not change the answer, except for clone and the
-         * mode rows below */
-        if (nr != LB_SECCOMP_NR_CLONE && !mode_row(nr)) {
+        expect("a syscall", &d, want_verdict);
+        /* arguments do not change the answer, except for clone, the mode
+         * rows and, in the allow-list, socket and socketpair below */
+        if (nr != LB_SECCOMP_NR_CLONE && !mode_row(nr) && !(allow_mode && is_socket_call(nr))) {
             for (int i = 0; i < 6; i++)
                 d.args[i] = UINT64_MAX;
-            expect(err ? "table row with arguments" : "allowed syscall with arguments", &d,
-                   err ? DENY(err) : LB_SECCOMP_RET_ALLOW);
+            expect("a syscall with arguments", &d, want_verdict);
         }
     }
 
@@ -206,7 +254,7 @@ int main(void) {
 #if defined(LB_SECCOMP_TARGET_X86_64)
         expect("x32 number", &d, DENY(LB_SC_EPERM));
 #else
-        expect("number with bit 30", &d, LB_SECCOMP_RET_ALLOW);
+        expect("number with bit 30", &d, allow_mode ? DENY(LB_SC_ENOSYS) : LB_SECCOMP_RET_ALLOW);
 #endif
     }
 #if defined(LB_SECCOMP_TARGET_X86_64)
@@ -291,7 +339,48 @@ int main(void) {
         }
     }
 
-    printf("  %s: %zu instructions, %zu table rows and %zu mode rows, %lu verdicts checked, %lu wrong\n",
-           TARGET, prog_len, (size_t)LB_SECCOMP_TABLE_LEN, (size_t)LB_SECCOMP_MODE_TABLE_LEN, verdicts, failures);
+    /* the allow-list's socket and socketpair: their families, the first
+     * argument and its low word, and EAFNOSUPPORT for any other */
+    if (allow_mode) {
+        static const struct { uint32_t nr; const uint32_t *af; size_t naf; } sockets[] = {
+            { LB_SECCOMP_NR_SOCKET, LB_SECCOMP_SOCKET_FAMILY_TABLE, LB_SECCOMP_SOCKET_FAMILY_LEN },
+            { LB_SECCOMP_NR_SOCKETPAIR, LB_SECCOMP_SOCKETPAIR_FAMILY_TABLE, LB_SECCOMP_SOCKETPAIR_FAMILY_LEN },
+        };
+        for (size_t s = 0; s < 2; s++) {
+            for (uint64_t af = 0; af < 256; af++) {
+                int listed = 0;
+                for (size_t f = 0; f < sockets[s].naf; f++)
+                    listed |= sockets[s].af[f] == af;
+                d = (struct data){ .nr = sockets[s].nr, .arch = LB_SECCOMP_AUDIT_ARCH,
+                                   .args = { af, UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX } };
+                expect(listed ? "a family it takes" : "a family it does not take", &d,
+                       listed ? LB_SECCOMP_RET_ALLOW : DENY(LB_SC_EAFNOSUPPORT));
+                /* the kernel reads an int: the high word does not count */
+                d.args[0] = af | 0xffffffff00000000ULL;
+                expect("a family with a high word", &d,
+                       listed ? LB_SECCOMP_RET_ALLOW : DENY(LB_SC_EAFNOSUPPORT));
+            }
+            static const uint64_t others[] = { 0xffffffffU, 0x80000000U, 0x100U | 1, 0x10000U | 2 };
+            for (size_t o = 0; o < sizeof(others) / sizeof(others[0]); o++) {
+                d = (struct data){ .nr = sockets[s].nr, .arch = LB_SECCOMP_AUDIT_ARCH, .args = { others[o] } };
+                expect("a family out of range", &d, DENY(LB_SC_EAFNOSUPPORT));
+            }
+            /* a family it takes in another argument does not count */
+            d = (struct data){ .nr = sockets[s].nr, .arch = LB_SECCOMP_AUDIT_ARCH,
+                               .args = { 40, sockets[s].af[0], sockets[s].af[0], sockets[s].af[0] } };
+            expect("a family in another argument", &d, DENY(LB_SC_EAFNOSUPPORT));
+        }
+    }
+
+    printf("  %s %s: %zu instructions, %zu table rows, %zu mode rows%s, %lu verdicts checked, %lu wrong\n",
+           TARGET, which, prog_len, (size_t)LB_SECCOMP_TABLE_LEN, (size_t)LB_SECCOMP_MODE_TABLE_LEN,
+           allow ? ", the allowed calls and the families of a socket" : "",
+           verdicts - verdicts_before, failures - failures_before);
+}
+
+int main(void) {
+    check_tables();
+    check_program(0);
+    check_program(1);
     return failures ? 1 : 0;
 }

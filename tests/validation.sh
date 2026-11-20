@@ -479,6 +479,35 @@ privileged=1'; do
     done
 }
 
+# --seccomp takes allow and deny (ROADMAP 8.3). allow is stored and shown;
+# deny, as no option, leaves the file without the line, which is the
+# deny-list; a privileged container has no profile to show. Anything else is
+# refused, and a .conf with another value cannot be used.
+t_seccomp_option() {
+    lb create a --seccomp allow && lb create b --seccomp deny && lb create c && lb create d --privileged --seccomp allow ||
+        return 1
+    conf_has a 'seccomp=allow' || return 1
+    ! grep -q '^seccomp=' "$C/b/.conf" "$C/c/.conf" || { echo "a deny-list is stored"; return 1; }
+    shown=$(for n in a b c d; do lb inspect "$n" | grep '^seccomp: '; done | paste -sd'|')
+    echo "$shown"
+    [ "$shown" = 'seccomp: allow|seccomp: deny|seccomp: deny|seccomp: -' ] || return 1
+    command -v python3 >/dev/null 2>&1 && {
+        lb inspect a --json | python3 -I -c 'import json, sys; assert json.load(sys.stdin)[0]["seccomp"] == "allow"' &&
+        lb inspect d --json | python3 -I -c 'import json, sys; assert json.load(sys.stdin)[0]["seccomp"] is None' ||
+            { echo "inspect --json does not say it"; return 1; }
+    }
+    for value in Allow deny-list '' 1 'allow
+privileged=1'; do
+        msg=$(lb create e --seccomp "$value" 2>&1) && { echo "--seccomp '$value' was taken"; return 1; }
+        case $msg in 'Error: --seccomp takes allow or deny, not: '*) ;; *) echo "--seccomp '$value': $msg"; return 1 ;; esac
+        [ ! -e "$C/e" ] || { echo "--seccomp '$value' left a container"; return 1; }
+    done
+    echo 'seccomp=none' >> "$C/c/.conf"
+    msg=$(lb inspect c 2>&1) && { echo "a .conf of seccomp=none was used"; return 1; }
+    printf '%s\n' "$msg"
+    case $msg in *'seccomp is not allow or deny'*) ;; *) return 1 ;; esac
+}
+
 # A whole disk of this host, as <major>:<minor>; with "partition", one of its
 # partitions instead.
 block_device() {
@@ -523,7 +552,7 @@ privileged=1'; do
 }
 
 t_missing_value_is_named() {
-    for option in --mem --swap --pids --cpu --oom-score --io-max --vol --dns --link --rootfs; do
+    for option in --mem --swap --pids --cpu --oom-score --io-max --vol --dns --link --rootfs --seccomp; do
         msg=$(lb create web 10.0.0.2 "$option" 2>&1) && { echo "$option without a value was accepted"; return 1; }
         printf '%s\n' "$msg"
         [ "$msg" = "Error: option $option requires a value" ] || return 1
@@ -1282,6 +1311,7 @@ bad = [k for k in want if c.get(k) != want[k]]
 assert not bad, "differ: " + ", ".join("%s=%r" % (k, c.get(k)) for k in bad)
 assert c["log_path"].endswith("/web/console.log") and c["host_interface"].startswith("vb-"), "paths"
 assert c["userns"] is False and c["uid_start"] is None and c["gid_start"] is None, "user namespace keys"
+assert c["seccomp"] == "deny", "the profile"
 ' "$W/vol" || return 1
     echo 'colour=blue' >> "$C/web/.conf"
     out=$(lb inspect web --json 2>"$W/err") && { echo "inspect --json of a configuration that cannot be used succeeded"; return 1; }
@@ -1909,6 +1939,7 @@ check 'subnet and gw that are no network are refused'         t_network_settings
 check 'an address with a zero in front of a number is refused' t_address_with_leading_zeros_refused
 check 'two creates at once get two addresses'                 t_creates_at_once_get_two_addresses
 check '--swap takes what --mem does and 0, and is none unless given' t_swap_option
+check '--seccomp takes allow or deny, and allow is stored and shown' t_seccomp_option
 check '--io-max is a line of io.max for a whole disk that is there' t_io_max_option
 check 'the firewall settings are Docker'"'"'s, and a wrong one keeps the built-in' t_firewall_settings
 check 'firewall_backend and bridge_accept_fwmark: Docker'"'"'s, and a wrong one is not taken' t_firewall_backend_settings

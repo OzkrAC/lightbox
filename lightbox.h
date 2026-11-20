@@ -116,6 +116,7 @@ typedef struct {
     int  oom_score;
     bool privileged;
     bool read_only;
+    bool seccomp_allow;         /* the allow-list profile; false: the deny-list */
     char base[13];              /* the snapshot it overlays; empty: a copy of its base */
     bool userns;                /* uid and gid 0 are uid_start and gid_start on the host */
     uint32_t uid_start;
@@ -139,6 +140,8 @@ typedef struct {
  * microseconds of each CPU_PERIOD_US */
 [[nodiscard]] bool parse_cpu_limit(const char *text, int *quota_us);
 [[nodiscard]] bool parse_oom_score(const char *text, int *out);
+/* "allow" or "deny", the seccomp profile, as an option and the file give it */
+[[nodiscard]] bool parse_seccomp_profile(const char *text, bool *allow);
 
 /*
  * A volume as it is written: src:dst[:ro]. NULL when it is one, with both

@@ -5,14 +5,17 @@
  * the real deny table, not a copy. Needs no privileges: an unprivileged
  * process may install a filter once it has set no_new_privs.
  *
- *   seccomp_profile run <program> [args...]
+ * Each command takes --allow first for the allow-list (ROADMAP 8.3); without
+ * it, the deny-list.
+ *
+ *   seccomp_profile run [--allow] <program> [args...]
  *       Install the profile, then execute the program under it.
  *
- *   seccomp_profile probe
+ *   seccomp_profile probe [--allow]
  *       Call every syscall of the deny table before and after installing the
  *       profile and print what each returned. tests/seccomp_cases.sh reads it.
  *
- *   seccomp_profile modes <dir>
+ *   seccomp_profile modes [--allow] <dir>
  *       Make the calls that set a file's mode, with the setuid or setgid bit
  *       and without, on fresh paths in <dir>/before and then, under the
  *       profile, in <dir>/after, and print what each returned:
@@ -31,6 +34,14 @@
  *   x32 <returned before> <returned after>
  *   clone_newuser <returned before> <returned after>
  *   clone_plain <returned before> <returned after>
+ *
+ * and with --allow, for a call the allow-list does not name (vhangup), a
+ * number past every table, and socket and socketpair of some families:
+ *
+ *   unlisted <returned before> <returned after>
+ *   past <returned before> <returned after>
+ *   socket <family> <returned before> <returned after>
+ *   socketpair <family> <returned before> <returned after>
  *
  * Probes pass -1 for every argument. A denied syscall never runs, and one that
  * does run (before the profile, or because the profile missed it) fails on the
@@ -109,10 +120,62 @@ static int64_t in_child(int64_t (*probe)(void)) {
     return result;
 }
 
+static bool allow_list;     /* --allow */
+
 static void install_profile(void) {
     if (lc_kernel_prctl(LB_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
         die("seccomp_profile: failed to set no_new_privs");
-    apply_seccomp();
+    apply_seccomp(allow_list);
+}
+
+/* ─── What only the allow-list does ─────────────────────────────────────── */
+
+#if defined(__x86_64__)
+#define NR_VHANGUP     153
+#define NR_SOCKET       41
+#define NR_SOCKETPAIR   53
+#else
+#define NR_VHANGUP      58
+#define NR_SOCKET      198
+#define NR_SOCKETPAIR  199
+#endif
+#define NR_PAST        1000     /* past every table and every syscall */
+#define SOCK_STREAM_   1
+#define SOCK_DGRAM_    2
+
+/* the families probed: four it takes, and AF_PACKET, AF_ALG and AF_VSOCK */
+static const int SOCKET_FAMILIES[] = { 1, 2, 10, 16, 17, 38, 40 };
+#define NSOCKET_FAMILIES (int)(sizeof(SOCKET_FAMILIES) / sizeof(SOCKET_FAMILIES[0]))
+static const int SOCKETPAIR_FAMILIES[] = { 1, 2 };
+#define NSOCKETPAIR_FAMILIES (int)(sizeof(SOCKETPAIR_FAMILIES) / sizeof(SOCKETPAIR_FAMILIES[0]))
+
+/* a descriptor is success, and closed */
+static int64_t opened(int64_t rc) {
+    if (rc < 0)
+        return rc;
+    lc_kernel_close_file((int32_t)rc);
+    return 0;
+}
+
+static int64_t probe_socket(int family) {
+    return opened(lc_syscall6(NR_SOCKET, family, family == 16 ? SOCK_DGRAM_ : SOCK_STREAM_ | O_CLOEXEC, 0, 0, 0, 0));
+}
+
+static int64_t probe_socketpair(int family) {
+    int32_t fds[2];
+    int64_t rc = lc_syscall6(NR_SOCKETPAIR, family, SOCK_STREAM_ | O_CLOEXEC, 0, (int64_t)fds, 0, 0);
+    if (rc == 0) {
+        lc_kernel_close_file(fds[0]);
+        lc_kernel_close_file(fds[1]);
+    }
+    return rc;
+}
+
+static void put_pair(const char *what, int64_t before, int64_t after) {
+    put(what);  put(" ");
+    put_num(before);
+    put(" ");   put_num(after);
+    put("\n");
 }
 
 /* ─── The calls that set a mode ───────────────────────────────────────────── */
@@ -289,6 +352,13 @@ static void cmd_probe(void) {
 #endif
     int64_t clone_before = in_child(probe_clone_newuser);
     int64_t plain_before = in_child(probe_clone_plain);
+    int64_t unlisted_before = lc_syscall6(NR_VHANGUP, 0, 0, 0, 0, 0, 0);
+    int64_t past_before = lc_syscall6(NR_PAST, 0, 0, 0, 0, 0, 0);
+    int64_t socket_before[NSOCKET_FAMILIES], socketpair_before[NSOCKETPAIR_FAMILIES];
+    for (int i = 0; i < NSOCKET_FAMILIES; i++)
+        socket_before[i] = probe_socket(SOCKET_FAMILIES[i]);
+    for (int i = 0; i < NSOCKETPAIR_FAMILIES; i++)
+        socketpair_before[i] = probe_socketpair(SOCKETPAIR_FAMILIES[i]);
 
     install_profile();
 
@@ -311,9 +381,35 @@ static void cmd_probe(void) {
     put("clone_plain ");    put_num(plain_before);
     put(" ");               put_num(in_child(probe_clone_plain));
     put("\n");
+    if (!allow_list)
+        return;
+    put_pair("unlisted", unlisted_before, lc_syscall6(NR_VHANGUP, 0, 0, 0, 0, 0, 0));
+    put_pair("past", past_before, lc_syscall6(NR_PAST, 0, 0, 0, 0, 0, 0));
+    char what[32];
+    for (int i = 0; i < NSOCKET_FAMILIES; i++) {
+        char digits[16];
+        fmt_int(digits, SOCKET_FAMILIES[i]);
+        bool cut = false;
+        str_append(what, str_append(what, 0, "socket ", sizeof(what), &cut), digits, sizeof(what), &cut);
+        put_pair(what, socket_before[i], probe_socket(SOCKET_FAMILIES[i]));
+    }
+    for (int i = 0; i < NSOCKETPAIR_FAMILIES; i++) {
+        char digits[16];
+        fmt_int(digits, SOCKETPAIR_FAMILIES[i]);
+        bool cut = false;
+        str_append(what, str_append(what, 0, "socketpair ", sizeof(what), &cut), digits, sizeof(what), &cut);
+        put_pair(what, socketpair_before[i], probe_socketpair(SOCKETPAIR_FAMILIES[i]));
+    }
 }
 
 int main(int argc, char **argv, char **envp) {
+    /* the command, then --allow */
+    if (argc >= 3 && streq(argv[2], "--allow")) {
+        allow_list = true;
+        argv[2] = argv[1];
+        argv++;
+        argc--;
+    }
     if (argc >= 3 && streq(argv[1], "run")) {
         install_profile();
         lc_kernel_execute(argv[2], argv + 2, envp);
@@ -327,5 +423,5 @@ int main(int argc, char **argv, char **envp) {
         cmd_modes(argv[2]);
         return 0;
     }
-    die("usage: seccomp_profile run <program> [args...] | seccomp_profile probe | seccomp_profile modes <dir>");
+    die("usage: seccomp_profile run|probe|modes [--allow] [<program> [args...] | <dir>]");
 }
