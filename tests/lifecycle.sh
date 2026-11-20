@@ -78,7 +78,7 @@ NETP=10.199.0
 GW=10.199.0.1
 WAN=lbt-wan                 # the interface the default route leaves by
 OUTSIDE=192.0.2.1           # an address beyond it, in a namespace that stands for the internet
-ALLOWED_CAPS=00000000a00405fb   # ALLOWED_CAPS of lightbox.c as /proc/<pid>/status prints a set
+ALLOWED_CAPS=00000000200405fb   # ALLOWED_CAPS of lightbox.c as /proc/<pid>/status prints a set
 BRNF=/proc/sys/net/bridge/bridge-nf-call-iptables
 
 settings() { # after LIFECYCLE_T is known

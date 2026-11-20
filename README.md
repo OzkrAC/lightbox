@@ -214,7 +214,7 @@ If the image has an `/init.sh`, the container's init runs it once the container 
 What the hook gets:
 
 - It runs as `/bin/sh /init.sh`, as root, in `/`, with `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, `HOME=/root` and `TERM=xterm` and nothing else of the environment `start` was given. The container is complete by then: its mounts, its `/dev`, its address and default route, its cgroup and limits, and the container is on record, so `stop` and `ls` find it.
-- It has the container's sandbox: 12 capabilities, the seccomp filter and no_new_privs, the masked and read-only parts of `/proc`. A hook that mounts filesystems or configures the network needs `--privileged`. Its root is the host's root (see [Threat model](#threat-model)).
+- It has the container's sandbox: 11 capabilities, the seccomp filter and no_new_privs, the masked and read-only parts of `/proc`. A hook that mounts filesystems or configures the network needs `--privileged`. Its root is the host's root (see [Threat model](#threat-model)).
 - The hook and everything it starts read from `/dev/null` and write to the container's log, not to the terminal `start` was typed on. `lightbox logs <name>` shows the log, and `logs -f` follows it until the container stops.
 - A hook that exits with a status other than 0 fails the start: `start` says which status it was, and the container is stopped and cleaned up. A hook that fails after `start` has returned stops the container as well.
 - `start` waits 30 seconds for the hook. If the hook is still running then, for instance because it runs its service in the foreground, `start` says so and returns; the container stays up. `start <name> -t <seconds>` or `start_timeout` in `lightbox.conf` sets the wait, and 0 does not wait at all.
@@ -460,7 +460,7 @@ The sandbox covers everything in a container: init, the `/init.sh` hook and all 
 
 | Feature | Implementation |
 |---------|---------------|
-| Capability dropping | The bounding, effective and permitted sets are reduced to 12 capabilities: Docker's default 14 without `NET_RAW` and `MKNOD`. The inheritable and ambient sets are emptied |
+| Capability dropping | The bounding, effective and permitted sets are reduced to 11 capabilities: Docker's default 14 without `NET_RAW`, `MKNOD` and `SETFCAP`. The inheritable and ambient sets are emptied |
 | Seccomp | BPF filter denying 57 syscalls on x86_64 (48 on aarch64), the x32 range, `clone` with namespace flags, and a mode with the setuid or setgid bit in `chmod`, `fchmod`, `fchmodat`, `fchmodat2`, `mknod`, `mknodat`, `creat`, and `open` and `openat` that make a file; `openat2`, whose mode it cannot read, answers ENOSYS so that callers use `openat` |
 | no_new_privs | Prevents SUID escalation |
 | /proc and /sys masking | The paths Docker masks by default are covered, files with `/dev/null` and directories with an empty read-only tmpfs. A mask that cannot be made fails the start |
@@ -476,8 +476,8 @@ The sandbox covers everything in a container: init, the `/init.sh` hook and all 
 
 lightbox keeps what runs in a container away from the host and from the other containers, as far as the kernel's namespaces, the sandbox and the firewall can:
 
-- **The host from a container's processes:** their own PID, mount, UTS, IPC and network namespaces, and with `--userns` a user namespace in which root is an unprivileged uid of the host's; 12 capabilities and a seccomp filter of Docker's kind, with no_new_privs; the paths of `/proc` and `/sys` that Docker masks, masked, and the rest of `/proc`'s system trees read-only; a root filesystem that is `nodev` and `nosuid`; and limits on memory, swap, processes, CPU and, with `--io-max`, I/O.
-- **The host from what a container leaves in a volume:** nothing in a container that is not privileged gives a file the setuid or the setgid bit, so no program it leaves in a volume, or in its own files, runs on the host with the rights of their owner, the volume's owner or root. Inside the container the bits would mean nothing, as its root is `nosuid` and no_new_privs is set. A package that installs such a program, such as `passwd`, `mount` or `sudo`, fails to install in a container: update it in the base on the host, or give the container `--privileged`.
+- **The host from a container's processes:** their own PID, mount, UTS, IPC and network namespaces, and with `--userns` a user namespace in which root is an unprivileged uid of the host's; 11 capabilities and a seccomp filter of Docker's kind, with no_new_privs; the paths of `/proc` and `/sys` that Docker masks, masked, and the rest of `/proc`'s system trees read-only; a root filesystem that is `nodev` and `nosuid`; and limits on memory, swap, processes, CPU and, with `--io-max`, I/O.
+- **The host from what a container leaves in a volume:** nothing in a container that is not privileged gives a file the setuid or the setgid bit or a file capability, so no program it leaves in a volume, or in its own files, runs on the host with the rights of their owner, the volume's owner or root. Inside the container they would mean nothing, as its root is `nosuid` and no_new_privs is set. A package that installs such a program, such as `passwd`, `mount` or `sudo`, or that runs `setcap`, such as `iputils-ping`, fails to install in a container: update it in the base on the host, or give the container `--privileged`.
 - **Containers from each other:** each on an isolated port of the bridge, and with `--link` kept to its links by firewall rules that lightbox owns and takes away with the container.
 - **The host's terminal and the installed binary from a container:** `exec` gives a command a terminal of the container's, not yours, and enters from a sealed copy of itself.
 

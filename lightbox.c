@@ -463,12 +463,16 @@ static void cgroup_join_self(const char *name) {
  * Deliberately stricter than Docker's historical default:
  * - no CAP_NET_RAW: avoid raw sockets/packet capture by default
  * - no CAP_MKNOD: device node creation is unnecessary with our fixed /dev setup
+ * - no CAP_SETFCAP (ROADMAP 8.2): a file capability that a container's root
+ *   wrote on a program in a volume would hold on the host, as root's without
+ *   --userns, for whoever runs it there. In the container it would give
+ *   nothing, as no_new_privs keeps an execve from granting it.
  */
 static const int ALLOWED_CAPS[] = {
     LB_CAP_CHOWN, LB_CAP_DAC_OVERRIDE, LB_CAP_FOWNER, LB_CAP_FSETID,
     LB_CAP_KILL, LB_CAP_SETGID, LB_CAP_SETUID, LB_CAP_SETPCAP,
     LB_CAP_NET_BIND_SERVICE, LB_CAP_SYS_CHROOT,
-    LB_CAP_AUDIT_WRITE, LB_CAP_SETFCAP,
+    LB_CAP_AUDIT_WRITE,
 };
 #define N_ALLOWED_CAPS (sizeof(ALLOWED_CAPS) / sizeof(ALLOWED_CAPS[0]))
 

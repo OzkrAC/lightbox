@@ -314,7 +314,7 @@ t_loopback_up() {
 
 # ─── The sandbox: capabilities, no_new_privs, seccomp, masked paths ─────────
 
-ALLOWED_CAPS=00000000a00405fb       # ALLOWED_CAPS of lightbox.c, as /proc/<pid>/status prints a set
+ALLOWED_CAPS=00000000200405fb       # ALLOWED_CAPS of lightbox.c, as /proc/<pid>/status prints a set
 
 field() { printf '%s\n' "$out" | awk -v k="$1:" '$1 == k { print $2 }'; }
 
