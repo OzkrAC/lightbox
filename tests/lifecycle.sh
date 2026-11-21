@@ -817,7 +817,8 @@ t_agent_run() {
     echo "run --profile agent: status $rc, $(printf '%s\n' "$out" | paste -sd' '); made: $(stat -c %u:%g "$T/vol/agentrun/made" 2>&1)"
     [ "$rc" = 3 ] && [ "$(printf '%s\n' "$out" | sed -n 2p)" = /workspace ] &&
         [ "$(stat -c %u:%g "$T/vol/agentrun/made")" = 2345:2346 ] && run_left "$name" || return 1
-    lb run --profile agent -- /bin/sh -c 'hostname; exec sleep 1118' >"$OUT/agentrun.out" 2>"$OUT/agentrun.err" </dev/null &
+    # "$LB" and not lb, whose timeout would be $! and take the SIGTERM alone
+    "$LB" run --profile agent -- /bin/sh -c 'hostname; exec sleep 1118' >"$OUT/agentrun.out" 2>"$OUT/agentrun.err" </dev/null &
     front=$!
     wait_until 30 test -s "$OUT/agentrun.out" && wait_until 5 running_cmd 'sleep 1118' ||
         { echo "the command did not start"; cat "$OUT/agentrun.err"; kill -KILL "$front"; return 1; }
