@@ -701,8 +701,10 @@ t_stopped_from_inside_is_exited() {
 # A container that was started by a lightbox before 0.5 has its records in
 # its own directory. After an upgrade it is still seen to be running, a
 # command can be run in it, and stop stops it and takes the old records away.
+# It has the network of then, nat: the records of --net outside, of 0.8, are
+# in run_dir, which a lightbox before 0.5 did not have.
 t_container_started_before_the_upgrade() {
-    up oldstyle || return 1
+    up oldstyle --net nat || return 1
     pid=$(pid_of oldstyle)
     mv "$RUN/oldstyle/pid" "$C/oldstyle/.pid" && mv "$RUN/oldstyle/pid_start" "$C/oldstyle/.pid_start" &&
     mv "$RUN/oldstyle/state" "$C/oldstyle/.state" && rm -rf -- "$RUN/oldstyle" || return 1
@@ -2136,7 +2138,12 @@ t_net_outside() { net_outside n start; }
 # --net none: loopback and nothing else. start makes no interface on the
 # host for it, and the container has no address, no route and no eth0.
 t_net_none() {
-    box nonet --net none || return 1
+    # without an address: box gives one, which --net none refuses
+    # shellcheck disable=SC2046  # options of one word each
+    lb create nonet --net none $(mode_options --net none) >"$OUT/nonet.create" 2>&1 ||
+        { cat "$OUT/nonet.create"; return 1; }
+    cat "$OUT/nonet.create"
+    grep -q '(no network)' "$OUT/nonet.create" || { echo "create does not say it has no network"; return 1; }
     [ ! -e "$C/nonet/.ip" ] || { echo "it has an address on record"; return 1; }
     lb inspect nonet | grep -qx 'net: none' && lb inspect nonet | grep -qx 'ip: -' ||
         { echo "inspect does not say it"; return 1; }
@@ -2252,7 +2259,8 @@ t_linked_containers() {
     lb stop linked >/dev/null && nothing_left linked
 }
 
-# A start puts in a container's link rules with one process, iptables-restore.
+# A start puts in a container's link rules, and with them the rules of
+# --net outside, the default, with one process, iptables-restore.
 t_link_rules_in_one_process() {
     command -v strace >/dev/null 2>&1 || { echo "no strace to watch a start with"; return 77; }
     brnf 1 || { echo "br_netfilter is not loaded, and a container with a link does not start without it"; return 77; }
@@ -2265,12 +2273,15 @@ t_link_rules_in_one_process() {
     settled onelinked || return 1
     lb stop onelinked >/dev/null 2>&1 || { echo "stop failed"; return 1; }
     wait "$tracer"
-    # but for the look at whether setup's rules are there, which every start has
+    # but for the looks at whether setup's jumps are there, which every start
+    # has; the links and the rules of --net outside, the default, go in as one
     tools=$(grep -E 'execve\("[^"]*/(ip6?tables[^"]*|nft)"' "$T/links.strace" | grep -v ' = -1 ')
     printf '%s\n' "$tools"
-    count=$(printf '%s\n' "$tools" | grep -v '"-C", "FORWARD", "-j", "LIGHTBOX-FORWARD"' | grep -c .)
+    put_in=$(printf '%s\n' "$tools" | grep -v -e '"-C", "FORWARD", "-j", "LIGHTBOX-FORWARD"' \
+                                              -e '"-C", "INPUT", "-j", "LIGHTBOX-INPUT"')
+    count=$(printf '%s\n' "$put_in" | grep -c .)
     echo "firewall tools the start ran to put rules in: $count"
-    [ "$count" = 1 ] && printf '%s\n' "$tools" | grep -v '"-C", "FORWARD"' | grep -q 'restore'
+    [ "$count" = 1 ] && printf '%s\n' "$put_in" | grep -q 'restore'
 }
 
 t_link_to_later_container() {
