@@ -12,6 +12,18 @@
  *                                             "left open <n>": descriptors it left open
  *   unit names <name>                         host_port_name and link_chain_name, a line each
  *   unit owner <name> <alias>                 port_owner_of_alias: ours or foreign
+ *   unit subid <subuid text> <subgid text> [<uid>:<gid>...]
+ *                                             subid_ranges of lightbox's lines, "range <start> <count>"
+ *                                             each or "bad line <n>", then userns_choose with those
+ *                                             ranges taken: "chose <uid> <gid>" or "none: <why>"
+ *   unit userns-start <text>                  userns_start_ok: "ok <n>" or "refused"
+ *   unit volume-maps <uid> <gid> <uid_start> <gid_start>
+ *                                             volume_maps for a source of uid and gid: its two lines,
+ *                                             "uid_map <line>" and "gid_map <line>", or "plain"
+ *   unit userns-volume <uid_start> <gid_start> <src:dst>
+ *                                             open_userns_volume of a container with that range, as
+ *                                             start takes it, attached at dst in this mount namespace:
+ *                                             "attached", or "refused: <why>"
  *   unit port owner|remove <ifname> <name>    host_port_owner: absent, ours, foreign or unknown;
  *                                             remove_own_port: "result <n>"
  *   unit rtnl <request> [args...]             one rtnetlink request, "result <n>" or what it found:
@@ -31,6 +43,13 @@
  *                                             nft_setup_text, with bridge_accept_fwmark if given
  *   unit firewall nft-record <name> [<link>...]
  *                                             nft_links_record for a container with those links
+ *   unit firewall egress <name> <ip> [<dns>...]
+ *                                             firewall_egress_text for a container of --net outside
+ *   unit firewall nft-egress <ip> [<dns>...]  nft_egress_record for it
+ *   unit firewall both <name> <ip> <dns> <link>
+ *                                             what a start gives iptables-restore for a container
+ *                                             of --net outside with that name server and link
+ *   unit nftegress add|remove <record>        nft_egress_text for that record, or "refused"
  *   unit nftlinks add|remove <record>         nft_links_text for that record, or "refused"; a line
  *                                             it would take lies right after the record's end
  *   unit fwmark <text>                        parse_fwmark: lines "mark <m>", "mask <k>", "as <text>",
@@ -235,6 +254,17 @@ static void put_line(const char *label, const char *text) {
     put("\n");
 }
 
+/* a number of 64 bits on a line of its own: the harness prints ints */
+static void put_int64(int64_t number) {
+    if (number < 0) put("-");
+    uint64_t magnitude = number < 0 ? 0 - (uint64_t)number : (uint64_t)number;
+    char digits[24];
+    int at = (int)sizeof(digits);
+    digits[--at] = '\0';
+    do { digits[--at] = (char)('0' + magnitude % 10); magnitude /= 10; } while (magnitude);
+    put_line("", digits + at);
+}
+
 static uint32_t ipv4_arg(const char *text) {
     uint32_t addr;
     if (!parse_ipv4(text, &addr))
@@ -312,9 +342,38 @@ static void put_config(const container_config *config) {
     put_number("oom_score", config->oom_score);
     put_number("privileged", config->privileged);
     put_number("readonly", config->read_only);
+    put_line("seccomp ", config->seccomp_allow ? "allow" : "deny");
+    char mode[NET_MODE_TEXT_MAX];
+    net_mode_text(mode, config->net, config->proxy_port);
+    put_line("net ", mode);
+    put(config->ndns ? "dns " : "dns -");
+    for (int i = 0; i < config->ndns; i++) {
+        if (i)
+            put(",");
+        put(config->dns[i]);
+    }
+    put("\n");
     put_line("io ", config->io[0] ? config->io : "-");
     put_line("swap ", config->swap[0] ? config->swap : "-");
     put_line("base ", config->base[0] ? config->base : "-");
+    if (config->ttl[0]) {
+        put("ttl ");
+        put(config->ttl);
+        put(" ");
+        put_int64(config->ttl_ms);
+    } else {
+        put("ttl -\n");
+    }
+    if (config->userns) {
+        char u[11], g[11];
+        format_u32(u, config->uid_start);
+        format_u32(g, config->gid_start);
+        put("userns ");
+        put(u);
+        put_line(" ", g);
+    } else {
+        put("userns -\n");
+    }
     for (int i = 0; i < config->nvols; i++) {
         put("vol ");
         put(config->vols[i].src);
@@ -329,7 +388,7 @@ static void put_config(const container_config *config) {
 /* A field of a configuration set to a value as it is, however long it is
  * allowed to be and whatever is in it. */
 static void set_unchecked(container_config *config, const char *assignment) {
-    static const char *const fields[] = { "mem=", "pids=", "cpu=", "io=", "link=", "src=", "dst=", "swap=" };
+    static const char *const fields[] = { "mem=", "pids=", "cpu=", "io=", "link=", "src=", "dst=", "swap=", "ttl=" };
     size_t which = 0, len = 0;
     for (; which < sizeof(fields) / sizeof(fields[0]); which++) {
         len = lc_string_length(fields[which]);
@@ -355,6 +414,11 @@ static void set_unchecked(container_config *config, const char *assignment) {
                 config->nvols++;
                 break;
         case 7: fits = str_copy(config->swap, value, sizeof(config->swap)); break;
+        /* the text as it is, and what it means when it is a duration */
+        case 8: fits = str_copy(config->ttl, value, sizeof(config->ttl));
+                if (!parse_duration_ms(value, &config->ttl_ms))
+                    config->ttl_ms = 0;
+                break;
         default: break;
     }
     if (!fits)
@@ -720,6 +784,105 @@ int main(int argc, char **argv, char **envp) {
         put_number("left open", open_descriptors() - before);
         return 0;
     }
+    if (argc >= 4 && streq(argv[1], "subid")) {
+        static subid_range uids[SUBID_RANGES_MAX], gids[SUBID_RANGES_MAX];
+        static uint32_t taken[64][2];
+        int line = 0, nu, ng;
+        nu = subid_ranges(argv[2], USERNS_OWNER, uids, SUBID_RANGES_MAX, &line);
+        if (nu < 0) {
+            put_number("bad uid line", line);
+            return 0;
+        }
+        ng = subid_ranges(argv[3], USERNS_OWNER, gids, SUBID_RANGES_MAX, &line);
+        if (ng < 0) {
+            put_number("bad gid line", line);
+            return 0;
+        }
+        for (int i = 0; i < nu; i++) {
+            char s[11], c[11];
+            format_u32(s, uids[i].start);
+            format_u32(c, uids[i].count);
+            put("uid range ");
+            put(s);
+            put_line(" ", c);
+        }
+        int ntaken = 0;
+        for (int i = 4; i < argc && ntaken < 64; i++, ntaken++) {
+            char *colon = argv[i];
+            while (*colon && *colon != ':') colon++;
+            if (!*colon)
+                die("unit: subid ... <uid>:<gid>");
+            *colon = '\0';
+            if (!parse_u32_text(argv[i], &taken[ntaken][0]) || !parse_u32_text(colon + 1, &taken[ntaken][1]))
+                die("unit: subid ... <uid>:<gid>");
+        }
+        uint32_t u = 0, g = 0;
+        const char *why = userns_choose(uids, nu, gids, ng, (const uint32_t (*)[2])taken, ntaken, &u, &g);
+        if (why) {
+            put_line("none: ", why);
+        } else {
+            char su[11], sg[11];
+            format_u32(su, u);
+            format_u32(sg, g);
+            put("chose ");
+            put(su);
+            put_line(" ", sg);
+        }
+        return 0;
+    }
+    if (argc == 3 && streq(argv[1], "userns-start")) {
+        uint32_t start = 0;
+        if (userns_start_ok(argv[2], &start)) {
+            char s[11];
+            format_u32(s, start);
+            put_line("ok ", s);
+        } else {
+            put("refused\n");
+        }
+        return 0;
+    }
+    if (argc == 6 && streq(argv[1], "volume-maps")) {
+        uint32_t ids[4];
+        for (int i = 0; i < 4; i++)
+            if (!parse_u32_text(argv[2 + i], &ids[i]))
+                die2("unit: not a number: ", argv[2 + i]);
+        id_map uids, gids;
+        if (!volume_maps(ids[0], ids[1], ids[2], ids[3], &uids, &gids)) {
+            put("plain\n");
+            return 0;
+        }
+        char line[ID_MAP_LINE_MAX];
+        id_map_line(line, &uids);
+        put("uid_map ");
+        put(line);
+        id_map_line(line, &gids);
+        put("gid_map ");
+        put(line);
+        return 0;
+    }
+    if (argc == 5 && streq(argv[1], "userns-volume")) {
+        uint32_t uid_start, gid_start;
+        static volume_spec spec;
+        if (!parse_u32_text(argv[2], &uid_start) || !parse_u32_text(argv[3], &gid_start))
+            die("unit: a first uid and gid are numbers");
+        if (parse_volume_spec(argv[4], &spec) != NULL)
+            die2("unit: not a volume: ", argv[4]);
+        struct volume_mount vol;
+        const char *wrong = open_userns_volume(&spec, uid_start, gid_start, &vol);
+        if (wrong) {
+            put_line("refused: ", wrong);
+            return 0;
+        }
+        int rc = attach_tree(vol.tree, spec.dst);
+        if (rc < 0) {
+            char digits[16];
+            fmt_int(digits, -rc);
+            put_line("not attached, errno ", digits);
+            return 1;
+        }
+        put("attached\n");
+        return 0;
+    }
     if (argc == 4 && streq(argv[1], "owner")) {
         port_owner owner = port_owner_of_alias(argv[3], argv[2]);
         put(owner == PORT_OURS ? "ours\n" : owner == PORT_FOREIGN ? "foreign\n" : "other\n");
@@ -781,6 +944,48 @@ int main(int argc, char **argv, char **envp) {
                 cfg_global.accept_fwmark_set = true;
             }
             fits = nft_setup_text(&net, text, sizeof(text));
+        } else if (streq(argv[2], "egress") && argc >= 5) {
+            container_config_init(&config);
+            config.net = NET_OUTSIDE;
+            for (int i = 5; i < argc && config.ndns < MAX_DNS; i++)
+                if (!str_copy(config.dns[config.ndns++], argv[i], sizeof(config.dns[0])))
+                    die("unit: a name server that is too long");
+            fits = firewall_egress_text(argv[3], argv[4], "", &config, text, sizeof(text));
+        } else if (streq(argv[2], "egress-proxy") && argc == 7) {
+            int64_t port;
+            container_config_init(&config);
+            config.net = NET_PROXY;
+            if (!parse_number(argv[6], 0, 99999, &port))
+                die("unit: firewall egress-proxy <name> <ip> <gw> <port>");
+            config.proxy_port = (int)port;
+            fits = firewall_egress_text(argv[3], argv[4], argv[5], &config, text, sizeof(text));
+        } else if (streq(argv[2], "both") && argc == 7) {
+            static char links_text[FIREWALL_TEXT_MAX], egress_text[FIREWALL_TEXT_MAX];
+            container_config_init(&config);
+            config.net = NET_OUTSIDE;
+            config.ndns = 1;
+            config.nlinks = 1;
+            if (!str_copy(config.dns[0], argv[5], sizeof(config.dns[0])) ||
+                !str_copy(config.links[0], argv[6], sizeof(config.links[0])))
+                die("unit: firewall both <name> <ip> <dns> <link>");
+            fits = firewall_links_text(argv[3], &config, links_text, sizeof(links_text)) &&
+                   firewall_egress_text(argv[3], argv[4], "", &config, egress_text, sizeof(egress_text)) &&
+                   firewall_rules_text(false, links_text, egress_text, text, sizeof(text));
+        } else if (streq(argv[2], "nft-egress")) {
+            container_config_init(&config);
+            config.net = NET_OUTSIDE;
+            for (int i = 4; i < argc && config.ndns < MAX_DNS; i++)
+                if (!str_copy(config.dns[config.ndns++], argv[i], sizeof(config.dns[0])))
+                    die("unit: a name server that is too long");
+            fits = nft_egress_record("unit", argv[3], "", &config, text, sizeof(text));
+        } else if (streq(argv[2], "nft-egress-proxy") && argc == 7) {
+            int64_t port;
+            container_config_init(&config);
+            config.net = NET_PROXY;
+            if (!parse_number(argv[6], 0, 99999, &port))
+                die("unit: firewall nft-egress-proxy <name> <ip> <gw> <port>");
+            config.proxy_port = (int)port;
+            fits = nft_egress_record(argv[3], argv[4], argv[5], &config, text, sizeof(text));
         } else if (streq(argv[2], "nft-record")) {
             container_config_init(&config);
             for (int i = 4; i < argc && config.nlinks < MAX_LINKS; i++)
@@ -791,6 +996,11 @@ int main(int argc, char **argv, char **envp) {
             die("unit: firewall links <name> [<link>...] | firewall setup <subnet> <gw> <bridge> <true|false>");
         }
         put(fits ? text : "too long\n");
+        return 0;
+    }
+    if (argc == 4 && streq(argv[1], "nftegress")) {
+        static char text[FIREWALL_TEXT_MAX];
+        put(nft_egress_text(argv[3], streq(argv[2], "remove"), text, sizeof(text)) ? text : "refused\n");
         return 0;
     }
     if (argc == 4 && streq(argv[1], "nftlinks")) {
@@ -879,7 +1089,7 @@ int main(int argc, char **argv, char **envp) {
         return 0;
     }
     if (argc >= 3 && streq(argv[1], "sandbox")) {
-        apply_sandbox();
+        apply_sandbox(false);
         exec_program(argv[2], (const char *const *)(argv + 2), TOOL_ENV);
         die2("unit: cannot execute ", argv[2]);
     }
@@ -907,14 +1117,29 @@ int main(int argc, char **argv, char **envp) {
             put("refused\n");
             return 0;
         }
-        /* in two halves: the harness prints ints */
-        if (number < 0) put("-");
-        uint64_t magnitude = number < 0 ? 0 - (uint64_t)number : (uint64_t)number;
-        char digits[24];
-        int at = (int)sizeof(digits);
-        digits[--at] = '\0';
-        do { digits[--at] = (char)('0' + magnitude % 10); magnitude /= 10; } while (magnitude);
-        put_line("", digits + at);
+        put_int64(number);
+        return 0;
+    }
+    /* keeper <file>: exec --timeout's worker ending its cgroup without
+     * cgroup.kill, with a file of PIDs standing in for cgroup.procs */
+    if (argc == 3 && streq(argv[1], "keeper")) {
+        lc_sysret fd = lc_kernel_open_file(argv[2], O_RDONLY | O_CLOEXEC, 0);
+        if (fd < 0)
+            die2("unit: cannot open ", argv[2]);
+        struct exec_keeper k = { .kill_fd = -1, .procs_fd = (int32_t)fd, .caller_fd = -1, .deadline = 0 };
+        keeper_end(&k);
+    }
+    /* runner <text>: is the run that a .runner of this text names there? */
+    if (argc == 3 && streq(argv[1], "runner")) {
+        put(runner_alive(argv[2]) ? "alive\n" : "gone\n");
+        return 0;
+    }
+    if (argc == 3 && streq(argv[1], "duration")) {
+        int64_t ms;
+        if (parse_duration_ms(argv[2], &ms))
+            put_int64(ms);
+        else
+            put("refused\n");
         return 0;
     }
     if (argc == 4 && streq(argv[1], "limit")) {
@@ -1164,7 +1389,16 @@ int main(int argc, char **argv, char **envp) {
             unit_probe(argv[i]);
         return 0;
     }
-    if (argc >= 5 && streq(argv[1], "relay") && streq(argv[3], "--")) {
+    /* relay <pty> [<duration>] -- <command>: with a duration, the deadline of
+     * exec's --timeout, after which the worker is killed and "relay: timed
+     * out" is the last line on standard output */
+    bool limited = argc >= 6 && streq(argv[1], "relay") && streq(argv[4], "--");
+    if ((argc >= 5 && streq(argv[1], "relay") && streq(argv[3], "--")) || limited) {
+        int64_t limit_ms = 0;
+        if (limited && !parse_duration_ms(argv[3], &limit_ms))
+            die2("unit: not a duration: ", argv[3]);
+        int64_t deadline = limited ? monotonic_ms() + limit_ms : 0;
+        char **command_argv = argv + (limited ? 5 : 4);
         struct lb_termios modes;
         bool restore = lc_kernel_device_control(STDIN, LB_TCGETS, &modes) >= 0;
         int32_t signal_fd = hold_relay_signals();
@@ -1184,13 +1418,18 @@ int main(int argc, char **argv, char **envp) {
                 die("unit: cannot start the command");
             if (command == 0) {
                 take_streams(&streams);
-                exec_program(argv[4], (const char *const *)(uintptr_t)(argv + 4), (const char *const *)(uintptr_t)envp);
-                die2("unit: cannot execute ", argv[4]);
+                exec_program(command_argv[0], (const char *const *)(uintptr_t)command_argv,
+                             (const char *const *)(uintptr_t)envp);
+                die2("unit: cannot execute ", command_argv[0]);
             }
-            lc_kernel_exit(exit_code_from_status(serve_command(&streams, (int32_t)command, worker_signals)));
+            lc_kernel_exit(exit_code_from_status(serve_command(&streams, (int32_t)command, worker_signals, NULL)));
         }
 
-        return finish_exec((int32_t)worker, signal_fd, restore ? &modes : NULL);
+        bool timed_out;
+        int code = finish_exec((int32_t)worker, signal_fd, restore ? &modes : NULL, NULL, deadline, &timed_out);
+        if (timed_out)
+            put_line("relay: ", "timed out");
+        return code;
     }
     if (argc >= 2 && streq(argv[1], "sealed")) {
         run_sealed();

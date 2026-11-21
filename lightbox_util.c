@@ -1,20 +1,23 @@
 #include "lightbox.h"
+#include "lightbox_devices.h"
 
 void print_str(int32_t fd, const char *s) {
     lc_print_string(fd, s, lc_string_length(s));
 }
 
+int failure_status = 1;
+
 void die(const char *msg) {
     print_str(STDERR, msg);
     lc_print_char(STDERR, '\n');
-    lc_kernel_exit(1);
+    lc_kernel_exit(failure_status);
 }
 
 void die2(const char *prefix, const char *detail) {
     print_str(STDERR, prefix);
     print_str(STDERR, detail);
     lc_print_char(STDERR, '\n');
-    lc_kernel_exit(1);
+    lc_kernel_exit(failure_status);
 }
 
 bool streq(const char *a, const char *b) {
@@ -77,7 +80,7 @@ void str_copy_or_die(char *dst, const char *src, size_t max, const char *what) {
     print_str(STDERR, " is too long: ");
     print_str(STDERR, src);
     print_str(STDERR, "\n");
-    lc_kernel_exit(1);
+    lc_kernel_exit(failure_status);
 }
 
 void path_join_or_die(char *buf, size_t bufsz, const char *a, const char *b) {
@@ -88,7 +91,7 @@ void path_join_or_die(char *buf, size_t bufsz, const char *a, const char *b) {
     print_str(STDERR, "/");
     print_str(STDERR, b);
     print_str(STDERR, "\n");
-    lc_kernel_exit(1);
+    lc_kernel_exit(failure_status);
 }
 
 /* "/proc/<pid><suffix>" */
@@ -170,6 +173,52 @@ bool parse_int_in(const char *s, int min, int max, int *out) {
 
 bool parse_seconds(const char *s, int *out) {
     return s && s[0] != '-' && parse_int_in(s, 0, SECONDS_MAX, out);
+}
+
+bool parse_duration_ms(const char *text, int64_t *ms) {
+    if (!text || text[0] < '0' || text[0] > '9')
+        return false;
+
+    /* the whole seconds stop growing past the largest duration, so that
+     * nothing wraps around however many digits there are */
+    const int64_t max_seconds = DURATION_MAX_MS / 1000;
+    int64_t whole = 0, thousandths = 0;
+    size_t i = 0;
+    for (; text[i] >= '0' && text[i] <= '9'; i++) {
+        whole = whole * 10 + (text[i] - '0');
+        if (whole > max_seconds)
+            return false;
+    }
+    if (text[i] == '.') {
+        int digits = 0;
+        for (i++; text[i] >= '0' && text[i] <= '9'; i++, digits++) {
+            if (digits == 3)
+                return false;
+            thousandths = thousandths * 10 + (text[i] - '0');
+        }
+        if (digits == 0)
+            return false;
+        for (; digits < 3; digits++)
+            thousandths *= 10;
+    }
+
+    int64_t unit = 1;
+    if (text[i] == 's') unit = 1;
+    else if (text[i] == 'm') unit = 60;
+    else if (text[i] == 'h') unit = 3600;
+    else if (text[i] == 'd') unit = 86400;
+    else if (text[i] != '\0') return false;
+    if (text[i] != '\0' && text[i + 1] != '\0')
+        return false;
+
+    /* whole is at most max_seconds, so this fits; the test is on its parts */
+    if (whole > max_seconds / unit)
+        return false;
+    int64_t value = (whole * 1000 + thousandths) * unit;
+    if (value < 1 || value > DURATION_MAX_MS)
+        return false;
+    *ms = value;
+    return true;
 }
 
 int fmt_int(char *buf, int val) {
@@ -311,7 +360,7 @@ void require_tool(const char *label, const char *path) {
     print_str(STDERR, " (expected at ");
     print_str(STDERR, path ? path : "-");
     print_str(STDERR, ")\n");
-    lc_kernel_exit(1);
+    lc_kernel_exit(failure_status);
 }
 
 
@@ -854,7 +903,9 @@ int loopback_up(void) {
  * that asks for nosuid would quietly take nodev away. Here such a call keeps
  * read-only, nosuid, nodev and noexec from what the mount has now: it can add
  * restrictions and never removes one. mount(8), which lightbox ran for every
- * mount until 0.2, behaved the same way.
+ * mount until 0.2, behaved the same way. It keeps how the mount keeps access
+ * times too, unless the call says: in a user namespace, a mount that came
+ * with the copy of the host's may not have that changed.
  */
 int do_mount(const char *source, const char *target,
              const char *fstype, uint64_t flags, const char *data) {
@@ -865,6 +916,11 @@ int do_mount(const char *source, const char *target,
         rc = lb_sys_statfs(target, &now);
         if (rc >= 0)
             flags |= (uint64_t)now.f_flags & MOUNT_KEPT_FLAGS;
+        if (rc >= 0 && !(flags & (LB_MS_NOATIME | LB_MS_RELATIME | LB_MS_STRICTATIME))) {
+            uint64_t f = (uint64_t)now.f_flags;
+            flags |= (f & LB_ST_NOATIME) ? LB_MS_NOATIME : (f & LB_ST_RELATIME) ? LB_MS_RELATIME : LB_MS_STRICTATIME;
+            flags |= (f & LB_ST_NODIRATIME) ? LB_MS_NODIRATIME : 0;
+        }
     }
     if (rc >= 0)
         rc = lc_kernel_mount(source, target, fstype, flags, data);
@@ -878,5 +934,34 @@ int do_mount(const char *source, const char *target,
 void require_mount(const char *source, const char *target,
                    const char *fstype, uint64_t flags, const char *data) {
     if (do_mount(source, target, fstype, flags, data) != 0)
-        lc_kernel_exit(1);      /* do_mount has said what failed */
+        lc_kernel_exit(failure_status);      /* do_mount has said what failed */
+}
+
+/* ─── The device program ────────────────────────────────────────────────── */
+
+lc_sysret device_program_load(char *log, uint32_t log_size) {
+    static struct lb_ebpf_insn prog[LB_DEV_PROG_LEN];
+    if (log && log_size)
+        log[0] = '\0';
+    if (lb_devices_build(prog) != LB_DEV_PROG_LEN)
+        return -LB_EINVAL;
+    /* It calls no helper of the kernel's, which is all a license decides. */
+    struct lb_bpf_prog_load load = {
+        .prog_type = LB_BPF_PROG_TYPE_CGROUP_DEVICE,
+        .insn_cnt = LB_DEV_PROG_LEN,
+        .insns = (uint64_t)(uintptr_t)prog,
+        .license = (uint64_t)(uintptr_t)"",
+        .prog_name = "lightbox_dev",
+    };
+    lc_sysret fd = lb_sys_bpf(LB_BPF_PROG_LOAD, &load, sizeof(load));
+    if (fd < 0 && fd != -LB_EPERM && log && log_size > 1) {
+        load.log_level = 1;
+        load.log_size = log_size;
+        load.log_buf = (uint64_t)(uintptr_t)log;
+        lc_sysret again = lb_sys_bpf(LB_BPF_PROG_LOAD, &load, sizeof(load));
+        if (again >= 0)
+            lc_kernel_close_file((int32_t)again);
+        log[log_size - 1] = '\0';
+    }
+    return fd;
 }

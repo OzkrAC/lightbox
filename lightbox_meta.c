@@ -156,7 +156,7 @@ void cmd_logs(int argc, char **argv) {
             print_str(STDERR, "' (errno ");
             print_str(STDERR, digits);
             print_str(STDERR, ")\n");
-            lc_kernel_exit(1);
+            lc_kernel_exit(failure_status);
         }
 
         /* a container that was never started has no log, which is an empty one */
@@ -169,7 +169,7 @@ void cmd_logs(int argc, char **argv) {
             if (n == 0)
                 break;
             if (lc_kernel_write_all(STDOUT, buf, (size_t)n) < 0)
-                lc_kernel_exit(1);          /* nobody reads this any more */
+                lc_kernel_exit(failure_status);          /* nobody reads this any more */
             got_some = true;
         }
 
@@ -218,6 +218,19 @@ static void report_number(struct report *r, const char *key, int value) {
     json_key(key, r->first);
     r->first = false;
     print_str(STDOUT, digits);
+}
+
+/* An id up to 4294967295, or none: "-" and null. */
+static void report_id(struct report *r, const char *key, bool have, uint32_t value) {
+    char digits[11];
+    format_u32(digits, value);
+    if (!r->json) {
+        print_kv(key, have ? digits : "-");
+        return;
+    }
+    json_key(key, r->first);
+    r->first = false;
+    print_str(STDOUT, have ? digits : "null");
 }
 
 static void report_flag(struct report *r, const char *key, bool value, const char *yes, const char *no) {
@@ -356,9 +369,17 @@ void cmd_inspect(int argc, char **argv) {
         report_text(&r, "io", config.io[0] ? config.io : NULL);
         report_text(&r, "storage", config.base[0] ? "overlay" : "copy");
         report_text(&r, "base", config.base[0] ? config.base : NULL);
+        report_flag(&r, "userns", config.userns, "1", "0");
+        report_id(&r, "uid_start", config.userns, config.uid_start);
+        report_id(&r, "gid_start", config.userns, config.gid_start);
         report_number(&r, "oom_score", config.oom_score);
         report_flag(&r, "privileged", config.privileged, "1", "0");
         report_flag(&r, "readonly", config.read_only, "1", "0");
+        report_text(&r, "seccomp", config.privileged ? NULL : config.seccomp_allow ? "allow" : "deny");
+        char mode[NET_MODE_TEXT_MAX];
+        net_mode_text(mode, config.net, config.proxy_port);
+        report_text(&r, "net", mode);
+        report_text(&r, "ttl", config.ttl[0] ? config.ttl : NULL);
         report_volumes(&r, &config);
         report_links(&r, &config);
     }
@@ -560,6 +581,28 @@ static void check_cgroups(struct doctor *d) {
                "the kernel offers them in cgroup.controllers of cgroup_root unless its command line has cgroup_disable= for one");
 }
 
+/* The cgroup device program a container that is not privileged starts with
+ * (ROADMAP 8.4): loaded and let go, which only root may. */
+static void check_device_filter(struct doctor *d) {
+    if (lb_sys_geteuid() != 0) {
+        doc_yes_no(d, "device_filter", false, "not known: only root may load the program", "sudo lightbox doctor");
+        return;
+    }
+    static char log[2048];
+    lc_sysret fd = device_program_load(log, sizeof(log));
+    if (fd >= 0) {
+        lc_kernel_close_file((int32_t)fd);
+        doc_yes_no(d, "device_filter", true, "the kernel loads the cgroup device program", NULL);
+        return;
+    }
+    char text[96];
+    bool cut = false;
+    size_t pos = str_append(text, 0, "the kernel refuses the cgroup device program: errno ", sizeof(text), &cut);
+    fmt_int(text + pos, (int)-fd);
+    doc_yes_no(d, "device_filter", false, text,
+               "boot a kernel with CONFIG_CGROUP_BPF and CONFIG_BPF_SYSCALL; only a --privileged container starts without it");
+}
+
 /* The base root filesystem: a directory with something in it to copy. */
 static void check_rootfs(struct doctor *d) {
     const char *rootfs = cfg_global.rootfs;
@@ -670,6 +713,20 @@ void cmd_doctor(int argc, char **argv) {
         doc_setting(d, "overlayfs", overlay ? "yes" : "no (a new container is a copy of its base, not an overlay)",
                     overlay ? "true" : "false");
     }
+    /* told, not counted: only a container created with --userns needs one */
+    {
+        int ranges = userns_range_count();
+        char text[200], digits[16];
+        fmt_int(digits, ranges);
+        bool cut = false;
+        size_t pos = str_append(text, 0, ranges < 0 ? "unreadable" : digits, sizeof(text), &cut);
+        str_append(text, pos, ranges < 0 ? " (" SUBUID_FILE " or " SUBGID_FILE " has a line of " USERNS_OWNER "'s that is no range)"
+                              : ranges == 0 ? " (create --userns needs a line such as " USERNS_OWNER ":2147483647:2147483648 in "
+                                              SUBUID_FILE " and in " SUBGID_FILE ")"
+                              : " (ranges of 65536 ids; a container created with --userns takes one)",
+                   sizeof(text), &cut);
+        doc_setting(d, "userns_ranges", text, ranges < 0 ? "null" : digits);
+    }
     /* told, not counted: start makes what is missing, as setup does */
     {
         const char *missing = host_network_missing();
@@ -705,6 +762,7 @@ void cmd_doctor(int argc, char **argv) {
         }
     }
     check_cgroups(d);
+    check_device_filter(d);
     if (nftables && cfg_global.ip_forward) {
         char forwarding[8];
         bool on = read_file("/proc/sys/net/ipv4/ip_forward", forwarding, sizeof(forwarding)) > 0 && forwarding[0] == '1';
@@ -741,5 +799,5 @@ void cmd_doctor(int argc, char **argv) {
         print_kv("overall", d->failed == 0 ? "ok" : "degraded");
     }
     if (d->failed != 0)
-        lc_kernel_exit(1);
+        lc_kernel_exit(failure_status);
 }

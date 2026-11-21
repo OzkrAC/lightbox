@@ -34,6 +34,21 @@ void container_log_path(char *buf, const char *name) {
     path_join_or_die(buf, MAX_PATH, base, "console.log");
 }
 
+/* What create wrote in the container's resolv.conf, for reset (ROADMAP 8.8). */
+void container_resolv_path(char *buf, const char *name) {
+    char base[MAX_PATH];
+    container_dir_path(base, name);
+    path_join_or_die(buf, MAX_PATH, base, ".resolv");
+}
+
+/* Who runs a box of run (ROADMAP 8.8): "<pid> <start time>\n" of that run,
+ * for the next run to remove the box when it is gone. */
+void container_runner_path(char *buf, const char *name) {
+    char base[MAX_PATH];
+    container_dir_path(base, name);
+    path_join_or_die(buf, MAX_PATH, base, ".runner");
+}
+
 /* A mark that create has not finished with the container. It is in the
  * container's directory, written to stay: a container that is half made is
  * still half made after a reboot. */
@@ -65,6 +80,7 @@ void container_pid_start_path(char *buf, const char *name) { run_file_path(buf, 
 void container_state_path(char *buf, const char *name)     { run_file_path(buf, name, "state"); }
 void container_exit_path(char *buf, const char *name)      { run_file_path(buf, name, "exit"); }
 void container_firewall_path(char *buf, const char *name)  { run_file_path(buf, name, "firewall"); }
+void container_egress_path(char *buf, const char *name)    { run_file_path(buf, name, "egress"); }
 
 /*
  * Before 0.5 these records were files in the container's directory: .pid,
@@ -203,7 +219,7 @@ int get_container_pid(const char *name) {
     return parse_int_in(buf, 1, PIDS_LIMIT_MAX, &pid) ? pid : -1;
 }
 
-static int read_proc_starttime(int pid, char *buf, size_t bufsz) {
+int proc_starttime(int pid, char *buf, size_t bufsz) {
     char path[64], statbuf[512];
     if (!proc_pid_path(path, sizeof(path), pid, "/stat") ||
         read_file(path, statbuf, sizeof(statbuf)) <= 0)
@@ -246,7 +262,7 @@ static int read_proc_starttime(int pid, char *buf, size_t bufsz) {
 int container_record_pid(const char *name, int pid) {
     char path[MAX_PATH], pidbuf[16], started[32];
 
-    if (read_proc_starttime(pid, started, sizeof(started)) < 0)
+    if (proc_starttime(pid, started, sizeof(started)) < 0)
         return -1;
     if (container_run_dir_make(name) != 0)
         return -1;
@@ -300,7 +316,7 @@ container_liveness container_probe(const char *name) {
     char expected_start[32], actual_start[32];
     if (get_container_pid_starttime(name, expected_start, sizeof(expected_start)) < 0)
         return CONTAINER_DEAD;
-    if (read_proc_starttime(pid, actual_start, sizeof(actual_start)) < 0)
+    if (proc_starttime(pid, actual_start, sizeof(actual_start)) < 0)
         return may_look ? CONTAINER_DEAD : CONTAINER_RUNNING;
     if (!streq(expected_start, actual_start))
         return CONTAINER_DEAD;
@@ -336,8 +352,12 @@ void container_shown_state(const char *name, container_liveness live, char *buf,
         return;
     }
     get_container_state(name, buf, bufsz);
-    if (live == CONTAINER_DEAD || streq(buf, "running"))
-        str_copy_or_die(buf, "exited", bufsz, "a container's state");
+    if (live == CONTAINER_DEAD || streq(buf, "running")) {
+        /* init says so when --ttl ended it (ROADMAP 8.8) */
+        int status = 0;
+        bool expired = container_exit_report(name, &status) && status == INIT_EXPIRED;
+        str_copy_or_die(buf, expired ? "expired" : "exited", bufsz, "a container's state");
+    }
 }
 
 /* ─── Locks ─────────────────────────────────────────────────────────────── */
@@ -426,7 +446,7 @@ void require_root(const char *command) {
     print_str(STDERR, "Error: lightbox ");
     print_str(STDERR, command);
     print_str(STDERR, " must be run as root\n");
-    lc_kernel_exit(1);
+    lc_kernel_exit(failure_status);
 }
 
 /* ─── Listing ───────────────────────────────────────────────────────────── */

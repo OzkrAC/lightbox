@@ -102,7 +102,7 @@ static void cfg_set_text(const char *key, const char *val, char *setting, size_t
     print_str(STDERR, " in lightbox.conf is too long: ");
     print_str(STDERR, val);
     print_str(STDERR, "\n");
-    lc_kernel_exit(1);
+    lc_kernel_exit(failure_status);
 }
 
 /*
@@ -231,7 +231,7 @@ static void require_short_directories(void) {
                           " characters a directory setting may have: ");
         print_str(STDERR, dirs[i].value);
         print_str(STDERR, "\n");
-        lc_kernel_exit(1);
+        lc_kernel_exit(failure_status);
     }
 }
 

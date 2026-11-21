@@ -16,9 +16,11 @@
  *   oom_score=500
  *   privileged=1            only when set, like the three after it
  *   readonly=1
- *   userns=0 and uid_start=<n>, which lightbox up to 0.5 could write, are
- *   read and mean nothing; userns=1 is refused, as user namespaces are not
- *   supported yet
+ *   userns=1                only with --userns, and then with the two after it:
+ *   uid_start=<n>           the host's uid and gid of the container's 0, the
+ *   gid_start=<n>           first of USERNS_SIZE of each; userns=0 and a
+ *                           uid_start alone, which lightbox up to 0.5 could
+ *                           write, mean nothing
  *   io=8:0 rbps=1048576     only when given: <major>:<minor>, and rbps, wbps,
  *                           riops or wiops, each at most once
  *   vol=/src:/dst[:ro]      once for each volume, in the order they are mounted
@@ -166,6 +168,76 @@ bool parse_cpu_limit(const char *text, int *quota_us) {
 
 bool parse_oom_score(const char *text, int *out) {
     return parse_int_in(text, OOM_SCORE_MIN, OOM_SCORE_MAX, out);
+}
+
+bool parse_seccomp_profile(const char *text, bool *allow) {
+    if (!streq(text, "allow") && !streq(text, "deny"))
+        return false;
+    *allow = streq(text, "allow");
+    return true;
+}
+
+static const char *const NET_MODE_NAMES[] = { [NET_NAT] = "nat", [NET_OUTSIDE] = "outside", [NET_NONE] = "none" };
+
+#define NET_PROXY_PREFIX "proxy:"
+
+/* proxy:<port>: a port from 1 to 65535 in decimal, as fmt_int writes it */
+bool parse_net_mode(const char *text, int *mode, int *proxy_port) {
+    for (int i = 0; i < (int)(sizeof(NET_MODE_NAMES) / sizeof(NET_MODE_NAMES[0])); i++) {
+        if (streq(text, NET_MODE_NAMES[i])) {
+            *mode = i;
+            *proxy_port = 0;
+            return true;
+        }
+    }
+    size_t head = sizeof(NET_PROXY_PREFIX) - 1;
+    int64_t port;
+    if (!lc_string_starts_with(text, lc_string_length(text), NET_PROXY_PREFIX, head) ||
+        text[head] < '1' || text[head] > '9' || !parse_number(text + head, 1, 65535, &port))
+        return false;
+    *mode = NET_PROXY;
+    *proxy_port = (int)port;
+    return true;
+}
+
+void net_mode_text(char out[NET_MODE_TEXT_MAX], int mode, int proxy_port) {
+    if (mode == NET_PROXY && proxy_port >= 1 && proxy_port <= 65535) {
+        size_t head = sizeof(NET_PROXY_PREFIX) - 1;
+        lc_bytes_copy(out, NET_PROXY_PREFIX, head);
+        fmt_int(out + head, proxy_port);
+        return;
+    }
+    const char *name = mode >= NET_NAT && mode <= NET_NONE ? NET_MODE_NAMES[mode] : "?";
+    lc_bytes_copy(out, name, lc_string_length(name) + 1);
+}
+
+/* "a,b,c": one to MAX_DNS IPv4 addresses, each in the form format_ipv4 writes */
+static bool parse_dns_list(const char *text, container_config *config) {
+    int n = 0;
+    const char *p = text;
+    for (;;) {
+        char one[16];
+        size_t len = 0;
+        while (p[len] && p[len] != ',')
+            len++;
+        uint32_t addr;
+        char back[IPV4_TEXT_MAX];
+        if (len == 0 || len >= sizeof(one) || n >= MAX_DNS)
+            return false;
+        lc_bytes_copy(one, p, len);
+        one[len] = '\0';
+        if (!parse_ipv4(one, &addr))
+            return false;
+        format_ipv4(back, addr);
+        if (!streq(back, one))
+            return false;
+        lc_bytes_copy(config->dns[n++], one, len + 1);
+        if (!p[len])
+            break;
+        p += len + 1;
+    }
+    config->ndns = n;
+    return true;
 }
 
 /* ─── Volumes ───────────────────────────────────────────────────────────── */
@@ -380,6 +452,8 @@ enum {
     KEY_MEM = 1 << 0, KEY_PIDS = 1 << 1, KEY_CPU = 1 << 2, KEY_OOM = 1 << 3,
     KEY_PRIVILEGED = 1 << 4, KEY_READONLY = 1 << 5, KEY_USERNS = 1 << 6,
     KEY_UID_START = 1 << 7, KEY_IO = 1 << 8, KEY_SWAP = 1 << 9, KEY_BASE = 1 << 10,
+    KEY_GID_START = 1 << 11, KEY_SECCOMP = 1 << 12, KEY_NET = 1 << 13, KEY_DNS = 1 << 14,
+    KEY_TTL = 1 << 15,
 };
 
 static unsigned key_bit(const char *key) {
@@ -387,6 +461,8 @@ static unsigned key_bit(const char *key) {
         { "mem", KEY_MEM }, { "pids", KEY_PIDS }, { "cpu", KEY_CPU }, { "oom_score", KEY_OOM },
         { "privileged", KEY_PRIVILEGED }, { "readonly", KEY_READONLY }, { "userns", KEY_USERNS },
         { "uid_start", KEY_UID_START }, { "io", KEY_IO }, { "swap", KEY_SWAP }, { "base", KEY_BASE },
+        { "gid_start", KEY_GID_START }, { "seccomp", KEY_SECCOMP }, { "net", KEY_NET },
+        { "dns", KEY_DNS }, { "ttl", KEY_TTL },
     };
     for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
         if (streq(key, keys[i].name))
@@ -482,19 +558,26 @@ static const char *config_line(container_config *config, char *line, unsigned *s
             return parse_flag(value, &config->privileged) ? NULL : "privileged is not 0 or 1";
         case KEY_READONLY:
             return parse_flag(value, &config->read_only) ? NULL : "readonly is not 0 or 1";
-        case KEY_USERNS: {
-            bool userns;
-            if (!parse_flag(value, &userns))
-                return "userns is not 0 or 1";
-            return userns ? "userns=1: user namespaces are not supported yet" : NULL;
-        }
+        case KEY_USERNS:
+            return parse_flag(value, &config->userns) ? NULL : "userns is not 0 or 1";
         case KEY_BASE:
             return base_id_ok(value) && str_copy(config->base, value, sizeof(config->base))
                    ? NULL : "base is not the id of a base snapshot";
-        case KEY_UID_START: {
-            int uid_start;
-            return parse_int_in(value, 0, INT32_MAX, &uid_start) ? NULL : "uid_start is not a number";
-        }
+        case KEY_UID_START:
+            /* up to 0.5, a number that meant nothing; checked as a range when userns=1 */
+            return parse_u32_text(value, &config->uid_start) ? NULL : "uid_start is not a number";
+        case KEY_GID_START:
+            return parse_u32_text(value, &config->gid_start) ? NULL : "gid_start is not a number";
+        case KEY_SECCOMP:
+            return parse_seccomp_profile(value, &config->seccomp_allow) ? NULL : "seccomp is not allow or deny";
+        case KEY_NET:
+            return parse_net_mode(value, &config->net, &config->proxy_port)
+                   ? NULL : "net is not nat, outside, none or proxy:<port>";
+        case KEY_DNS:
+            return parse_dns_list(value, config) ? NULL : "dns is not a list of up to " STRINGIFY(MAX_DNS) " IPv4 addresses";
+        case KEY_TTL:
+            return parse_duration_ms(value, &config->ttl_ms) && str_copy(config->ttl, value, sizeof(config->ttl))
+                   ? NULL : "ttl is not a duration from 1 ms to 365 days, such as 30m or 8h";
         default:    /* KEY_IO */
             return io_limit_ok(value) && str_copy(config->io, value, sizeof(config->io))
                    ? NULL : "io is not <major>:<minor> with rbps, wbps, riops or wiops =<number> or =max";
@@ -526,6 +609,19 @@ const char *container_config_parse(char *text, const char *path, container_confi
             first = false;
         }
         line = last ? end : end + 1;
+    }
+
+    if (config->userns) {
+        char text_uid[11], text_gid[11];
+        format_u32(text_uid, config->uid_start);
+        format_u32(text_gid, config->gid_start);
+        uint32_t ignored;
+        /* one that is not there is 0, which starts no range */
+        if (!userns_start_ok(text_uid, &ignored) || !userns_start_ok(text_gid, &ignored))
+            return config_problem(path, 0, "has userns=1 without a uid_start and a gid_start of a range of "
+                                  "65536 ids that has neither 0 nor 4294967295 in it", NULL);
+    } else {
+        config->uid_start = config->gid_start = 0;
     }
 
     const char *unusable = container_config_fill_defaults(config);
@@ -588,9 +684,16 @@ static bool same_config(const container_config *a, const container_config *b) {
     if (!streq(a->mem, b->mem) || !streq(a->swap, b->swap) || !streq(a->pids, b->pids) ||
         !streq(a->cpu, b->cpu) ||
         !streq(a->io, b->io) || !streq(a->base, b->base) || a->oom_score != b->oom_score ||
-        a->privileged != b->privileged || a->read_only != b->read_only ||
+        a->privileged != b->privileged || a->read_only != b->read_only || a->userns != b->userns ||
+        a->uid_start != b->uid_start || a->gid_start != b->gid_start ||
+        a->seccomp_allow != b->seccomp_allow || a->net != b->net || a->proxy_port != b->proxy_port ||
+        a->ndns != b->ndns || !streq(a->ttl, b->ttl) || a->ttl_ms != b->ttl_ms ||
         a->nvols != b->nvols || a->nlinks != b->nlinks)
         return false;
+    for (int i = 0; i < a->ndns; i++) {
+        if (!streq(a->dns[i], b->dns[i]))
+            return false;
+    }
     for (int i = 0; i < a->nvols; i++) {
         if (!streq(a->vols[i].src, b->vols[i].src) || !streq(a->vols[i].dst, b->vols[i].dst) ||
             a->vols[i].ro != b->vols[i].ro)
@@ -617,10 +720,38 @@ const char *container_config_save(const char *name, const container_config *conf
     put_number(&out, "oom_score", config->oom_score);
     if (config->privileged) put_line(&out, "privileged", "1");
     if (config->read_only)  put_line(&out, "readonly", "1");
+    /* without the line, the deny-list: what create --seccomp deny makes, and
+     * what every container had before 0.8 */
+    if (config->seccomp_allow) put_line(&out, "seccomp", "allow");
+    /* without the line, nat: what create --net nat makes, and what every
+     * container had before 0.8 */
+    if (config->net != NET_NAT) {
+        char mode[NET_MODE_TEXT_MAX];
+        net_mode_text(mode, config->net, config->proxy_port);
+        put_line(&out, "net", mode);
+    }
+    if (config->ndns > 0) {
+        put(&out, "dns=");
+        for (int i = 0; i < config->ndns; i++) {
+            if (i) put(&out, ",");
+            put(&out, config->dns[i]);
+        }
+        put(&out, "\n");
+    }
+    if (config->userns) {
+        char digits[11];
+        put_line(&out, "userns", "1");
+        format_u32(digits, config->uid_start);
+        put_line(&out, "uid_start", digits);
+        format_u32(digits, config->gid_start);
+        put_line(&out, "gid_start", digits);
+    }
     if (config->io[0])
         put_line(&out, "io", config->io);
     if (config->base[0])
         put_line(&out, "base", config->base);
+    if (config->ttl[0])
+        put_line(&out, "ttl", config->ttl);
 
     for (int i = 0; i < config->nvols; i++) {
         const volume_spec *vol = &config->vols[i];
