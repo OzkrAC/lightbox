@@ -1107,6 +1107,15 @@ int main(int argc, char **argv, char **envp) {
         put_int64(number);
         return 0;
     }
+    /* keeper <file>: exec --timeout's worker ending its cgroup without
+     * cgroup.kill, with a file of PIDs standing in for cgroup.procs */
+    if (argc == 3 && streq(argv[1], "keeper")) {
+        lc_sysret fd = lc_kernel_open_file(argv[2], O_RDONLY | O_CLOEXEC, 0);
+        if (fd < 0)
+            die2("unit: cannot open ", argv[2]);
+        struct exec_keeper k = { .kill_fd = -1, .procs_fd = (int32_t)fd, .caller_fd = -1, .deadline = 0 };
+        keeper_end(&k);
+    }
     if (argc == 3 && streq(argv[1], "duration")) {
         int64_t ms;
         if (parse_duration_ms(argv[2], &ms))
@@ -1395,7 +1404,7 @@ int main(int argc, char **argv, char **envp) {
                              (const char *const *)(uintptr_t)envp);
                 die2("unit: cannot execute ", command_argv[0]);
             }
-            lc_kernel_exit(exit_code_from_status(serve_command(&streams, (int32_t)command, worker_signals)));
+            lc_kernel_exit(exit_code_from_status(serve_command(&streams, (int32_t)command, worker_signals, NULL)));
         }
 
         bool timed_out;

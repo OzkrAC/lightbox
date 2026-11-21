@@ -1287,6 +1287,21 @@ h_deadline_ends_the_worker() {
     [ $rc -eq 4 ] && [ "$out" = done ] && [ "$ms" -lt 2500 ]
 }
 
+# Without cgroup.kill, exec --timeout's worker kills what the exec's
+# cgroup.procs lists, and then itself: here a file lists one process.
+h_keeper_kills_what_is_listed() {
+    local victim rc vrc
+    sleep 1081 &
+    victim=$!
+    echo "$victim" > "$D/procs"
+    "$UNIT" keeper "$D/procs"
+    rc=$?
+    wait "$victim"
+    vrc=$?
+    echo "the worker ended with $rc, the process it listed with $vrc"
+    [ $rc -eq 137 ] && [ $vrc -eq 137 ]
+}
+
 # More than a pipe or a terminal holds at once, in both directions.
 h_plenty_goes_through() {
     seq 1 30000 > "$D/numbers"
@@ -1324,6 +1339,7 @@ t_streams_half_a_terminal()     { in_scratch_dir h_pipes_for_half_a_terminal; }
 t_streams_signals()             { in_scratch_dir h_signals_are_passed_on; }
 t_streams_plenty()              { in_scratch_dir h_plenty_goes_through; }
 t_streams_deadline()            { in_scratch_dir h_deadline_ends_the_worker; }
+t_streams_keeper()              { in_scratch_dir h_keeper_kills_what_is_listed; }
 
 # ─── exec: the binary it runs from ──────────────────────────────────────────
 
@@ -3239,6 +3255,7 @@ check 'a pipe stands in where only one side is a terminal'       t_streams_half_
 check 'a signal that asks exec to end reaches the command'       t_streams_signals
 check 'plenty of data goes through, both ways'                   t_streams_plenty
 check "at exec's deadline the worker is killed; before it, the status is the command's" t_streams_deadline
+check "without cgroup.kill, the worker of exec --timeout kills what its cgroup lists, then itself" t_streams_keeper
 
 check 'exec executes itself again from a sealed copy in memory'  t_exec_runs_from_a_sealed_copy
 check 'a read-only mount of the binary does where memfds may not' t_exec_sealing_by_a_read_only_mount

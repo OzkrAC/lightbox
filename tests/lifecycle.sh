@@ -765,6 +765,41 @@ t_exec_timeout() {
     [ "$(state_of extime)" = running ] || { echo "the container: $(state_of extime)"; return 1; }
 }
 
+none_running() { local w; for w; do running_cmd "$w" && return 1; done; return 0; }  # command lines
+
+# exec --timeout holds without the process that ran exec: its worker, which
+# the container cannot reach, ends the command and all it started at once
+# when that process is killed, and a second past the deadline when it is
+# stopped, after which it returns 124.
+t_exec_timeout_without_its_exec() {
+    local front began ms rc
+    up exkeep || return 1
+    "$LB" exec exkeep --timeout 60s /bin/sh -c "$KIT setsid sleep 1077 >/dev/null 2>&1 </dev/null & exec sleep 1078" \
+        >/dev/null 2>&1 </dev/null &
+    front=$!
+    wait_until 5 running_cmd 'sleep 1077' && wait_until 5 running_cmd 'sleep 1078' ||
+        { echo "the command did not start"; kill -KILL "$front"; return 1; }
+    kill -KILL "$front"
+    wait "$front" 2>/dev/null
+    wait_until 3 none_running 'sleep 1077' 'sleep 1078' || { echo "the command outlived its exec"; return 1; }
+    sh_in exkeep true || return 1
+    [ -z "$(exec_cgroups exkeep)" ] || { echo "left: $(exec_cgroups exkeep)"; return 1; }
+
+    "$LB" exec exkeep --timeout 1s /bin/sh -c "exec sleep 1079" >/dev/null 2>"$OUT/exkeep.err" </dev/null &
+    front=$!
+    wait_until 5 running_cmd 'sleep 1079' || { echo "the second did not start"; kill -KILL "$front"; return 1; }
+    kill -STOP "$front"
+    began=$(date +%s%N)
+    wait_until 5 none_running 'sleep 1079' || { kill -KILL "$front"; echo "the command outlived its deadline"; return 1; }
+    ms=$(( ($(date +%s%N) - began) / 1000000 ))
+    kill -CONT "$front"
+    wait "$front"
+    rc=$?
+    cat "$OUT/exkeep.err"
+    echo "with exec stopped, the command ended $ms ms after that; exec returned $rc"
+    [ "$ms" -lt 3000 ] && [ "$rc" = 124 ]
+}
+
 # A container whose init died with an exec's cgroup left below its own is
 # cleared away whole, the exec's cgroup first.
 t_exec_cgroup_of_a_dead_init() {
@@ -3710,6 +3745,7 @@ if [ "$MODE" = inside ]; then
     check "exec returns the command's status, and 125, 126 and 127 for what is not the command's" t_exec_status
     check 'an exec runs in a cgroup of its own, and stop takes away one that is left' t_exec_cgroup
     check 'exec --timeout ends the command and all it started, and returns 124' t_exec_timeout
+    check 'exec --timeout holds when the exec is killed or stopped'      t_exec_timeout_without_its_exec
     check "the cgroup an exec left goes with a container whose init died" t_exec_cgroup_of_a_dead_init
     check 'exec without a command runs a shell on standard input'         t_exec_default_shell
     check 'a container has its own hostname, processes and root'          t_own_world

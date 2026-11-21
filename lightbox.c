@@ -404,9 +404,21 @@ static const char *cgroup_create(const char *name, int pid, const container_conf
  * a buffer that ends in the middle of one, it would be another process's.
  * How many there were, or -1 when the list could not be read.
  */
+static int each_listed_pid_in(int32_t fd, void (*fn)(int pid));
+
 static int each_listed_pid(const char *procs_path, void (*fn)(int pid)) {
     lc_sysret fd = lc_kernel_open_file(procs_path, O_RDONLY | O_CLOEXEC, 0);
     if (fd < 0)
+        return -1;
+    int count = each_listed_pid_in((int32_t)fd, fn);
+    lc_kernel_close_file((int32_t)fd);
+    return count;
+}
+
+/* The same, from the start of a cgroup.procs that is open: read again from
+ * its beginning every time. The descriptor stays open. */
+static int each_listed_pid_in(int32_t fd, void (*fn)(int pid)) {
+    if (lc_kernel_seek_position(fd, 0, SEEK_SET) < 0)
         return -1;
 
     char buf[4096];
@@ -414,11 +426,9 @@ static int each_listed_pid(const char *procs_path, void (*fn)(int pid)) {
     int64_t pid = 0;
     bool in_number = false;
     for (;;) {
-        lc_sysret n = lc_kernel_read_retry((int32_t)fd, buf, sizeof(buf));
-        if (n < 0) {
-            lc_kernel_close_file((int32_t)fd);
+        lc_sysret n = lc_kernel_read_retry(fd, buf, sizeof(buf));
+        if (n < 0)
             return -1;
-        }
         /* at the end of the list a number without a newline ends too */
         for (lc_sysret i = 0; i < (n == 0 ? 1 : n); i++) {
             char c = n == 0 ? '\n' : buf[i];
@@ -438,7 +448,6 @@ static int each_listed_pid(const char *procs_path, void (*fn)(int pid)) {
         if (n == 0)
             break;
     }
-    lc_kernel_close_file((int32_t)fd);
     return count;
 }
 
@@ -2036,6 +2045,8 @@ struct exec_request {
     const char  *workdir;               /* --workdir, or NULL */
     int64_t      timeout_ms;            /* --timeout, or 0 */
     const char  *timeout_text;          /* as it was given */
+    int64_t      keeper_deadline;       /* with --timeout: when the worker ends it, the caller failing */
+    int32_t      caller_fd;             /* with --timeout: a pidfd of the process that ran exec */
     const char  *term;                  /* the caller's TERM, or NULL */
     const char  *proxy[PROXY_ENV_COUNT];    /* --net proxy: where its proxy is */
     int          nproxy;
@@ -2941,18 +2952,89 @@ static uint64_t relay_signal_mask(void) {
  * what it wrote last is still delivered; what something it left behind may
  * write later is not waited for.
  */
-static int32_t relay_until_exit(struct exec_streams *st, int32_t command, int32_t signal_fd) {
+/*
+ * exec --timeout is kept by two processes. The one that ran exec ends the
+ * exec's cgroup at the deadline; its worker, which the container cannot
+ * reach, keeps watch too, should that one not: when the process that ran
+ * exec ends, killed or otherwise, while the command runs, the worker ends
+ * everything in the cgroup at once, itself with it, and when that process
+ * is held up, stopped for one, the worker does so EXEC_KEEPER_MARGIN_MS past
+ * the deadline. Only root on the host, by killing both, can let a command
+ * outlive its limit.
+ */
+#define EXEC_KEEPER_MARGIN_MS 1000
+
+struct exec_keeper {
+    int32_t kill_fd;        /* the exec's cgroup.kill, or -1 before Linux 5.14 */
+    int32_t procs_fd;       /* its cgroup.procs */
+    int32_t caller_fd;      /* a pidfd of the process that ran exec */
+    int64_t deadline;       /* monotonic ms */
+};
+
+/* In the worker, on the host still: what it needs to end the exec's cgroup
+ * with from inside the container. Ends the process when it cannot. */
+static void keeper_open(struct exec_keeper *k, const char *cg, const struct exec_request *req) {
+    char path[MAX_PATH];
+    k->caller_fd = req->caller_fd;
+    k->deadline = req->keeper_deadline;
+    k->kill_fd = -1;
+    if (path_join(path, sizeof(path), cg, "cgroup.kill")) {
+        lc_sysret fd = lc_kernel_open_file(path, O_WRONLY | O_CLOEXEC, 0);
+        if (fd >= 0)
+            k->kill_fd = (int32_t)fd;
+    }
+    lc_sysret procs = path_join(path, sizeof(path), cg, "cgroup.procs")
+                          ? lc_kernel_open_file(path, O_RDONLY | O_CLOEXEC, 0) : -1;
+    if (procs < 0)
+        die("Error: cannot open the cgroup.procs of the exec, to keep its --timeout with");
+    k->procs_fd = (int32_t)procs;
+}
+
+static int keeper_self;
+
+static void kill_unless_keeper(int pid) {
+    if (pid != keeper_self)
+        lc_kernel_send_signal(pid, SIGKILL);
+}
+
+/* End everything in the exec's cgroup, this worker last. */
+[[noreturn]] static void keeper_end(const struct exec_keeper *k) {
+    if (k->kill_fd >= 0)
+        (void)lc_kernel_write_bytes(k->kill_fd, "1", 1);   /* this process with the rest */
+    keeper_self = lc_kernel_get_process_id();
+    int64_t until = monotonic_ms() + CGROUP_EMPTY_MS;
+    while (each_listed_pid_in(k->procs_fd, kill_unless_keeper) > 1 && monotonic_ms() < until)
+        sleep_ms(10);
+    lc_kernel_send_signal(keeper_self, SIGKILL);
+    lc_kernel_exit(EXEC_TIMED_OUT);
+}
+
+static int32_t relay_until_exit(struct exec_streams *st, int32_t command, int32_t signal_fd,
+                                const struct exec_keeper *keeper) {
     int32_t status = 0;
     bool ended = false;
 
     while (!ended) {
-        struct lb_pollfd fds[4];
-        struct channel *of[4];
-        bool writing[4];
+        struct lb_pollfd fds[5];
+        struct channel *of[5];
+        bool writing[5];
         uint64_t count = 0;
 
         fds[count] = (struct lb_pollfd){ .fd = signal_fd, .events = LB_POLLIN, .revents = 0 };
         of[count++] = NULL;
+        /* the process that ran exec: readable once it has ended */
+        lc_timespec left, *wait = NULL;
+        if (keeper) {
+            fds[count] = (struct lb_pollfd){ .fd = keeper->caller_fd, .events = LB_POLLIN, .revents = 0 };
+            writing[count] = false;
+            of[count++] = NULL;
+            int64_t ms = keeper->deadline - monotonic_ms();
+            if (ms <= 0)
+                keeper_end(keeper);
+            left.seconds = ms / 1000;
+            left.nanoseconds = (ms % 1000) * 1000000;
+            wait = &left;
+        }
         for (int i = 0; i < st->nchannels; i++) {
             struct channel *c = &st->channels[i];
             if (c->have > c->sent && c->to >= 0) {
@@ -2966,11 +3048,13 @@ static int32_t relay_until_exit(struct exec_streams *st, int32_t command, int32_
             }
         }
 
-        lc_sysret ready = lb_sys_ppoll(fds, count, NULL);
+        lc_sysret ready = lb_sys_ppoll(fds, count, wait);
         if (ready < 0 && ready != -LB_EINTR)
             die("Error: failed to wait on the command's streams");
         if (ready <= 0)
             continue;
+        if (keeper && fds[1].revents)
+            keeper_end(keeper);
 
         if (fds[0].revents & LB_POLLIN) {
             lc_signal_info si;
@@ -2986,7 +3070,7 @@ static int32_t relay_until_exit(struct exec_streams *st, int32_t command, int32_
                 }
             }
         }
-        for (uint64_t i = 1; i < count; i++) {
+        for (uint64_t i = keeper ? 2 : 1; i < count; i++) {
             if (!fds[i].revents)
                 continue;
             if (writing[i])
@@ -3020,7 +3104,8 @@ static int32_t relay_until_exit(struct exec_streams *st, int32_t command, int32_
  * time, and gets its modes back at the end; the process that ran exec keeps
  * them too and puts them back once more, in case this one is killed.
  */
-static int32_t serve_command(struct exec_streams *st, int32_t command, int32_t signal_fd) {
+static int32_t serve_command(struct exec_streams *st, int32_t command, int32_t signal_fd,
+                             const struct exec_keeper *keeper) {
     release_command_ends(st);
 
     struct lb_termios saved, raw;
@@ -3031,7 +3116,7 @@ static int32_t serve_command(struct exec_streams *st, int32_t command, int32_t s
         lc_kernel_device_control(STDIN, LB_TCSETS, &raw);
     }
 
-    int32_t status = relay_until_exit(st, command, signal_fd);
+    int32_t status = relay_until_exit(st, command, signal_fd, keeper);
 
     if (restore)
         lc_kernel_device_control(STDIN, LB_TCSETS, &saved);
@@ -3048,6 +3133,16 @@ static int32_t hold_relay_signals(void) {
         return -1;
     lc_sysret fd = lc_kernel_create_signal_fd(-1, &read_here, SFD_CLOEXEC);
     return fd < 0 ? -1 : (int32_t)fd;
+}
+
+/*
+ * A worker killed past the deadline was ended for its time limit, by its own
+ * keeper when this process was held up: *timed_out says so.
+ */
+static int32_t worker_status(int32_t status, int64_t deadline, bool *timed_out) {
+    if (deadline && (status & 0x7f) == SIGKILL && monotonic_ms() >= deadline)
+        *timed_out = true;
+    return status;
 }
 
 /*
@@ -3068,7 +3163,7 @@ static int32_t attend_worker(int32_t worker, int32_t signal_fd, const char *cg, 
             if (ms <= 0) {
                 /* a command that ended just now has its own status */
                 if (lc_kernel_wait_for_child(worker, &status, WNOHANG) == worker)
-                    return status;
+                    return worker_status(status, deadline, timed_out);
                 *timed_out = true;
                 if (cg)
                     (void)cgroup_kill_all(cg);
@@ -3090,7 +3185,7 @@ static int32_t attend_worker(int32_t worker, int32_t signal_fd, const char *cg, 
             continue;
         if (si.signal == SIGCHLD) {
             if (lc_kernel_wait_for_child(worker, &status, WNOHANG) == worker)
-                return status;
+                return worker_status(status, deadline, timed_out);
         } else if (si.signal != LB_SIGWINCH && si.code <= 0) {
             lc_kernel_send_signal(worker, (int32_t)si.signal);
         }
@@ -3144,6 +3239,11 @@ static int exec_inside_container(const char *cg, int target_pid, int privileged,
     /* Join the exec's cgroup, below the container's, before switching mount
      * namespaces: what is forked from here on is in it. */
     cgroup_join_self(cg);
+    /* and with --timeout, what keeps the limit should the process that ran
+     * exec not, opened here on the host */
+    static struct exec_keeper keeper;
+    if (req->timeout_ms)
+        keeper_open(&keeper, cg, req);
     /* and when memory runs short, be what the container's processes are to
      * the kernel, not what the caller of exec was */
     {
@@ -3203,7 +3303,7 @@ static int exec_inside_container(const char *cg, int target_pid, int privileged,
         run_command(req, &id);
     }
 
-    return serve_command(&streams, (int32_t)child, signal_fd);
+    return serve_command(&streams, (int32_t)child, signal_fd, req->timeout_ms ? &keeper : NULL);
 }
 
 /* ─── Starting: the command's side ──────────────────────────────────────── */
@@ -4792,6 +4892,15 @@ static void cmd_exec(int argc, char **argv) {
 
     static char cg[MAX_PATH];
     exec_cgroup_make(name, cg);
+    if (req.timeout_ms) {
+        lc_sysret self = lb_sys_pidfd_open(lc_kernel_get_process_id(), 0);
+        if (self < 0) {
+            exec_cgroup_end(name, cg, false);
+            die("Error: --timeout needs a pidfd (Linux 5.3), for the worker to keep the limit with");
+        }
+        req.caller_fd = (int32_t)self;
+        req.keeper_deadline = started + req.timeout_ms + EXEC_KEEPER_MARGIN_MS;
+    }
 
     int32_t signal_fd = hold_relay_signals();
     if (signal_fd < 0) {
