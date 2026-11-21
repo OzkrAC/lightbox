@@ -111,13 +111,14 @@ jobs:
       - name: Build
         run: make CC=gcc-14
       # The suite makes bridge and veth interfaces, and lightbox's firewall
-      # rules use the state match and masquerading, in iptables and in
-      # nftables, whose bridge family needs nft_meta_bridge. Runner kernels
-      # keep some modules in a package of extras.
+      # rules use the state match, masquerading and, for --net outside, the
+      # address type match and rejection, in iptables and in nftables, whose
+      # bridge family needs nft_meta_bridge. Runner kernels keep some modules
+      # in a package of extras.
       - name: Kernel modules
         run: |
           missing=
-          for m in bridge veth br_netfilter xt_state xt_conntrack xt_MASQUERADE nf_nat nf_tables nft_meta_bridge nft_masq nft_chain_nat nft_ct; do
+          for m in bridge veth br_netfilter xt_state xt_conntrack xt_MASQUERADE xt_addrtype ipt_REJECT nf_nat nf_tables nft_meta_bridge nft_masq nft_chain_nat nft_ct nft_reject_ipv4; do
             sudo modprobe -n "$m" 2>/dev/null || missing="$missing $m"
           done
           if [ -n "$missing" ]; then

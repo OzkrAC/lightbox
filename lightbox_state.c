@@ -65,6 +65,7 @@ void container_pid_start_path(char *buf, const char *name) { run_file_path(buf, 
 void container_state_path(char *buf, const char *name)     { run_file_path(buf, name, "state"); }
 void container_exit_path(char *buf, const char *name)      { run_file_path(buf, name, "exit"); }
 void container_firewall_path(char *buf, const char *name)  { run_file_path(buf, name, "firewall"); }
+void container_egress_path(char *buf, const char *name)    { run_file_path(buf, name, "egress"); }
 
 /*
  * Before 0.5 these records were files in the container's directory: .pid,

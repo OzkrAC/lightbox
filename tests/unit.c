@@ -43,6 +43,13 @@
  *                                             nft_setup_text, with bridge_accept_fwmark if given
  *   unit firewall nft-record <name> [<link>...]
  *                                             nft_links_record for a container with those links
+ *   unit firewall egress <name> <ip> [<dns>...]
+ *                                             firewall_egress_text for a container of --net outside
+ *   unit firewall nft-egress <ip> [<dns>...]  nft_egress_record for it
+ *   unit firewall both <name> <ip> <dns> <link>
+ *                                             what a start gives iptables-restore for a container
+ *                                             of --net outside with that name server and link
+ *   unit nftegress add|remove <record>        nft_egress_text for that record, or "refused"
  *   unit nftlinks add|remove <record>         nft_links_text for that record, or "refused"; a line
  *                                             it would take lies right after the record's end
  *   unit fwmark <text>                        parse_fwmark: lines "mark <m>", "mask <k>", "as <text>",
@@ -325,6 +332,14 @@ static void put_config(const container_config *config) {
     put_number("privileged", config->privileged);
     put_number("readonly", config->read_only);
     put_line("seccomp ", config->seccomp_allow ? "allow" : "deny");
+    put_line("net ", net_mode_name(config->net));
+    put(config->ndns ? "dns " : "dns -");
+    for (int i = 0; i < config->ndns; i++) {
+        if (i)
+            put(",");
+        put(config->dns[i]);
+    }
+    put("\n");
     put_line("io ", config->io[0] ? config->io : "-");
     put_line("swap ", config->swap[0] ? config->swap : "-");
     put_line("base ", config->base[0] ? config->base : "-");
@@ -903,6 +918,32 @@ int main(int argc, char **argv, char **envp) {
                 cfg_global.accept_fwmark_set = true;
             }
             fits = nft_setup_text(&net, text, sizeof(text));
+        } else if (streq(argv[2], "egress") && argc >= 5) {
+            container_config_init(&config);
+            config.net = NET_OUTSIDE;
+            for (int i = 5; i < argc && config.ndns < MAX_DNS; i++)
+                if (!str_copy(config.dns[config.ndns++], argv[i], sizeof(config.dns[0])))
+                    die("unit: a name server that is too long");
+            fits = firewall_egress_text(argv[3], argv[4], &config, text, sizeof(text));
+        } else if (streq(argv[2], "both") && argc == 7) {
+            static char links_text[FIREWALL_TEXT_MAX], egress_text[FIREWALL_TEXT_MAX];
+            container_config_init(&config);
+            config.net = NET_OUTSIDE;
+            config.ndns = 1;
+            config.nlinks = 1;
+            if (!str_copy(config.dns[0], argv[5], sizeof(config.dns[0])) ||
+                !str_copy(config.links[0], argv[6], sizeof(config.links[0])))
+                die("unit: firewall both <name> <ip> <dns> <link>");
+            fits = firewall_links_text(argv[3], &config, links_text, sizeof(links_text)) &&
+                   firewall_egress_text(argv[3], argv[4], &config, egress_text, sizeof(egress_text)) &&
+                   firewall_rules_text(false, links_text, egress_text, text, sizeof(text));
+        } else if (streq(argv[2], "nft-egress")) {
+            container_config_init(&config);
+            config.net = NET_OUTSIDE;
+            for (int i = 4; i < argc && config.ndns < MAX_DNS; i++)
+                if (!str_copy(config.dns[config.ndns++], argv[i], sizeof(config.dns[0])))
+                    die("unit: a name server that is too long");
+            fits = nft_egress_record(argv[3], &config, text, sizeof(text));
         } else if (streq(argv[2], "nft-record")) {
             container_config_init(&config);
             for (int i = 4; i < argc && config.nlinks < MAX_LINKS; i++)
@@ -913,6 +954,11 @@ int main(int argc, char **argv, char **envp) {
             die("unit: firewall links <name> [<link>...] | firewall setup <subnet> <gw> <bridge> <true|false>");
         }
         put(fits ? text : "too long\n");
+        return 0;
+    }
+    if (argc == 4 && streq(argv[1], "nftegress")) {
+        static char text[FIREWALL_TEXT_MAX];
+        put(nft_egress_text(argv[3], streq(argv[2], "remove"), text, sizeof(text)) ? text : "refused\n");
         return 0;
     }
     if (argc == 4 && streq(argv[1], "nftlinks")) {

@@ -275,6 +275,12 @@ nothing_left() { # name
     if [ -n "$port" ] && nft list set bridge lightbox links 2>/dev/null | grep -q "\"$port\""; then
         echo "an element of the nftables set of links names $port"; bad=1
     fi
+    if [ -n "$port" ] && { [ -e "$RUN/$1/egress" ] || iptables -n -L "LO-${port#vb-}" >/dev/null 2>&1; }; then
+        echo "the firewall chain LO-${port#vb-} of its --net outside, or the record of it, is left"; bad=1
+    fi
+    if [ -e "$C/$1/.ip" ] && nft list set ip lightbox outside 2>/dev/null | grep -qw "$(addr_of "$1")"; then
+        echo "the nftables set of --net outside has its address"; bad=1
+    fi
     echo "state: $(state_of "$1")"
     return $bad
 }
@@ -289,6 +295,58 @@ reaches() { # name address
     answer=$(sh_in "$1" "$KIT nc -w 3 $2 9 </dev/null" 2>&1)
     printf '%s -> %s: %s\n' "$1" "$2" "${answer:-no answer}"
     case $answer in *[Rr]efused*) return 0 ;; *) return 1 ;; esac
+}
+
+# Does the firewall refuse a TCP connection from the container to that
+# address at once, as --net outside does? It answers with "administratively
+# prohibited", which a client says as no route to the host.
+rejected() { # name address
+    local answer
+    answer=$(sh_in "$1" "$KIT nc -w 3 $2 9 </dev/null" 2>&1)
+    printf '%s -> %s: %s\n' "$1" "$2" "${answer:-no answer}"
+    case $answer in *'No route to host'*) return 0 ;; *) return 1 ;; esac
+}
+
+# Addresses beyond the host that a container of --net outside may not reach,
+# in the namespace that stands for the internet: a private one, a name
+# server on another, and the metadata address of the clouds.
+PRIVATE=172.31.255.1
+PRIVATE_DNS=172.31.255.53
+METADATA=169.254.169.254
+private_addresses() {
+    local outside a
+    outside=$(cat "$T/outside")
+    for a in "$PRIVATE" "$PRIVATE_DNS" "$METADATA"; do
+        nsenter -t "$outside" -n ip addr show dev lo | grep -q " $a/32 " ||
+            nsenter -t "$outside" -n ip addr add "$a/32" dev lo || return 1
+        ip route show "$a/32" | grep -q . || ip route add "$a/32" via "$OUTSIDE" || return 1
+    done
+}
+
+# A name server at that address in the namespace that stands for the
+# internet, which answers every question for an address with 192.0.2.77:
+# its PID, or nothing without python3.
+dns_responder() { # address
+    command -v python3 >/dev/null 2>&1 || return 1
+    cat > "$T/dns.py" <<'PYTHON'
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind((sys.argv[1], 53))
+while True:
+    q, peer = s.recvfrom(512)
+    end = 12
+    while end < len(q) and q[end] != 0:
+        end += q[end] + 1
+    if len(q) < 12 or end + 5 > len(q):
+        continue
+    question = q[12:end + 5]
+    a = q[end + 1:end + 3] == b"\x00\x01"
+    answer = b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04" + bytes([192, 0, 2, 77]) if a else b""
+    s.sendto(q[:2] + b"\x81\x80\x00\x01" + (b"\x00\x01" if a else b"\x00\x00") + b"\x00\x00\x00\x00" +
+             question + answer, peer)
+PYTHON
+    nsenter -t "$(cat "$T/outside")" -n python3 -I "$T/dns.py" "$1" >/dev/null 2>&1 &
+    echo $!
 }
 
 # Whether bridged traffic passes through iptables in this network namespace.
@@ -337,6 +395,15 @@ t_setup() {
     iptables -t nat -C LIGHTBOX-POSTROUTING -s "$SUBNET" ! -o "$BR" -j MASQUERADE &&
     iptables -n -L LIGHTBOX-USER >/dev/null && iptables -n -L LIGHTBOX-LINKS >/dev/null ||
         { echo "a rule or a chain is missing:"; iptables-save; return 1; }
+    # --net outside: INPUT begins with the jump to LIGHTBOX-INPUT, and what
+    # leaves the bridge or reaches the host goes through LIGHTBOX-EGRESS
+    [ "$(iptables -S INPUT | sed -n 2p)" = '-A INPUT -j LIGHTBOX-INPUT' ] ||
+        { echo "INPUT does not begin with the jump to LIGHTBOX-INPUT"; iptables -S INPUT; return 1; }
+    iptables -C LIGHTBOX-FORWARD -i "$BR" ! -o "$BR" -j LIGHTBOX-EGRESS &&
+    iptables -C LIGHTBOX-INPUT -i "$BR" -j LIGHTBOX-EGRESS &&
+    iptables -C LIGHTBOX-OUTSIDE -m addrtype --dst-type LOCAL -j REJECT --reject-with icmp-admin-prohibited &&
+    iptables -C LIGHTBOX-OUTSIDE -d 169.254.0.0/16 -j REJECT --reject-with icmp-admin-prohibited ||
+        { echo "a rule of --net outside is missing:"; iptables-save; return 1; }
     # nothing names the interface the default route leaves by
     ! iptables-save | grep -qw -- "$WAN" || { echo "a rule names $WAN"; return 1; }
     # the fixture made these 0755, as installations before 0.2 did
@@ -430,11 +497,17 @@ t_firewall_false() {
     printf '%s\n' "$said"
     [ "$rules" = "$(firewall_rules)" ] || { echo "setup with firewall = false changed the firewall:"; firewall_rules; return 1; }
     case $said in *'no firewall rules were made'*) ;; *) return 1 ;; esac
-    box fwpeer && box fwlinked --link fwpeer || return 1
+    box fwpeer --net nat && box fwlinked --net nat --link fwpeer || return 1
     said=$(alt_lb start fwlinked 2>&1 </dev/null) && { echo "a container with links started with firewall = false"; return 1; }
     printf '%s\n' "$said"
-    case $said in *'firewall = false'*) ;; *) return 1 ;; esac
-    nothing_left fwlinked
+    case $said in *'has links, and firewall = false'*) ;; *) return 1 ;; esac
+    nothing_left fwlinked || return 1
+    # and one of --net outside, which only lightbox's rules keep to it
+    box fwoutside || return 1
+    said=$(alt_lb start fwoutside 2>&1 </dev/null) && { echo "a container of --net outside started with firewall = false"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *'has --net outside, and firewall = false'*) ;; *) return 1 ;; esac
+    nothing_left fwoutside
 }
 
 # setup reads subnet and gw as one network before it changes anything: a
@@ -2027,9 +2100,65 @@ t_network_inside() {
     printf '%s\n' "$said" | grep -q "^default via $GW "
 }
 
+# --net outside, the default (ROADMAP 8.5): a container reaches the outside
+# and resolves a name through its name server, which is on a private
+# address, and is refused at once the host, on the bridge's address and on
+# its other one, a private address, the metadata address, and its name
+# server on any port but 53. A container of --net nat beside it reaches all
+# of them, so that it is the rules that refuse them. Then stopped, nothing of
+# the rules is left. starter: the command that starts a container.
+net_outside() { # prefix, starter...
+    local p=$1 dns_pid said a
+    shift
+    need_nc || return 77
+    private_addresses || return 1
+    box "${p}out" --dns "$PRIVATE_DNS" && box "${p}nat" --net nat --dns "$PRIVATE_DNS" || return 1
+    [ "$(conf_value "${p}out" net)" = outside ] || { echo "the default is not outside: $(conf_value "${p}out" net)"; return 1; }
+    "$@" "${p}out" && "$@" "${p}nat" || return 1
+    for a in "$GW" 192.0.2.2 "$PRIVATE" "$METADATA" "$PRIVATE_DNS"; do
+        reaches "${p}nat" "$a" || { echo "the container of --net nat does not reach $a"; return 1; }
+        rejected "${p}out" "$a" || { echo "$a was not refused at once"; return 1; }
+    done
+    reaches "${p}out" "$OUTSIDE" || { echo "the container of --net outside does not reach the outside"; return 1; }
+    if dns_pid=$(dns_responder "$PRIVATE_DNS"); then
+        sleep 0.5
+        said=$(sh_in "${p}out" "$KIT nslookup lbt.example $PRIVATE_DNS" 2>&1)
+        kill "$dns_pid" 2>/dev/null
+        printf '%s\n' "$said"
+        printf '%s\n' "$said" | grep -q '192\.0\.2\.77' || { echo "the name was not resolved"; return 1; }
+    else
+        echo "no python3 for a name server: that a name is resolved is not tried"
+    fi
+    lb stop "${p}out" >/dev/null && nothing_left "${p}out"
+}
+t_net_outside() { net_outside n start; }
+
+# --net none: loopback and nothing else. start makes no interface on the
+# host for it, and the container has no address, no route and no eth0.
+t_net_none() {
+    box nonet --net none || return 1
+    [ ! -e "$C/nonet/.ip" ] || { echo "it has an address on record"; return 1; }
+    lb inspect nonet | grep -qx 'net: none' && lb inspect nonet | grep -qx 'ip: -' ||
+        { echo "inspect does not say it"; return 1; }
+    before=$(links_now)
+    start nonet || return 1
+    [ "$(links_now)" = "$before" ] || { echo "start made an interface on the host: $(links_now | tr '\n' ' ')"; return 1; }
+    said=$(sh_in nonet 'cat /proc/net/dev' | sed '1,2d' | awk -F: '{ gsub(/ /, "", $1); print $1 }' | paste -sd' ' -)
+    echo "its interfaces: $said"
+    [ "$said" = lo ] || return 1
+    said=$(sh_in nonet "$KIT ip -4 addr; $KIT ip route" 2>&1)
+    printf '%s\n' "$said"
+    printf '%s\n' "$said" | grep -q 'inet 127\.0\.0\.1/8' && ! printf '%s\n' "$said" | grep -q 'default' ||
+        { echo "it has more than loopback"; return 1; }
+    said=$(sh_in nonet "$KIT nc -w 2 $OUTSIDE 9 </dev/null" 2>&1) && { echo "it reached the outside"; return 1; }
+    echo "the outside: $said"
+    case $said in *'unreachable'*) ;; *) return 1 ;; esac
+    lb stop nonet >/dev/null && nothing_left nonet
+}
+
 t_reaches_gateway() {
     need_nc || return 77
-    up togw || return 1
+    up togw --net nat || return 1
     reaches togw "$GW"
 }
 
@@ -2056,7 +2185,7 @@ t_wide_subnet() {
     ip -o -4 addr show dev "$WIDE_BR" | grep -q ' 10\.9\.0\.1/16 ' || { echo "the bridge does not have 10.9.0.1/16"; return 1; }
     iptables -t nat -C LIGHTBOX-POSTROUTING -s 10.9.0.0/16 ! -o "$WIDE_BR" -j MASQUERADE || { echo "no address translation for 10.9.0.0/16"; return 1; }
     # shellcheck disable=SC2046  # options of one word each
-    lb create wide 10.9.5.2 $(mode_options) >"$OUT/wide.create" 2>&1 || { cat "$OUT/wide.create"; return 1; }
+    lb create wide 10.9.5.2 --net nat $(mode_options) >"$OUT/wide.create" 2>&1 || { cat "$OUT/wide.create"; return 1; }
     start wide || return 1
     said=$(sh_in wide "$KIT ip addr; $KIT ip route")
     printf '%s\n' "$said"
@@ -2079,7 +2208,7 @@ t_wide_subnet() {
 t_isolated_when_filtered() {
     need_nc || return 77
     brnf 1 || { echo "br_netfilter is not loaded, so bridged traffic cannot be filtered here"; return 77; }
-    up iso1 && up iso2 || return 1
+    up iso1 --net nat && up iso2 --net nat || return 1
     reaches iso1 "$(addr_of iso2)" && { echo "iso1 reached iso2"; return 1; }
     reaches iso2 "$(addr_of iso1)" && { echo "iso2 reached iso1"; return 1; }
     reaches iso1 "$GW"      # it is the firewall that stops them, not a network that does not work
@@ -2090,7 +2219,7 @@ t_isolated_when_filtered() {
 t_isolated_when_not_filtered() {
     need_nc || return 77
     if [ -e "$BRNF" ]; then brnf 0 || return 1; fi
-    up iso3 && up iso4 || return 1
+    up iso3 --net nat && up iso4 --net nat || return 1
     reaches iso3 "$(addr_of iso4)" && { echo "iso3 reached iso4"; return 1; }
     reaches iso4 "$(addr_of iso3)" && { echo "iso4 reached iso3"; return 1; }
     reaches iso3 "$GW"      # and the bridge address is still within reach
@@ -2463,7 +2592,8 @@ t_config_in_etc() {
 
 # What a reboot takes: the bridge, every firewall rule and chain, forwarding
 # and run_dir. A start makes the host's side of the network again, as setup
-# makes it, and says so; the container reaches the gateway and the outside.
+# makes it, and says so; the container, of --net outside, reaches the outside
+# and is refused the gateway, as its rules are made again with it.
 t_start_after_a_reboot_of_the_network() {
     box rebuilt || return 1
     ip link delete "$BR" &&
@@ -2474,11 +2604,12 @@ t_start_after_a_reboot_of_the_network() {
     grep -q 'making it again' "$OUT/rebuilt.start" || { echo "start did not say that it made the network again"; return 1; }
     ip -o -4 addr show dev "$BR" | grep -q " $GW/24 " || { echo "the bridge is not there with $GW/24"; return 1; }
     iptables -C FORWARD -j LIGHTBOX-USER && iptables -C FORWARD -j LIGHTBOX-FORWARD &&
+    iptables -C INPUT -j LIGHTBOX-INPUT &&
     iptables -t nat -C POSTROUTING -j LIGHTBOX-POSTROUTING || { echo "lightbox's jumps are not there"; return 1; }
     [ "$(cat /proc/sys/net/ipv4/ip_forward)" = 1 ] && [ "$(iptables -S FORWARD | head -n 1)" = '-P FORWARD DROP' ] ||
         { echo "forwarding is not on with the FORWARD policy at DROP"; return 1; }
     if [ -e "$T/have_nc" ]; then
-        reaches rebuilt "$GW" && reaches rebuilt "$OUTSIDE"
+        rejected rebuilt "$GW" && reaches rebuilt "$OUTSIDE"
     else
         echo "the suite's busybox has no nc: whether the container reaches anything is not tried"
     fi
@@ -2506,7 +2637,15 @@ t_nft_start_after_the_tables_went() {
 }
 
 # iptables as it is, without counters and comments
-saved_rules() { iptables-save | grep -v '^#' | sed -E 's/ \[[0-9]+:[0-9]+\]$//'; }
+# The chains of containers' --net outside and the jumps to them go in as
+# each container starts, or as reload puts them back, in whatever order that
+# is: those lines are compared as a set, and the rest as they stand.
+saved_rules() {
+    local all egress='^(:LO-|-A LO-|-A LIGHTBOX-EGRESS )'
+    all=$(iptables-save | grep -v '^#' | sed -E 's/ \[[0-9]+:[0-9]+\]$//')
+    printf '%s\n' "$all" | grep -Ev "$egress"
+    printf '%s\n' "$all" | grep -E "$egress" | sort
+}
 
 # what a firewall's reload or flush does to lightbox's rules, its policy left
 flush_firewall() {
@@ -2521,13 +2660,19 @@ t_reload_puts_back_what_a_flush_took() {
     need_nc || return 77
     up rlpeer && up rllinked --link rlpeer && up rlalone || return 1
     reaches rllinked "$(addr_of rlpeer)" || { echo "the link did not hold before the flush"; return 1; }
+    # what every running container has, as reload puts it in, whatever
+    # backend an earlier case started it with
+    lb reload >/dev/null 2>&1 || return 1
     before=$(saved_rules)
     flush_firewall || return 1
     ! reaches rllinked "$(addr_of rlpeer)" || { echo "the link held without its rules"; return 1; }
     lb reload >"$OUT/reload" 2>&1 || { cat "$OUT/reload"; return 1; }
     cat "$OUT/reload"
     grep -qx "The links of container 'rllinked' are in again" "$OUT/reload" || return 1
-    ! grep -q "'rlalone'\|'rlpeer'" "$OUT/reload" || { echo "reload put in links of a container that has none"; return 1; }
+    ! grep -q "links of container 'rlalone'\|links of container 'rlpeer'" "$OUT/reload" ||
+        { echo "reload put in links of a container that has none"; return 1; }
+    grep -qx "The --net outside rules of container 'rlalone' are in again" "$OUT/reload" ||
+        { echo "reload did not put back the rules of --net outside"; return 1; }
     [ "$(saved_rules)" = "$before" ] ||
         { echo "the rules are not as they were:"; diff <(printf '%s\n' "$before") <(saved_rules); return 1; }
     reaches rllinked "$(addr_of rlpeer)" && reaches rllinked "$OUTSIDE" || return 1
@@ -2543,9 +2688,10 @@ t_reload_puts_back_what_a_flush_took() {
 t_start_after_a_flush_puts_back_links() {
     need_nc || return 77
     up sfpeer && up sflinked --link sfpeer || return 1
+    lb reload >/dev/null 2>&1 || return 1
     before=$(saved_rules)
     flush_firewall || return 1
-    up sfnew || return 1
+    up sfnew --net nat || return 1
     grep -q 'making it again' "$OUT/sfnew.start" && grep -qx "The links of container 'sflinked' are in again" "$OUT/sfnew.start" ||
         { echo "start did not make the network again and put back the links"; return 1; }
     [ "$(saved_rules)" = "$before" ] ||
@@ -2732,6 +2878,13 @@ t_setup_teardown() {
 
 # ─── Cases: firewall_backend = nftables ─────────────────────────────────────
 
+# --net outside with firewall_backend = nftables, as with iptables.
+t_nft_net_outside() {
+    nft_setup nftout || return $?
+    net_outside f with_alt_start
+}
+with_alt_start() { LIGHTBOX_CONFIG="$ALT_CONF" start "$1"; }
+
 # Can this host have lightbox's tables: nft, and nf_tables with the bridge
 # family and its meta match, in this network namespace?
 nft_ok() {
@@ -2768,9 +2921,18 @@ t_nft_setup() {
     nft list chain ip lightbox forward | grep -qF "oifname \"$BR\" ct state established,related accept" &&
     nft list chain ip lightbox postrouting | grep -qF "ip saddr $SUBNET oifname != \"$BR\" masquerade" &&
     nft list chain bridge lightbox forward | grep -qF "ibrname \"$BR\" iifname . oifname @links accept" &&
-    nft list chain bridge lightbox forward | grep -qF "ibrname \"$BR\" drop" || { echo "a rule is missing"; return 1; }
+    nft list chain bridge lightbox forward | grep -qF "ibrname \"$BR\" drop" &&
+    nft list chain ip lightbox forward | grep -qF "iifname \"$BR\" oifname != \"$BR\" ip saddr @outside jump egress" &&
+    nft list chain ip lightbox input | grep -qF "iifname \"$BR\" ip saddr @outside jump egress_host" &&
+    nft list chain ip lightbox egress_host | grep -qF "reject with icmp admin-prohibited" ||
+        { echo "a rule is missing"; return 1; }
     iptables -n -L LIGHTBOX-FORWARD >/dev/null 2>&1 && { echo "LIGHTBOX-FORWARD is left"; return 1; }
     iptables -n -L LIGHTBOX-LINKS >/dev/null 2>&1 && { echo "LIGHTBOX-LINKS is left"; return 1; }
+    for chain in LIGHTBOX-INPUT LIGHTBOX-EGRESS LIGHTBOX-OUTSIDE; do
+        iptables -n -L "$chain" >/dev/null 2>&1 && { echo "$chain is left"; return 1; }
+    done
+    ! iptables -S | grep -q '^-N LO-' || { echo "a chain of a container's --net outside is left"; return 1; }
+    iptables -C INPUT -j LIGHTBOX-INPUT 2>/dev/null && { echo "the jump to LIGHTBOX-INPUT is left"; return 1; }
     iptables -t nat -n -L LIGHTBOX-POSTROUTING >/dev/null 2>&1 && { echo "LIGHTBOX-POSTROUTING is left"; return 1; }
     iptables -C FORWARD -j LIGHTBOX-USER || { echo "the host's LIGHTBOX-USER lost its jump"; return 1; }
     case $said in *'iptables FORWARD'*'iptables -P FORWARD ACCEPT'*) ;; *) echo "setup did not name the FORWARD policy that drops"; return 1 ;; esac
@@ -2782,7 +2944,8 @@ t_nft_setup() {
     said=$(lb setup 2>&1) || { printf '%s\n' "$said"; return 1; }
     printf '%s\n' "$said"
     ! nft list tables | grep -q ' lightbox$' || { echo "left: $(nft list tables)"; return 1; }
-    iptables -C FORWARD -j LIGHTBOX-FORWARD && iptables -t nat -C POSTROUTING -j LIGHTBOX-POSTROUTING
+    iptables -C FORWARD -j LIGHTBOX-FORWARD && iptables -C INPUT -j LIGHTBOX-INPUT &&
+    iptables -t nat -C POSTROUTING -j LIGHTBOX-POSTROUTING
 }
 
 # Where nothing passes bridged traffic through iptables, linked containers
@@ -2804,7 +2967,8 @@ t_nft_links_without_brnf() {
     alt_lb stop nlinked >/dev/null && nothing_left nlinked
 }
 
-# A start puts in a container's links with one process, nft.
+# A start puts in a container's links with one process, nft, and with them
+# the rules of --net outside, the default.
 t_nft_one_process() {
     command -v strace >/dev/null 2>&1 || { echo "no strace to watch a start with"; return 77; }
     nft_setup nftone; rc=$?; [ $rc = 0 ] || return $rc
@@ -2817,9 +2981,10 @@ t_nft_one_process() {
     settled nonelinked || return 1
     alt_lb stop nonelinked >/dev/null 2>&1 || { echo "stop failed"; return 1; }
     wait "$tracer"
-    # but for the look at whether setup's tables are there, which every start has
+    # but for the look at whether setup's tables are there, which every start
+    # has; the links and the rules of --net outside, the default, go in as one
     tools=$(grep -E 'execve\("[^"]*/(ip6?tables[^"]*|nft)"' "$T/nftlinks.strace" | grep -v ' = -1 ' |
-            grep -v '"list", "tables"')
+            grep -v '"list", "chains"')
     printf '%s\n' "$tools"
     [ "$(printf '%s\n' "$tools" | grep -c .)" = 1 ] && printf '%s\n' "$tools" | grep -q '/nft"'
 }
@@ -3247,7 +3412,9 @@ if [ "$MODE" = inside ]; then
     check 'another user cannot reach container files'                     t_storage_closed_to_others
 
     check 'a container has loopback, its address and a default route'     t_network_inside
-    check 'a container reaches the bridge address'                        t_reaches_gateway
+    check 'a container of --net outside reaches the outside and its name server, and nothing else' t_net_outside
+    check 'a container of --net none has loopback and nothing else'      t_net_none
+    check 'a container of --net nat reaches the bridge address'          t_reaches_gateway
     check 'a container reaches an outside address through address translation' t_reaches_outside
     check 'on a /16, a container far from the gateway has its prefix and reaches it' t_wide_subnet
     check 'the host'"'"'s own rules in LIGHTBOX-USER decide first, and setup keeps them' t_user_chain
@@ -3269,6 +3436,7 @@ if [ "$MODE" = inside ]; then
 
     check 'nftables: setup makes the two tables, and takes lightbox'"'"'s iptables chains out' t_nft_setup
     check 'nftables: linked containers reach each other without br_netfilter, a third neither' t_nft_links_without_brnf
+    check 'nftables: a container of --net outside reaches the outside and its name server, and nothing else' t_nft_net_outside
     check 'nftables: a start puts in its links with one process'          t_nft_one_process
     check 'nftables: rm of a dead container takes its links out of the set' t_nft_rm_leaves_nothing
     check 'nftables: setup does not turn forwarding on, as Docker does not' t_nft_forwarding

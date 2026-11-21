@@ -29,7 +29,6 @@
 /* ─── Compile-time limits ───────────────────────────────────────────────── */
 
 #define MAX_PATH         512
-#define MAX_DNS          3       /* as many as a resolver reads from resolv.conf */
 #define CHILD_STACK_SIZE (1024 * 1024) /* 1 MiB */
 
 /* ─── Configurable defaults ─────────────────────────────────────────────── */
@@ -819,7 +818,8 @@ static const char *write_etc_files(const char *root, const char *name, const cha
         pos = str_append(text, pos, "127.0.0.1\tlocalhost\n", sizeof(text), &cut);
     else if (text[pos - 1] != '\n')
         pos = str_append(text, pos, "\n", sizeof(text), &cut);
-    pos = str_append(text, pos, ip, sizeof(text), &cut);
+    /* a container of --net none has no address: its name is a loopback one */
+    pos = str_append(text, pos, ip[0] ? ip : "127.0.1.1", sizeof(text), &cut);
     pos = str_append(text, pos, "\t", sizeof(text), &cut);
     pos = str_append(text, pos, name, sizeof(text), &cut);
     str_append(text, pos, "\n", sizeof(text), &cut);
@@ -1052,6 +1052,10 @@ static void cmd_create(int argc, char **argv) {
      * (ROADMAP 8.3). A .conf without the line is a container made before
      * 0.8, which keeps the deny-list it was made with. */
     cfg.seccomp_allow = true;
+    /* and reaches the internet and its name servers only, unless it asks
+     * for more or for nothing (ROADMAP 8.5); a .conf without the line is of
+     * a container made before 0.8, which has today's network */
+    cfg.net = NET_OUTSIDE;
     char dns[MAX_DNS][16];
     int ndns = 0;
 
@@ -1081,6 +1085,10 @@ static void cmd_create(int argc, char **argv) {
             const char *value = option_value(argc, argv, &i);
             if (!parse_seccomp_profile(value, &cfg.seccomp_allow))
                 die2("Error: --seccomp takes allow or deny, not: ", value);
+        } else if (streq(opt, "--net")) {
+            const char *value = option_value(argc, argv, &i);
+            if (!parse_net_mode(value, &cfg.net))
+                die2("Error: --net takes nat, outside or none, not: ", value);
         } else if (streq(opt, "--rootfs")) {
             str_copy_or_die(cfg_global.rootfs, option_value(argc, argv, &i), MAX_PATH, "--rootfs");
         } else if (streq(opt, "--copy")) {
@@ -1126,6 +1134,18 @@ static void cmd_create(int argc, char **argv) {
     if (cfg.userns)
         require_root("create --userns");
 
+    /* --net none: loopback, and no address, link or rule to have */
+    if (cfg.net == NET_NONE) {
+        if (address_given)
+            die2("Error: a container with --net none has no address: ", argv[1]);
+        if (cfg.nlinks > 0)
+            die("Error: a container with --net none has no network for --link");
+    }
+    /* --net outside is lightbox's firewall rules: without them it would be nat */
+    if (cfg.net == NET_OUTSIDE && !cfg_global.firewall)
+        die("Error: --net outside, the default, needs lightbox's firewall rules, and lightbox.conf has\n"
+            "firewall = false; create the container with --net nat or --net none");
+
     /* check if container already exists */
     char cdir[MAX_PATH], root[MAX_PATH];
     container_dir_path(cdir, name);
@@ -1151,8 +1171,9 @@ static void cmd_create(int argc, char **argv) {
     /* One create at a time: what one decides about names and addresses holds
      * until it is done. */
     store_lock();
-    char ip[IPV4_TEXT_MAX];
-    choose_address(&net, address_given ? &asked : NULL, ip);
+    char ip[IPV4_TEXT_MAX] = "";
+    if (cfg.net != NET_NONE)
+        choose_address(&net, address_given ? &asked : NULL, ip);
     if (cfg.userns) {
         const char *why = userns_allocate(&cfg.uid_start, &cfg.gid_start);
         if (why) {
@@ -1222,6 +1243,14 @@ static void cmd_create(int argc, char **argv) {
             create_err = "the name servers do not fit in resolv.conf";
             goto fail_create;
         }
+        /* --net outside lets it ask them, and only them of the addresses it
+         * may not reach: on record, as the container may write its own
+         * resolv.conf */
+        if (cfg.net == NET_OUTSIDE) {
+            cfg.ndns = ndns ? ndns : 2;
+            for (int i = 0; i < cfg.ndns; i++)
+                str_copy_or_die(cfg.dns[i], ndns ? dns[i] : public_servers[i], sizeof(cfg.dns[0]), "--dns");
+        }
     }
 
     /*
@@ -1287,10 +1316,10 @@ static void cmd_create(int argc, char **argv) {
             goto fail_create;
     }
 
-    /* store IP */
+    /* store IP: none for --net none */
     char ip_path[MAX_PATH];
     container_ip_path(ip_path, name);
-    if (write_file_atomic(ip_path, ip, MODE_PRIVATE_FILE) < 0) {
+    if (ip[0] && write_file_atomic(ip_path, ip, MODE_PRIVATE_FILE) < 0) {
         create_err = "failed to write IP metadata";
         goto fail_create;
     }
@@ -1307,9 +1336,13 @@ static void cmd_create(int argc, char **argv) {
     }
     print_str(STDOUT,"Container '");
     print_str(STDOUT,name);
-    print_str(STDOUT,"' created (ip=");
-    print_str(STDOUT,ip);
-    print_str(STDOUT,")\n");
+    if (ip[0]) {
+        print_str(STDOUT, "' created (ip=");
+        print_str(STDOUT, ip);
+        print_str(STDOUT, ")\n");
+    } else {
+        print_str(STDOUT, "' created (no network)\n");
+    }
     return;
 
 fail_create:
@@ -3116,6 +3149,7 @@ static void cleanup_start_failure(const char *name, const char *port, bool port_
 
     (void)cgroup_destroy(name);     /* it has said so if it could not */
     (void)firewall_remove_links(name);
+    (void)firewall_remove_egress(name);
 
     container_forget_pid(name);
     (void)record_container_state(name, "failed\n");
@@ -3136,6 +3170,8 @@ static bool release_container(const char *name) {
     /* its link rules: what the record of them names, whatever its
      * configuration says or whether it can be read */
     if (firewall_remove_links(name) != 0)
+        clean = false;
+    if (firewall_remove_egress(name) != 0)
         clean = false;
 
     /* the host's end of the container's interface, if the kernel has not
@@ -3510,7 +3546,8 @@ static void build_container(const struct child_args *ca) {
      * the namespace from the host for it. From the pivot to the hook nothing
      * of the image is run: its tools are not needed, and not trusted with
      * what init may do. */
-    if (loopback_up() != 0 || container_interface_up(ca->address, ca->prefix, ca->gateway) != 0)
+    if (loopback_up() != 0 ||
+        (ca->address && container_interface_up(ca->address, ca->prefix, ca->gateway) != 0))
         lc_kernel_exit(1);
 }
 
@@ -3642,31 +3679,45 @@ static void start_one(const char *name, int hook_wait) {
     (void)reconcile(name);          /* an earlier run that ended without a stop */
     container_forget_pid(name);     /* and whatever else one left on record */
 
-    /* The bridge, the firewall rules and forwarding, made again when a
-     * reboot took them. What makes them takes the store's lock; teardown,
-     * which holds that, never waits for a container's. */
-    ensure_host_network(name);
-
-    /* The container's address, which has to be one of the network as it is
-     * set now: with another subnet since the container was created, it would
-     * start and reach nothing. */
-    char ip[IPV4_TEXT_MAX];
-    container_network net;
-    uint32_t addr;
-    container_network_load_or_die(&net);
-    if (read_container_ip(name, ip, sizeof(ip)) < 0 || !parse_ipv4(ip, &addr))
-        die2("Error: the container has no address on record; remove it and create it again: ", name);
-    {
-        const char *why = address_unusable(&net, addr);
-        if (why)
-            die_about_address(ip, why);
-    }
-
     /* What the container is configured with: read here, once, for the whole
      * start. Init gets it with the memory it is cloned with. */
     static container_config config;
     container_config_load_or_die(name, &config);
     bool privileged = config.privileged;
+    /* --net none: loopback, and no address, interface or rule (ROADMAP 8.5) */
+    bool networked = config.net != NET_NONE;
+
+    /* The bridge, the firewall rules and forwarding, made again when a
+     * reboot took them. What makes them takes the store's lock; teardown,
+     * which holds that, never waits for a container's. */
+    if (networked)
+        ensure_host_network(name);
+
+    /* The container's address, which has to be one of the network as it is
+     * set now: with another subnet since the container was created, it would
+     * start and reach nothing. */
+    char ip[IPV4_TEXT_MAX] = "";
+    container_network net = {0};
+    uint32_t addr = 0;
+    if (networked) {
+        container_network_load_or_die(&net);
+        if (read_container_ip(name, ip, sizeof(ip)) < 0 || !parse_ipv4(ip, &addr))
+            die2("Error: the container has no address on record; remove it and create it again: ", name);
+        const char *why = address_unusable(&net, addr);
+        if (why)
+            die_about_address(ip, why);
+    }
+
+    /* --net outside is lightbox's firewall rules, which it is not started
+     * without */
+    if (config.net == NET_OUTSIDE && !cfg_global.firewall) {
+        print_str(STDERR, "Error: container '");
+        print_str(STDERR, name);
+        print_str(STDERR, "' has --net outside, and firewall = false in lightbox.conf. Only\n"
+                          "lightbox's rules keep it to the internet and its name servers, so it is not\n"
+                          "started without them\n");
+        lc_kernel_exit(1);
+    }
     bool read_only = config.read_only;
     int oom_score = config.oom_score;
 
@@ -3701,9 +3752,10 @@ static void start_one(const char *name, int hook_wait) {
         lc_kernel_exit(1);
     }
     bool nftables = cfg_global.firewall_backend == FIREWALL_NFTABLES;
-    if (linked && nftables)
+    bool ruled = linked || config.net == NET_OUTSIDE;
+    if (ruled && nftables)
         require_tool("nft", tool_path_nft());
-    else if (linked)
+    else if (ruled)
         require_tool("iptables-restore", tool_path_iptables_restore());
     if (linked && !nftables && !bridge_traffic_is_filtered()) {
         print_str(STDERR, "Error: container '");
@@ -3744,10 +3796,10 @@ static void start_one(const char *name, int hook_wait) {
     /* The end of the container's interface on the host, by a name made from
      * its own. One that is there already is cleared away when lightbox made
      * it for this container; when not, it is left alone and the start ends. */
-    char port[IFNAME_TEXT_MAX], port_err[128];
+    char port[IFNAME_TEXT_MAX] = "", port_err[128];
     bool port_made = false;
-    host_port_name(name, port);
-    {
+    if (networked) {
+        host_port_name(name, port);
         port_owner owner = host_port_owner(port, name);
         if (owner == PORT_FOREIGN) {
             bool cut = false;
@@ -3886,8 +3938,9 @@ static void start_one(const char *name, int hook_wait) {
      * of it is on the host under a name of the container's. The kernel takes
      * no alias with the pair, so the host's end gets it as it joins the
      * bridge, and until then only this start knows the interface is its own.
-     * Init brings eth0 up and gives it its address once it has its first byte. */
-    {
+     * Init brings eth0 up and gives it its address once it has its first
+     * byte. A container of --net none has none. */
+    if (networked) {
         rtnl nl;
         int rc = rtnl_open(&nl);
         if (rc < 0) {
@@ -3967,8 +4020,8 @@ static void start_one(const char *name, int hook_wait) {
         start_err = "failed to record the container's init";
         goto fail_start;
     }
-    if (firewall_add_links(name, &config) != 0) {
-        start_err = "failed to put in the firewall rules of the container's links";
+    if (firewall_add_rules(name, ip, &config) != 0) {
+        start_err = "failed to put in the firewall rules of the container's links or --net outside";
         goto fail_start;
     }
 
@@ -4366,6 +4419,8 @@ static void rm_one(const char *name, int force) {
     (void)reconcile(name);
     if (firewall_remove_links(name) != 0)
         die2("Error: the container is not removed while the firewall rules of its links are there: ", name);
+    if (firewall_remove_egress(name) != 0)
+        die2("Error: the container is not removed while the firewall rules of its --net outside are there: ", name);
 
     char cdir[MAX_PATH];
     container_dir_path(cdir, name);
@@ -4519,6 +4574,8 @@ static const struct { const char *name; const char *text; } command_help[] = {
         "         --privileged           Disable security sandbox\n"
         "         --seccomp allow|deny   The seccomp profile: the allow-list, or the deny-list\n"
         "                                (default: allow)\n"
+        "         --net nat|outside|none What it may reach: the network as before 0.8, the internet\n"
+        "                                and its name servers only, or nothing (default: outside)\n"
         "         --oom-score <n>        OOM score adjustment (default: 500)\n"
         "         --link <name>          Allow network to another container\n"
         "         --dns <address>        A name server for the container (up to 3; default: the host's)\n" },

@@ -177,6 +177,51 @@ bool parse_seccomp_profile(const char *text, bool *allow) {
     return true;
 }
 
+static const char *const NET_MODE_NAMES[] = { [NET_NAT] = "nat", [NET_OUTSIDE] = "outside", [NET_NONE] = "none" };
+
+bool parse_net_mode(const char *text, int *mode) {
+    for (int i = 0; i < (int)(sizeof(NET_MODE_NAMES) / sizeof(NET_MODE_NAMES[0])); i++) {
+        if (streq(text, NET_MODE_NAMES[i])) {
+            *mode = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+const char *net_mode_name(int mode) {
+    return mode >= NET_NAT && mode <= NET_NONE ? NET_MODE_NAMES[mode] : "?";
+}
+
+/* "a,b,c": one to MAX_DNS IPv4 addresses, each in the form format_ipv4 writes */
+static bool parse_dns_list(const char *text, container_config *config) {
+    int n = 0;
+    const char *p = text;
+    for (;;) {
+        char one[16];
+        size_t len = 0;
+        while (p[len] && p[len] != ',')
+            len++;
+        uint32_t addr;
+        char back[IPV4_TEXT_MAX];
+        if (len == 0 || len >= sizeof(one) || n >= MAX_DNS)
+            return false;
+        lc_bytes_copy(one, p, len);
+        one[len] = '\0';
+        if (!parse_ipv4(one, &addr))
+            return false;
+        format_ipv4(back, addr);
+        if (!streq(back, one))
+            return false;
+        lc_bytes_copy(config->dns[n++], one, len + 1);
+        if (!p[len])
+            break;
+        p += len + 1;
+    }
+    config->ndns = n;
+    return true;
+}
+
 /* ─── Volumes ───────────────────────────────────────────────────────────── */
 
 /*
@@ -389,7 +434,7 @@ enum {
     KEY_MEM = 1 << 0, KEY_PIDS = 1 << 1, KEY_CPU = 1 << 2, KEY_OOM = 1 << 3,
     KEY_PRIVILEGED = 1 << 4, KEY_READONLY = 1 << 5, KEY_USERNS = 1 << 6,
     KEY_UID_START = 1 << 7, KEY_IO = 1 << 8, KEY_SWAP = 1 << 9, KEY_BASE = 1 << 10,
-    KEY_GID_START = 1 << 11, KEY_SECCOMP = 1 << 12,
+    KEY_GID_START = 1 << 11, KEY_SECCOMP = 1 << 12, KEY_NET = 1 << 13, KEY_DNS = 1 << 14,
 };
 
 static unsigned key_bit(const char *key) {
@@ -397,7 +442,8 @@ static unsigned key_bit(const char *key) {
         { "mem", KEY_MEM }, { "pids", KEY_PIDS }, { "cpu", KEY_CPU }, { "oom_score", KEY_OOM },
         { "privileged", KEY_PRIVILEGED }, { "readonly", KEY_READONLY }, { "userns", KEY_USERNS },
         { "uid_start", KEY_UID_START }, { "io", KEY_IO }, { "swap", KEY_SWAP }, { "base", KEY_BASE },
-        { "gid_start", KEY_GID_START }, { "seccomp", KEY_SECCOMP },
+        { "gid_start", KEY_GID_START }, { "seccomp", KEY_SECCOMP }, { "net", KEY_NET },
+        { "dns", KEY_DNS },
     };
     for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
         if (streq(key, keys[i].name))
@@ -505,6 +551,10 @@ static const char *config_line(container_config *config, char *line, unsigned *s
             return parse_u32_text(value, &config->gid_start) ? NULL : "gid_start is not a number";
         case KEY_SECCOMP:
             return parse_seccomp_profile(value, &config->seccomp_allow) ? NULL : "seccomp is not allow or deny";
+        case KEY_NET:
+            return parse_net_mode(value, &config->net) ? NULL : "net is not nat, outside or none";
+        case KEY_DNS:
+            return parse_dns_list(value, config) ? NULL : "dns is not a list of up to " STRINGIFY(MAX_DNS) " IPv4 addresses";
         default:    /* KEY_IO */
             return io_limit_ok(value) && str_copy(config->io, value, sizeof(config->io))
                    ? NULL : "io is not <major>:<minor> with rbps, wbps, riops or wiops =<number> or =max";
@@ -644,6 +694,17 @@ const char *container_config_save(const char *name, const container_config *conf
     /* without the line, the deny-list: what create --seccomp deny makes, and
      * what every container had before 0.8 */
     if (config->seccomp_allow) put_line(&out, "seccomp", "allow");
+    /* without the line, nat: what create --net nat makes, and what every
+     * container had before 0.8 */
+    if (config->net != NET_NAT) put_line(&out, "net", net_mode_name(config->net));
+    if (config->ndns > 0) {
+        put(&out, "dns=");
+        for (int i = 0; i < config->ndns; i++) {
+            if (i) put(&out, ",");
+            put(&out, config->dns[i]);
+        }
+        put(&out, "\n");
+    }
     if (config->userns) {
         char digits[11];
         put_line(&out, "userns", "1");

@@ -509,6 +509,52 @@ privileged=1'; do
     case $msg in *'seccomp is not allow or deny'*) ;; *) return 1 ;; esac
 }
 
+# --net takes nat, outside and none (ROADMAP 8.5). outside, the default, is
+# stored with the name servers it may ask; nat, as a .conf from before 0.8,
+# leaves the file without either line; none is stored, has no address and
+# takes neither an address nor --link. With firewall = false lightbox makes
+# no rules, and so no container of outside. Anything else is refused and
+# makes nothing, and a .conf of another net cannot be used.
+t_net_option() {
+    lb create a && lb create b --net nat && lb create c --net none &&
+        lb create d --net outside --dns 10.0.0.2 --dns 1.1.1.1 || return 1
+    conf_has a 'net=outside' && grep -q '^dns=[0-9]' "$C/a/.conf" || { echo "a: no net=outside and dns="; return 1; }
+    ! grep -q '^net=\|^dns=' "$C/b/.conf" || { echo "nat is stored"; return 1; }
+    conf_has c 'net=none' && ! grep -q '^dns=' "$C/c/.conf" && [ ! -e "$C/c/.ip" ] ||
+        { echo "none is not stored, or has an address"; return 1; }
+    conf_has d 'dns=10.0.0.2,1.1.1.1' || { echo "the name servers of --dns are not stored"; return 1; }
+    shown=$(for n in a b c d; do lb inspect "$n" | grep '^net: '; done | paste -sd'|')
+    echo "$shown"
+    [ "$shown" = 'net: outside|net: nat|net: none|net: outside' ] || return 1
+    lb inspect c | grep -qx 'ip: -' || { echo "inspect shows c with an address"; return 1; }
+    command -v python3 >/dev/null 2>&1 && {
+        lb inspect a --json | python3 -I -c 'import json, sys; assert json.load(sys.stdin)[0]["net"] == "outside"' &&
+        lb inspect c --json | python3 -I -c 'import json, sys; c = json.load(sys.stdin)[0]; assert c["net"] == "none" and c["ip"] is None' ||
+            { echo "inspect --json does not say it"; return 1; }
+    }
+    expect_refused() { # what it says, create arguments...
+        local want=$1
+        shift
+        msg=$(lb create e "$@" 2>&1) && { echo "create e $* was taken"; return 1; }
+        [ "$msg" = "$want" ] || { echo "create e $*: $msg"; return 1; }
+        [ ! -e "$C/e" ] || { echo "create e $* left a container"; return 1; }
+    }
+    expect_refused 'Error: a container with --net none has no address: 10.0.0.9' 10.0.0.9 --net none || return 1
+    expect_refused 'Error: a container with --net none has no network for --link' --net none --link a || return 1
+    for value in Outside internet '' nat,none; do
+        expect_refused "Error: --net takes nat, outside or none, not: $value" --net "$value" || return 1
+    done
+    cp "$CONF" "$W/conf.good"
+    echo 'firewall = false' >> "$CONF"
+    expect_refused 'Error: --net outside, the default, needs lightbox'"'"'s firewall rules, and lightbox.conf has
+firewall = false; create the container with --net nat or --net none' || { cp "$W/conf.good" "$CONF"; return 1; }
+    lb create f --net nat >/dev/null && lb create g --net none >/dev/null || { cp "$W/conf.good" "$CONF"; return 1; }
+    cp "$W/conf.good" "$CONF"
+    echo 'net=internet' >> "$C/b/.conf"
+    msg=$(lb inspect b 2>&1) && { echo "a .conf of net=internet was used"; return 1; }
+    case $msg in *'net is not nat, outside or none'*) ;; *) echo "$msg"; return 1 ;; esac
+}
+
 # A whole disk of this host, as <major>:<minor>; with "partition", one of its
 # partitions instead.
 block_device() {
@@ -553,7 +599,7 @@ privileged=1'; do
 }
 
 t_missing_value_is_named() {
-    for option in --mem --swap --pids --cpu --oom-score --io-max --vol --dns --link --rootfs --seccomp; do
+    for option in --mem --swap --pids --cpu --oom-score --io-max --vol --dns --link --rootfs --seccomp --net; do
         msg=$(lb create web 10.0.0.2 "$option" 2>&1) && { echo "$option without a value was accepted"; return 1; }
         printf '%s\n' "$msg"
         [ "$msg" = "Error: option $option requires a value" ] || return 1
@@ -1941,6 +1987,7 @@ check 'an address with a zero in front of a number is refused' t_address_with_le
 check 'two creates at once get two addresses'                 t_creates_at_once_get_two_addresses
 check '--swap takes what --mem does and 0, and is none unless given' t_swap_option
 check '--seccomp takes allow or deny, allow is the default, and it is stored and shown' t_seccomp_option
+check '--net takes nat, outside or none, outside is the default, and it is stored and shown' t_net_option
 check '--io-max is a line of io.max for a whole disk that is there' t_io_max_option
 check 'the firewall settings are Docker'"'"'s, and a wrong one keeps the built-in' t_firewall_settings
 check 'firewall_backend and bridge_accept_fwmark: Docker'"'"'s, and a wrong one is not taken' t_firewall_backend_settings

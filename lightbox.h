@@ -24,6 +24,12 @@
 #define NAME_MAX_LEN     30
 #define MAX_VOLS         16
 #define MAX_LINKS        8
+#define MAX_DNS          3       /* as many as a resolver reads from resolv.conf */
+
+/* What a container may reach (ROADMAP 8.5): today's network, the internet
+ * and its name servers only, or nothing at all. A .conf without the line is
+ * of a container made before 0.8, which has today's. */
+enum { NET_NAT = 0, NET_OUTSIDE = 1, NET_NONE = 2 };
 
 /* The largest legal container .conf: MAX_VOLS volumes of two MAX_PATH paths,
  * MAX_LINKS links and the scalar keys. The reader and the writer of a .conf
@@ -117,6 +123,9 @@ typedef struct {
     bool privileged;
     bool read_only;
     bool seccomp_allow;         /* the allow-list profile; false: the deny-list */
+    int  net;                   /* NET_NAT, NET_OUTSIDE or NET_NONE */
+    int  ndns;                  /* the name servers create gave it, which outside lets it ask */
+    char dns[MAX_DNS][16];
     char base[13];              /* the snapshot it overlays; empty: a copy of its base */
     bool userns;                /* uid and gid 0 are uid_start and gid_start on the host */
     uint32_t uid_start;
@@ -142,6 +151,9 @@ typedef struct {
 [[nodiscard]] bool parse_oom_score(const char *text, int *out);
 /* "allow" or "deny", the seccomp profile, as an option and the file give it */
 [[nodiscard]] bool parse_seccomp_profile(const char *text, bool *allow);
+/* "nat", "outside" or "none", as --net and the file give it, and its name */
+[[nodiscard]] bool parse_net_mode(const char *text, int *mode);
+const char *net_mode_name(int mode);
 
 /*
  * A volume as it is written: src:dst[:ro]. NULL when it is one, with both
@@ -437,6 +449,8 @@ void container_ip_path(char *buf, const char *name);
 /* <run_dir>/<name>/firewall: there while the container may have link rules.
  * container_forget_run leaves it, and so its directory, in place. */
 void container_firewall_path(char *buf, const char *name);
+/* <run_dir>/<name>/egress: the same, for the rules of --net outside */
+void container_egress_path(char *buf, const char *name);
 void container_conf_path(char *buf, const char *name);
 void container_creating_path(char *buf, const char *name);
 /* what the container's init, its hook and its services write to stdout and stderr */
@@ -623,6 +637,25 @@ void rtnl_close(rtnl *nl);
 int firewall_add_links(const char *name, const container_config *config);
 /* What firewall_add_links put in, taken out: 0 when nothing of it is left. */
 int firewall_remove_links(const char *name);
+/* --net outside (ROADMAP 8.5): what iptables-restore is given for the
+ * container at ip, and under nftables the record of its elements and the
+ * text that puts them in or takes them out. False when it does not fit. */
+[[nodiscard]] bool firewall_egress_text(const char *name, const char *ip, const container_config *config,
+                                        char *out, size_t outsz);
+[[nodiscard]] bool nft_egress_record(const char *ip, const container_config *config, char *out, size_t outsz);
+[[nodiscard]] bool nft_egress_text(const char *record, bool removal, char *out, size_t outsz);
+/* The rules of --net outside for the container at ip put in: 0, or -1 once
+ * said. Nothing for another --net. */
+int firewall_add_egress(const char *name, const char *ip, const container_config *config);
+/* What firewall_add_egress put in, taken out: 0 when nothing of it is left. */
+int firewall_remove_egress(const char *name);
+/* The texts of a container's links and of its --net outside as one, which
+ * either may be empty: nft's in a row, iptables-restore's as one table with
+ * every chain declared before any rule. False when it does not fit. */
+[[nodiscard]] bool firewall_rules_text(bool nftables, const char *links, const char *egress, char *out, size_t outsz);
+/* The links and the --net outside rules of a container, as a start puts them
+ * in: with one process. 0, or -1 once said. */
+int firewall_add_rules(const char *name, const char *ip, const container_config *config);
 /* does iptables see what the bridge switches between containers? */
 bool bridge_traffic_is_filtered(void);
 
@@ -688,8 +721,8 @@ void cmd_setup(void);
 /* setup's part of the network again, and the link rules of the containers
  * that run: what a firewall's reload took */
 void cmd_reload(int argc, char **argv);
-/* the link rules of the containers that run but except, put in again; how
- * many could not be */
+/* the link rules and the rules of --net outside of the containers that run
+ * but except, put in again; how many could not be */
 int put_back_running_links(const char *except);
 void cmd_doctor(int argc, char **argv);
 void cmd_ls(int argc, char **argv);

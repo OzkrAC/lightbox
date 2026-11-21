@@ -1887,25 +1887,60 @@ COMMIT'
 }
 
 # firewall_backend = nftables: setup's two tables in one transaction. The
-# chains are flushed and filled again and the set of links is not, as its
-# elements are the running containers'. Between two ports of the bridge, the
-# pairs in links and nothing else; out of the bridge anything, and back what
-# belongs to it; the subnet masqueraded when ip_masq is true.
+# chains are flushed and filled again and the sets of links and of --net
+# outside are not, as their elements are the running containers'; the set of
+# refused ranges is. Between two ports of the bridge, the pairs in links and
+# nothing else; out of the bridge anything, and back what belongs to it; the
+# subnet masqueraded when ip_masq is true. What a container of --net outside
+# sends out of the bridge goes through egress, and what it sends the host
+# through egress_host, which refuses it every address of the host's.
 t_nft_setup_text() {
     got=$("$UNIT" firewall nft-setup 10.9.5.0/16 10.9.0.1 br7 true)
     tab=$(printf '\t')
     want="table ip lightbox {
+${tab}set outside {
+${tab}${tab}type ipv4_addr
+${tab}}
+${tab}set outside_dns {
+${tab}${tab}type ipv4_addr . ipv4_addr
+${tab}}
+${tab}set refused {
+${tab}${tab}type ipv4_addr
+${tab}${tab}flags interval
+${tab}}
+${tab}chain egress {
+${tab}}
+${tab}chain egress_host {
+${tab}}
 ${tab}chain forward {
 ${tab}${tab}type filter hook forward priority filter; policy accept;
+${tab}}
+${tab}chain input {
+${tab}${tab}type filter hook input priority filter; policy accept;
 ${tab}}
 ${tab}chain postrouting {
 ${tab}${tab}type nat hook postrouting priority srcnat; policy accept;
 ${tab}}
 }
+flush chain ip lightbox egress
+flush chain ip lightbox egress_host
 flush chain ip lightbox forward
+flush chain ip lightbox input
 flush chain ip lightbox postrouting
+flush set ip lightbox refused
+add element ip lightbox refused { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/3 }
 add rule ip lightbox forward oifname \"br7\" ct state established,related accept
 add rule ip lightbox forward oifname \"br7\" iifname != \"br7\" drop
+add rule ip lightbox forward iifname \"br7\" oifname != \"br7\" ip saddr @outside jump egress
+add rule ip lightbox input iifname \"br7\" ip saddr @outside jump egress_host
+add rule ip lightbox egress ct state established,related return
+add rule ip lightbox egress ip saddr . ip daddr @outside_dns udp dport 53 return
+add rule ip lightbox egress ip saddr . ip daddr @outside_dns tcp dport 53 return
+add rule ip lightbox egress ip daddr @refused reject with icmp type admin-prohibited
+add rule ip lightbox egress_host ct state established,related return
+add rule ip lightbox egress_host ip saddr . ip daddr @outside_dns udp dport 53 return
+add rule ip lightbox egress_host ip saddr . ip daddr @outside_dns tcp dport 53 return
+add rule ip lightbox egress_host reject with icmp type admin-prohibited
 add rule ip lightbox postrouting ip saddr 10.9.0.0/16 oifname != \"br7\" masquerade
 table bridge lightbox {
 ${tab}set links {
@@ -1923,8 +1958,9 @@ add rule bridge lightbox forward meta ibrname \"br7\" drop"
     [ "$got" = 0 ] || { echo "with ip_masq = false, masquerade rules: $got"; return 1; }
     # bridge_accept_fwmark: accepted before anything is dropped, in both tables
     got=$("$UNIT" firewall nft-setup 10.0.0.0/24 10.0.0.1 br0 true 0x10/0xf0 | grep -n 'mark')
-    [ "$got" = '11:add rule ip lightbox forward meta mark & 0xf0 == 0x10 accept
-24:add rule bridge lightbox forward meta mark & 0xf0 == 0x10 accept' ] || { printf '%s\n' "$got"; return 1; }
+    [ "$got" = '33:add rule ip lightbox forward meta mark & 0xf0 == 0x10 accept
+34:add rule ip lightbox input meta mark & 0xf0 == 0x10 accept
+57:add rule bridge lightbox forward meta mark & 0xf0 == 0x10 accept' ] || { printf '%s\n' "$got"; return 1; }
     got=$("$UNIT" firewall nft-setup 10.0.0.0/24 10.0.0.1 br0 true 0x10 | grep 'mark' | head -n 1)
     [ "$got" = 'add rule ip lightbox forward meta mark 0x10 accept' ] || { echo "a mark without a mask: $got"; return 1; }
     # a bridge whose name would not stay between the quotes gets no rules
@@ -2106,15 +2142,35 @@ t_kernel_floor() {
 # What setup puts in its chains: between two ports of the bridge what a link
 # allows and nothing else; out by any interface but the bridge, and back what
 # belongs to that; masquerading of the subnet, as the network spells it, when
-# ip_masq is true.
+# ip_masq is true. For --net outside (ROADMAP 8.5), what leaves the bridge and
+# what reaches the host from it goes through LIGHTBOX-EGRESS, and
+# LIGHTBOX-OUTSIDE refuses the host's addresses and the ranges that are no
+# one's on the internet.
 t_firewall_setup_text() {
     got=$("$UNIT" firewall setup 10.9.5.0/16 10.9.0.1 br7 true)
     want='*filter
 -F LIGHTBOX-FORWARD
 -A LIGHTBOX-FORWARD -i br7 -o br7 -j LIGHTBOX-LINKS
+-A LIGHTBOX-FORWARD -i br7 ! -o br7 -j LIGHTBOX-EGRESS
 -A LIGHTBOX-FORWARD -i br7 -o br7 -j DROP
 -A LIGHTBOX-FORWARD -i br7 ! -o br7 -j ACCEPT
 -A LIGHTBOX-FORWARD -o br7 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-F LIGHTBOX-INPUT
+-A LIGHTBOX-INPUT -i br7 -j LIGHTBOX-EGRESS
+-F LIGHTBOX-OUTSIDE
+-A LIGHTBOX-OUTSIDE -m addrtype --dst-type LOCAL -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-OUTSIDE -m addrtype --dst-type BROADCAST -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-OUTSIDE -m addrtype --dst-type MULTICAST -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-OUTSIDE -d 0.0.0.0/8 -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-OUTSIDE -d 10.0.0.0/8 -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-OUTSIDE -d 100.64.0.0/10 -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-OUTSIDE -d 127.0.0.0/8 -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-OUTSIDE -d 169.254.0.0/16 -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-OUTSIDE -d 172.16.0.0/12 -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-OUTSIDE -d 192.0.0.0/24 -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-OUTSIDE -d 192.168.0.0/16 -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-OUTSIDE -d 198.18.0.0/15 -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-OUTSIDE -d 224.0.0.0/3 -j REJECT --reject-with icmp-admin-prohibited
 COMMIT
 *nat
 -F LIGHTBOX-POSTROUTING
@@ -2125,6 +2181,98 @@ COMMIT'
     [ "$got" = '*nat
 -F LIGHTBOX-POSTROUTING
 COMMIT' ] || { echo "with ip_masq = false:"; printf '%s\n' "$got"; return 1; }
+}
+
+# --net outside under iptables (ROADMAP 8.5): a chain of the container's
+# own, by a name made from its name, that lets on what answers it and what
+# goes to its name servers on port 53, and sends the rest to
+# LIGHTBOX-OUTSIDE; LIGHTBOX-EGRESS jumps to it for its address. An address
+# that is not one in the form lightbox writes gets no rules.
+t_firewall_egress_text() {
+    got=$("$UNIT" firewall egress web 10.199.0.5 10.0.0.2 1.1.1.1)
+    want='*filter
+:LO-5ea0e1194872 - [0:0]
+-A LO-5ea0e1194872 -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
+-A LO-5ea0e1194872 -d 10.0.0.2 -p udp --dport 53 -j RETURN
+-A LO-5ea0e1194872 -d 10.0.0.2 -p tcp --dport 53 -j RETURN
+-A LO-5ea0e1194872 -d 1.1.1.1 -p udp --dport 53 -j RETURN
+-A LO-5ea0e1194872 -d 1.1.1.1 -p tcp --dport 53 -j RETURN
+-A LO-5ea0e1194872 -j LIGHTBOX-OUTSIDE
+-A LIGHTBOX-EGRESS -s 10.199.0.5 -j LO-5ea0e1194872
+COMMIT'
+    [ "$got" = "$want" ] || { printf '%s\n' "$got"; return 1; }
+    got=$("$UNIT" firewall egress web 10.199.0.5 | grep -c -- '--dport 53')
+    [ "$got" = 0 ] || { echo "rules for name servers without one: $got"; return 1; }
+    for ip in 10.199.0.05 10.199.0.5/32 ' 10.199.0.5' 10.199.0.256 '10.199.0.5 -j ACCEPT' ''; do
+        got=$("$UNIT" firewall egress web "$ip")
+        [ "$got" = 'too long' ] || { echo "address '$ip': $got"; return 1; }
+    done
+    got=$("$UNIT" firewall egress web 10.199.0.5 '1.1.1.1 -j X')
+    [ "$got" = 'too long' ] || { echo "a name server with more in it: $got"; return 1; }
+}
+
+# What a start gives iptables-restore for a container with links and --net
+# outside: one table, both chains declared before any rule.
+t_firewall_both_text() {
+    got=$("$UNIT" firewall both web 10.199.0.5 10.0.0.2 db)
+    want='*filter
+:LB-5ea0e1194872 - [0:0]
+:LO-5ea0e1194872 - [0:0]
+-A LB-5ea0e1194872 -m physdev --physdev-in vb-5ea0e1194872 --physdev-out vb-08914e07b53b -j ACCEPT
+-A LB-5ea0e1194872 -m physdev --physdev-in vb-08914e07b53b --physdev-out vb-5ea0e1194872 -j ACCEPT
+-A LIGHTBOX-LINKS -j LB-5ea0e1194872
+-A LO-5ea0e1194872 -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
+-A LO-5ea0e1194872 -d 10.0.0.2 -p udp --dport 53 -j RETURN
+-A LO-5ea0e1194872 -d 10.0.0.2 -p tcp --dport 53 -j RETURN
+-A LO-5ea0e1194872 -j LIGHTBOX-OUTSIDE
+-A LIGHTBOX-EGRESS -s 10.199.0.5 -j LO-5ea0e1194872
+COMMIT'
+    [ "$got" = "$want" ] || { printf '%s\n' "$got"; return 1; }
+}
+
+# --net outside under nftables: the record is the address and the name
+# servers, a line each; from it the elements of the sets outside and
+# outside_dns, put in, or put in and taken out again. A record that is not
+# one lightbox writes is refused.
+t_nft_egress_text() {
+    got=$("$UNIT" firewall nft-egress 10.199.0.5 10.0.0.2 1.1.1.1)
+    [ "$got" = 'nftables
+10.199.0.5
+10.0.0.2
+1.1.1.1' ] || { printf '%s\n' "$got"; return 1; }
+    record=$(printf 'nftables\n10.199.0.5\n10.0.0.2\n1.1.1.1\n')
+    got=$("$UNIT" nftegress add "$record
+")
+    [ "$got" = 'add element ip lightbox outside { 10.199.0.5 }
+add element ip lightbox outside_dns { 10.199.0.5 . 10.0.0.2, 10.199.0.5 . 1.1.1.1 }' ] || { printf '%s\n' "$got"; return 1; }
+    got=$("$UNIT" nftegress remove "$record
+")
+    [ "$got" = 'add element ip lightbox outside { 10.199.0.5 }
+add element ip lightbox outside_dns { 10.199.0.5 . 10.0.0.2, 10.199.0.5 . 1.1.1.1 }
+delete element ip lightbox outside { 10.199.0.5 }
+delete element ip lightbox outside_dns { 10.199.0.5 . 10.0.0.2, 10.199.0.5 . 1.1.1.1 }' ] || { printf '%s\n' "$got"; return 1; }
+    got=$("$UNIT" nftegress add 'nftables
+10.199.0.5
+')
+    [ "$got" = 'add element ip lightbox outside { 10.199.0.5 }' ] || { echo "without name servers: $got"; return 1; }
+    for wrong in '' 'nftables
+' 'iptables
+10.199.0.5
+' 'nftables
+10.199.0.5' 'nftables
+10.199.0.05
+' 'nftables
+10.199.0.5 }
+' 'nftables
+10.199.0.5
+1.1.1.1
+1.1.1.2
+1.1.1.3
+1.1.1.4
+'; do
+        got=$("$UNIT" nftegress add "$wrong")
+        [ "$got" = refused ] || { printf 'record %s: %s\n' "$wrong" "$got"; return 1; }
+    done
 }
 
 t_limits() {
@@ -2253,6 +2401,8 @@ oom_score -300
 privileged 1
 readonly 1
 seccomp deny
+net nat
+dns -
 io 8:0 rbps=1048576
 swap 1G
 base -
@@ -2313,6 +2463,40 @@ config_seccomp_key() {
     case $got in "refused: $D/web/.conf: line 7: "*) ;; *) return 1 ;; esac
 }
 t_config_seccomp_key() { in_config_dir config_seccomp_key; }
+
+# net= and dns= (ROADMAP 8.5): nat, outside or none, and without the line nat,
+# as a container from before 0.8 has; up to three name servers, each in the
+# form lightbox writes. Anything else is refused with its line, and so is a
+# second of either.
+config_net_keys() {
+    head='version=1\nmem=64M\npids=32\ncpu=1\noom_score=0\n'
+    # shellcheck disable=SC2059     # the head is a format of its own
+    conf() { printf "$head$1" > "$D/web/.conf"; got=$(config); printf '%s\n' "$got"; }
+    for mode in nat outside none; do
+        conf "net=$mode\\n"
+        printf '%s\n' "$got" | grep -qx "net $mode" || return 1
+    done
+    conf ''
+    printf '%s\n' "$got" | grep -qx 'net nat' && printf '%s\n' "$got" | grep -qx 'dns -' || return 1
+    for wrong in Outside 'nat,' internet ''; do
+        conf "net=$wrong\\n"
+        [ "$got" = "refused: $D/web/.conf: line 6: net is not nat, outside or none" ] || return 1
+    done
+    conf 'net=outside\nnet=nat\n'
+    case $got in "refused: $D/web/.conf: line 7: "*) ;; *) return 1 ;; esac
+    conf 'dns=10.0.0.2,1.1.1.1,8.8.8.8\n'
+    printf '%s\n' "$got" | grep -qx 'dns 10.0.0.2,1.1.1.1,8.8.8.8' || return 1
+    conf 'dns=1.1.1.1\n'
+    printf '%s\n' "$got" | grep -qx 'dns 1.1.1.1' || return 1
+    for wrong in '' '1.1.1.1,' ',1.1.1.1' 1.1.1.01 1.1.1.1,2.2.2.2,3.3.3.3,4.4.4.4 '1.1.1.1 2.2.2.2' 1.1.1.1/32 a; do
+        conf "dns=$wrong\\n"
+        [ "$got" = "refused: $D/web/.conf: line 6: dns is not a list of up to 3 IPv4 addresses" ] ||
+            { echo "dns=$wrong"; return 1; }
+    done
+    conf 'dns=1.1.1.1\ndns=8.8.8.8\n'
+    case $got in "refused: $D/web/.conf: line 7: "*) ;; *) return 1 ;; esac
+}
+t_config_net_keys() { in_config_dir config_net_keys; }
 
 # The ranges /etc/subuid and /etc/subgid give lightbox, and the one a new
 # container gets: the first pair of 65536 that no container's overlaps, the
@@ -2398,6 +2582,8 @@ oom_score 500
 privileged 0
 readonly 0
 seccomp deny
+net nat
+dns -
 io -
 swap -
 base -
@@ -2528,6 +2714,8 @@ oom_score 100
 privileged 1
 readonly 0
 seccomp deny
+net nat
+dns -
 io -
 swap -
 base -
@@ -2565,7 +2753,7 @@ vol=/srv/data:/data
 link=db' ] || { echo "the file is not what was put in"; bad=1; }
     [ "$(stat -c %a "$D/web/.conf")" = 600 ] || { echo "the file's mode is $(stat -c %a "$D/web/.conf")"; bad=1; }
     got=$(config | tr '\n' ' ')
-    case $got in 'version 1 mem 1G pids max cpu 0.25 oom_score 500 '*'seccomp deny io 8:0 wbps=1024 swap 64M base - userns - vol /srv/data -> /data rw link db ') ;;
+    case $got in 'version 1 mem 1G pids max cpu 0.25 oom_score 500 '*'seccomp deny net nat dns - io 8:0 wbps=1024 swap 64M base - userns - vol /srv/data -> /data rw link db ') ;;
         *) echo "read back: $got"; bad=1 ;; esac
 
     before=$(cat "$D/web/.conf")
@@ -2934,6 +3122,9 @@ check 'a record of link rules names a chain of lightbox'"'"'s or is refused' t_l
 check 'a container'"'"'s link rules are a chain of its own, by port and not address' t_firewall_links_text
 check 'setup'"'"'s rules: links between ports, out by any interface, masquerade if set' t_firewall_setup_text
 check 'nftables: setup'"'"'s two tables, flushed chains, a set of links that is kept' t_nft_setup_text
+check '--net outside under iptables: a chain of the container'"'"'s own, its name servers and the rest refused' t_firewall_egress_text
+check '--net outside under nftables: a record of the address and name servers, and the sets'"'"' elements' t_nft_egress_text
+check 'a start puts in links and --net outside as one table, the chains before the rules' t_firewall_both_text
 check 'nftables: a container'"'"'s links are elements of the set, each once, taken out safely' t_nft_link_elements
 check 'nftables: a record that is not lightbox'"'"'s is not given to nft'  t_nft_records_refused
 check 'bridge_accept_fwmark: a mark nft reads as written, and none that matches all' t_fwmarks
@@ -2947,6 +3138,7 @@ check 'a .conf is read into one structure, whole'                t_config_is_rea
 check 'what a .conf leaves out is the default, if that is usable' t_config_defaults
 check 'userns=1 is read with a uid_start and a gid_start, and refused without' t_config_userns_keys
 check 'seccomp= is allow or deny, and the deny-list without it' t_config_seccomp_key
+check 'net= is nat, outside or none, nat without it, and dns= up to three addresses' t_config_net_keys
 check 'a new container gets the first range of /etc/subuid and /etc/subgid that is free' t_userns_ranges
 check "a volume's maps make the container's root its source's owner, and never host root" t_volume_maps
 check 'base= is a snapshot'"'"'s id, read as it is, or refused'          t_config_base_key

@@ -376,6 +376,7 @@ void cmd_inspect(int argc, char **argv) {
         report_flag(&r, "privileged", config.privileged, "1", "0");
         report_flag(&r, "readonly", config.read_only, "1", "0");
         report_text(&r, "seccomp", config.privileged ? NULL : config.seccomp_allow ? "allow" : "deny");
+        report_text(&r, "net", net_mode_name(config.net));
         report_volumes(&r, &config);
         report_links(&r, &config);
     }
