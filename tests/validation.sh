@@ -1037,7 +1037,9 @@ t_runtime_records_are_apart() {
     lb create web 10.0.0.2 || return 1
     echo "the container's directory: $(ls -A "$C/web" | tr '\n' ' ')"
     echo "run_dir: $(ls -A "$R" | tr '\n' ' ')"
-    [ "$(ls -A "$C/web" | tr '\n' ' ')" = '.conf .ip rootfs ' ] || { echo "create left more than a container is made of"; return 1; }
+    [ "$(ls -A "$C/web" | tr '\n' ' ')" = '.conf .ip .resolv rootfs ' ] || { echo "create left more than a container is made of"; return 1; }
+    [ "$(cat "$C/web/.resolv")" = "$(cat "$C/web/rootfs/etc/resolv.conf")" ] || { echo ".resolv is not what create wrote"; return 1; }
+    [ "$(mode_of "$C/web/.resolv")" = 600 ] || { echo ".resolv is $(mode_of "$C/web/.resolv")"; return 1; }
     [ -z "$(ls -A "$R")" ] || { echo "create made a runtime record"; return 1; }
     report=$(lb inspect web)
     for line in 'state: stopped' 'running: no' 'pid: -' "pid_path: $R/web/pid" "pid_start_path: $R/web/pid_start" \
@@ -1215,7 +1217,7 @@ t_root_is_asked_for_first() {
     chmod 755 "$W/data" "$C"
     before=$(kept_sum)
     bad=0
-    for words in setup 'setup --teardown' reload 'start web' 'stop web' 'exec web /bin/true'; do
+    for words in setup 'setup --teardown' reload 'start web' 'stop web' 'exec web /bin/true' 'reset web'; do
         # shellcheck disable=SC2086
         msg=$(lb $words 2>&1) && { echo "lightbox $words succeeded"; bad=1; }
         echo "lightbox $words: $msg"
@@ -1702,6 +1704,10 @@ t_update_restart_rm_options() {
     expect 'Usage: lightbox restart <name>... [-t <seconds>]' restart
     expect 'Usage: lightbox rm [-f] <name>...' rm -f
     expect 'Error: unknown option: --forcefully' rm --forcefully web
+    expect 'Usage: lightbox reset <name>... [-t <seconds>]' reset
+    expect 'Error: not a number of seconds from 0 to 86400: soon' reset web -t soon
+    expect 'Error: unknown option: --hard' reset web --hard
+    expect 'Error: container name must only contain [a-zA-Z0-9_-]' reset 'we b'
     if [ "$(id -u)" -ne 0 ]; then
         expect 'Error: lightbox update must be run as root' update web --mem 64M
         expect 'Error: lightbox restart must be run as root' restart web
@@ -1999,7 +2005,7 @@ check 'rm clears away a container that ended without a stop' t_rm_of_a_dead_cont
 check 'inspect writes nothing'                              t_inspect_writes_nothing
 check 'a process owned by another user is not gone'         t_other_users_process_is_not_gone
 check 'a dead container is shown as exited'                 t_dead_container_shown_as_exited
-check 'setup, start, stop and exec ask for root first'      t_root_is_asked_for_first
+check 'setup, start, stop, exec and reset ask for root first' t_root_is_asked_for_first
 check 'eight add-vol at once all take effect'               t_commands_take_turns
 check 'a command waits for a lock and says so; ls does not' t_lock_is_waited_for
 check 'start checks its options before it does anything'    t_start_options_are_checked
@@ -2069,7 +2075,7 @@ check 'rm takes several names, and names those it did not remove'      t_rm_hand
 check 'a surplus argument is an error that names it'                    t_surplus_arguments_are_errors
 check 'doctor says how to fix each thing it finds missing'              t_doctor_says_how_to_fix
 check 'doctor --json: settings and checks, typed'                       t_doctor_json
-check 'update, restart and rm -f check their options before anything'  t_update_restart_rm_options
+check 'update, restart, rm -f and reset check their options before anything'  t_update_restart_rm_options
 check 'update writes the limits into a stopped container'"'"'s .conf'       t_update_rewrites_the_conf
 check 'create --userns is root'"'"'s, and inspect and doctor show the ranges' t_userns_as_a_user_sees_it
 check 'base add, ls and rm manage the snapshots of bases'              t_base_snapshots

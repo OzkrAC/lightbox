@@ -34,6 +34,13 @@ void container_log_path(char *buf, const char *name) {
     path_join_or_die(buf, MAX_PATH, base, "console.log");
 }
 
+/* What create wrote in the container's resolv.conf, for reset (ROADMAP 8.8). */
+void container_resolv_path(char *buf, const char *name) {
+    char base[MAX_PATH];
+    container_dir_path(base, name);
+    path_join_or_die(buf, MAX_PATH, base, ".resolv");
+}
+
 /* A mark that create has not finished with the container. It is in the
  * container's directory, written to stay: a container that is half made is
  * still half made after a reboot. */

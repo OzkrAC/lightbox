@@ -478,6 +478,8 @@ void container_firewall_path(char *buf, const char *name);
 void container_egress_path(char *buf, const char *name);
 void container_conf_path(char *buf, const char *name);
 void container_creating_path(char *buf, const char *name);
+/* .resolv: what create wrote in its resolv.conf, which reset writes again */
+void container_resolv_path(char *buf, const char *name);
 /* what the container's init, its hook and its services write to stdout and stderr */
 void container_log_path(char *buf, const char *name);
 

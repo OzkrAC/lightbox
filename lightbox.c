@@ -1211,6 +1211,58 @@ static int overlay_etc(const char *name, const container_config *cfg, const char
     return code;
 }
 
+/*
+ * What a container asks for names, as create writes it in its resolv.conf:
+ * for --net proxy none, as its proxy looks names up; otherwise the ones
+ * --dns gave (dns, ndns); or with none given, the ones on record in cfg,
+ * which --net outside keeps; or the dns setting; or the ones this host asks,
+ * without its own loopback; or two public ones. For --net outside what it
+ * asks goes on record in cfg. NULL, or what failed.
+ */
+#define RESOLV_TEXT_MAX 4096
+static const char *make_resolv(container_config *cfg, char dns[MAX_DNS][16], int ndns, char resolv[RESOLV_TEXT_MAX]) {
+    if (cfg->net == NET_PROXY) {
+        /* none: a lookup of its own could carry data out */
+        static const char proxy_resolv[] = "# --net proxy: the proxy looks up names\n";
+        lc_bytes_copy(resolv, proxy_resolv, sizeof(proxy_resolv));
+        return NULL;
+    }
+    if (ndns == 0 && cfg->ndns > 0) {
+        for (int i = 0; i < cfg->ndns && i < MAX_DNS; i++)
+            lc_bytes_copy(dns[i], cfg->dns[i], sizeof(cfg->dns[0]));
+        ndns = cfg->ndns < MAX_DNS ? cfg->ndns : MAX_DNS;
+    }
+    if (ndns == 0 && cfg_global.dns[0]) {
+        ndns = name_servers_listed(cfg_global.dns, dns);
+        if (ndns <= 0)
+            return "the dns setting in lightbox.conf is not a list of up to " STRINGIFY(MAX_DNS) " IPv4 addresses";
+    }
+    if (ndns == 0)
+        ndns = name_servers_of("/etc/resolv.conf", dns);
+    if (ndns == 0)      /* behind systemd-resolved's stub, the servers it asks */
+        ndns = name_servers_of("/run/systemd/resolve/resolv.conf", dns);
+    const char *const public_servers[] = { "1.1.1.1", "8.8.8.8" };
+    bool cut = false;
+    size_t pos = 0;
+    resolv[0] = '\0';
+    for (int i = 0; i < (ndns ? ndns : 2); i++) {
+        pos = str_append(resolv, pos, "nameserver ", RESOLV_TEXT_MAX, &cut);
+        pos = str_append(resolv, pos, ndns ? dns[i] : public_servers[i], RESOLV_TEXT_MAX, &cut);
+        pos = str_append(resolv, pos, "\n", RESOLV_TEXT_MAX, &cut);
+    }
+    if (cut)
+        return "the name servers do not fit in resolv.conf";
+    /* --net outside lets it ask them, and only them of the addresses it may
+     * not reach: on record, as the container may write its own resolv.conf */
+    if (cfg->net == NET_OUTSIDE) {
+        cfg->ndns = ndns ? ndns : 2;
+        for (int i = 0; i < cfg->ndns; i++)
+            if (!str_copy(cfg->dns[i], ndns ? dns[i] : public_servers[i], sizeof(cfg->dns[0])))
+                return "a name server is too long to be one";
+    }
+    return NULL;
+}
+
 static void cmd_create(int argc, char **argv) {
     bool full_copy = false;     /* --copy: the container is a copy of its base, not an overlay */
     require_tool("cp", tool_path_cp());
@@ -1424,51 +1476,10 @@ static void cmd_create(int argc, char **argv) {
         create_err = "failed to mark the container as being created";
         goto fail_create;
     }
-    /*
-     * What the container asks for names: the ones --dns gave; or the dns
-     * setting; or the ones this host asks, without its own loopback; or two
-     * public ones.
-     */
-    char resolv[4096];
-    if (cfg.net == NET_PROXY) {
-        /* none: a lookup of its own could carry data out, and its proxy looks
-         * names up */
-        static const char proxy_resolv[] = "# --net proxy: the proxy looks up names\n";
-        lc_bytes_copy(resolv, proxy_resolv, sizeof(proxy_resolv));
-    } else {
-        if (ndns == 0 && cfg_global.dns[0]) {
-            ndns = name_servers_listed(cfg_global.dns, dns);
-            if (ndns <= 0) {
-                create_err = "the dns setting in lightbox.conf is not a list of up to " STRINGIFY(MAX_DNS) " IPv4 addresses";
-                goto fail_create;
-            }
-        }
-        if (ndns == 0)
-            ndns = name_servers_of("/etc/resolv.conf", dns);
-        if (ndns == 0)      /* behind systemd-resolved's stub, the servers it asks */
-            ndns = name_servers_of("/run/systemd/resolve/resolv.conf", dns);
-        const char *const public_servers[] = { "1.1.1.1", "8.8.8.8" };
-        bool cut = false;
-        size_t pos = 0;
-        resolv[0] = '\0';
-        for (int i = 0; i < (ndns ? ndns : 2); i++) {
-            pos = str_append(resolv, pos, "nameserver ", sizeof(resolv), &cut);
-            pos = str_append(resolv, pos, ndns ? dns[i] : public_servers[i], sizeof(resolv), &cut);
-            pos = str_append(resolv, pos, "\n", sizeof(resolv), &cut);
-        }
-        if (cut) {
-            create_err = "the name servers do not fit in resolv.conf";
-            goto fail_create;
-        }
-        /* --net outside lets it ask them, and only them of the addresses it
-         * may not reach: on record, as the container may write its own
-         * resolv.conf */
-        if (cfg.net == NET_OUTSIDE) {
-            cfg.ndns = ndns ? ndns : 2;
-            for (int i = 0; i < cfg.ndns; i++)
-                str_copy_or_die(cfg.dns[i], ndns ? dns[i] : public_servers[i], sizeof(cfg.dns[0]), "--dns");
-        }
-    }
+    static char resolv[RESOLV_TEXT_MAX];
+    create_err = make_resolv(&cfg, dns, ndns, resolv);
+    if (create_err)
+        goto fail_create;
 
     /*
      * The container's root. An overlay of a snapshot of the base: the
@@ -1538,6 +1549,14 @@ static void cmd_create(int argc, char **argv) {
     container_ip_path(ip_path, name);
     if (ip[0] && write_file_atomic(ip_path, ip, MODE_PRIVATE_FILE) < 0) {
         create_err = "failed to write IP metadata";
+        goto fail_create;
+    }
+
+    /* what it was given to ask for names, for reset to write again */
+    char resolv_path[MAX_PATH];
+    container_resolv_path(resolv_path, name);
+    if (write_file_atomic(resolv_path, resolv, MODE_PRIVATE_FILE) < 0) {
+        create_err = "failed to keep what the container's resolv.conf says";
         goto fail_create;
     }
 
@@ -4635,6 +4654,98 @@ static void cmd_restart(int argc, char **argv) {
     each_container("not restarted", count, argv, restart_one, seconds);
 }
 
+/* ─── reset ─────────────────────────────────────────────────────────────── */
+
+/*
+ * reset <name>... [-t <seconds>] (ROADMAP 8.8): the root filesystem of a
+ * container that overlays a snapshot made its base's again, without a copy:
+ * its upper layer, rootfs/, and the overlay's work directory are replaced by
+ * empty ones, and the /etc files that create wrote are written through the
+ * overlay again. Its volumes, configuration, address and log are not
+ * touched. One that runs is stopped first, as stop stops it. A container
+ * that is a copy of its base has nothing to be reset to and is refused.
+ *
+ * While its layer is replaced the container is marked as one that create has
+ * not finished: a reset cut short leaves it half made, not started by start,
+ * and a reset again makes it whole, or rm removes it.
+ */
+static void reset_one(const char *name, int seconds) {
+    require_root("reset");
+    static container_config cfg;
+    container_config_load_or_die(name, &cfg);
+    if (!cfg.base[0])
+        die2("Error: the container is a copy of its base, and not an overlay of a snapshot, so it has\n"
+             "nothing to be reset to; remove it and create it again: ", name);
+    if (!stop_if_running(name, seconds))
+        lc_kernel_exit(failure_status);
+
+    container_lock(name);
+    if (is_running(name))
+        die2("Error: the container was started again before it could be reset: ", name);
+    (void)reconcile(name);      /* one that ended without a stop is cleared away first */
+    container_config_load_or_die(name, &cfg);
+    if (!cfg.base[0])
+        die2("Error: the container is a copy of its base, and has nothing to be reset to: ", name);
+    char lower[MAX_PATH];
+    if (!base_rootfs_path(lower, cfg.base) || !path_is_directory(lower))
+        die2("Error: the base snapshot that the container overlays is not there: ", cfg.base);
+    /* nothing is taken away before an overlay is known to mount */
+    if (!overlay_mounts_here(name, cfg.userns ? &cfg : NULL))
+        die2("Error: no overlay can be mounted here, and the container is left as it was: ", name);
+
+    char ip[IPV4_TEXT_MAX] = "";
+    if (cfg.net != NET_NONE && read_container_ip(name, ip, sizeof(ip)) < 0)
+        die2("Error: the container's address is not on record: ", name);
+    static char resolv[RESOLV_TEXT_MAX];
+    char resolv_path[MAX_PATH];
+    container_resolv_path(resolv_path, name);
+    if (read_file(resolv_path, resolv, sizeof(resolv)) <= 0) {
+        /* made before create kept it: what create would write now, with
+         * the name servers of --net outside as they are on record */
+        static container_config again;
+        again = cfg;
+        char dns[MAX_DNS][16];
+        const char *failed = make_resolv(&again, dns, 0, resolv);
+        if (failed)
+            die2("Error: ", failed);
+        print_str(STDERR, "Note: the container was made before lightbox kept its resolv.conf: it gets the one\n"
+                          "create would write now\n");
+    }
+
+    char creating[MAX_PATH], root[MAX_PATH], work[MAX_PATH], merged[MAX_PATH];
+    container_creating_path(creating, name);
+    container_root(root, name);
+    if (!overlay_dirs(name, work, merged))
+        die2("Error: the paths of the container's overlay are too long: ", name);
+    print_str(STDOUT, "Resetting container '");
+    print_str(STDOUT, name);
+    print_str(STDOUT, "'...\n");
+    if (write_file_atomic(creating, "", MODE_PRIVATE_FILE) != 0)
+        die("Error: failed to mark the container as being reset");
+    const char *dirs[] = { root, work, merged };
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++)
+        if (path_exists(dirs[i]))
+            require_rm_rf(dirs[i]);
+    if (overlay_etc(name, &cfg, ip, resolv) != 0)
+        die2("Error: failed to write the container's files in /etc; it is left half made, and reset\n"
+             "makes it whole: ", name);
+    container_forget_run(name);
+    if (remove_file_durably(creating) != 0)
+        die("Error: failed to mark the container as reset");
+    print_str(STDOUT, "Container '");
+    print_str(STDOUT, name);
+    print_str(STDOUT, "' reset: its root filesystem is its base's again\n");
+}
+
+static void cmd_reset(int argc, char **argv) {
+    int seconds = cfg_global.stop_timeout;
+    int count = names_and_seconds(argc, argv, &seconds, NULL);
+    if (count == 0)
+        die("Usage: lightbox reset <name>... [-t <seconds>]");
+    require_root("reset");
+    each_container("not reset", count, argv, reset_one, seconds);
+}
+
 /* ─── cmd_update ────────────────────────────────────────────────────────── */
 
 /*
@@ -5016,6 +5127,9 @@ static const struct { const char *name; const char *text; } command_help[] = {
         "  rm-vol <name> <dst>           Remove the volume at a destination\n" },
     { "restart",
         "  restart <name>... [-t <seconds>]  Stop containers that run, as stop does, and start them\n" },
+    { "reset",
+        "  reset  <name>... [-t <seconds>]  Make the root filesystem of containers their base's again,\n"
+        "                                without a copy; one that runs is stopped first. Volumes are kept\n" },
     { "update",
         "  update <name> [--mem <limit>] [--pids <limit>] [--cpu <num>]\n"
         "                                Change a container's limits, live if it runs and from its next\n"
@@ -5187,6 +5301,7 @@ int main(int argc, char **argv, char **envp) {
     else if (streq(cmd, "start"))  cmd_start(sub_argc, sub_argv);
     else if (streq(cmd, "stop"))   cmd_stop(sub_argc, sub_argv);
     else if (streq(cmd, "restart")) cmd_restart(sub_argc, sub_argv);
+    else if (streq(cmd, "reset"))  cmd_reset(sub_argc, sub_argv);
     else if (streq(cmd, "update")) cmd_update(sub_argc, sub_argv);
     else if (streq(cmd, "add-vol")) cmd_add_vol(sub_argc, sub_argv);
     else if (streq(cmd, "rm-vol")) cmd_rm_vol(sub_argc, sub_argv);

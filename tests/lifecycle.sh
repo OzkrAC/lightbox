@@ -2934,6 +2934,48 @@ t_overlay_root() {
     [ "$(sh_in ov1 'cat /made-here')" = mine ] || { echo "what the container wrote did not outlast a restart"; return 1; }
 }
 
+# reset (ROADMAP 8.8): a container that runs is stopped, and its root
+# filesystem is its base's again, with only the files create wrote in its
+# rootfs/, which is still its root's, and nothing copied; its /etc is as
+# create made it, and its volume as the container left it. A container
+# marked as half made, as a reset cut short leaves it, is not started, and
+# reset makes it whole. A copy of its base is refused, and runs on.
+t_reset() {
+    local said etc own owner
+    OVERLAY=1
+    mkdir -p "$T/vol/resetvol"
+    box rst --vol "$T/vol/resetvol:/data" && volume_for rst "$T/vol/resetvol" && start rst || return 1
+    etc=$(sh_in rst 'cat /etc/hostname /etc/hosts /etc/resolv.conf')
+    owner=$(stat -c %u:%g "$C/rst/rootfs")
+    sh_in rst 'echo mine > /made-here && echo kept > /data/kept && rm /etc/group && echo changed > /etc/resolv.conf' || return 1
+    said=$(lb reset rst </dev/null) || { printf '%s\n' "$said"; return 1; }
+    printf '%s\n' "$said"
+    printf '%s\n' "$said" | grep -qx "Container 'rst' reset: its root filesystem is its base's again" || return 1
+    nothing_left rst || return 1
+    own=$(cd "$C/rst/rootfs" && find . -type f | sort | paste -sd' ' -)
+    echo "its own files: $own; rootfs/ $(stat -c %u:%g "$C/rst/rootfs"), was $owner"
+    [ "$own" = './etc/hostname ./etc/hosts ./etc/resolv.conf' ] || { echo "rootfs/ has more than create wrote"; return 1; }
+    [ "$(stat -c %u:%g "$C/rst/rootfs")" = "$owner" ] || { echo "rootfs/ changed hands"; return 1; }
+    [ "$(cat "$T/vol/resetvol/kept")" = kept ] || { echo "the volume lost its file"; return 1; }
+    start rst || return 1
+    sh_in rst 'test ! -e /made-here && test -e /etc/group' || { echo "what the container did is still there"; return 1; }
+    [ "$(sh_in rst 'cat /etc/hostname /etc/hosts /etc/resolv.conf')" = "$etc" ] || { echo "/etc is not as create made it"; return 1; }
+    [ "$(sh_in rst 'cat /data/kept')" = kept ] || { echo "the container does not see its volume's file"; return 1; }
+
+    lb stop rst >/dev/null || return 1
+    : > "$C/rst/.creating"
+    lb start rst >/dev/null 2>&1 </dev/null && { echo "a half made container was started"; return 1; }
+    lb reset rst </dev/null || return 1
+    [ ! -e "$C/rst/.creating" ] || { echo "reset left the mark"; return 1; }
+    start rst || return 1
+
+    up rstc --copy || return 1
+    said=$(lb reset rstc 2>&1 </dev/null) && { echo "a copy was reset"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *"is a copy of its base"*) ;; *) return 1 ;; esac
+    [ "$(state_of rstc)" = running ] || { echo "the copy did not run on: $(state_of rstc)"; return 1; }
+}
+
 # --copy: a copy of the base, as before 0.7, with no snapshot of its own.
 t_copy_root() {
     box cp1 --copy || return 1
@@ -3883,6 +3925,7 @@ if [ "$MODE" = inside ]; then
     check 'without --config or LIGHTBOX_CONFIG, /etc/lightbox/lightbox.conf is read' t_config_in_etc
     check 'a container overlays a snapshot of its base, and keeps its own files apart' t_overlay_root
     check '--copy makes a container a copy of its base'                   t_copy_root
+    check "reset makes a container's root its base's again, and keeps its volume" t_reset
     check 'base ls, base rm and base add manage the snapshots'            t_base_commands
     check 'no case ran ip or nsenter, which were masked in every one'     t_no_ip_or_nsenter_ran
 
