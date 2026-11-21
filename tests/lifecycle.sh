@@ -2252,9 +2252,9 @@ PROXY_PORT=3128
 # its resolv.conf names none; exec and the hook have the variables of its
 # proxy, and --env replaces one. A container of --net nat beside it reaches
 # all of them. With links, that one names it with --link, made before it so
-# that create could not refuse the link, and neither reaches the other. Then
-# stopped, nothing of its rules is left. links: whether links can be had
-# here; starter: what starts a container.
+# that create could not refuse the link, and neither reaches the other. With
+# both stopped, nothing of their rules is left. links: whether links can be
+# had here; starter: what starts a container.
 net_proxy() { # prefix, links (yes|no), starter...
     local p=$1 links=$2 rc=0
     shift 2
@@ -2280,7 +2280,10 @@ EOF
     kill "$proxy" "$tcp53" 2>/dev/null
     port_free() { ! ss -ltn | grep -q ":$PROXY_PORT "; }
     wait_until 5 port_free || { echo "the listener on port $PROXY_PORT is still there"; rc=1; }
-    [ "$rc" = 0 ] && lb stop "${p}prx" >/dev/null && nothing_left "${p}prx"
+    # both: the nftables elements of the link name the container of --net
+    # proxy too, and are the other's, which take them out when it stops
+    [ "$rc" = 0 ] && lb stop "${p}prx" >/dev/null && lb stop "${p}lnk" >/dev/null &&
+        nothing_left "${p}prx" && nothing_left "${p}lnk"
 }
 net_proxy_checks() { # prefix, links
     local p=$1 links=$2 said v url dns_pid try
