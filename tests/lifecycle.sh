@@ -899,14 +899,16 @@ t_run() {
 # removed by the next run, which says so.
 t_run_ends() {
     local front rc name said
-    mkdir -p "$T/vol/runsig" "$T/vol/runkill"
+    # the command says the box's name on run's stdout, which goes to a file:
+    # a volume would need to be the box's root's, whose range is not known
+    # before run has made the box
     # shellcheck disable=SC2046
-    "$LB" run $(mode_options) --vol "$T/vol/runsig:/out" -- /bin/sh -c 'hostname > /out/name; exec sleep 1114' \
-        >/dev/null 2>"$OUT/runsig.err" </dev/null &
+    "$LB" run $(mode_options) -- /bin/sh -c 'hostname; exec sleep 1114' \
+        >"$OUT/runsig.out" 2>"$OUT/runsig.err" </dev/null &
     front=$!
-    wait_until 20 test -s "$T/vol/runsig/name" && wait_until 5 running_cmd 'sleep 1114' ||
+    wait_until 20 test -s "$OUT/runsig.out" && wait_until 5 running_cmd 'sleep 1114' ||
         { echo "the command did not start"; cat "$OUT/runsig.err"; kill -KILL "$front"; return 1; }
-    name=$(cat "$T/vol/runsig/name")
+    name=$(cat "$OUT/runsig.out")
     kill -TERM "$front"
     wait "$front"
     rc=$?
@@ -914,12 +916,12 @@ t_run_ends() {
     [ "$rc" = 143 ] && ! running_cmd 'sleep 1114' && run_left "$name" || return 1
 
     # shellcheck disable=SC2046
-    "$LB" run $(mode_options) --vol "$T/vol/runkill:/out" -- /bin/sh -c 'hostname > /out/name; exec sleep 1115' \
-        >/dev/null 2>&1 </dev/null &
+    "$LB" run $(mode_options) -- /bin/sh -c 'hostname; exec sleep 1115' \
+        >"$OUT/runkill.out" 2>&1 </dev/null &
     front=$!
-    wait_until 20 test -s "$T/vol/runkill/name" && wait_until 5 running_cmd 'sleep 1115' ||
-        { echo "the second did not start"; kill -KILL "$front"; return 1; }
-    name=$(cat "$T/vol/runkill/name")
+    wait_until 20 test -s "$OUT/runkill.out" && wait_until 5 running_cmd 'sleep 1115' ||
+        { echo "the second did not start"; cat "$OUT/runkill.out"; kill -KILL "$front"; return 1; }
+    name=$(cat "$OUT/runkill.out")
     kill -KILL "$front"
     wait "$front" 2>/dev/null
     echo "its run killed, $name: $(state_of "$name"); .runner: $(cat "$C/$name/.runner" 2>&1)"
