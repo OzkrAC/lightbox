@@ -4,7 +4,7 @@ What changed for someone who uses lightbox, newest first. `ROADMAP.md` has the r
 
 ## 0.8.0
 
-Not tagged yet: the part of Phase 8 that is written so far.
+Phase 8 of the roadmap: the agent profile, a box for an AI agent's working session, in which every command is taken for possibly hostile. `create --profile agent` and `run --profile agent` turn on with one switch what the phase built: a user namespace whose root is an unprivileged uid of the host's, on idmapped mounts, with volumes that keep their owner; the allow-list seccomp profile, now every new container's; a device program that keeps a container to its own `/dev`; `--net none`, or `--net proxy:<port>` to one port of the gateway, with `--net outside` the default for other containers; limits and a lifetime of their own; and `--workspace`. Beside it: `exec` statuses of its own and `--timeout`, `run`, `reset` and `--ttl`, the audit log of every `exec` and `run`, `doctor --profile agent`, and README's "Running an agent in a box", which says where the profile stops. On GitHub's runners a start takes a median of 11.7 ms on x86_64 and 16.2 ms on aarch64, and a stop 9.3 and 9.9.
 
 ### Changes you may have to act on
 
