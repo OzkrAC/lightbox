@@ -1,6 +1,6 @@
 /*
- * Compile-only check of lightbox_sys.h and lightbox_seccomp.h against the
- * kernel's own headers.
+ * Compile-only check of lightbox_sys.h, lightbox_seccomp.h and
+ * lightbox_devices.h against the kernel's own headers.
  *
  * lightbox is freestanding and carries a few syscall numbers, constants and
  * structure layouts of its own, and its seccomp table lists numbers for two
@@ -31,13 +31,16 @@
 #include <asm/termios.h>
 #include <asm/unistd.h>
 #include <linux/audit.h>
+#include <linux/bpf.h>
 #include <linux/capability.h>
 #include <linux/fcntl.h>
 #include <linux/filter.h>
 #include <linux/magic.h>
+#include <linux/major.h>
 #include <linux/if_addr.h>
 #include <linux/if_link.h>
 #include <linux/memfd.h>
+#include <linux/time.h>
 #include <linux/mount.h>
 #include <linux/netlink.h>
 #include <linux/openat2.h>
@@ -51,6 +54,7 @@
 
 #include "../lightbox_sys.h"
 #include "../lightbox_seccomp.h"
+#include "../lightbox_devices.h"
 
 #define SAME_NR(name) \
     _Static_assert(LB_SYS_##name == __NR_##name, \
@@ -66,11 +70,16 @@ SAME_NR(renameat);
 SAME_NR(ppoll);
 SAME_NR(close_range);
 SAME_NR(pidfd_open);
+SAME_NR(getrandom);
+
+/* --ttl's clock (ROADMAP 8.8) */
+_Static_assert(LB_CLOCK_BOOTTIME == CLOCK_BOOTTIME, "LB_CLOCK_BOOTTIME is not CLOCK_BOOTTIME");
 SAME_NR(open_tree);
 SAME_NR(openat2);
 SAME_NR(fcntl);
 SAME_NR(flock);
 SAME_NR(geteuid);
+SAME_NR(getuid);
 SAME_NR(memfd_create);
 SAME_NR(execveat);
 SAME_NR(mount_setattr);
@@ -78,14 +87,18 @@ SAME_NR(move_mount);
 SAME_NR(pidfd_send_signal);
 SAME_NR(statx);
 SAME_NR(faccessat);
+SAME_NR(bpf);
 
 #define SAME_VALUE(ours, kernels) \
     _Static_assert((ours) == (kernels), #ours " differs from the kernel's " #kernels)
 
+SAME_VALUE(LB_EPERM, EPERM);
 SAME_VALUE(LB_ENOENT, ENOENT);
 SAME_VALUE(LB_ENODEV, ENODEV);
 SAME_VALUE(LB_ESRCH, ESRCH);
 SAME_VALUE(LB_EINTR, EINTR);
+SAME_VALUE(LB_EIO, EIO);
+SAME_VALUE(LB_ENOMEM, ENOMEM);
 SAME_VALUE(LB_EEXIST, EEXIST);
 SAME_VALUE(LB_EACCES, EACCES);
 SAME_VALUE(LB_ENOTDIR, ENOTDIR);
@@ -113,6 +126,9 @@ SAME_VALUE(LB_F_SEAL_SHRINK, F_SEAL_SHRINK);
 SAME_VALUE(LB_F_SEAL_GROW, F_SEAL_GROW);
 SAME_VALUE(LB_F_SEAL_WRITE, F_SEAL_WRITE);
 SAME_VALUE(LB_MOUNT_ATTR_RDONLY, MOUNT_ATTR_RDONLY);
+SAME_VALUE(LB_MOUNT_ATTR_NOSUID, MOUNT_ATTR_NOSUID);
+SAME_VALUE(LB_MOUNT_ATTR_NODEV, MOUNT_ATTR_NODEV);
+SAME_VALUE(LB_MOUNT_ATTR_IDMAP, MOUNT_ATTR_IDMAP);
 SAME_VALUE(LB_SIGPIPE, SIGPIPE);
 SAME_VALUE(LB_SIGCONT, SIGCONT);
 SAME_VALUE(LB_SIGTTOU, SIGTTOU);
@@ -159,6 +175,8 @@ SAME_VALUE(LB_S_IFDIR, S_IFDIR);
 SAME_VALUE(LB_STATX_TYPE, STATX_TYPE);
 SAME_VALUE(LB_STATX_INO, STATX_INO);
 SAME_VALUE(LB_STATX_MODE, STATX_MODE);
+SAME_VALUE(LB_STATX_UID, STATX_UID);
+SAME_VALUE(LB_STATX_GID, STATX_GID);
 SAME_VALUE(LB_STATX_ATTR_MOUNT_ROOT, STATX_ATTR_MOUNT_ROOT);
 SAME_VALUE(LB_CGROUP_SUPER_MAGIC, CGROUP_SUPER_MAGIC);
 SAME_VALUE(LB_CGROUP2_SUPER_MAGIC, CGROUP2_SUPER_MAGIC);
@@ -194,6 +212,10 @@ SAME_VALUE(LB_ST_RDONLY, MS_RDONLY);
 SAME_VALUE(LB_ST_NOSUID, MS_NOSUID);
 SAME_VALUE(LB_ST_NODEV, MS_NODEV);
 SAME_VALUE(LB_ST_NOEXEC, MS_NOEXEC);
+SAME_VALUE(LB_MS_NOATIME, MS_NOATIME);
+SAME_VALUE(LB_MS_NODIRATIME, MS_NODIRATIME);
+SAME_VALUE(LB_MS_RELATIME, MS_RELATIME);
+SAME_VALUE(LB_MS_STRICTATIME, MS_STRICTATIME);
 
 #define SAME_SIZE(ours, kernels) \
     _Static_assert(sizeof(struct ours) == sizeof(struct kernels), \
@@ -211,6 +233,8 @@ SAME_FIELD(lb_statfs, statfs, f_flags);
 SAME_SIZE(lb_statx, statx);
 SAME_FIELD(lb_statx, statx, stx_mask);
 SAME_FIELD(lb_statx, statx, stx_attributes);
+SAME_FIELD(lb_statx, statx, stx_uid);
+SAME_FIELD(lb_statx, statx, stx_gid);
 SAME_FIELD(lb_statx, statx, stx_mode);
 SAME_FIELD(lb_statx, statx, stx_attributes_mask);
 SAME_FIELD(lb_statx, statx, stx_dev_major);
@@ -382,6 +406,30 @@ LB_SECCOMP_DENY(CHECK_ROW)
 #endif
 LB_SECCOMP_DENY_X86_64(CHECK_ROW_X86_64)
 
+/* the mode table, as the deny table */
+#define CHECK_MODE_ROW(name, x86_64, aarch64, mode, flags) CHECK_ROW(name, x86_64, aarch64, 0)
+LB_SECCOMP_MODE(CHECK_MODE_ROW)
+#define CHECK_MODE_ROW_X86_64(name, nr, mode, flags) CHECK_ROW_X86_64(name, nr, 0)
+LB_SECCOMP_MODE_X86_64(CHECK_MODE_ROW_X86_64)
+/* the allow table, as the deny table */
+#define CHECK_ALLOW_ROW(name, x86_64, aarch64) CHECK_ROW(name, x86_64, aarch64, 0)
+LB_SECCOMP_ALLOW(CHECK_ALLOW_ROW)
+#define CHECK_ALLOW_ROW_X86_64(name, nr) CHECK_ROW_X86_64(name, nr, 0)
+LB_SECCOMP_ALLOW_X86_64(CHECK_ALLOW_ROW_X86_64)
+#if defined(__x86_64__)
+SAME_VALUE(LB_SECCOMP_NR_SOCKET, LB_SECCOMP_NR_SOCKET_X86_64);
+SAME_VALUE(LB_SECCOMP_NR_SOCKETPAIR, LB_SECCOMP_NR_SOCKETPAIR_X86_64);
+#else
+SAME_VALUE(LB_SECCOMP_NR_SOCKET, LB_SECCOMP_NR_SOCKET_AARCH64);
+SAME_VALUE(LB_SECCOMP_NR_SOCKETPAIR, LB_SECCOMP_NR_SOCKETPAIR_AARCH64);
+#endif
+SAME_VALUE(LB_SECCOMP_NR_SOCKET, __NR_socket);
+SAME_VALUE(LB_SECCOMP_NR_SOCKETPAIR, __NR_socketpair);
+SAME_VALUE(LB_SC_EAFNOSUPPORT, EAFNOSUPPORT);
+
+SAME_VALUE(LB_SECCOMP_SUID_SGID, S_ISUID | S_ISGID);
+SAME_VALUE(LB_SECCOMP_CREATE_FLAGS, O_CREAT | __O_TMPFILE);
+
 SAME_VALUE(LB_SECCOMP_NR_CLONE, __NR_clone);
 SAME_VALUE(LB_SC_EPERM, EPERM);
 SAME_VALUE(LB_SC_ENOSYS, ENOSYS);
@@ -411,6 +459,9 @@ SAME_VALUE(LB_BPF_RET_K, BPF_RET | BPF_K);
 SAME_VALUE(LB_SECCOMP_DATA_NR, offsetof(struct seccomp_data, nr));
 SAME_VALUE(LB_SECCOMP_DATA_ARCH, offsetof(struct seccomp_data, arch));
 SAME_VALUE(LB_SECCOMP_DATA_ARG0_LO, offsetof(struct seccomp_data, args));
+SAME_VALUE(LB_SECCOMP_DATA_ARG_LO(1), offsetof(struct seccomp_data, args[1]));
+SAME_VALUE(LB_SECCOMP_DATA_ARG_LO(2), offsetof(struct seccomp_data, args[2]));
+SAME_VALUE(LB_SECCOMP_DATA_ARG_LO(3), offsetof(struct seccomp_data, args[3]));
 
 SAME_VALUE(LB_SECCOMP_CLONE_NS_FLAGS,
            CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWIPC |
@@ -427,3 +478,67 @@ SAME_FIELD(lb_sock_filter, sock_filter, k);
 SAME_SIZE(lb_sock_fprog, sock_fprog);
 SAME_FIELD(lb_sock_fprog, sock_fprog, len);
 SAME_FIELD(lb_sock_fprog, sock_fprog, filter);
+
+/* ─── The device program (lightbox_devices.h) and bpf(2) ────────────────── */
+
+SAME_VALUE(LB_BPF_PROG_LOAD, BPF_PROG_LOAD);
+SAME_VALUE(LB_BPF_PROG_ATTACH, BPF_PROG_ATTACH);
+SAME_VALUE(LB_BPF_PROG_TYPE_CGROUP_DEVICE, BPF_PROG_TYPE_CGROUP_DEVICE);
+SAME_VALUE(LB_BPF_CGROUP_DEVICE, BPF_CGROUP_DEVICE);
+SAME_VALUE(LB_BPF_OBJ_NAME_LEN, BPF_OBJ_NAME_LEN);
+
+SAME_VALUE(LB_DEVCG_ACC_MKNOD, BPF_DEVCG_ACC_MKNOD);
+SAME_VALUE(LB_DEVCG_ACC_READ, BPF_DEVCG_ACC_READ);
+SAME_VALUE(LB_DEVCG_ACC_WRITE, BPF_DEVCG_ACC_WRITE);
+SAME_VALUE(LB_DEVCG_DEV_BLOCK, BPF_DEVCG_DEV_BLOCK);
+SAME_VALUE(LB_DEVCG_DEV_CHAR, BPF_DEVCG_DEV_CHAR);
+SAME_VALUE(LB_DEVCG_CTX_ACCESS_TYPE, offsetof(struct bpf_cgroup_dev_ctx, access_type));
+SAME_VALUE(LB_DEVCG_CTX_MAJOR, offsetof(struct bpf_cgroup_dev_ctx, major));
+SAME_VALUE(LB_DEVCG_CTX_MINOR, offsetof(struct bpf_cgroup_dev_ctx, minor));
+SAME_VALUE(LB_DEVCG_CTX_MINOR + 4, sizeof(struct bpf_cgroup_dev_ctx));
+
+SAME_VALUE(LB_EBPF_LDX_MEM_W, BPF_LDX | BPF_MEM | BPF_W);
+SAME_VALUE(LB_EBPF_ALU64_MOV_K, BPF_ALU64 | BPF_MOV | BPF_K);
+SAME_VALUE(LB_EBPF_ALU64_MOV_X, BPF_ALU64 | BPF_MOV | BPF_X);
+SAME_VALUE(LB_EBPF_ALU64_AND_K, BPF_ALU64 | BPF_AND | BPF_K);
+SAME_VALUE(LB_EBPF_ALU64_RSH_K, BPF_ALU64 | BPF_RSH | BPF_K);
+SAME_VALUE(LB_EBPF_JMP_JNE_K, BPF_JMP | BPF_JNE | BPF_K);
+SAME_VALUE(LB_EBPF_JMP_JLT_K, BPF_JMP | BPF_JLT | BPF_K);
+SAME_VALUE(LB_EBPF_JMP_JGT_K, BPF_JMP | BPF_JGT | BPF_K);
+SAME_VALUE(LB_EBPF_JMP_JSET_K, BPF_JMP | BPF_JSET | BPF_K);
+SAME_VALUE(LB_EBPF_JMP_EXIT, BPF_JMP | BPF_EXIT);
+
+/* The registers' nibbles are bit-fields, which offsetof cannot see:
+ * tests/devices_filter.c reads them back through the kernel's struct. */
+SAME_SIZE(lb_ebpf_insn, bpf_insn);
+SAME_FIELD(lb_ebpf_insn, bpf_insn, code);
+SAME_FIELD(lb_ebpf_insn, bpf_insn, off);
+SAME_FIELD(lb_ebpf_insn, bpf_insn, imm);
+
+/* the two parts of union bpf_attr that lightbox fills */
+#define SAME_ATTR(ours, field) \
+    _Static_assert(offsetof(struct ours, field) == offsetof(union bpf_attr, field) && \
+                   sizeof(((struct ours *)0)->field) == sizeof(((union bpf_attr *)0)->field), \
+                   "struct " #ours "." #field " does not match the kernel's union bpf_attr")
+
+SAME_ATTR(lb_bpf_prog_load, prog_type);
+SAME_ATTR(lb_bpf_prog_load, insn_cnt);
+SAME_ATTR(lb_bpf_prog_load, insns);
+SAME_ATTR(lb_bpf_prog_load, license);
+SAME_ATTR(lb_bpf_prog_load, log_level);
+SAME_ATTR(lb_bpf_prog_load, log_size);
+SAME_ATTR(lb_bpf_prog_load, log_buf);
+SAME_ATTR(lb_bpf_prog_load, kern_version);
+SAME_ATTR(lb_bpf_prog_load, prog_flags);
+SAME_ATTR(lb_bpf_prog_load, prog_name);
+SAME_VALUE(sizeof(struct lb_bpf_prog_load), offsetof(union bpf_attr, prog_name) + BPF_OBJ_NAME_LEN);
+SAME_ATTR(lb_bpf_prog_attach, target_fd);
+SAME_ATTR(lb_bpf_prog_attach, attach_bpf_fd);
+SAME_ATTR(lb_bpf_prog_attach, attach_type);
+SAME_ATTR(lb_bpf_prog_attach, attach_flags);
+SAME_VALUE(sizeof(struct lb_bpf_prog_attach), offsetof(union bpf_attr, attach_flags) + 4);
+
+SAME_VALUE(LB_DEV_MEM_MAJOR, MEM_MAJOR);
+SAME_VALUE(LB_DEV_TTYAUX_MAJOR, TTYAUX_MAJOR);
+SAME_VALUE(LB_DEV_PTS_MAJOR, UNIX98_PTY_SLAVE_MAJOR);
+SAME_VALUE(LB_DEV_PTS_MAJORS, UNIX98_PTY_MAJOR_COUNT);

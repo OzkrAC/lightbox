@@ -118,27 +118,41 @@ static void print_kv_int(const char *key, int val) {
 
 
 /*
- * logs <name> [-f]: what the container's init, its hook and its services
- * wrote to stdout and stderr, from every start since the container was made.
- * With -f it goes on for as long as the container runs.
+ * logs <name> [-f] [--audit]: what the container's init, its hook and its
+ * services wrote to stdout and stderr, from every start since the container
+ * was made. With --audit, the lines of the audit log about the box of that
+ * name (ROADMAP 8.9): what exec and run asked of it, kept after it is
+ * removed. With -f it goes on for as long as the container runs.
  */
 void cmd_logs(int argc, char **argv) {
-    if (argc < 1) die("Usage: lightbox logs <name> [-f]");
-    const char *name = argv[0];
-    validate_name(name);
-
-    bool follow = false;
-    for (int i = 1; i < argc; i++) {
+    const char *name = NULL;
+    bool follow = false, audit = false;
+    for (int i = 0; i < argc; i++) {
         if (streq(argv[i], "-f") || streq(argv[i], "--follow"))
             follow = true;
+        else if (streq(argv[i], "--audit"))
+            audit = true;
+        else if (argv[i][0] == '-' && argv[i][1])
+            die2("Error: unknown option: ", argv[i]);
+        else if (!name)
+            name = argv[i];
         else
-            die2(argv[i][0] == '-' ? "Error: unknown option: " : "Error: unexpected argument: ", argv[i]);
+            die2("Error: unexpected argument: ", argv[i]);
     }
+    if (!name) die("Usage: lightbox logs <name> [-f] [--audit]");
+    validate_name(name);
 
     char path[MAX_PATH];
-    container_dir_path(path, name);
-    if (!path_exists(path)) die2("Error: container does not exist: ", name);
-    container_log_path(path, name);
+    struct audit_filter filter;
+    if (audit) {
+        /* a box that was removed has its lines there still */
+        audit_log_path(path);
+        audit_filter_start(&filter, name);
+    } else {
+        container_dir_path(path, name);
+        if (!path_exists(path)) die2("Error: container does not exist: ", name);
+        container_log_path(path, name);
+    }
 
     lc_sysret fd = -LB_ENOENT;
     for (;;) {
@@ -151,25 +165,33 @@ void cmd_logs(int argc, char **argv) {
         if (fd < 0 && fd != -LB_ENOENT) {
             char digits[16];
             fmt_int(digits, (int)-fd);
-            print_str(STDERR, "Error: cannot read the log of container '");
-            print_str(STDERR, name);
-            print_str(STDERR, "' (errno ");
+            print_str(STDERR, audit ? "Error: cannot read the audit log " : "Error: cannot read the log of container '");
+            print_str(STDERR, audit ? path : name);
+            print_str(STDERR, audit ? " (errno " : "' (errno ");
             print_str(STDERR, digits);
             print_str(STDERR, ")\n");
-            lc_kernel_exit(1);
+            lc_kernel_exit(failure_status);
         }
 
-        /* a container that was never started has no log, which is an empty one */
+        /* a container that was never started has no log, which is an empty
+         * one, and a host where no exec ran no audit log */
         bool got_some = false;
         while (fd >= 0) {
             char buf[4096];
+            static char kept[sizeof(buf) + sizeof(filter.prefix)];
             lc_sysret n = lc_kernel_read_retry((int32_t)fd, buf, sizeof(buf));
             if (n < 0)
                 die("Error: reading the log failed");
             if (n == 0)
                 break;
-            if (lc_kernel_write_all(STDOUT, buf, (size_t)n) < 0)
-                lc_kernel_exit(1);          /* nobody reads this any more */
+            const char *out = buf;
+            size_t len = (size_t)n;
+            if (audit) {
+                len = audit_filter(&filter, buf, len, kept);
+                out = kept;
+            }
+            if (lc_kernel_write_all(STDOUT, out, len) < 0)
+                lc_kernel_exit(failure_status);          /* nobody reads this any more */
             got_some = true;
         }
 
@@ -218,6 +240,19 @@ static void report_number(struct report *r, const char *key, int value) {
     json_key(key, r->first);
     r->first = false;
     print_str(STDOUT, digits);
+}
+
+/* An id up to 4294967295, or none: "-" and null. */
+static void report_id(struct report *r, const char *key, bool have, uint32_t value) {
+    char digits[11];
+    format_u32(digits, value);
+    if (!r->json) {
+        print_kv(key, have ? digits : "-");
+        return;
+    }
+    json_key(key, r->first);
+    r->first = false;
+    print_str(STDOUT, have ? digits : "null");
 }
 
 static void report_flag(struct report *r, const char *key, bool value, const char *yes, const char *no) {
@@ -339,6 +374,11 @@ void cmd_inspect(int argc, char **argv) {
     report_text(&r, "config_path", conf_path);
     report_text(&r, "ip_path", ip_path);
     report_text(&r, "log_path", log_path);
+    {
+        char audit_path[MAX_PATH];
+        audit_log_path(audit_path);
+        report_text(&r, "audit_path", audit_path);
+    }
     report_text(&r, "pid_path", pid_path);
     report_text(&r, "pid_start_path", pid_start_path);
     report_text(&r, "state_path", state_path);
@@ -356,9 +396,20 @@ void cmd_inspect(int argc, char **argv) {
         report_text(&r, "io", config.io[0] ? config.io : NULL);
         report_text(&r, "storage", config.base[0] ? "overlay" : "copy");
         report_text(&r, "base", config.base[0] ? config.base : NULL);
+        report_flag(&r, "userns", config.userns, "1", "0");
+        report_id(&r, "uid_start", config.userns, config.uid_start);
+        report_id(&r, "gid_start", config.userns, config.gid_start);
         report_number(&r, "oom_score", config.oom_score);
         report_flag(&r, "privileged", config.privileged, "1", "0");
         report_flag(&r, "readonly", config.read_only, "1", "0");
+        report_text(&r, "seccomp", config.privileged ? NULL : config.seccomp_allow ? "allow" : "deny");
+        char mode[NET_MODE_TEXT_MAX];
+        net_mode_text(mode, config.net, config.proxy_port);
+        report_text(&r, "net", mode);
+        report_text(&r, "ttl", config.ttl[0] ? config.ttl : NULL);
+        report_text(&r, "id", config.id[0] ? config.id : NULL);
+        report_text(&r, "profile", config.profile == PROFILE_AGENT ? "agent" : NULL);
+        report_text(&r, "workdir", config.workdir[0] ? config.workdir : NULL);
         report_volumes(&r, &config);
         report_links(&r, &config);
     }
@@ -470,19 +521,36 @@ static void check_root(struct doctor *d) {
                "run lightbox as root, as setup, start, stop and exec need: sudo lightbox doctor");
 }
 
-static void check_kernel(struct doctor *d) {
-    char release[128] = "";
-    int n = read_file("/proc/sys/kernel/osrelease", release, sizeof(release));
+/* The kernel's release, or "" when it cannot be read: its length. */
+static int kernel_release(char *release, size_t max) {
+    int n = read_file("/proc/sys/kernel/osrelease", release, max);
+    if (n < 0)
+        n = 0;
+    release[n] = '\0';
     while (n > 0 && (release[n - 1] == '\n' || release[n - 1] == ' '))
         release[--n] = '\0';
+    return n;
+}
+
+/* "<release>; <needs>", and whether the release is that version or later */
+static void doc_kernel(struct doctor *d, const char *name, int want_major, int want_minor, const char *needs,
+                       const char *fix) {
+    char release[128];
+    int n = kernel_release(release, sizeof(release));
     int major, minor;
-    bool ok = kernel_release_at_least(release, KERNEL_FLOOR_MAJOR, KERNEL_FLOOR_MINOR, &major, &minor);
-    char detail[192];
+    bool ok = kernel_release_at_least(release, want_major, want_minor, &major, &minor);
+    char detail[256];
     bool cut = false;
     size_t pos = str_append(detail, 0, n > 0 ? release : "the release cannot be read", sizeof(detail), &cut);
-    str_append(detail, pos, "; lightbox needs Linux " STRINGIFY(KERNEL_FLOOR_MAJOR) "." STRINGIFY(KERNEL_FLOOR_MINOR)
-               " or later", sizeof(detail), &cut);
-    doc_yes_no(d, "kernel", ok, detail, "boot Linux " STRINGIFY(KERNEL_FLOOR_MAJOR) "." STRINGIFY(KERNEL_FLOOR_MINOR) " or later");
+    pos = str_append(detail, pos, "; ", sizeof(detail), &cut);
+    str_append(detail, pos, needs, sizeof(detail), &cut);
+    doc_yes_no(d, name, ok, detail, fix);
+}
+
+static void check_kernel(struct doctor *d) {
+    doc_kernel(d, "kernel", KERNEL_FLOOR_MAJOR, KERNEL_FLOOR_MINOR,
+               "lightbox needs Linux " STRINGIFY(KERNEL_FLOOR_MAJOR) "." STRINGIFY(KERNEL_FLOOR_MINOR) " or later",
+               "boot Linux " STRINGIFY(KERNEL_FLOOR_MAJOR) "." STRINGIFY(KERNEL_FLOOR_MINOR) " or later");
 }
 
 /*
@@ -560,6 +628,28 @@ static void check_cgroups(struct doctor *d) {
                "the kernel offers them in cgroup.controllers of cgroup_root unless its command line has cgroup_disable= for one");
 }
 
+/* The cgroup device program a container that is not privileged starts with
+ * (ROADMAP 8.4): loaded and let go, which only root may. */
+static void check_device_filter(struct doctor *d) {
+    if (lb_sys_geteuid() != 0) {
+        doc_yes_no(d, "device_filter", false, "not known: only root may load the program", "sudo lightbox doctor");
+        return;
+    }
+    static char log[2048];
+    lc_sysret fd = device_program_load(log, sizeof(log));
+    if (fd >= 0) {
+        lc_kernel_close_file((int32_t)fd);
+        doc_yes_no(d, "device_filter", true, "the kernel loads the cgroup device program", NULL);
+        return;
+    }
+    char text[96];
+    bool cut = false;
+    size_t pos = str_append(text, 0, "the kernel refuses the cgroup device program: errno ", sizeof(text), &cut);
+    fmt_int(text + pos, (int)-fd);
+    doc_yes_no(d, "device_filter", false, text,
+               "boot a kernel with CONFIG_CGROUP_BPF and CONFIG_BPF_SYSCALL; only a --privileged container starts without it");
+}
+
 /* The base root filesystem: a directory with something in it to copy. */
 static void check_rootfs(struct doctor *d) {
     const char *rootfs = cfg_global.rootfs;
@@ -596,13 +686,166 @@ static void check_exec_sealing(struct doctor *d) {
     }
 }
 
+/* Is overlayfs among the filesystems the kernel has? */
+static bool overlayfs_listed(void) {
+    static char filesystems[8192];
+    return read_file("/proc/filesystems", filesystems, sizeof(filesystems)) > 0 &&
+           lc_string_contains(filesystems, lc_string_length(filesystems), "\toverlay\n", 9);
+}
+
+/*
+ * doctor --profile agent (ROADMAP 8.11): what a box of the profile needs
+ * beyond what every container does. Its root is an overlay on an idmapped
+ * snapshot of its base, which needs Linux 5.19, a filesystem under the
+ * snapshots and the containers that idmaps, and a range of ids; exec and
+ * stop end what it started with cgroup.kill; and nft is what filters its
+ * traffic at the bridge with firewall_backend = nftables. Whether overlayfs
+ * is there is not looked at: create tries a mount, which loads it, and
+ * /proc/filesystems lists it only once it is loaded.
+ */
+#define AGENT_KERNEL_MAJOR 5
+#define AGENT_KERNEL_MINOR 19
+#define AGENT_PROBE_ID     65534u      /* the id a probe's mount is idmapped to: nobody's */
+
+/* An idmapped copy of the mount at each path made and let go, never
+ * attached: whether the filesystems there take one. Root's alone. */
+static void check_agent_idmap(struct doctor *d) {
+    char bases[MAX_PATH];
+    bases_dir_path(bases);
+    const char *paths[2] = { path_is_directory(bases) ? bases : cfg_global.lightbox_dir, cfg_global.container_dir };
+    char text[2 * MAX_PATH + 96];
+    bool cut = false;
+    if (lb_sys_geteuid() != 0) {
+        doc_yes_no(d, "agent.idmap", false, "not known: only root may make an idmapped mount",
+                   "sudo lightbox doctor --profile agent");
+        return;
+    }
+    id_map one = { .inside = 0, .outside = AGENT_PROBE_ID, .count = 1 };
+    int ns = userns_fd_mapped(&one, &one);
+    if (ns < 0) {
+        size_t pos = str_append(text, 0, "a user namespace cannot be made: errno ", sizeof(text), &cut);
+        fmt_int(text + pos, -ns);
+        doc_yes_no(d, "agent.idmap", false, text,
+                   "boot a kernel with CONFIG_USER_NS, and with user.max_user_namespaces above 0");
+        return;
+    }
+    const char *wrong = NULL, *where = NULL, *step = "";
+    int rc = 0;
+    for (size_t i = 0; i < 2 && !wrong; i++) {
+        where = paths[i];
+        if (!path_is_directory(where)) {
+            wrong = "is not there";
+            break;
+        }
+        int tree = idmapped_tree(where, ns, false, &step);
+        if (tree < 0) {
+            wrong = "cannot be idmapped";
+            rc = -tree;
+        } else {
+            lc_kernel_close_file(tree);
+        }
+    }
+    lc_kernel_close_file(ns);
+    if (!wrong) {
+        size_t pos = str_append(text, 0, paths[0], sizeof(text), &cut);
+        pos = str_append(text, pos, " and ", sizeof(text), &cut);
+        str_append(text, pos, paths[1], sizeof(text), &cut);
+        doc_yes_no(d, "agent.idmap", true, text, NULL);
+        return;
+    }
+    size_t pos = str_append(text, 0, where, sizeof(text), &cut);
+    pos = str_append(text, pos, " ", sizeof(text), &cut);
+    pos = str_append(text, pos, wrong, sizeof(text), &cut);
+    if (rc) {
+        pos = str_append(text, pos, ": ", sizeof(text), &cut);
+        pos = str_append(text, pos, step, sizeof(text), &cut);
+        pos = str_append(text, pos, ", errno ", sizeof(text), &cut);
+        fmt_int(text + pos, rc);
+    }
+    doc_yes_no(d, "agent.idmap", false, text,
+               rc ? "keep lightbox_dir and container_dir on a filesystem with idmapped mounts, such as ext4, xfs or btrfs"
+                  : "lightbox setup makes it");
+}
+
+/* cgroup.kill in lightbox's cgroup, or, before a container has made that,
+ * in the cgroup doctor runs in. The root cgroup has none; the root of a
+ * cgroup namespace, which /proc/self/cgroup shows as "/", may be another. */
+static void check_agent_cgroup_kill(struct doctor *d) {
+    char path[MAX_PATH] = "";
+    bool cut = false, known = true;
+    if (path_is_directory(cfg_global.cgroup_base)) {
+        if (!path_join(path, sizeof(path), cfg_global.cgroup_base, "cgroup.kill"))
+            path[0] = '\0';
+    } else {
+        static char self[MAX_PATH];
+        int n = read_file("/proc/self/cgroup", self, sizeof(self));
+        while (n > 0 && self[n - 1] == '\n')
+            self[--n] = '\0';
+        /* "0::<path>", the one line of cgroup v2 */
+        if (n >= 4 && lc_string_starts_with(self, (size_t)n, "0::/", 4)) {
+            bool top = n == 4;
+            size_t pos = str_append(path, 0, cfg_global.cgroup_root, sizeof(path), &cut);
+            pos = str_append(path, pos, top ? "" : self + 3, sizeof(path), &cut);
+            str_append(path, pos, "/cgroup.kill", sizeof(path), &cut);
+            if (cut)
+                path[0] = '\0';
+            known = !top || path_exists(path);
+        }
+    }
+    if (!path[0] || !known) {
+        doc_yes_no(d, "agent.cgroup_kill", false, "not known: no cgroup but the root one to look in",
+                   "start a container, which makes cgroup_base, and run doctor again");
+        return;
+    }
+    doc_yes_no(d, "agent.cgroup_kill", path_exists(path), path,
+               "boot Linux 5.14 or later: without cgroup.kill a box's processes are ended a list at a time");
+}
+
+static void check_agent(struct doctor *d) {
+    doc_kernel(d, "agent.kernel", AGENT_KERNEL_MAJOR, AGENT_KERNEL_MINOR,
+               "the profile needs Linux " STRINGIFY(AGENT_KERNEL_MAJOR) "." STRINGIFY(AGENT_KERNEL_MINOR)
+               " or later, for an overlay on an idmapped layer",
+               "boot Linux " STRINGIFY(AGENT_KERNEL_MAJOR) "." STRINGIFY(AGENT_KERNEL_MINOR) " or later");
+    {
+        int ranges = userns_range_count();
+        char text[160];
+        bool cut = false;
+        if (ranges < 0) {
+            str_append(text, 0, SUBUID_FILE " or " SUBGID_FILE " has a line of " USERNS_OWNER "'s that is no range",
+                       sizeof(text), &cut);
+        } else if (ranges == 0) {
+            str_append(text, 0, "none of " USERNS_OWNER "'s in " SUBUID_FILE " and " SUBGID_FILE, sizeof(text), &cut);
+        } else {
+            fmt_int(text, ranges);
+            str_append(text, lc_string_length(text), " ranges of 65536 ids, one for each box", sizeof(text), &cut);
+        }
+        doc_yes_no(d, "agent.userns_ranges", ranges > 0, text,
+                   "give " USERNS_OWNER " a range in " SUBUID_FILE " and " SUBGID_FILE ", such as "
+                   USERNS_OWNER ":2147483647:2147483648");
+    }
+    check_agent_idmap(d);
+    const char *nft = tool_path_nft();
+    doc_file(d, "agent.nft", path_executable(nft), nft,
+             "install nftables, and set firewall_backend = nftables in lightbox.conf: lightbox then filters a "
+             "box's traffic at the bridge, which with iptables needs br_netfilter");
+    check_agent_cgroup_kill(d);
+}
+
 void cmd_doctor(int argc, char **argv) {
     struct doctor doc = { .json = false, .first = true, .failed = 0 };
+    bool agent = false;
     for (int i = 0; i < argc; i++) {
-        if (streq(argv[i], "--json"))
+        if (streq(argv[i], "--json")) {
             doc.json = true;
-        else
+        } else if (streq(argv[i], "--profile")) {
+            if (i + 1 >= argc)
+                die("Error: option --profile requires a value");
+            if (!streq(argv[++i], "agent"))
+                die2("Error: --profile takes agent, not: ", argv[i]);
+            agent = true;
+        } else {
             die2(argv[i][0] == '-' ? "Error: unknown option: " : "Error: unexpected argument: ", argv[i]);
+        }
     }
     struct doctor *d = &doc;
     static const struct {
@@ -664,11 +907,23 @@ void cmd_doctor(int argc, char **argv) {
     }
     /* told, not counted: without it a new container is a copy of its base */
     {
-        static char filesystems[8192];
-        bool overlay = read_file("/proc/filesystems", filesystems, sizeof(filesystems)) > 0 &&
-                       lc_string_contains(filesystems, lc_string_length(filesystems), "\toverlay\n", 9);
+        bool overlay = overlayfs_listed();
         doc_setting(d, "overlayfs", overlay ? "yes" : "no (a new container is a copy of its base, not an overlay)",
                     overlay ? "true" : "false");
+    }
+    /* told, not counted: only a container created with --userns needs one */
+    {
+        int ranges = userns_range_count();
+        char text[200], digits[16];
+        fmt_int(digits, ranges);
+        bool cut = false;
+        size_t pos = str_append(text, 0, ranges < 0 ? "unreadable" : digits, sizeof(text), &cut);
+        str_append(text, pos, ranges < 0 ? " (" SUBUID_FILE " or " SUBGID_FILE " has a line of " USERNS_OWNER "'s that is no range)"
+                              : ranges == 0 ? " (create --userns needs a line such as " USERNS_OWNER ":2147483647:2147483648 in "
+                                              SUBUID_FILE " and in " SUBGID_FILE ")"
+                              : " (ranges of 65536 ids; a container created with --userns takes one)",
+                   sizeof(text), &cut);
+        doc_setting(d, "userns_ranges", text, ranges < 0 ? "null" : digits);
     }
     /* told, not counted: start makes what is missing, as setup does */
     {
@@ -705,6 +960,7 @@ void cmd_doctor(int argc, char **argv) {
         }
     }
     check_cgroups(d);
+    check_device_filter(d);
     if (nftables && cfg_global.ip_forward) {
         char forwarding[8];
         bool on = read_file("/proc/sys/net/ipv4/ip_forward", forwarding, sizeof(forwarding)) > 0 && forwarding[0] == '1';
@@ -732,6 +988,8 @@ void cmd_doctor(int argc, char **argv) {
     }
 
     check_exec_sealing(d);
+    if (agent)
+        check_agent(d);
 
     if (d->json) {
         print_str(STDOUT, "],\"overall\":");
@@ -741,5 +999,5 @@ void cmd_doctor(int argc, char **argv) {
         print_kv("overall", d->failed == 0 ? "ok" : "degraded");
     }
     if (d->failed != 0)
-        lc_kernel_exit(1);
+        lc_kernel_exit(failure_status);
 }

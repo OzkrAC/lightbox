@@ -234,42 +234,19 @@ static int base_users(const char *id, char *out, size_t max) {
     return users;
 }
 
-/* seconds since 1970 as UTC: "2026-11-17 14:10:03" */
-static void format_utc(char out[20], int64_t seconds) {
-    int64_t days = seconds / 86400, rest = seconds % 86400;
-    /* days to a civil date, after Howard Hinnant's days_from_civil inverted */
-    int64_t z = days + 719468, era = z / 146097, doe = z - era * 146097;
-    int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    int64_t y = yoe + era * 400, doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    int64_t mp = (5 * doy + 2) / 153, d = doy - (153 * mp + 2) / 5 + 1, m = mp < 10 ? mp + 3 : mp - 9;
-    if (m <= 2) y++;
-    int64_t parts[6] = { y, m, d, rest / 3600, rest % 3600 / 60, rest % 60 };
-    static const char sep[] = "-- ::";
-    size_t pos = 0;
-    for (int i = 0; i < 6; i++) {
-        int64_t v = parts[i];
-        int width = i == 0 ? 4 : 2;
-        for (int k = width - 1; k >= 0; k--) {
-            out[pos + (size_t)k] = (char)('0' + v % 10);
-            v /= 10;
-        }
-        pos += (size_t)width;
-        if (i < 5)
-            out[pos++] = sep[i];
-    }
-    out[pos] = '\0';
-}
-
 static void base_ls(void) {
     static char ids[MAX_LISTED][NAME_MAX_LEN + 1];
     int count = list_bases(ids, MAX_LISTED);
     print_str(STDOUT, "ID            TAKEN (UTC)          SOURCE  CONTAINERS\n");
     for (int i = 0; i < count; i++) {
-        char source[MAX_PATH], when[20], users[1024];
+        char source[MAX_PATH], when[UTC_TEXT_LEN + 1] = { 0 }, users[1024];
         int64_t s, n;
         if (!base_read(ids[i], source, &s, &n))
             continue;
-        format_utc(when, s);
+        /* "2026-11-17 14:10:03": the time as RFC 3339 has it, to the second */
+        format_utc(when, s, 0);
+        when[10] = ' ';
+        when[19] = '\0';
         int used = base_users(ids[i], users, sizeof(users));
         print_str(STDOUT, ids[i]);
         print_str(STDOUT, "  ");
@@ -303,7 +280,7 @@ void cmd_base(int argc, char **argv) {
         (void)store_lock();
         char id[BASE_ID_TEXT];
         if (base_take(source, id) != 0)
-            lc_kernel_exit(1);
+            lc_kernel_exit(failure_status);
         print_str(STDOUT, "Base ");
         print_str(STDOUT, id);
         print_str(STDOUT, " taken of ");
@@ -344,7 +321,7 @@ void cmd_base(int argc, char **argv) {
             print_str(STDOUT, " removed\n");
         }
         if (failed)
-            lc_kernel_exit(1);
+            lc_kernel_exit(failure_status);
         return;
     }
     die2("Error: unknown base command: ", argv[0]);

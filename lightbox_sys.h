@@ -29,6 +29,7 @@
 #define LB_SYS_flock      73
 #define LB_SYS_fsync      74
 #define LB_SYS_fchdir     81
+#define LB_SYS_getuid     102
 #define LB_SYS_geteuid    107
 #define LB_SYS_capget     125
 #define LB_SYS_capset     126
@@ -37,7 +38,9 @@
 #define LB_SYS_renameat   264
 #define LB_SYS_ppoll      271
 #define LB_SYS_memfd_create 319
+#define LB_SYS_getrandom  318
 #define LB_SYS_execveat   322
+#define LB_SYS_bpf        321
 #define LB_SYS_statx      332
 #define LB_SYS_faccessat  269
 #define LB_SYS_pidfd_send_signal 424
@@ -58,9 +61,12 @@
 #define LB_SYS_fsync      82
 #define LB_SYS_capget     90
 #define LB_SYS_capset     91
+#define LB_SYS_getuid     174
 #define LB_SYS_geteuid    175
 #define LB_SYS_memfd_create 279
+#define LB_SYS_getrandom  278
 #define LB_SYS_execveat   281
+#define LB_SYS_bpf        280
 #define LB_SYS_statx      291
 #define LB_SYS_faccessat  48
 #define LB_SYS_pidfd_send_signal 424
@@ -76,10 +82,17 @@
 
 /* ─── Kernel constants (the same on both architectures) ─────────────────── */
 
+/* CLOCK_BOOTTIME: CLOCK_MONOTONIC with the time the system was suspended,
+ * for a lifetime that counts as a clock on the wall does */
+#define LB_CLOCK_BOOTTIME 7
+
+#define LB_EPERM                  1
 #define LB_ENOENT                 2
 #define LB_ESRCH                  3
 #define LB_EINTR                  4
+#define LB_EIO                    5
 #define LB_EAGAIN                 11
+#define LB_ENOMEM                 12
 #define LB_EACCES                 13
 #define LB_EBUSY                  16
 #define LB_EEXIST                 17
@@ -114,6 +127,8 @@
 #define LB_STATX_TYPE             0x00000001U
 #define LB_STATX_INO              0x00000100U
 #define LB_STATX_MODE             0x00000002U
+#define LB_STATX_UID              0x00000008U
+#define LB_STATX_GID              0x00000010U
 #define LB_STATX_ATTR_MOUNT_ROOT  0x00002000U   /* reported since Linux 5.8 */
 
 #define LB_CGROUP_SUPER_MAGIC     0x0027e0eb    /* a cgroup v1 hierarchy */
@@ -125,6 +140,15 @@
 #define LB_ST_NOSUID              2
 #define LB_ST_NODEV               4
 #define LB_ST_NOEXEC              8
+/* How a mount keeps access times: in statfs's f_flags, and as mount(2) takes
+ * them; noatime and nodiratime have the same bits in both, relatime not. */
+#define LB_ST_NOATIME             1024
+#define LB_ST_NODIRATIME          2048
+#define LB_ST_RELATIME            4096
+#define LB_MS_NOATIME             1024
+#define LB_MS_NODIRATIME          2048
+#define LB_MS_RELATIME            (1 << 21)
+#define LB_MS_STRICTATIME         (1 << 24)
 
 /* Terminals (asm-generic/ioctls.h, termbits.h, fcntl.h).
  *
@@ -178,8 +202,12 @@
 #define LB_F_SEAL_GROW                0x0004
 #define LB_F_SEAL_WRITE               0x0008
 
-/* mount_setattr(2), Linux 5.12 (linux/mount.h) */
+/* mount_setattr(2), Linux 5.12 (linux/mount.h): read-only, and the flags of
+ * an idmapped mount, whose files show the ids of a user namespace */
 #define LB_MOUNT_ATTR_RDONLY          0x00000001
+#define LB_MOUNT_ATTR_NOSUID          0x00000002
+#define LB_MOUNT_ATTR_NODEV           0x00000004
+#define LB_MOUNT_ATTR_IDMAP           0x00100000
 
 /* flock(2) (asm-generic/fcntl.h). A lock belongs to the open file, and is
  * gone when the last descriptor of that open file is closed. */
@@ -398,6 +426,29 @@ struct lb_mount_attr {
     uint64_t userns_fd;
 };
 
+/* union bpf_attr (linux/bpf.h) as BPF_PROG_LOAD reads it, to the program's
+ * name; the kernel takes the rest of the union as zero */
+struct lb_bpf_prog_load {
+    uint32_t prog_type;
+    uint32_t insn_cnt;
+    uint64_t insns;             /* the instructions' address */
+    uint64_t license;           /* a string's address */
+    uint32_t log_level;
+    uint32_t log_size;
+    uint64_t log_buf;
+    uint32_t kern_version;
+    uint32_t prog_flags;
+    char     prog_name[16];
+};
+
+/* union bpf_attr as BPF_PROG_ATTACH reads it, to its flags */
+struct lb_bpf_prog_attach {
+    uint32_t target_fd;         /* the cgroup's directory */
+    uint32_t attach_bpf_fd;     /* the program */
+    uint32_t attach_type;
+    uint32_t attach_flags;
+};
+
 /* struct open_how (linux/openat2.h) */
 struct lb_open_how {
     uint64_t flags;
@@ -518,6 +569,12 @@ static inline lc_sysret lb_sys_ppoll(struct lb_pollfd *fds, uint64_t count, lc_t
 
 /* pidfd_open(2), Linux 5.3: a descriptor for a process, which stays that
  * process's whatever becomes of its number, and reads as ready when it ends */
+/* getrandom(2), Linux 3.17: from the kernel's pool, which is ready once the
+ * system is up */
+static inline lc_sysret lb_sys_getrandom(void *buf, uint64_t len, uint32_t flags) {
+    return lc_syscall3(LB_SYS_getrandom, (int64_t)(uintptr_t)buf, (int64_t)len, flags);
+}
+
 static inline lc_sysret lb_sys_pidfd_open(int32_t pid, uint32_t flags) {
     return lc_syscall2(LB_SYS_pidfd_open, pid, flags);
 }
@@ -534,6 +591,10 @@ static inline lc_sysret lb_sys_flock(int32_t fd, int32_t operation) {
 
 static inline lc_sysret lb_sys_geteuid(void) {
     return lc_syscall0(LB_SYS_geteuid);
+}
+
+static inline lc_sysret lb_sys_getuid(void) {
+    return lc_syscall0(LB_SYS_getuid);
 }
 
 static inline lc_sysret lb_sys_fcntl(int32_t fd, int32_t request, uint64_t argument) {
@@ -569,6 +630,11 @@ static inline lc_sysret lb_sys_move_mount(int32_t from_dirfd, const char *from_p
                                           int32_t to_dirfd, const char *to_path, uint32_t flags) {
     return lc_syscall5(LB_SYS_move_mount, from_dirfd, (int64_t)from_path,
                        to_dirfd, (int64_t)to_path, flags);
+}
+
+/* bpf(2), with one of the two layouts above */
+static inline lc_sysret lb_sys_bpf(int32_t cmd, void *attr, uint32_t size) {
+    return lc_syscall3(LB_SYS_bpf, cmd, (int64_t)attr, size);
 }
 
 /* close_range(2), Linux 5.9: close every descriptor from first to last */

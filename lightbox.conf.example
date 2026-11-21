@@ -81,6 +81,18 @@
 # default_cpu = 1
 # default_oom = 500
 
+# The limits and the lifetime of a box made with `create --profile agent` or
+# `run --profile agent`, for what no option gives it: --mem, --pids, --cpu
+# and --ttl still choose for one box. Each takes what its option takes, and
+# agent_ttl takes none too, for a box with no lifetime. One that is anything
+# else is reported, and a box of the profile that would have needed it is
+# refused. The box keeps what it was given in its .conf: a change here holds
+# for boxes made after it.
+# agent_mem = 2G
+# agent_pids = 512
+# agent_cpu = 2
+# agent_ttl = 8h
+
 # Seconds that `lightbox start` waits for a container's /init.sh to end.
 # When they have passed it says so and returns; the container stays up.
 # 0 does not wait at all. `start -t <seconds>` overrides this for one start.

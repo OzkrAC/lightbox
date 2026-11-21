@@ -74,7 +74,7 @@ CFLAGS  = $(CSTD) -O2 -DNDEBUG $(WARN) $(HARDEN) $(ARCH_CFLAGS) \
 LDFLAGS = -static -no-pie -nostdlib -nostartfiles -nodefaultlibs \
           -T $(LIGHTC)/lightc.ld
 
-SRCS = lightbox.c lightbox_meta.c lightbox_state.c lightbox_container.c lightbox_net.c lightbox_config.c lightbox_util.c lightbox_base.c lightbox_netlink.c
+SRCS = lightbox.c lightbox_meta.c lightbox_state.c lightbox_container.c lightbox_net.c lightbox_config.c lightbox_util.c lightbox_base.c lightbox_netlink.c lightbox_userns.c lightbox_audit.c
 OBJS = $(SRCS:.c=.o)
 DEPS = $(OBJS:.o=.d)
 
@@ -129,10 +129,11 @@ analyze: | $(LIGHTC_HDR)
 	    $(CC) $(CFLAGS) $(ANALYZE_FLAGS) -c $$f -o /dev/null || rc=1; \
 	done; exit $$rc
 
-# lightbox_sys.h and the seccomp table of lightbox_seccomp.h against the
-# kernel's headers, for every compiler that is installed. Compile-only: nothing
-# is linked or run. The second file holds what needs the C library's headers
-# beside the kernel's.
+# lightbox_sys.h, the seccomp table of lightbox_seccomp.h and the device
+# program's constants of lightbox_devices.h against the kernel's headers, for
+# every compiler that is installed. Compile-only: nothing is linked or run.
+# The second file holds what needs the C library's headers beside the
+# kernel's.
 SYS_CHECK_CCS := $(sort $(CC) $(foreach c,aarch64-linux-gnu-gcc x86_64-linux-gnu-gcc,$(shell command -v $(c) >/dev/null 2>&1 && echo $(c))))
 
 check-sys:
@@ -154,18 +155,23 @@ HOSTCC ?= cc
 
 # lightbox's own helpers, called from the command line. Like the seccomp
 # harness below, it is lightbox.c itself with another main().
-tests/unit: tests/unit.c lightbox.c lightbox.h lightbox_sys.h lightbox_seccomp.h $(OBJS) $(LIGHTC_LIB)
+tests/unit: tests/unit.c lightbox.c lightbox.h lightbox_sys.h lightbox_seccomp.h lightbox_devices.h $(OBJS) $(LIGHTC_LIB)
 	$(CC) $(CFLAGS) -MMD -MP -c tests/unit.c -o tests/unit.o
 	$(CC) $(LDFLAGS) tests/unit.o $(filter-out lightbox.o,$(OBJS)) $(LIGHTC_LIB) -o $@
 
-test-unit: tests/unit
+# The cgroup device program, interpreted (lightbox_devices.h). Hosted, as it
+# reads the kernel's struct bpf_insn back; the unit suite runs it.
+tests/devices_filter: tests/devices_filter.c lightbox_devices.h
+	-$(HOSTCC) -O1 -Wall -Wextra $< -o $@
+
+test-unit: tests/unit tests/devices_filter
 	bash tests/unit_cases.sh tests/unit
 
 test-validation: lightbox
 	bash tests/validation.sh ./lightbox
 
 # The seccomp harness is lightbox.c itself with another main().
-tests/seccomp_profile: tests/seccomp_profile.c lightbox.c lightbox.h lightbox_sys.h lightbox_seccomp.h $(OBJS) $(LIGHTC_LIB)
+tests/seccomp_profile: tests/seccomp_profile.c lightbox.c lightbox.h lightbox_sys.h lightbox_seccomp.h lightbox_devices.h $(OBJS) $(LIGHTC_LIB)
 	$(CC) $(CFLAGS) -MMD -MP -c tests/seccomp_profile.c -o tests/seccomp_profile.o
 	$(CC) $(LDFLAGS) tests/seccomp_profile.o $(filter-out lightbox.o,$(OBJS)) $(LIGHTC_LIB) -o $@
 
@@ -194,6 +200,11 @@ test: test-unit test-validation test-seccomp
 # and PID namespaces; tests/lifecycle.sh says what it leaves alone. sudo drops
 # the environment, so its options go on make's command line:
 #     sudo make test-lifecycle V=1 KEEP=1
+# LIGHTBOX_TEST_USERNS=overlay makes every container with --userns, and
+# LIGHTBOX_TEST_USERNS=copy with --userns --copy. LIGHTBOX_TEST_SECCOMP=deny
+# makes every container with --seccomp deny, alone or with either, and
+# LIGHTBOX_TEST_ROOTFS=<dir> builds them from that root filesystem, such as
+# one that tests/fetch_image.sh unpacked.
 # It builds nothing, so that sudo leaves no file of root's in the tree.
 REQUIRE_BUILT = $(MAKE) -q --no-print-directory lightbox || { \
     echo "lightbox is missing or older than its sources: run make first, without sudo" >&2; exit 2; }
@@ -241,6 +252,6 @@ uninstall:
 clean:
 	rm -f lightbox $(OBJS) $(DEPS)
 	rm -f $(SECCOMP_TESTS) tests/seccomp_profile.o tests/seccomp_profile.d
-	rm -f tests/unit tests/unit.o tests/unit.d
+	rm -f tests/unit tests/unit.o tests/unit.d tests/devices_filter
 
 .PHONY: analyze bench check check-sys clean install test test-lifecycle test-seccomp test-unit test-validation uninstall

@@ -11,6 +11,12 @@
 # filesystem from. lightbox runs neither ip nor nsenter: every case runs with
 # both masked, and the last but one looks that nothing ran them.
 #
+# Every image, the suite's own or one of LIGHTBOX_TEST_ROOTFS, gets that busybox
+# at /lbt/busybox too, and a case that looks at the network from inside a
+# container runs its nc, ip and hostname from there. What an image has of its
+# own differs: Debian's has none of the three, and Alpine's nc says nothing of
+# a refusal. Everything else a case runs in a container is the image's own.
+#
 # The host is not used and nothing is left on it. The suite runs itself again
 # in private network, mount and PID namespaces with a throwaway configuration:
 # its bridge, firewall rules, interfaces and mounts exist only there, and every
@@ -22,7 +28,19 @@
 # loses meanwhile is reported and does not count.
 #
 #   LIGHTBOX_TEST_ROOTFS=/path  use a copy of this root filesystem (Alpine, Debian ...)
-#   BUSYBOX=/path               the static busybox to build the root filesystem from
+#   LIGHTBOX_TEST_USERNS=overlay
+#                               make every container with --userns: every case is
+#                               then one of a container whose root is an
+#                               unprivileged uid of the host's (ROADMAP 8.1)
+#   LIGHTBOX_TEST_USERNS=copy   the same, and with --copy but in the cases about
+#                               overlays
+#   LIGHTBOX_TEST_SECCOMP=deny  make every container with --seccomp deny, but where
+#                               a case chooses the profile (ROADMAP 8.3); with
+#                               either of the two above, or alone. Without it a
+#                               container has the default, the allow-list, which
+#                               =allow names
+#   BUSYBOX=/path               the static busybox to build the root filesystem from,
+#                               and to put in every image at /lbt/busybox
 #   LIGHTBOX_TEST_MODPROBE=1    load br_netfilter when it is not loaded (CI sets this;
 #                               on a workstation it changes how every bridge is filtered)
 #   CASE_TIMEOUT=90             seconds one case may take
@@ -72,7 +90,8 @@ NETP=10.199.0
 GW=10.199.0.1
 WAN=lbt-wan                 # the interface the default route leaves by
 OUTSIDE=192.0.2.1           # an address beyond it, in a namespace that stands for the internet
-ALLOWED_CAPS=00000000a00405fb   # ALLOWED_CAPS of lightbox.c as /proc/<pid>/status prints a set
+ALLOWED_CAPS=00000000200405fb   # ALLOWED_CAPS of lightbox.c as /proc/<pid>/status prints a set
+KIT=/lbt/busybox            # in every image: the suite's own busybox, to look at the network with
 BRNF=/proc/sys/net/bridge/bridge-nf-call-iptables
 
 settings() { # after LIFECYCLE_T is known
@@ -81,6 +100,8 @@ settings() { # after LIFECYCLE_T is known
     BB=${LIFECYCLE_BB:-}
     [ -n "$T" ] && [ -d "$T" ] || { echo "lifecycle: no work directory" >&2; exit 2; }
     C="$T/lb/containers"
+    USERNS_MODE=${LIGHTBOX_TEST_USERNS:-}
+    SECCOMP_MODE=${LIGHTBOX_TEST_SECCOMP:-}
     RUN="$T/run"                # run_dir: the records of a container that runs are in $RUN/<name>/
     BASE="$T/base"
     OUT="$T/out"
@@ -134,8 +155,49 @@ box() { # name [create options] : create a container on the next free address
     local name=$1 ip
     shift
     ip=$(next_ip) || return 1
-    lb create "$name" "$ip" "$@" >"$OUT/$name.create" 2>&1 || { cat "$OUT/$name.create"; return 1; }
+    # shellcheck disable=SC2046  # options of one word each
+    lb create "$name" "$ip" "$@" $(mode_options "$@") >"$OUT/$name.create" 2>&1 || { cat "$OUT/$name.create"; return 1; }
     port_of "$name" >/dev/null
+}
+
+# What LIGHTBOX_TEST_USERNS adds to a create: --userns, and with copy --copy
+# too, where the case did not give them. A case about overlays sets OVERLAY=1,
+# which keeps --copy out; a container that is to have no range is made with
+# PLAIN=1 box ..., which adds nothing of the two. LIGHTBOX_TEST_SECCOMP adds
+# --seccomp with its profile where the case gives no --seccomp.
+mode_options() { # the options the case gives
+    local given=" $* "
+    if [ -n "$SECCOMP_MODE" ]; then
+        case $given in *' --seccomp '*) ;; *) echo --seccomp "$SECCOMP_MODE" ;; esac
+    fi
+    [ -n "$USERNS_MODE" ] && [ -z "${PLAIN:-}" ] || return 0
+    case $given in *' --userns '*) ;; *) echo --userns ;; esac
+    if [ "$USERNS_MODE" = copy ] && [ -z "${OVERLAY:-}" ]; then
+        case $given in *' --copy '*) ;; *) echo --copy ;; esac
+    fi
+}
+
+conf_value() { sed -n "s/^$2=//p" "$C/$1/.conf"; }  # name key
+
+# What the suite puts in a container's rootfs/ from the host, made its root's,
+# as if the container had made it. In the upper layer of an overlay with
+# --userns that is the first uid and gid of its range. A --copy with --userns
+# is idmapped as it is, and there host root's files are its root's already.
+made_for() { # name path...
+    local name=$1
+    shift
+    [ "$(conf_value "$name" userns)" = 1 ] && [ -n "$(conf_value "$name" base)" ] || return 0
+    chown -hR "$(conf_value "$name" uid_start):$(conf_value "$name" gid_start)" "$@"
+}
+
+# A volume that a container writes in, made its root's on the host. With
+# --userns that is the first uid and gid of its range: host root's files are
+# not its root's.
+volume_for() { # name path...
+    local name=$1
+    shift
+    [ "$(conf_value "$name" userns)" = 1 ] || return 0
+    chown -R "$(conf_value "$name" uid_start):$(conf_value "$name" gid_start)" "$@"
 }
 
 # The end of a container's interface on the host, as inspect names it: kept,
@@ -213,20 +275,154 @@ nothing_left() { # name
     if [ -n "$port" ] && nft list set bridge lightbox links 2>/dev/null | grep -q "\"$port\""; then
         echo "an element of the nftables set of links names $port"; bad=1
     fi
+    if [ -n "$port" ] && { [ -e "$RUN/$1/egress" ] || iptables -n -L "LO-${port#vb-}" >/dev/null 2>&1; }; then
+        echo "the firewall chain LO-${port#vb-} of its --net outside, or the record of it, is left"; bad=1
+    fi
+    if [ -e "$C/$1/.ip" ] && nft list set ip lightbox outside 2>/dev/null | grep -qw "$(addr_of "$1")"; then
+        echo "the nftables set of --net outside has its address"; bad=1
+    fi
+    if [ -e "$C/$1/.ip" ] && nft list set ip lightbox proxied 2>/dev/null | grep -qw "$(addr_of "$1")"; then
+        echo "the nftables set of --net proxy has its address"; bad=1
+    fi
+    if [ -n "$port" ] && nft list set bridge lightbox sealed 2>/dev/null | grep -q "\"$port\""; then
+        echo "the nftables set of the ports of --net proxy names $port"; bad=1
+    fi
+    if [ -e "$C/$1/.ip" ] && iptables -S LIGHTBOX-LINKS 2>/dev/null | grep -q -- " $(addr_of "$1")/32 -j DROP"; then
+        echo "a drop of --net proxy for its address is left in LIGHTBOX-LINKS"; bad=1
+    fi
     echo "state: $(state_of "$1")"
     return $bad
 }
 
-need_nc() { [ -e "$T/have_nc" ] || { echo "this image has no nc to open connections with"; return 77; }; }
+need_nc() { [ -e "$T/have_nc" ] || { echo "the suite's busybox has no nc to open connections with"; return 77; }; }
 
 # Does a TCP connection from the container get an answer from that address?
 # Nothing listens on the port, so the answer is a refusal. Traffic that is
 # filtered or not routed gets none, and the attempt times out.
 reaches() { # name address
     local answer
-    answer=$(sh_in "$1" "nc -w 3 $2 9 </dev/null" 2>&1)
+    answer=$(sh_in "$1" "$KIT nc -w 3 $2 9 </dev/null" 2>&1)
     printf '%s -> %s: %s\n' "$1" "$2" "${answer:-no answer}"
     case $answer in *[Rr]efused*) return 0 ;; *) return 1 ;; esac
+}
+
+# Listeners on port 7 of the host and of the namespace that stands for the
+# internet, on every address of theirs, which answer "here": started with
+# the network, for as long as the suite runs. The firewall refuses TCP with a
+# reset, as a port that nothing listens on does, so a refusal is the
+# firewall's only where a listener is.
+ECHO_PORT=7
+need_listeners() { [ -e "$T/have_listeners" ] || { echo "no python3 for the listeners on port $ECHO_PORT"; return 77; }; }
+
+# Does the listener at that address and port answer the container with that
+# line?
+answers() { # name address port line
+    local answer
+    answer=$(sh_in "$1" "$KIT nc -w 3 $2 $3 </dev/null" 2>&1)
+    printf '%s -> %s port %s: %s\n' "$1" "$2" "$3" "${answer:-no answer}"
+    [ "$answer" = "$4" ]
+}
+answered() { answers "$1" "$2" "$ECHO_PORT" here; }   # name address
+
+# Does the firewall refuse a TCP connection from the container to that port,
+# where a listener is, at once, as --net outside and proxy do: a reset,
+# which a client says as refused, within a second, exec's own time with it?
+rejected() { # name address [port]
+    local answer t0 t1 ms port=${3:-$ECHO_PORT}
+    t0=$(date +%s%N)
+    answer=$(sh_in "$1" "$KIT nc -w 3 $2 $port </dev/null" 2>&1)
+    t1=$(date +%s%N)
+    ms=$(( (t1 - t0) / 1000000 ))
+    printf '%s -> %s port %s: %s, in %s ms\n' "$1" "$2" "$port" "${answer:-no answer}" "$ms"
+    case $answer in *[Rr]efused*) [ "$ms" -lt 1000 ] ;; *) return 1 ;; esac
+}
+
+# Addresses beyond the host that a container of --net outside may not reach,
+# in the namespace that stands for the internet: a private one, a name
+# server on another, and the metadata address of the clouds.
+PRIVATE=172.31.255.1
+PRIVATE_DNS=172.31.255.53
+METADATA=169.254.169.254
+private_addresses() {
+    local outside a
+    outside=$(cat "$T/outside")
+    for a in "$PRIVATE" "$PRIVATE_DNS" "$METADATA"; do
+        nsenter -t "$outside" -n ip addr show dev lo | grep -q " $a/32 " ||
+            nsenter -t "$outside" -n ip addr add "$a/32" dev lo || return 1
+        ip route show "$a/32" | grep -q . || ip route add "$a/32" via "$OUTSIDE" || return 1
+    done
+}
+
+# A name server at that address in the namespace that stands for the
+# internet, which answers every question for an address with 192.0.2.77,
+# and with a log file writes there each name it is asked: its PID, or
+# nothing without python3.
+dns_responder() { # address [log]
+    command -v python3 >/dev/null 2>&1 || return 1
+    cat > "$T/dns.py" <<'PYTHON'
+import socket, sys
+log = open(sys.argv[2], "a", buffering=1) if len(sys.argv) > 2 else None
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind((sys.argv[1], 53))
+while True:
+    q, peer = s.recvfrom(512)
+    end = 12
+    labels = []
+    while end < len(q) and q[end] != 0:
+        labels.append(q[end + 1:end + 1 + q[end]].decode("ascii", "replace"))
+        end += q[end] + 1
+    if log:
+        log.write(".".join(labels) + "\n")
+    if len(q) < 12 or end + 5 > len(q):
+        continue
+    question = q[12:end + 5]
+    a = q[end + 1:end + 3] == b"\x00\x01"
+    answer = b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04" + bytes([192, 0, 2, 77]) if a else b""
+    s.sendto(q[:2] + b"\x81\x80\x00\x01" + (b"\x00\x01" if a else b"\x00\x00") + b"\x00\x00\x00\x00" +
+             question + answer, peer)
+PYTHON
+    nsenter -t "$(cat "$T/outside")" -n python3 -I "$T/dns.py" "$@" >/dev/null 2>&1 &
+    echo $!
+}
+
+# A TCP listener that answers each connection with a line and closes it,
+# once it has read what the other end sends, up to a blank line or for half a
+# second: closed with that unread, the connection would be reset and the
+# answer lost. Its PID, or nothing without python3. With a namespace's PID,
+# in that namespace's network.
+tcp_listener() { # address port line [pid of the namespace]
+    command -v python3 >/dev/null 2>&1 || return 1
+    # written once: a second listener does not rewrite what the first reads
+    [ -e "$T/listener.py" ] || cat > "$T/listener.py" <<'PYTHON'
+import socket, sys
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind((sys.argv[1], int(sys.argv[2])))
+s.listen(8)
+while True:
+    c, _ = s.accept()
+    c.settimeout(0.5)
+    asked = b""
+    try:
+        while b"\r\n\r\n" not in asked and len(asked) < 65536:
+            more = c.recv(4096)
+            if not more:
+                break
+            asked += more
+    except OSError:
+        pass
+    try:
+        c.sendall(sys.argv[3].encode() + b"\n")
+    except OSError:
+        pass
+    c.close()
+PYTHON
+    if [ -n "${4:-}" ]; then
+        nsenter -t "$4" -n python3 -I "$T/listener.py" "$1" "$2" "$3" >/dev/null 2>&1 &
+    else
+        python3 -I "$T/listener.py" "$1" "$2" "$3" >/dev/null 2>&1 &
+    fi
+    echo $!
 }
 
 # Whether bridged traffic passes through iptables in this network namespace.
@@ -275,6 +471,17 @@ t_setup() {
     iptables -t nat -C LIGHTBOX-POSTROUTING -s "$SUBNET" ! -o "$BR" -j MASQUERADE &&
     iptables -n -L LIGHTBOX-USER >/dev/null && iptables -n -L LIGHTBOX-LINKS >/dev/null ||
         { echo "a rule or a chain is missing:"; iptables-save; return 1; }
+    # --net outside: INPUT begins with the jump to LIGHTBOX-INPUT, and what
+    # leaves the bridge or reaches the host goes through LIGHTBOX-EGRESS
+    [ "$(iptables -S INPUT | sed -n 2p)" = '-A INPUT -j LIGHTBOX-INPUT' ] ||
+        { echo "INPUT does not begin with the jump to LIGHTBOX-INPUT"; iptables -S INPUT; return 1; }
+    iptables -C LIGHTBOX-FORWARD -i "$BR" ! -o "$BR" -j LIGHTBOX-EGRESS &&
+    iptables -C LIGHTBOX-INPUT -i "$BR" -j LIGHTBOX-EGRESS &&
+    iptables -C LIGHTBOX-OUTSIDE -m addrtype --dst-type LOCAL -p tcp -j REJECT --reject-with tcp-reset &&
+    iptables -C LIGHTBOX-OUTSIDE -m addrtype --dst-type LOCAL -j REJECT --reject-with icmp-admin-prohibited &&
+    iptables -C LIGHTBOX-OUTSIDE -d 169.254.0.0/16 -p tcp -j REJECT --reject-with tcp-reset &&
+    iptables -C LIGHTBOX-OUTSIDE -d 169.254.0.0/16 -j REJECT --reject-with icmp-admin-prohibited ||
+        { echo "a rule of --net outside is missing:"; iptables-save; return 1; }
     # nothing names the interface the default route leaves by
     ! iptables-save | grep -qw -- "$WAN" || { echo "a rule names $WAN"; return 1; }
     # the fixture made these 0755, as installations before 0.2 did
@@ -368,11 +575,17 @@ t_firewall_false() {
     printf '%s\n' "$said"
     [ "$rules" = "$(firewall_rules)" ] || { echo "setup with firewall = false changed the firewall:"; firewall_rules; return 1; }
     case $said in *'no firewall rules were made'*) ;; *) return 1 ;; esac
-    box fwpeer && box fwlinked --link fwpeer || return 1
+    box fwpeer --net nat && box fwlinked --net nat --link fwpeer || return 1
     said=$(alt_lb start fwlinked 2>&1 </dev/null) && { echo "a container with links started with firewall = false"; return 1; }
     printf '%s\n' "$said"
-    case $said in *'firewall = false'*) ;; *) return 1 ;; esac
-    nothing_left fwlinked
+    case $said in *'has links, and firewall = false'*) ;; *) return 1 ;; esac
+    nothing_left fwlinked || return 1
+    # and one of --net outside, which only lightbox's rules keep to it
+    box fwoutside || return 1
+    said=$(alt_lb start fwoutside 2>&1 </dev/null) && { echo "a container of --net outside started with firewall = false"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *'has --net outside, and firewall = false'*) ;; *) return 1 ;; esac
+    nothing_left fwoutside
 }
 
 # setup reads subnet and gw as one network before it changes anything: a
@@ -464,14 +677,639 @@ t_queries_show_running() {
     lb inspect shown | grep -qx "pid: $pid"
 }
 
+# exec's status (ROADMAP 8.7) is the command's, or 128 and its signal; 126
+# and 127 are a command that could not be run, and 125 a failure of
+# lightbox's own, such as a container that is not running.
 t_exec_status() {
     up status || return 1
     sh_in status 'exit 0';         a=$?
     sh_in status 'exit 7';         b=$?
     sh_in status 'kill -TERM $$';  c=$?
     lb exec status /no/such/program </dev/null; d=$?
-    echo "exit 0 -> $a, exit 7 -> $b, killed by SIGTERM -> $c, a missing program -> $d"
-    [ $a -eq 0 ] && [ $b -eq 7 ] && [ $c -eq 143 ] && [ $d -ne 0 ]
+    sh_in status ': > /not-executable'
+    lb exec status /not-executable </dev/null; e=$?
+    lb exec status --workdir /no/such/dir /bin/true </dev/null; f=$?
+    lb stop status >/dev/null || return 1
+    lb exec status /bin/true </dev/null; g=$?
+    echo "exit 0 -> $a, exit 7 -> $b, killed by SIGTERM -> $c, a missing program -> $d," \
+         "a file that cannot be executed -> $e, a --workdir that is not there -> $f, a stopped container -> $g"
+    [ $a -eq 0 ] && [ $b -eq 7 ] && [ $c -eq 143 ] && [ $d -eq 127 ] && [ $e -eq 126 ] && [ $f -eq 126 ] && [ $g -eq 125 ]
+}
+
+# Is a process running with this command line, its words joined by spaces?
+running_cmd() { # words
+    local f
+    for f in /proc/[0-9]*/cmdline; do
+        [ "$(tr '\0' ' ' < "$f" 2>/dev/null)" = "$1 " ] && return 0
+    done
+    return 1
+}
+exec_cgroups() { ls -d "$CG/$1"/exec-* 2>/dev/null; }    # name
+cgroup_empty() { grep -qx 'populated 0' "$1/cgroup.events"; }  # path
+
+# Every exec runs in a cgroup of its own below the container's, which goes
+# when the command ends. Without --timeout what it starts in the background
+# goes on, in that cgroup, which stays until it has ended and is then taken
+# away by the next exec; stop takes away one that still has a process.
+t_exec_cgroup() {
+    local said kept
+    up excg || return 1
+    said=$(sh_in excg 'cat /proc/self/cgroup')
+    echo "the cgroup of an exec: $said"
+    printf '%s\n' "$said" | grep -Eq '/excg/exec-[0-9]+-[0-9]+$' || { echo "it is not in a cgroup of its own"; return 1; }
+    [ -z "$(exec_cgroups excg)" ] || { echo "left after the exec: $(exec_cgroups excg)"; return 1; }
+    sh_in excg "$KIT setsid sleep 1071 >/dev/null 2>&1 </dev/null &" || return 1
+    wait_until 5 running_cmd 'sleep 1071' || { echo "what it started is not running"; return 1; }
+    kept=$(exec_cgroups excg)
+    echo "left with a process in it: $kept"
+    [ "$(printf '%s\n' "$kept" | grep -c .)" = 1 ] && running_cmd 'sleep 1071' &&
+        [ -n "$(cat "$kept/cgroup.procs")" ] || { echo "what it started is not there, in its cgroup"; return 1; }
+    kill $(cat "$kept/cgroup.procs")
+    wait_until 5 cgroup_empty "$kept" || { echo "the process did not end"; return 1; }
+    sh_in excg true || return 1
+    [ ! -d "$kept" ] || { echo "the next exec did not take away the empty cgroup $kept"; return 1; }
+    sh_in excg "$KIT setsid sleep 1072 >/dev/null 2>&1 </dev/null &" || return 1
+    wait_until 5 running_cmd 'sleep 1072' || { echo "the second is not running"; return 1; }
+    [ -n "$(exec_cgroups excg)" ] || { echo "no cgroup was left with the second"; return 1; }
+    lb stop excg >/dev/null || return 1
+    ! running_cmd 'sleep 1072' || { echo "stop left what the exec started"; return 1; }
+    nothing_left excg
+}
+
+# exec --timeout ends the command and all it started, in the background and
+# in sessions of their own, at the deadline, and exec returns 124. A command
+# that ends before it returns its own status, and what it left in the
+# background is ended with it.
+t_exec_timeout() {
+    local began ms rc
+    up extime || return 1
+    began=$(date +%s%N)
+    lb exec extime --timeout 2s /bin/sh -c "$KIT setsid sleep 1073 & sleep 1074" >"$OUT/extime.out" 2>"$OUT/extime.err" </dev/null
+    rc=$?
+    ms=$(( ($(date +%s%N) - began) / 1000000 ))
+    cat "$OUT/extime.err"
+    echo "status $rc in $ms ms"
+    [ "$rc" = 124 ] && [ "$ms" -lt 3000 ] || return 1
+    grep -q 'ran past its time limit, --timeout 2s' "$OUT/extime.err" || { echo "exec did not say why"; return 1; }
+    [ -z "$(exec_cgroups extime)" ] || { echo "left: $(exec_cgroups extime)"; return 1; }
+    ! running_cmd 'sleep 1073' && ! running_cmd 'sleep 1074' || { echo "a sleep is left"; return 1; }
+    began=$(date +%s%N)
+    # the second's sleep has begun when the shell ends
+    lb exec extime --timeout 30s /bin/sh -c "$KIT setsid sleep 1075 >/dev/null 2>&1 </dev/null & sleep 1; exit 3" </dev/null
+    rc=$?
+    ms=$(( ($(date +%s%N) - began) / 1000000 ))
+    echo "a command that ended before its deadline: status $rc in $ms ms"
+    [ "$rc" = 3 ] && [ "$ms" -lt 5000 ] || return 1
+    ! running_cmd 'sleep 1075' || { echo "what it left in the background goes on"; return 1; }
+    [ -z "$(exec_cgroups extime)" ] || { echo "left: $(exec_cgroups extime)"; return 1; }
+    [ "$(state_of extime)" = running ] || { echo "the container: $(state_of extime)"; return 1; }
+}
+
+none_running() { local w; for w; do running_cmd "$w" && return 1; done; return 0; }  # command lines
+
+# A box created with nothing but --profile agent and --workspace (ROADMAP
+# 8.10) has each setting of the profile in its .conf under its own key, and
+# Phase 8's first two exit conditions hold for it: its uid 0 is an
+# unprivileged uid on the host, the allow-list filter is installed, its only
+# interface is lo, and a file it writes in its workspace, where every exec
+# runs, belongs on the host to the workspace's owner.
+t_agent_profile() {
+    need_subids || return 77
+    local key inside ifaces u g said
+    mkdir -p "$T/vol/agentws" && chown 2345:2346 "$T/vol/agentws" || return 1
+    lb create agent --profile agent --workspace "$T/vol/agentws" >"$OUT/agent.create" 2>&1 </dev/null ||
+        { cat "$OUT/agent.create"; return 1; }
+    port_of agent >/dev/null
+    cat "$C/agent/.conf"
+    for key in profile=agent userns=1 seccomp=allow net=none mem=2G pids=512 cpu=2 ttl=8h workdir=/workspace \
+               "vol=$T/vol/agentws:/workspace"; do
+        grep -qxF -- "$key" "$C/agent/.conf" || { echo "the .conf has no $key"; return 1; }
+    done
+    [ -n "$(conf_value agent base)" ] && [ ! -e "$C/agent/.ip" ] || { echo "not an overlay, or it has an address"; return 1; }
+    lb inspect agent | grep -qx 'profile: agent' || { echo "inspect does not say the profile"; return 1; }
+    start agent || return 1
+    u=$(conf_value agent uid_start) g=$(conf_value agent gid_start)
+    echo "init on the host: $(host_ids_of "$(pid_of agent)"), its range from $u $g"
+    [ "$u" -gt 0 ] && [ "$(host_ids_of "$(pid_of agent)")" = "$u $g" ] || { echo "uid 0 in the box is not an unprivileged uid"; return 1; }
+    inside=$(lb exec agent /bin/sh -c "id -u; pwd; grep '^Seccomp:' /proc/self/status | tr -d '\t'; echo made > made" </dev/null | paste -sd' ')
+    echo "in it: $inside"
+    [ "$inside" = '0 /workspace Seccomp:2' ] || return 1
+    said=$(sh_in agent "$KIT hostname another" 2>&1) && { echo "the box took sethostname"; return 1; }
+    case $said in *'not implemented'*) ;; *) echo "not the allow-list, which answers ENOSYS: $said"; return 1 ;; esac
+    ifaces=$(sh_in agent 'cat /proc/net/dev' | sed '1,2d' | awk -F: '{ gsub(/ /, "", $1); print $1 }' | paste -sd' ')
+    echo "its interfaces: $ifaces; what it made in its workspace, on the host: $(stat -c %u:%g "$T/vol/agentws/made")"
+    [ "$ifaces" = lo ] && [ "$(stat -c %u:%g "$T/vol/agentws/made")" = 2345:2346 ] || return 1
+    [ "$(lb exec agent --workdir /tmp /bin/sh -c pwd </dev/null)" = /tmp ] || { echo "--workdir does not hold over the workspace"; return 1; }
+    lb stop agent >/dev/null && lb rm agent >/dev/null || return 1
+    nothing_left agent
+}
+
+# run --profile agent (ROADMAP 8.10, and 8.8's exit condition): the status
+# of the command, run in its workspace, and nothing of the box left; the
+# same after SIGTERM to run.
+t_agent_run() {
+    need_subids || return 77
+    local out rc name front
+    mkdir -p "$T/vol/agentrun" && chown 2345:2346 "$T/vol/agentrun" || return 1
+    out=$(lb run --profile agent --workspace "$T/vol/agentrun" -- /bin/sh -c 'hostname; pwd; echo made > made; exit 3' </dev/null)
+    rc=$?
+    name=$(printf '%s\n' "$out" | sed -n 1p)
+    echo "run --profile agent: status $rc, $(printf '%s\n' "$out" | paste -sd' '); made: $(stat -c %u:%g "$T/vol/agentrun/made" 2>&1)"
+    [ "$rc" = 3 ] && [ "$(printf '%s\n' "$out" | sed -n 2p)" = /workspace ] &&
+        [ "$(stat -c %u:%g "$T/vol/agentrun/made")" = 2345:2346 ] && run_left "$name" || return 1
+    # "$LB" and not lb, whose timeout would be $! and take the SIGTERM alone
+    "$LB" run --profile agent -- /bin/sh -c 'hostname; exec sleep 1118' >"$OUT/agentrun.out" 2>"$OUT/agentrun.err" </dev/null &
+    front=$!
+    wait_until 30 test -s "$OUT/agentrun.out" && wait_until 5 running_cmd 'sleep 1118' ||
+        { echo "the command did not start"; cat "$OUT/agentrun.err"; kill -KILL "$front"; return 1; }
+    name=$(cat "$OUT/agentrun.out")
+    kill -TERM "$front"
+    wait "$front"
+    rc=$?
+    echo "SIGTERM to run --profile agent of $name: status $rc"
+    [ "$rc" = 143 ] && ! running_cmd 'sleep 1118' && run_left "$name"
+}
+
+# ─── The agent group (ROADMAP 8.11) ─────────────────────────────────────────
+#
+# Phase 8's exit conditions for boxes of --profile agent, with t_agent_profile
+# and t_agent_run above: what doctor --profile agent says, the proxy, exec
+# --timeout and lightbox's own statuses, reset, --ttl and the audit log; and
+# the commands of README's "Running an agent in a box", in a copy of the
+# suite's own. The boxes are made with lb create and not box, whose
+# mode_options would give them --seccomp deny or --copy, which the profile
+# refuses.
+
+# A box of the profile, created with lb create: what create said on failure.
+agent_box() { # name [address] [create options]
+    local name=$1
+    shift
+    lb create "$name" "$@" --profile agent >"$OUT/$name.create" 2>&1 </dev/null || { cat "$OUT/$name.create"; return 1; }
+    port_of "$name" >/dev/null
+}
+
+# doctor --profile agent finds nothing missing on a host set up for the
+# profile; with nft masked it exits 1, and says that agent.nft is missing and
+# what fixes it.
+t_agent_doctor() {
+    need_subids || return 77
+    local said rc nft check
+    said=$(lb doctor --profile agent 2>&1)
+    rc=$?
+    printf '%s\n' "$said" | grep -A1 '^agent\.'
+    [ "$rc" = 0 ] || { echo "doctor --profile agent exited $rc on a host set up for the profile"; return 1; }
+    for check in kernel userns_ranges idmap nft cgroup_kill; do
+        printf '%s\n' "$said" | grep -Eq "^agent\.$check: (yes|ok) " || { echo "agent.$check does not pass"; return 1; }
+    done
+    nft=$(printf '%s\n' "$said" | sed -n 's/^agent\.nft: ok (\(.*\))$/\1/p')
+    nft=$(readlink -f "$nft") && [ -n "$nft" ] || { echo "the path of nft is not said"; return 1; }
+    mount --bind /dev/null "$nft" || return 1
+    said=$(lb doctor --profile agent 2>&1)
+    rc=$?
+    umount "$nft" || return 1
+    printf '%s\n' "$said" | grep -A1 '^agent\.nft: '
+    [ "$rc" = 1 ] || { echo "doctor --profile agent exited $rc with nft masked"; return 1; }
+    printf '%s\n' "$said" | grep -A1 '^agent\.nft: missing (' | tail -n 1 | grep -q '^  to fix: install nftables' ||
+        { echo "agent.nft is not said to be missing, with its fix"; return 1; }
+    lb doctor --profile agent >/dev/null || { echo "doctor --profile agent fails with nft back"; return 1; }
+}
+
+# With --net proxy:<port>, a box of the profile reaches that port of the
+# gateway and nothing else: another port of the gateway, the proxy's port on
+# the host's other address, the outside and a name server on TCP, each with
+# a listener, are refused within a second; its resolv.conf names no name
+# server. A listener on the gateway stands in for the proxy.
+t_agent_proxy() {
+    need_subids || return 77
+    need_nc || return 77
+    need_listeners || return 77
+    private_addresses || return 1
+    local proxy tcp53 try said rc=0
+    agent_box aprx "$(next_ip)" --net "proxy:$PROXY_PORT" || return 1
+    [ "$(conf_value aprx net)" = "proxy:$PROXY_PORT" ] && [ -s "$C/aprx/.ip" ] || { cat "$C/aprx/.conf"; return 1; }
+    proxy=$(tcp_listener 0.0.0.0 "$PROXY_PORT" 'the proxy here') &&
+        tcp53=$(tcp_listener 0.0.0.0 53 'a name server on TCP' "$(cat "$T/outside")") || return 1
+    start aprx || rc=1
+    if [ "$rc" = 0 ]; then
+        for try in 1 2 3 4 5; do
+            answers aprx "$GW" "$PROXY_PORT" 'the proxy here' && break
+            [ "$try" = 5 ] && { echo "the box did not reach its proxy"; rc=1; }
+            sleep 0.3
+        done
+    fi
+    if [ "$rc" = 0 ]; then
+        rejected aprx "$GW" && rejected aprx 192.0.2.2 "$PROXY_PORT" && rejected aprx "$OUTSIDE" &&
+            rejected aprx "$PRIVATE_DNS" 53 || { echo "it was not refused within a second"; rc=1; }
+        said=$(sh_in aprx 'cat /etc/resolv.conf')
+        echo "its resolv.conf: $said"
+        printf '%s\n' "$said" | grep -q nameserver && { echo "it names a name server"; rc=1; }
+    fi
+    kill "$proxy" "$tcp53" 2>/dev/null
+    port_free() { ! ss -ltn | grep -q ":$PROXY_PORT "; }
+    wait_until 5 port_free || { echo "the listener on port $PROXY_PORT is still there"; rc=1; }
+    [ "$rc" = 0 ] && lb stop aprx >/dev/null && nothing_left aprx && lb rm aprx >/dev/null
+}
+
+# In a box of the profile, exec --timeout ends the command and all it
+# started, a process in a session of its own among them, and returns 124; a
+# command's own status is its own, one that is not there is 127, and an exec
+# into a box that does not run is 125, lightbox's own.
+t_agent_timeout() {
+    need_subids || return 77
+    local began ms rc
+    agent_box atime && start atime || return 1
+    began=$(date +%s%N)
+    lb exec atime --timeout 2s /bin/sh -c "$KIT setsid sleep 1123 & sleep 1124" >/dev/null 2>"$OUT/atime.err" </dev/null
+    rc=$?
+    ms=$(( ($(date +%s%N) - began) / 1000000 ))
+    cat "$OUT/atime.err"
+    echo "--timeout 2s: status $rc in $ms ms"
+    [ "$rc" = 124 ] && [ "$ms" -lt 3000 ] || return 1
+    none_running 'sleep 1123' 'sleep 1124' || { echo "a sleep is left"; return 1; }
+    [ -z "$(exec_cgroups atime)" ] || { echo "left: $(exec_cgroups atime)"; return 1; }
+    lb exec atime /bin/sh -c 'exit 3' </dev/null
+    rc=$?
+    lb exec atime /not-there </dev/null 2>/dev/null
+    rc="$rc $?"
+    lb stop atime >/dev/null || return 1
+    lb exec atime /bin/true </dev/null 2>"$OUT/atime.err"
+    rc="$rc $?"
+    echo "exit 3, a command that is not there, and an exec into a box that does not run: $rc; $(cat "$OUT/atime.err")"
+    [ "$rc" = '3 127 125' ] && nothing_left atime && lb rm atime >/dev/null
+}
+
+# reset of a box of the profile: what it wrote outside its workspace is gone
+# and nothing of its base was copied, as its rootfs/ has no more than what
+# create wrote; what it wrote in its workspace stays.
+t_agent_reset() {
+    need_subids || return 77
+    local own more
+    mkdir -p "$T/vol/agentreset" && chown 2345:2346 "$T/vol/agentreset" || return 1
+    agent_box arst --workspace "$T/vol/agentreset" && start arst || return 1
+    sh_in arst 'echo mine > /made-here && echo kept > kept && rm /etc/group' || return 1
+    lb reset arst </dev/null || return 1
+    nothing_left arst || return 1
+    own=$(cd "$C/arst/rootfs" && find . -type f | sort | paste -sd' ' -)
+    echo "its own files: $own"
+    more=$(cd "$C/arst/rootfs" && find . -type f ! -path ./etc/hostname ! -path ./etc/hosts ! -path ./etc/resolv.conf)
+    [ -z "$more" ] || { echo "rootfs/ has more than create wrote: $more"; return 1; }
+    [ "$(cat "$T/vol/agentreset/kept")" = kept ] || { echo "the workspace lost its file"; return 1; }
+    start arst || return 1
+    [ "$(sh_in arst 'test ! -e /made-here && test -e /etc/group && cat kept')" = kept ] ||
+        { echo "what the box did is still there, or its workspace is not"; return 1; }
+    lb stop arst >/dev/null && lb rm arst >/dev/null
+}
+
+# A box of the profile with --ttl 2s ends on time, with what it started, and
+# is expired; the --ttl given is its, not agent_ttl's.
+t_agent_ttl() {
+    need_subids || return 77
+    local began ms
+    agent_box attl --ttl 2s || return 1
+    [ "$(conf_value attl ttl)" = 2s ] || { echo "ttl=$(conf_value attl ttl)"; return 1; }
+    began=$(date +%s%N)
+    start attl || return 1
+    sh_in attl "$KIT setsid sleep 1125 >/dev/null 2>&1 </dev/null &" || return 1
+    wait_until 5 running_cmd 'sleep 1125' || { echo "what the exec started is not running"; return 1; }
+    shows_expired() { lb ls | grep -Eq '^attl +[^ ]+ +expired'; }
+    wait_until 6 shows_expired || { lb ls; echo "ls does not show it as expired"; return 1; }
+    ms=$(( ($(date +%s%N) - began) / 1000000 ))
+    lb ls
+    echo "expired $ms ms after its start began"
+    [ "$ms" -ge 2000 ] && [ "$ms" -lt 4000 ] || return 1
+    ! running_cmd 'sleep 1125' || { echo "a process is left"; return 1; }
+    lb stop attl >/dev/null 2>&1
+    nothing_left attl && [ "$(state_of attl)" = expired ] && lb rm attl >/dev/null
+}
+
+# The exec of a box of the profile and the command of a run --profile agent
+# are each in the audit log, start and end, by the box's name and id; and no
+# file the box can read has the log's lines, but the one it wrote itself,
+# which the search has to find.
+t_agent_audit() {
+    need_subids || return 77
+    local id name rc found
+    agent_box aaud && start aaud || return 1
+    id=$(conf_value aaud id)
+    lb exec aaud /bin/sh -c 'exit 5' agentmarker4712 </dev/null
+    rc=$?
+    name=$(lb run --profile agent -- /bin/sh -c hostname </dev/null) || return 1
+    echo "exec: $rc; run of $name; their lines:"
+    { lb logs --audit aaud; lb logs --audit "$name"; } | tee "$OUT/aaud.lines"
+    [ "$rc" = 5 ] || return 1
+    python3 -I -c '
+import json, sys
+box_id, run = sys.argv[2], sys.argv[3]
+lines = [json.loads(l) for l in open(sys.argv[1])]
+assert len(lines) == 4, "%d lines" % len(lines)
+a, b, c, d = lines
+assert [l["event"] for l in lines] == ["start", "end", "start", "end"], "the events"
+assert a["box"] == b["box"] == "aaud" and a["box_id"] == b["box_id"] == box_id, "the box"
+assert a["via"] == "exec" and a["argv"] == ["/bin/sh", "-c", "exit 5", "agentmarker4712"] and b["status"] == 5, "the exec"
+assert c["box"] == d["box"] == run and c["box_id"] == d["box_id"] != box_id, "the box of run"
+assert c["via"] == "run" and c["argv"] == ["/bin/sh", "-c", "hostname"] and d["status"] == 0, "the command of run"
+' "$OUT/aaud.lines" "$id" "$name" || return 1
+    found=$(LB_TIMEOUT=120 lb exec aaud /bin/sh -c \
+        "echo agentmarker4712 > /tmp/control; for d in /*; do case \$d in /proc|/sys|/dev) ;;
+         *) $KIT find \"\$d\" -type f -exec $KIT grep -l 'agentmarke[r]4712' {} + ;; esac; done" \
+        </dev/null 2>/dev/null)
+    echo "files in the box with what the log has: $found"
+    [ "$found" = /tmp/control ] && lb stop aaud >/dev/null && lb rm aaud >/dev/null
+}
+
+# README's "Running an agent in a box", its fenced commands in the order it
+# has them, kept in step with it by hand, as no case reads README. Here lb
+# stands for sudo ./lightbox, guide for the name agent, and a directory of
+# the case's, owned by an unprivileged uid as one of the reader's is, for
+# ~/agent-work.
+t_agent_guide() {
+    need_subids || return 77
+    local ws=$T/vol/agentguide said
+    # sudo ./lightbox doctor --profile agent
+    lb doctor --profile agent >"$OUT/guide.doctor" 2>&1 || { cat "$OUT/guide.doctor"; return 1; }
+    # mkdir -p ~/agent-work
+    mkdir -p "$ws" && chown 2345:2346 "$ws" || return 1
+    # sudo ./lightbox create agent --profile agent --workspace ~/agent-work
+    lb create guide --profile agent --workspace "$ws" </dev/null || return 1
+    port_of guide >/dev/null
+    # sudo ./lightbox start agent
+    start guide || return 1
+    # sudo ./lightbox exec agent --timeout 10m -- /bin/sh -c 'id -u; pwd; echo done > result.txt'
+    said=$(lb exec guide --timeout 10m -- /bin/sh -c 'id -u; pwd; echo done > result.txt' </dev/null | paste -sd' ')
+    echo "exec: $said"
+    [ "$said" = '0 /workspace' ] || return 1
+    # cat ~/agent-work/result.txt
+    [ "$(cat "$ws/result.txt")" = done ] && [ "$(stat -c %u:%g "$ws/result.txt")" = 2345:2346 ] ||
+        { echo "result.txt: $(cat "$ws/result.txt"), $(stat -c %u:%g "$ws/result.txt")"; return 1; }
+    # sudo ./lightbox logs --audit agent
+    said=$(lb logs --audit guide)
+    printf '%s\n' "$said"
+    [ "$(printf '%s\n' "$said" | grep -c '"box":"guide"')" = 2 ] || { echo "not the start and the end of the exec"; return 1; }
+    # sudo ./lightbox reset agent
+    lb reset guide </dev/null || return 1
+    # sudo ./lightbox rm agent
+    lb rm guide </dev/null || return 1
+    [ ! -e "$C/guide" ] || { echo "the box is still there"; return 1; }
+    # sudo ./lightbox run --profile agent --workspace ~/agent-work --timeout 10m -- /bin/sh -c 'cat result.txt'
+    said=$(lb run --profile agent --workspace "$ws" --timeout 10m -- /bin/sh -c 'cat result.txt' </dev/null)
+    echo "run: $said"
+    [ "$said" = done ] || return 1
+    # sudo ./lightbox create agent --profile agent --net proxy:3128 --workspace ~/agent-work
+    lb create guide --profile agent --net proxy:3128 --workspace "$ws" </dev/null || return 1
+    port_of guide >/dev/null
+    # sudo ./lightbox start agent
+    start guide || return 1
+    # sudo ./lightbox exec agent -- /bin/sh -c 'echo "$HTTPS_PROXY"'
+    said=$(lb exec guide -- /bin/sh -c 'echo "$HTTPS_PROXY"' </dev/null)
+    echo "HTTPS_PROXY in the box: $said"
+    [ "$said" = "http://$GW:3128" ] || return 1
+    # sudo ./lightbox stop agent
+    lb stop guide </dev/null || return 1
+    nothing_left guide || return 1
+    # sudo ./lightbox rm agent
+    lb rm guide </dev/null && [ ! -e "$C/guide" ]
+}
+
+# Every exec writes two lines to the audit log of the host (ROADMAP 8.9): one
+# as its command starts and one when it has ended. They parse as JSON, name
+# the box by its name and id, and carry what was asked, --env by its keys
+# only, and how it ended. The lines of a run are kept when its box is gone.
+# No file in the box has what the log has.
+t_audit_log() {
+    local log=$T/lb/audit.log id rc found name
+    up audit || return 1
+    id=$(conf_value audit id)
+    lb exec audit --env TOKEN=not-for-the-log --workdir /tmp /bin/sh -c 'exit 7' auditmarker4711 </dev/null
+    rc=$?
+    lb exec audit --timeout 1s /bin/sleep 1116 </dev/null 2>/dev/null
+    echo "statuses $rc and $?; the log: $(stat -c '%a %U' "$log"), its directory $(stat -c '%a' "$T/lb")"
+    lb logs --audit audit
+    lb logs --audit audit | python3 -I -c '
+import json, re, sys
+box_id = sys.argv[1]
+lines = [json.loads(l) for l in sys.stdin]
+assert len(lines) == 4, "%d lines" % len(lines)
+a, b, c, d = lines
+for l in lines:
+    assert l["box"] == "audit" and l["box_id"] == box_id, "the box"
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z", l["time"]), l["time"]
+assert [l["event"] for l in lines] == ["start", "end", "start", "end"], "the events"
+assert a["exec_id"] == b["exec_id"] != c["exec_id"] == d["exec_id"], "the exec ids"
+assert a["via"] == "exec" and a["uid"] == 0 and a["user"] is None and a["workdir"] == "/tmp" and a["timeout"] is None
+assert a["env"] == ["TOKEN"] and a["argv"] == ["/bin/sh", "-c", "exit 7", "auditmarker4711"], "what was asked"
+assert b["status"] == 7 and b["timed_out"] is False and b["duration_ms"] >= 0, "its end"
+assert c["timeout"] == "1s" and c["argv"] == ["/bin/sleep", "1116"], "the second"
+assert d["status"] == 124 and d["timed_out"] is True and d["duration_ms"] >= 1000, "its end"
+' "$id" || return 1
+    [ "$rc" = 7 ] && [ "$(stat -c '%a %U' "$log")" = '600 root' ] || return 1
+    ! grep -q not-for-the-log "$log" || { echo "the value of an --env is in the log"; return 1; }
+    # what the box can read, but /proc, /sys and lightbox's own /dev, with one
+    # file the box writes that has it, which the search has to find: the
+    # pattern does not match itself, which is in the command lines of /proc
+    found=$(LB_TIMEOUT=120 lb exec audit /bin/sh -c \
+        "echo auditmarker4711 > /tmp/control; for d in /*; do case \$d in /proc|/sys|/dev) ;;
+         *) $KIT find \"\$d\" -type f -exec $KIT grep -l 'auditmarke[r]4711' {} + ;; esac; done" \
+        </dev/null 2>/dev/null)
+    echo "files in the box with what the log has: $found"
+    [ "$found" = /tmp/control ] || return 1
+
+    # shellcheck disable=SC2046
+    name=$(lb run $(mode_options) -- /bin/sh -c 'hostname; exit 5' </dev/null)
+    rc=$?
+    echo "run of $name: $rc; its lines:"
+    lb logs --audit "$name"
+    [ "$rc" = 5 ] && [ ! -e "$C/$name" ] || return 1
+    lb logs --audit "$name" | python3 -I -c '
+import json, re, sys
+lines = [json.loads(l) for l in sys.stdin]
+assert [l["event"] for l in lines] == ["start", "end"] and lines[0]["via"] == "run", "the lines of run"
+assert re.fullmatch("[0-9a-f]{16}", lines[0]["box_id"]) and lines[1]["status"] == 5, "its box and status"
+'
+}
+
+# exec --timeout holds without the process that ran exec: its worker, which
+# the container cannot reach, ends the command and all it started at once
+# when that process is killed, and a second past the deadline when it is
+# stopped, after which it returns 124.
+t_exec_timeout_without_its_exec() {
+    local front began ms rc
+    up exkeep || return 1
+    "$LB" exec exkeep --timeout 60s /bin/sh -c "$KIT setsid sleep 1077 >/dev/null 2>&1 </dev/null & exec sleep 1078" \
+        >/dev/null 2>&1 </dev/null &
+    front=$!
+    wait_until 5 running_cmd 'sleep 1077' && wait_until 5 running_cmd 'sleep 1078' ||
+        { echo "the command did not start"; kill -KILL "$front"; return 1; }
+    kill -KILL "$front"
+    wait "$front" 2>/dev/null
+    wait_until 3 none_running 'sleep 1077' 'sleep 1078' || { echo "the command outlived its exec"; return 1; }
+    sh_in exkeep true || return 1
+    [ -z "$(exec_cgroups exkeep)" ] || { echo "left: $(exec_cgroups exkeep)"; return 1; }
+
+    "$LB" exec exkeep --timeout 1s /bin/sh -c "exec sleep 1079" >/dev/null 2>"$OUT/exkeep.err" </dev/null &
+    front=$!
+    wait_until 5 running_cmd 'sleep 1079' || { echo "the second did not start"; kill -KILL "$front"; return 1; }
+    kill -STOP "$front"
+    began=$(date +%s%N)
+    wait_until 5 none_running 'sleep 1079' || { kill -KILL "$front"; echo "the command outlived its deadline"; return 1; }
+    ms=$(( ($(date +%s%N) - began) / 1000000 ))
+    kill -CONT "$front"
+    wait "$front"
+    rc=$?
+    cat "$OUT/exkeep.err"
+    echo "with exec stopped, the command ended $ms ms after that; exec returned $rc"
+    [ "$ms" -lt 3000 ] && [ "$rc" = 124 ]
+}
+
+# --ttl (ROADMAP 8.8): a container ends at the end of its lifetime from its
+# start, as stop ends it, with what its hook and an exec left running, and
+# ls and inspect show it as expired, as its log says; the next stop clears
+# away what it left and keeps it expired, and a start gives it a lifetime
+# again.
+t_ttl() {
+    local began ms
+    box ttlbox --ttl 2s || return 1
+    hook ttlbox <<EOF
+$KIT setsid sleep 1101 >/dev/null 2>&1 </dev/null &
+EOF
+    began=$(date +%s%N)
+    start ttlbox || return 1
+    sh_in ttlbox "$KIT setsid sleep 1102 >/dev/null 2>&1 </dev/null &" || return 1
+    wait_until 5 running_cmd 'sleep 1101' && wait_until 5 running_cmd 'sleep 1102' ||
+        { echo "what the hook and the exec started is not running"; return 1; }
+    shows_expired() { lb ls | grep -Eq '^ttlbox +[0-9.]+ +expired'; }
+    wait_until 6 shows_expired || { lb ls; echo "ls does not show it as expired"; return 1; }
+    ms=$(( ($(date +%s%N) - began) / 1000000 ))
+    lb ls
+    echo "expired $ms ms after its start began"
+    [ "$ms" -ge 2000 ] && [ "$ms" -lt 4000 ] || return 1
+    lb inspect ttlbox | grep -qx 'state: expired' || { echo "inspect does not show it as expired"; return 1; }
+    none_running 'sleep 1101' 'sleep 1102' || { echo "a process is left"; return 1; }
+    cgroup_empty "$CG/ttlbox" || { echo "its cgroup is not empty"; return 1; }
+    grep -q -- '--ttl is over; it stops' "$C/ttlbox/console.log" || { echo "the log does not say why"; return 1; }
+    lb stop ttlbox >"$OUT/ttlbox.stop" 2>&1
+    cat "$OUT/ttlbox.stop"
+    grep -q 'came to the end of its --ttl' "$OUT/ttlbox.stop" || return 1
+    nothing_left ttlbox && [ "$(state_of ttlbox)" = expired ] || return 1
+    start ttlbox && [ "$(state_of ttlbox)" = running ]
+}
+
+# What is left of a box of run that is gone: nothing, no directory, cgroup,
+# record, interface or firewall rule.
+run_left() { # name [address]
+    local bad=0
+    [ ! -e "$C/$1" ] || { echo "the directory of $1 is left"; bad=1; }
+    [ ! -e "$CG/$1" ] || { echo "the cgroup of $1 is left"; bad=1; }
+    [ ! -e "$RUN/$1" ] || { echo "the records of $1 are left"; bad=1; }
+    ! ip -o link show | grep -qF "lightbox:$1" || { echo "the interface of $1 is left"; bad=1; }
+    if [ -n "${2:-}" ]; then
+        ! iptables-save 2>/dev/null | grep -qF -- "$2/32" || { echo "an iptables rule names $2"; bad=1; }
+        ! nft list ruleset 2>/dev/null | grep -qwF -- "$2" || { echo "an nftables rule names $2"; bad=1; }
+    fi
+    return $bad
+}
+
+# run (ROADMAP 8.8): a box for one command. What it prints is the command's
+# alone, its status is the command's, and nothing of the box is left. Its
+# create options reach the box and its exec options the command; --timeout
+# ends the command with 124, a command that is not there is 127, and an
+# option create refuses is 125, with no box made.
+t_run() {
+    local out rc name ip began ms said
+    # shellcheck disable=SC2046  # options of one word each
+    out=$(lb run $(mode_options) -- /bin/sh -c "hostname; $KIT ip -o -4 addr show eth0 | $KIT awk '{ print \$4 }'; echo to-stderr >&2; exit 3" \
+          2>"$OUT/run.err" </dev/null)
+    rc=$?
+    printf '%s\n' "$out"
+    echo "status $rc; on stderr: $(cat "$OUT/run.err")"
+    name=$(printf '%s\n' "$out" | sed -n 1p)
+    ip=$(printf '%s\n' "$out" | sed -n 2p)
+    ip=${ip%/*}
+    [ "$rc" = 3 ] && [ "$(printf '%s\n' "$out" | grep -c .)" = 2 ] && [ "$(cat "$OUT/run.err")" = to-stderr ] ||
+        { echo "run printed more than the command, or did not return its status"; return 1; }
+    printf '%s\n' "$name" | grep -Eqx 'run-[0-9a-f]{12}' && [ -n "$ip" ] || { echo "the box was not run-<12 hex digits> with an address"; return 1; }
+    run_left "$name" "$ip" || return 1
+
+    # shellcheck disable=SC2046
+    out=$(lb run $(mode_options) --net none --env GREETING=hi --workdir /tmp -- \
+          /bin/sh -c 'echo "$GREETING $(pwd)"; cat /proc/net/dev' </dev/null)
+    said=$(printf '%s\n' "$out" | sed '1,3d' | awk -F: '{ gsub(/ /, "", $1); print $1 }' | paste -sd' ' -)
+    echo "with --net none, --env and --workdir: $(printf '%s\n' "$out" | sed -n 1p); its interfaces: $said"
+    [ "$(printf '%s\n' "$out" | sed -n 1p)" = 'hi /tmp' ] && [ "$said" = lo ] || return 1
+    began=$(date +%s%N)
+    # shellcheck disable=SC2046
+    lb run $(mode_options) --timeout 1s -- /bin/sleep 1113 </dev/null
+    rc=$?
+    ms=$(( ($(date +%s%N) - began) / 1000000 ))
+    echo "--timeout 1s: status $rc in $ms ms"
+    [ "$rc" = 124 ] && [ "$ms" -lt 6000 ] && ! running_cmd 'sleep 1113' || return 1
+    # shellcheck disable=SC2046
+    lb run $(mode_options) -- /no/such/program </dev/null 2>/dev/null
+    rc=$?
+    echo "a program that is not there: $rc"
+    [ "$rc" = 127 ] || return 1
+    out=$(lb run --mem 1x -- /bin/true 2>&1 </dev/null)
+    rc=$?
+    echo "--mem 1x: $rc, $out"
+    [ "$rc" = 125 ] && [ "$out" = 'Error: --mem takes <number>[K|M|G|T] or max, not: 1x' ] || return 1
+    [ -z "$(ls -d "$C"/run-* 2>/dev/null)" ] || { echo "boxes are left: $(ls -d "$C"/run-*)"; return 1; }
+}
+
+# A box of run whose command a SIGTERM to run ends is removed, and run
+# returns the command's status; one whose run was killed outright is
+# removed by the next run, which says so.
+t_run_ends() {
+    local front rc name said
+    # the command says the box's name on run's stdout, which goes to a file:
+    # a volume would need to be the box's root's, whose range is not known
+    # before run has made the box
+    # shellcheck disable=SC2046
+    "$LB" run $(mode_options) -- /bin/sh -c 'hostname; exec sleep 1114' \
+        >"$OUT/runsig.out" 2>"$OUT/runsig.err" </dev/null &
+    front=$!
+    wait_until 20 test -s "$OUT/runsig.out" && wait_until 5 running_cmd 'sleep 1114' ||
+        { echo "the command did not start"; cat "$OUT/runsig.err"; kill -KILL "$front"; return 1; }
+    name=$(cat "$OUT/runsig.out")
+    kill -TERM "$front"
+    wait "$front"
+    rc=$?
+    echo "SIGTERM to run of $name: status $rc; $(cat "$OUT/runsig.err")"
+    [ "$rc" = 143 ] && ! running_cmd 'sleep 1114' && run_left "$name" || return 1
+
+    # shellcheck disable=SC2046
+    "$LB" run $(mode_options) -- /bin/sh -c 'hostname; exec sleep 1115' \
+        >"$OUT/runkill.out" 2>&1 </dev/null &
+    front=$!
+    wait_until 20 test -s "$OUT/runkill.out" && wait_until 5 running_cmd 'sleep 1115' ||
+        { echo "the second did not start"; cat "$OUT/runkill.out"; kill -KILL "$front"; return 1; }
+    name=$(cat "$OUT/runkill.out")
+    kill -KILL "$front"
+    wait "$front" 2>/dev/null
+    echo "its run killed, $name: $(state_of "$name"); .runner: $(cat "$C/$name/.runner" 2>&1)"
+    [ "$(state_of "$name")" = running ] && [ -s "$C/$name/.runner" ] || { echo "the box of a killed run is not there"; return 1; }
+    # shellcheck disable=SC2046
+    said=$(lb run $(mode_options) -- /bin/true 2>&1 </dev/null) || { printf '%s\n' "$said"; return 1; }
+    printf '%s\n' "$said"
+    printf '%s\n' "$said" | grep -qxF "Note: removing the box '$name', whose run is gone" || return 1
+    ! running_cmd 'sleep 1115' && run_left "$name"
+}
+
+# A container whose init died with an exec's cgroup left below its own is
+# cleared away whole, the exec's cgroup first.
+t_exec_cgroup_of_a_dead_init() {
+    local pid
+    up exdead || return 1
+    sh_in exdead "$KIT setsid sleep 1076 >/dev/null 2>&1 </dev/null &" || return 1
+    wait_until 5 running_cmd 'sleep 1076' || { echo "what it started is not running"; return 1; }
+    [ -n "$(exec_cgroups exdead)" ] || { echo "no cgroup was left"; return 1; }
+    pid=$(pid_of exdead)
+    kill -KILL "$pid"
+    wait_until 5 gone "$pid" || return 1
+    # stop clears it away and says that it does not run
+    lb stop exdead >"$OUT/exdead.stop" 2>&1
+    cat "$OUT/exdead.stop"
+    grep -q "had ended without a stop; what it left has been cleared away" "$OUT/exdead.stop" || return 1
+    ! running_cmd 'sleep 1076' || { echo "the sleep is left"; return 1; }
+    nothing_left exdead
 }
 
 t_exec_default_shell() {
@@ -566,8 +1404,10 @@ t_stopped_from_inside_is_exited() {
 # A container that was started by a lightbox before 0.5 has its records in
 # its own directory. After an upgrade it is still seen to be running, a
 # command can be run in it, and stop stops it and takes the old records away.
+# It has the network of then, nat: the records of --net outside, of 0.8, are
+# in run_dir, which a lightbox before 0.5 did not have.
 t_container_started_before_the_upgrade() {
-    up oldstyle || return 1
+    up oldstyle --net nat || return 1
     pid=$(pid_of oldstyle)
     mv "$RUN/oldstyle/pid" "$C/oldstyle/.pid" && mv "$RUN/oldstyle/pid_start" "$C/oldstyle/.pid_start" &&
     mv "$RUN/oldstyle/state" "$C/oldstyle/.state" && rm -rf -- "$RUN/oldstyle" || return 1
@@ -685,16 +1525,20 @@ lbuser" ] || return 1
 
 # The groups of a command are what the container's files give its user, and
 # none for a uid the container has no account for. The groups of whoever runs
-# lightbox are not among them, with --user or without.
+# lightbox are not among them, with --user or without. Root's are 0 and those
+# the image's /etc/group lists it in, which Alpine's does in ten.
 t_exec_unknown_uid_drops_groups() {
     command -v setpriv >/dev/null 2>&1 || { echo "no setpriv to put the caller in a group with"; return 77; }
     up nogroups || return 1
     said=$(setpriv --groups 4242 timeout -k 5 60 "$LB" exec nogroups --user 1234 /bin/sh -c 'id -G' </dev/null) || return 1
     echo "groups of uid 1234 in the container: $said (the caller was in group 4242)"
     [ "$said" = 1234 ] || return 1
-    said=$(setpriv --groups 4242 timeout -k 5 60 "$LB" exec nogroups /bin/sh -c 'id -u; id -G' </dev/null | tr '\n' ' ') || return 1
-    echo "uid and groups without --user: $said"
-    [ "$said" = "0 0 " ]
+    uid=$(setpriv --groups 4242 timeout -k 5 60 "$LB" exec nogroups /bin/sh -c 'id -u' </dev/null) &&
+    said=$(setpriv --groups 4242 timeout -k 5 60 "$LB" exec nogroups /bin/sh -c 'id -G' </dev/null) || return 1
+    said=$(printf '%s\n' "$said" | tr ' ' '\n' | sort -n -u | paste -sd' ' -)
+    want=$(awk -F: '$3 == 0 || ("," $4 ",") ~ /,root,/ { print $3 }' "$BASE/etc/group" | sort -n -u | paste -sd' ' -)
+    echo "uid and groups without --user: $uid, $said; the image gives root $want"
+    [ "$uid" = 0 ] && [ "$said" = "$want" ]
 }
 
 t_exec_user_is_strict() {
@@ -871,7 +1715,7 @@ t_exec_environment() {
 t_volume_directory() {
     mkdir -p "$T/vol/shared"
     echo from-the-host > "$T/vol/shared/in"
-    up vdir --vol "$T/vol/shared:/data" || return 1
+    box vdir --vol "$T/vol/shared:/data" && volume_for vdir "$T/vol/shared" && start vdir || return 1
     [ "$(sh_in vdir 'cat /data/in')" = from-the-host ] || return 1
     sh_in vdir 'echo from-the-container > /data/out' || return 1
     [ "$(cat "$T/vol/shared/out")" = from-the-container ]
@@ -1021,6 +1865,7 @@ t_volume_destination_is_inside() {
     mkdir -p "$C/vlink/rootfs/srv" "$C/vlink/rootfs$host"
     ln -s /srv "$C/vlink/rootfs/link"
     ln -s "$host" "$C/vlink/rootfs/away"
+    made_for vlink "$C/vlink/rootfs/srv" "$C/vlink/rootfs${host%/*}" "$C/vlink/rootfs/link" "$C/vlink/rootfs/away" || return 1
     start vlink || return 1
     [ "$(sh_in vlink 'cat /srv/data/in')" = through-a-link ] || { echo "the volume is not where the link leads in the container"; return 1; }
     [ "$(sh_in vlink 'cat /away/data/in')" = through-a-link ] || { echo "the second volume is not reachable through its link"; return 1; }
@@ -1030,7 +1875,7 @@ t_volume_destination_is_inside() {
 
     # the same link when the container has no such directory: it leads nowhere, and the start says so
     box vnowhere --vol "$T/vol/linked:/away/data" || return 1
-    ln -s "$host" "$C/vnowhere/rootfs/away"
+    ln -s "$host" "$C/vnowhere/rootfs/away" && made_for vnowhere "$C/vnowhere/rootfs/away" || return 1
     if said=$(start vnowhere); then
         printf '%s\n' "$said"
         echo "a volume was mounted through a link that leads nowhere in the container"
@@ -1046,7 +1891,8 @@ t_volume_under_tmp() {
     mkdir -p "$T/vol/cache"
     echo cached > "$T/vol/cache/in"
     echo 'one = 1' > "$T/vol/one.conf"
-    up vtmp --read-only --vol "$T/vol/cache:/tmp/cache" --vol "$T/vol/one.conf:/run/app/one.conf:ro" --vol "$T/vol/cache:/not/in/the/image" || return 1
+    box vtmp --read-only --vol "$T/vol/cache:/tmp/cache" --vol "$T/vol/one.conf:/run/app/one.conf:ro" --vol "$T/vol/cache:/not/in/the/image" &&
+        volume_for vtmp "$T/vol/cache" && start vtmp || return 1
     [ "$(sh_in vtmp 'cat /tmp/cache/in')" = cached ] || { echo "a volume under /tmp is not visible"; return 1; }
     [ "$(sh_in vtmp 'cat /run/app/one.conf')" = 'one = 1' ] || { echo "a file volume under /run is not visible"; return 1; }
     [ "$(sh_in vtmp 'cat /not/in/the/image/in')" = cached ] || { echo "a volume at a path the image lacks is not there, with a read-only root"; return 1; }
@@ -1097,6 +1943,49 @@ t_run_mode() {
     said=$(sh_in runmode 'ls -ld /run')
     echo "$said"
     case $said in drwxr-xr-x*) ;; *) return 1 ;; esac
+}
+
+# Nothing in a container gives a file the setuid or the setgid bit, in its own
+# files or in a volume, which are on the host too (ROADMAP 8.2): chmod asks for
+# either and is refused, and a plain mode is taken.
+t_no_setuid_or_setgid_bits() {
+    mkdir -p "$T/vol/bits" || return 1
+    box bits --vol "$T/vol/bits:/bits" && volume_for bits "$T/vol/bits" && start bits || return 1
+    sh_in bits 'echo x > /bits/file && echo x > /file && chmod 750 /bits/file /file' || return 1
+    for change in 'u+s /bits/file' 'g+s /bits/file' '4755 /file' '2755 /file' '6755 /bits/file'; do
+        if said=$(sh_in bits "chmod $change" 2>&1); then
+            echo "chmod $change was taken"
+            return 1
+        fi
+        echo "chmod $change: $said"
+        case $said in *'not permitted'*) ;; *) echo "refused for another reason than the bits"; return 1 ;; esac
+    done
+    modes=$(stat -c %a "$T/vol/bits/file" "$C/bits/rootfs/file" | paste -sd' ')
+    echo "on the host: $modes"
+    [ "$modes" = '750 750' ]
+}
+
+# --seccomp allow (ROADMAP 8.3): the .conf and inspect say so, and what exec
+# runs is under the allow-list: a call it does not name answers ENOSYS, as
+# sethostname does, which the deny-list lets through to be refused for want
+# of CAP_SYS_ADMIN; and the rest works. --seccomp deny is the deny-list, which
+# a .conf without the line has, as one made before 0.8 does.
+t_seccomp_profiles() {
+    box sallow --seccomp allow && box sdeny --seccomp deny && start sallow && start sdeny || return 1
+    [ "$(conf_value sallow seccomp)" = allow ] && [ -z "$(conf_value sdeny seccomp)" ] ||
+        { echo "the .conf of each: $(conf_value sallow seccomp), $(conf_value sdeny seccomp)"; return 1; }
+    lb inspect sallow | grep -qx 'seccomp: allow' && lb inspect sdeny | grep -qx 'seccomp: deny' ||
+        { echo "inspect does not say which profile each has"; return 1; }
+    said_allow=$(sh_in sallow "$KIT hostname another" 2>&1) && { echo "the allow-list took sethostname"; return 1; }
+    said_deny=$(sh_in sdeny "$KIT hostname another" 2>&1) && { echo "the deny-list container set its hostname"; return 1; }
+    echo "allow-list: $said_allow"
+    echo "deny-list:  $said_deny"
+    case $said_allow in *'not implemented'*) ;; *) echo "the allow-list did not answer ENOSYS"; return 1 ;; esac
+    case $said_deny in *'not permitted'*) ;; *) echo "the deny-list did not leave it to the kernel"; return 1 ;; esac
+    for name in sallow sdeny; do
+        sh_in "$name" 'grep -q "^Seccomp:.2" /proc/self/status && echo works' | grep -qx works ||
+            { echo "$name: a command does not run under a filter"; return 1; }
+    done
 }
 
 t_rootfs_mount_flags() {
@@ -1176,21 +2065,31 @@ t_image_with_one_binary() {
     [ -n "$BB" ] || { echo "no static busybox to make the image from"; return 77; }
     mkdir -p "$T/base-one"
     cp "$BB" "$T/base-one/busybox"
-    lb create one "$(next_ip)" --rootfs "$T/base-one" || return 1
+    box one --rootfs "$T/base-one" || return 1
     start one || { echo "an image without mount, ip and sh did not start"; return 1; }
     [ "$(lb exec one /busybox echo runs </dev/null)" = runs ] && lb stop one
 }
 
 t_start_runs_nothing_from_the_image() {
-    [ -n "$BB" ] || { echo "the recording stand-ins are made for the busybox image"; return 77; }
     box record || return 1
+    # Where the image's /bin is: /usr/bin in an image of merged /usr, such as
+    # Debian's, in which /bin is a link. A directory bin/ in the upper layer
+    # would hide that link, and with it the image's /bin/sh.
+    bin=$(chroot "$BASE" "$KIT" readlink -f /bin) && [ -n "$bin" ] || return 1
+    # that directory of the container's own, which the upper layer of an
+    # overlay lacks
+    mkdir -p "$C/record/rootfs$bin" || return 1
     for tool in mount ip; do
-        rm -f "$C/record/rootfs/bin/$tool"
-        printf '#!/bin/sh\necho %s >> /run-from-the-image\nexec /bin/busybox %s "$@"\n' "$tool" "$tool" \
-            > "$C/record/rootfs/bin/$tool"
-        chmod 755 "$C/record/rootfs/bin/$tool"
+        rm -f "$C/record/rootfs$bin/$tool"
+        printf '#!/bin/sh\necho %s >> /run-from-the-image\nexec %s %s "$@"\n' "$tool" "$KIT" "$tool" \
+            > "$C/record/rootfs$bin/$tool" && chmod 755 "$C/record/rootfs$bin/$tool" || return 1
     done
+    top=${bin#/}
+    made_for record "$C/record/rootfs/${top%%/*}" || return 1
     start record || return 1
+    # what the container has at /bin/mount and /bin/ip is the stand-ins
+    [ "$(sh_in record 'cat /bin/mount /bin/ip' | grep -c 'run-from-the-image')" = 2 ] ||
+        { echo "the stand-ins are not what the container has"; return 1; }
     log="$C/record/rootfs/run-from-the-image"
     if [ -s "$log" ]; then
         echo "run from the image during start: $(sort "$log" | uniq -c | tr -s ' \n' ' ')"
@@ -1299,7 +2198,8 @@ t_cgroup_membership() {
     grep -qx "$(pid_of member)" "$CG/member/cgroup.procs" || { echo "init is not in the container's cgroup"; return 1; }
     where=$(sh_in member 'cat /proc/self/cgroup')
     echo "a command run by exec is in: $where"
-    case $where in *"/${CG##*/}/member") ;; *) return 1 ;; esac
+    # the exec's own, below the container's (ROADMAP 8.7)
+    case $where in *"/${CG##*/}/member/exec-"[0-9]*-[0-9]*) ;; *) return 1 ;; esac
 }
 
 # ─── Cases: the init hook, starting and stopping ────────────────────────────
@@ -1831,6 +2731,60 @@ exit $bad
 EOF
 }
 
+# The cgroup device program (ROADMAP 8.4): a container opens the devices of
+# its /dev and no other. The suite makes nodes as host root in the
+# container's /dev, a tmpfs that is not nodev, and the program refuses them
+# by their numbers whatever their name: /dev/kmsg's, /dev/mem's and a block
+# device's. A node of /dev/null's numbers under another name opens, and
+# /dev/urandom is read and not written, which its read-only mount did not
+# keep it from. A block device in a volume is refused too, as volumes are
+# nodev. A privileged container has no program, and opens the same nodes. The
+# /dev of a container with a user namespace of its own is that namespace's,
+# in which host root has no id: the suite cannot make a node there at all.
+t_device_filter() {
+    mkdir -p "$T/vol/devs" && mknod -m 666 "$T/vol/devs/loop" b 7 0 || return 1
+    up devs --vol "$T/vol/devs:/devs" && PLAIN=1 up devpriv --privileged || return 1
+    plant() { # name
+        local dev
+        dev=/proc/$(pid_of "$1")/root/dev
+        mknod -m 666 "$dev/lbt-kmsg" c 1 11 && mknod -m 666 "$dev/lbt-mem" c 1 1 &&
+        mknod -m 666 "$dev/lbt-loop" b 7 0 && mknod -m 666 "$dev/lbt-null" c 1 3
+    }
+    plant devpriv || { echo "the suite cannot make nodes in the /dev of devpriv"; return 1; }
+    refusals=('echo x > /dev/urandom' ': < /devs/loop')
+    if [ "$(conf_value devs userns)" = 1 ]; then
+        said=$(plant devs 2>&1) && { echo "host root made a node in the /dev of a container with --userns"; return 1; }
+        echo "in the /dev of a container with --userns: $said"
+        [ ! -e "/proc/$(pid_of devs)/root/dev/lbt-kmsg" ] || { echo "a node was left there"; return 1; }
+    else
+        plant devs || { echo "the suite cannot make nodes in the /dev of devs"; return 1; }
+        refusals+=(': < /dev/lbt-kmsg' ': < /dev/lbt-mem' ': < /dev/lbt-loop')
+        sh_in devs ': < /dev/lbt-null && echo x > /dev/lbt-null' ||
+            { echo "a node of /dev/null's numbers under another name does not open"; return 1; }
+    fi
+
+    said=$(sh_in devs ': < /dev/null && echo x > /dev/null &&
+                       head -c 8 /dev/zero | wc -c && head -c 8 /dev/urandom | wc -c' 2>&1)
+    said=$(printf '%s\n' "$said" | tr -d ' ' | paste -sd' ' -)
+    echo "its own devices: $said"
+    [ "$said" = '8 8' ] || { echo "a device of its own does not work"; return 1; }
+
+    # the volume's nodev refuses first, with EACCES; the program refuses with EPERM
+    for what in "${refusals[@]}"; do
+        said=$(sh_in devs "$what" 2>&1) && { echo "taken: $what"; return 1; }
+        echo "$what: $said"
+        case $what:$said in
+            *'/devs/'*:*denied*) ;;
+            *'/dev/'*:*'not permitted'*) ;;
+            *) echo "not refused as the device program or the volume's nodev refuses"; return 1 ;;
+        esac
+    done
+
+    sh_in devpriv ': < /dev/lbt-kmsg && : < /dev/lbt-null && echo x > /dev/urandom' ||
+        { echo "the privileged container cannot open them"; return 1; }
+    echo "the privileged container opens /dev/kmsg's numbers and writes /dev/urandom"
+}
+
 t_storage_closed_to_others() {
     command -v setpriv >/dev/null 2>&1 || { echo "no setpriv to become another user with"; return 77; }
     as_nobody() { setpriv --reuid 65534 --regid 65534 --clear-groups "$@"; }
@@ -1845,16 +2799,257 @@ t_storage_closed_to_others() {
 
 t_network_inside() {
     up net || return 1
-    said=$(sh_in net 'ip addr; ip route')
+    said=$(sh_in net "$KIT ip addr; $KIT ip route")
     printf '%s\n' "$said"
     printf '%s\n' "$said" | grep -q 'inet 127\.0\.0\.1/8' &&
     printf '%s\n' "$said" | grep -q "inet $(addr_of net)/24" &&
     printf '%s\n' "$said" | grep -q "^default via $GW "
 }
 
+# --net outside, the default (ROADMAP 8.5): a container reaches the outside
+# and resolves a name through its name server, which is on a private
+# address, and is refused at once the host, on the bridge's address and on
+# its other one, a private address, the metadata address, and its name
+# server on any port but 53. A container of --net nat beside it reaches all
+# of them, so that it is the rules that refuse them. Then stopped, nothing of
+# the rules is left. starter: the command that starts a container.
+net_outside() { # prefix, starter...
+    local p=$1 dns_pid said a
+    shift
+    need_nc || return 77
+    need_listeners || return 77
+    private_addresses || return 1
+    box "${p}out" --dns "$PRIVATE_DNS" && box "${p}nat" --net nat --dns "$PRIVATE_DNS" || return 1
+    [ "$(conf_value "${p}out" net)" = outside ] || { echo "the default is not outside: $(conf_value "${p}out" net)"; return 1; }
+    "$@" "${p}out" && "$@" "${p}nat" || return 1
+    for a in "$GW" 192.0.2.2 "$PRIVATE" "$METADATA" "$PRIVATE_DNS"; do
+        answered "${p}nat" "$a" || { echo "the container of --net nat does not reach $a"; return 1; }
+        rejected "${p}out" "$a" || { echo "$a was not refused at once"; return 1; }
+    done
+    answered "${p}out" "$OUTSIDE" || { echo "the container of --net outside does not reach the outside"; return 1; }
+    if dns_pid=$(dns_responder "$PRIVATE_DNS"); then
+        sleep 0.5
+        said=$(sh_in "${p}out" "$KIT nslookup lbt.example $PRIVATE_DNS" 2>&1)
+        kill "$dns_pid" 2>/dev/null
+        printf '%s\n' "$said"
+        printf '%s\n' "$said" | grep -q '192\.0\.2\.77' || { echo "the name was not resolved"; return 1; }
+    else
+        echo "no python3 for a name server: that a name is resolved is not tried"
+    fi
+    lb stop "${p}out" >/dev/null && nothing_left "${p}out"
+}
+t_net_outside() { net_outside n start; }
+
+# --net none: loopback and nothing else. start makes no interface on the
+# host for it, and the container has no address, no route and no eth0.
+t_net_none() {
+    # without an address: box gives one, which --net none refuses
+    # shellcheck disable=SC2046  # options of one word each
+    lb create nonet --net none $(mode_options --net none) >"$OUT/nonet.create" 2>&1 ||
+        { cat "$OUT/nonet.create"; return 1; }
+    cat "$OUT/nonet.create"
+    grep -q '(no network)' "$OUT/nonet.create" || { echo "create does not say it has no network"; return 1; }
+    [ ! -e "$C/nonet/.ip" ] || { echo "it has an address on record"; return 1; }
+    lb inspect nonet | grep -qx 'net: none' && lb inspect nonet | grep -qx 'ip: -' ||
+        { echo "inspect does not say it"; return 1; }
+    before=$(links_now)
+    start nonet || return 1
+    [ "$(links_now)" = "$before" ] || { echo "start made an interface on the host: $(links_now | tr '\n' ' ')"; return 1; }
+    said=$(sh_in nonet 'cat /proc/net/dev' | sed '1,2d' | awk -F: '{ gsub(/ /, "", $1); print $1 }' | paste -sd' ' -)
+    echo "its interfaces: $said"
+    [ "$said" = lo ] || return 1
+    said=$(sh_in nonet "$KIT ip -4 addr; $KIT ip route" 2>&1)
+    printf '%s\n' "$said"
+    printf '%s\n' "$said" | grep -q 'inet 127\.0\.0\.1/8' && ! printf '%s\n' "$said" | grep -q 'default' ||
+        { echo "it has more than loopback"; return 1; }
+    said=$(sh_in nonet "$KIT nc -w 2 $OUTSIDE 9 </dev/null" 2>&1) && { echo "it reached the outside"; return 1; }
+    echo "the outside: $said"
+    case $said in *'unreachable'*) ;; *) return 1 ;; esac
+    lb stop nonet >/dev/null && nothing_left nonet
+}
+
+PROXY_PORT=3128
+
+# --net proxy:<port> (ROADMAP 8.6), with a listener on the gateway standing
+# in for the proxy: the container reaches that port of the gateway and
+# nothing else. Another port of the gateway, the proxy's port on the host's
+# other address, the outside and a name server on TCP, each with a listener,
+# are refused within a second, and a name server on UDP does not answer it;
+# its resolv.conf names none; exec and the hook have the variables of its
+# proxy, and --env replaces one. A container of --net nat beside it reaches
+# all of them. With links, that one names it with --link, made before it so
+# that create could not refuse the link, and neither reaches the other. With
+# both stopped, nothing of their rules is left. links: whether links can be
+# had here; starter: what starts a container.
+net_proxy() { # prefix, links (yes|no), starter...
+    local p=$1 links=$2 rc=0
+    shift 2
+    need_nc || return 77
+    need_listeners || return 77
+    private_addresses || return 1
+    if [ "$links" = yes ]; then
+        box "${p}lnk" --net nat --link "${p}prx" || return 1
+    else
+        box "${p}lnk" --net nat || return 1
+    fi
+    box "${p}prx" --net "proxy:$PROXY_PORT" || return 1
+    [ "$(conf_value "${p}prx" net)" = "proxy:$PROXY_PORT" ] || { echo "net=$(conf_value "${p}prx" net)"; return 1; }
+    hook "${p}prx" <<'EOF'
+env > /hook.env
+EOF
+    # in place of the proxy, on every address of the host; and a name server
+    # on TCP beyond it
+    local proxy tcp53
+    proxy=$(tcp_listener 0.0.0.0 "$PROXY_PORT" 'the proxy here') &&
+        tcp53=$(tcp_listener 0.0.0.0 53 'a name server on TCP' "$(cat "$T/outside")") || return 1
+    "$@" "${p}lnk" && "$@" "${p}prx" && net_proxy_checks "$p" "$links" || rc=1
+    kill "$proxy" "$tcp53" 2>/dev/null
+    port_free() { ! ss -ltn | grep -q ":$PROXY_PORT "; }
+    wait_until 5 port_free || { echo "the listener on port $PROXY_PORT is still there"; rc=1; }
+    # both: the nftables elements of the link name the container of --net
+    # proxy too, and are the other's, which take them out when it stops
+    [ "$rc" = 0 ] && lb stop "${p}prx" >/dev/null && lb stop "${p}lnk" >/dev/null &&
+        nothing_left "${p}prx" && nothing_left "${p}lnk"
+}
+net_proxy_checks() { # prefix, links
+    local p=$1 links=$2 said v url dns_pid try
+    for try in 1 2 3 4 5; do
+        answers "${p}prx" "$GW" "$PROXY_PORT" 'the proxy here' && break
+        [ "$try" = 5 ] && { echo "the container did not reach its proxy"; return 1; }
+        sleep 0.3
+    done
+    answered "${p}lnk" "$GW" && answers "${p}lnk" 192.0.2.2 "$PROXY_PORT" 'the proxy here' &&
+    answered "${p}lnk" "$OUTSIDE" && answers "${p}lnk" "$PRIVATE_DNS" 53 'a name server on TCP' ||
+        { echo "the container of --net nat does not reach one of them"; return 1; }
+    rejected "${p}prx" "$GW" && rejected "${p}prx" 192.0.2.2 "$PROXY_PORT" && rejected "${p}prx" "$OUTSIDE" &&
+    rejected "${p}prx" "$PRIVATE_DNS" 53 || { echo "it was not refused within a second"; return 1; }
+    if dns_pid=$(dns_responder "$PRIVATE_DNS"); then
+        sleep 0.5
+        said=$(sh_in "${p}lnk" "$KIT nslookup lbt.example $PRIVATE_DNS" 2>&1)
+        printf '%s\n' "$said" | grep -q '192\.0\.2\.77' || { kill "$dns_pid"; echo "the name server did not answer --net nat: $said"; return 1; }
+        said=$(LB_TIMEOUT=20 lb exec "${p}prx" /bin/sh -c "$KIT nslookup lbt.example $PRIVATE_DNS" </dev/null 2>&1)
+        kill "$dns_pid" 2>/dev/null
+        printf '%s\n' "$said"
+        printf '%s\n' "$said" | grep -q '192\.0\.2\.77' && { echo "the container of --net proxy had a name looked up"; return 1; }
+    fi
+    said=$(sh_in "${p}prx" 'cat /etc/resolv.conf')
+    echo "its resolv.conf: $said"
+    printf '%s\n' "$said" | grep -q nameserver && { echo "it names a name server"; return 1; }
+    url="http://$GW:$PROXY_PORT"
+    for v in "HTTP_PROXY=$url" "HTTPS_PROXY=$url" "http_proxy=$url" "https_proxy=$url" \
+             'NO_PROXY=localhost,127.0.0.1,::1' 'no_proxy=localhost,127.0.0.1,::1'; do
+        sh_in "${p}prx" env | grep -qxF "$v" || { echo "exec has no $v:"; sh_in "${p}prx" env; return 1; }
+        sh_in "${p}prx" 'cat /hook.env' | grep -qxF "$v" || { echo "the hook had no $v"; return 1; }
+    done
+    said=$(lb exec "${p}prx" --env HTTP_PROXY=http://elsewhere:1 -- env </dev/null | grep '^HTTP_PROXY=')
+    [ "$said" = 'HTTP_PROXY=http://elsewhere:1' ] || { echo "--env did not replace it: $said"; return 1; }
+    sh_in "${p}lnk" env | grep -qi '_proxy=' && { echo "a container of --net nat has the variables"; return 1; }
+    if [ "$links" = yes ]; then
+        # nothing listens on port 9 of either: reaching it is a refusal, and
+        # what the bridge drops gets no answer at all
+        reaches "${p}lnk" "$(addr_of "${p}prx")" && { echo "a container linked to it reached it"; return 1; }
+        reaches "${p}prx" "$(addr_of "${p}lnk")" && { echo "it reached a container linked to it"; return 1; }
+    fi
+    return 0
+}
+t_net_proxy() {
+    local links=yes
+    brnf 1 || { links=no; echo "br_netfilter is not loaded: that a link to it reaches nothing is not tried"; }
+    net_proxy x "$links" start
+}
+
+# contrib/proxy/squid.conf (ROADMAP 8.6), as it is but for where it listens,
+# the subnet it serves and where its list of domains is: from a container of
+# --net proxy, through the variables exec gives it, a name on the list is
+# reached on port 80 and through CONNECT on port 443, and Squid looks it up
+# from a hosts file; a name not on the list, an address, a name on the list
+# that is a private address and CONNECT to another port are refused; and the
+# name not on the list is never asked of the name server, so that a lookup
+# carries nothing out.
+t_proxy_example() {
+    need_nc || return 77
+    command -v squid >/dev/null 2>&1 || { echo "no squid"; return 77; }
+    command -v python3 >/dev/null 2>&1 || { echo "no python3 for a name server and the outside's servers"; return 77; }
+    private_addresses || return 1
+    local example sq squid_pid web tls dns_pid said rc=0 outside
+    example=$(cd "$(dirname "$SELF")/.." && pwd)/contrib/proxy
+    # Squid gives up root for nobody, who has to reach its files
+    sq=$(mktemp -d /tmp/lbt-squid.XXXXXX) && chmod 755 "$sq" || return 1
+    printf '%s\n' allowed.lbt.test private.lbt.test > "$sq/allowed"
+    # and not refused.lbt.test: were it looked up, the name server would be asked
+    printf '%s\n' "$OUTSIDE allowed.lbt.test" "$PRIVATE private.lbt.test" > "$sq/hosts"
+    sed -e "s|^http_port 10\.0\.0\.1:3128\$|http_port $GW:$PROXY_PORT|" \
+        -e "s|^acl lightbox src 10\.0\.0\.0/24\$|acl lightbox src $SUBNET|" \
+        -e "s|\"/etc/squid/lightbox-allowed-domains\"|\"$sq/allowed\"|" "$example/squid.conf" > "$sq/squid.conf"
+    grep -qx "http_port $GW:$PROXY_PORT" "$sq/squid.conf" && grep -qx "acl lightbox src $SUBNET" "$sq/squid.conf" &&
+        grep -qF "\"$sq/allowed\"" "$sq/squid.conf" || { echo "the example is not as this case expects it"; rm -rf -- "$sq"; return 1; }
+    cat >> "$sq/squid.conf" <<EOF
+# the case's own
+visible_hostname lbt-proxy
+hosts_file $sq/hosts
+dns_nameservers $PRIVATE_DNS
+cache_effective_user nobody
+pid_filename $sq/squid.pid
+cache_log $sq/cache.log
+access_log stdio:$sq/access.log
+coredump_dir $sq
+shutdown_lifetime 1 seconds
+EOF
+    chown -R 65534 "$sq" || { rm -rf -- "$sq"; return 1; }
+    squid -k parse -f "$sq/squid.conf" > "$OUT/squid.parse" 2>&1 || { cat "$OUT/squid.parse"; rm -rf -- "$sq"; return 1; }
+    outside=$(cat "$T/outside")
+    : > "$T/dns.log"
+    dns_pid=$(dns_responder "$PRIVATE_DNS" "$T/dns.log")
+    web=$(tcp_listener 0.0.0.0 80 "$(printf 'HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 17\r\n\r\nfrom the outside')" "$outside")
+    tls=$(tcp_listener 0.0.0.0 443 'a tunnel to the outside' "$outside")
+    squid -N -f "$sq/squid.conf" > "$OUT/squid.out" 2>&1 &
+    squid_pid=$!
+    listening() { ss -ltn | grep -qF "$GW:$PROXY_PORT"; }
+    wait_until 20 listening || { echo "squid does not listen:"; cat "$OUT/squid.out" "$sq/cache.log"; rc=1; }
+    if [ "$rc" = 0 ]; then
+        box sqprx --net "proxy:$PROXY_PORT" && start sqprx || rc=1
+    fi
+    if [ "$rc" = 0 ]; then
+        said=$(sh_in sqprx "$KIT wget -q -O - http://allowed.lbt.test/" 2>&1)
+        echo "http://allowed.lbt.test/: $said"
+        [ "$said" = 'from the outside' ] || { echo "a name on the list was not reached on port 80"; rc=1; }
+        # nc's input stays open a while: at its end nc half-closes the
+        # connection, which Squid takes for the client giving up
+        connect() { # authority
+            { printf 'CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n' "$1" "$1"; sleep 2; } |
+                lb exec sqprx /bin/sh -c "$KIT nc -w 3 $GW $PROXY_PORT" 2>&1 | tr -d '\r'
+        }
+        said=$(connect allowed.lbt.test:443)
+        printf 'CONNECT allowed.lbt.test:443: %s\n' "$said"
+        printf '%s\n' "$said" | grep -q '^HTTP/1\.1 200 ' && printf '%s\n' "$said" | grep -qx 'a tunnel to the outside' ||
+            { echo "CONNECT to a name on the list did not go through"; rc=1; }
+        for authority in refused.lbt.test:443 "$OUTSIDE:443" private.lbt.test:443 allowed.lbt.test:22; do
+            said=$(connect "$authority" | head -n 1)
+            printf 'CONNECT %s: %s\n' "$authority" "$said"
+            case $said in 'HTTP/1.1 403 '*) ;; *) echo "CONNECT $authority was not refused"; rc=1 ;; esac
+        done
+        said=$(sh_in sqprx "$KIT wget -q -O - http://refused.lbt.test/" 2>&1) && { echo "a name not on the list was reached"; rc=1; }
+        echo "http://refused.lbt.test/: $said"
+        echo "what the name server was asked: $(paste -sd' ' "$T/dns.log")"
+        grep -q refused "$T/dns.log" && { echo "a name not on the list was looked up"; rc=1; }
+        lb stop sqprx >/dev/null || rc=1
+    fi
+    kill "$squid_pid" 2>/dev/null
+    squid_ended() { ! alive "$squid_pid"; }
+    wait_until 10 squid_ended || kill -KILL "$squid_pid" 2>/dev/null
+    wait "$squid_pid" 2>/dev/null
+    kill "$web" "$tls" "$dns_pid" 2>/dev/null
+    if [ "$rc" != 0 ]; then
+        echo "squid's log:"; cat "$sq/cache.log" 2>/dev/null | tail -n 30
+        echo "its access log:"; cat "$sq/access.log" 2>/dev/null
+    fi
+    rm -rf -- "$sq"
+    return "$rc"
+}
+
 t_reaches_gateway() {
     need_nc || return 77
-    up togw || return 1
+    up togw --net nat || return 1
     reaches togw "$GW"
 }
 
@@ -1880,16 +3075,17 @@ t_wide_subnet() {
     ip -o -4 addr show dev "$WIDE_BR"
     ip -o -4 addr show dev "$WIDE_BR" | grep -q ' 10\.9\.0\.1/16 ' || { echo "the bridge does not have 10.9.0.1/16"; return 1; }
     iptables -t nat -C LIGHTBOX-POSTROUTING -s 10.9.0.0/16 ! -o "$WIDE_BR" -j MASQUERADE || { echo "no address translation for 10.9.0.0/16"; return 1; }
-    lb create wide 10.9.5.2 >"$OUT/wide.create" 2>&1 || { cat "$OUT/wide.create"; return 1; }
+    # shellcheck disable=SC2046  # options of one word each
+    lb create wide 10.9.5.2 --net nat $(mode_options) >"$OUT/wide.create" 2>&1 || { cat "$OUT/wide.create"; return 1; }
     start wide || return 1
-    said=$(sh_in wide 'ip addr; ip route')
+    said=$(sh_in wide "$KIT ip addr; $KIT ip route")
     printf '%s\n' "$said"
     printf '%s\n' "$said" | grep -q 'inet 10\.9\.5\.2/16' && printf '%s\n' "$said" | grep -q '^default via 10\.9\.0\.1 ' ||
         { echo "the container does not have 10.9.5.2/16 and a route by 10.9.0.1"; return 1; }
     if [ -e "$T/have_nc" ]; then
         reaches wide 10.9.0.1 || return 1
     else
-        echo "this image has no nc: whether the gateway answers is not tried"
+        echo "the suite's busybox has no nc: whether the gateway answers is not tried"
     fi
     lb stop wide >/dev/null || return 1
     # on the suite's network that address is no container's, and start says so
@@ -1903,7 +3099,7 @@ t_wide_subnet() {
 t_isolated_when_filtered() {
     need_nc || return 77
     brnf 1 || { echo "br_netfilter is not loaded, so bridged traffic cannot be filtered here"; return 77; }
-    up iso1 && up iso2 || return 1
+    up iso1 --net nat && up iso2 --net nat || return 1
     reaches iso1 "$(addr_of iso2)" && { echo "iso1 reached iso2"; return 1; }
     reaches iso2 "$(addr_of iso1)" && { echo "iso2 reached iso1"; return 1; }
     reaches iso1 "$GW"      # it is the firewall that stops them, not a network that does not work
@@ -1914,7 +3110,7 @@ t_isolated_when_filtered() {
 t_isolated_when_not_filtered() {
     need_nc || return 77
     if [ -e "$BRNF" ]; then brnf 0 || return 1; fi
-    up iso3 && up iso4 || return 1
+    up iso3 --net nat && up iso4 --net nat || return 1
     reaches iso3 "$(addr_of iso4)" && { echo "iso3 reached iso4"; return 1; }
     reaches iso4 "$(addr_of iso3)" && { echo "iso4 reached iso3"; return 1; }
     reaches iso3 "$GW"      # and the bridge address is still within reach
@@ -1947,7 +3143,8 @@ t_linked_containers() {
     lb stop linked >/dev/null && nothing_left linked
 }
 
-# A start puts in a container's link rules with one process, iptables-restore.
+# A start puts in a container's link rules, and with them the rules of
+# --net outside, the default, with one process, iptables-restore.
 t_link_rules_in_one_process() {
     command -v strace >/dev/null 2>&1 || { echo "no strace to watch a start with"; return 77; }
     brnf 1 || { echo "br_netfilter is not loaded, and a container with a link does not start without it"; return 77; }
@@ -1960,12 +3157,15 @@ t_link_rules_in_one_process() {
     settled onelinked || return 1
     lb stop onelinked >/dev/null 2>&1 || { echo "stop failed"; return 1; }
     wait "$tracer"
-    # but for the look at whether setup's rules are there, which every start has
+    # but for the looks at whether setup's jumps are there, which every start
+    # has; the links and the rules of --net outside, the default, go in as one
     tools=$(grep -E 'execve\("[^"]*/(ip6?tables[^"]*|nft)"' "$T/links.strace" | grep -v ' = -1 ')
     printf '%s\n' "$tools"
-    count=$(printf '%s\n' "$tools" | grep -v '"-C", "FORWARD", "-j", "LIGHTBOX-FORWARD"' | grep -c .)
+    put_in=$(printf '%s\n' "$tools" | grep -v -e '"-C", "FORWARD", "-j", "LIGHTBOX-FORWARD"' \
+                                              -e '"-C", "INPUT", "-j", "LIGHTBOX-INPUT"')
+    count=$(printf '%s\n' "$put_in" | grep -c .)
     echo "firewall tools the start ran to put rules in: $count"
-    [ "$count" = 1 ] && printf '%s\n' "$tools" | grep -v '"-C", "FORWARD"' | grep -q 'restore'
+    [ "$count" = 1 ] && printf '%s\n' "$put_in" | grep -q 'restore'
 }
 
 t_link_to_later_container() {
@@ -2062,7 +3262,7 @@ t_interface_is_eth0() {
     printf '%s\n' "$said" | sed '1,2d' | awk -F: '{ gsub(/ /, "", $1); printf "%s ", $1 } END { print "" }'
     printf '%s\n' "$said" | grep -q '^ *eth0:' || return 1
     ! printf '%s\n' "$said" | grep -q '^ *ve-' || { echo "the container has a ve- interface"; return 1; }
-    printf '%s\n' "$(sh_in ifname 'ip -4 addr show dev eth0')" | grep -q "inet $(addr_of ifname)/"
+    printf '%s\n' "$(sh_in ifname "$KIT ip -4 addr show dev eth0")" | grep -q "inet $(addr_of ifname)/"
 }
 
 t_no_ipv6_in_container() {
@@ -2203,18 +3403,19 @@ base_of() { sed -n 's/^base=//p' "$C/$1/.conf"; }
 # changed in rootfs/ only, and a change of the base afterwards reaches no
 # container.
 t_overlay_root() {
+    OVERLAY=1
     box ov1 && box ov2 || return 1
     id=$(base_of ov1)
     echo "base snapshot: $id; of ov2: $(base_of ov2)"
     [ -n "$id" ] && [ "$(base_of ov2)" = "$id" ] || { echo "the two do not overlay one snapshot"; return 1; }
     snap=$T/lb/bases/$id/rootfs
-    [ -x "$snap/bin/busybox" ] || { echo "the snapshot has no busybox"; return 1; }
+    [ -x "$snap$KIT" ] || { echo "the snapshot has no $KIT"; return 1; }
     lb inspect ov1 | grep -x 'storage: overlay' && lb inspect ov1 | grep -x "base: $id" || return 1
     own=$(cd "$C/ov1/rootfs" && find . -type f | sort | paste -sd' ' -)
     echo "ov1's own files: $own"
     [ "$own" = './etc/hostname ./etc/hosts ./etc/resolv.conf' ] || { echo "rootfs/ has more than create wrote"; return 1; }
     start ov1 || return 1
-    [ "$(sh_in ov1 'test -x /bin/busybox && cat /etc/hostname')" = ov1 ] || { echo "the base or the hostname is not there"; return 1; }
+    [ "$(sh_in ov1 "test -x $KIT && cat /etc/hostname")" = ov1 ] || { echo "the base or the hostname is not there"; return 1; }
     sh_in ov1 'echo mine > /made-here && rm /etc/group' || return 1
     [ "$(cat "$C/ov1/rootfs/made-here")" = mine ] || { echo "what the container wrote is not in its rootfs/"; return 1; }
     [ ! -e "$snap/made-here" ] && [ -e "$snap/etc/group" ] || { echo "the snapshot was changed"; return 1; }
@@ -2226,11 +3427,53 @@ t_overlay_root() {
     [ "$(sh_in ov1 'cat /made-here')" = mine ] || { echo "what the container wrote did not outlast a restart"; return 1; }
 }
 
+# reset (ROADMAP 8.8): a container that runs is stopped, and its root
+# filesystem is its base's again, with only the files create wrote in its
+# rootfs/, which is still its root's, and nothing copied; its /etc is as
+# create made it, and its volume as the container left it. A container
+# marked as half made, as a reset cut short leaves it, is not started, and
+# reset makes it whole. A copy of its base is refused, and runs on.
+t_reset() {
+    local said etc own owner
+    OVERLAY=1
+    mkdir -p "$T/vol/resetvol"
+    box rst --vol "$T/vol/resetvol:/data" && volume_for rst "$T/vol/resetvol" && start rst || return 1
+    etc=$(sh_in rst 'cat /etc/hostname /etc/hosts /etc/resolv.conf')
+    owner=$(stat -c %u:%g "$C/rst/rootfs")
+    sh_in rst 'echo mine > /made-here && echo kept > /data/kept && rm /etc/group && echo changed > /etc/resolv.conf' || return 1
+    said=$(lb reset rst </dev/null) || { printf '%s\n' "$said"; return 1; }
+    printf '%s\n' "$said"
+    printf '%s\n' "$said" | grep -qx "Container 'rst' reset: its root filesystem is its base's again" || return 1
+    nothing_left rst || return 1
+    own=$(cd "$C/rst/rootfs" && find . -type f | sort | paste -sd' ' -)
+    echo "its own files: $own; rootfs/ $(stat -c %u:%g "$C/rst/rootfs"), was $owner"
+    [ "$own" = './etc/hostname ./etc/hosts ./etc/resolv.conf' ] || { echo "rootfs/ has more than create wrote"; return 1; }
+    [ "$(stat -c %u:%g "$C/rst/rootfs")" = "$owner" ] || { echo "rootfs/ changed hands"; return 1; }
+    [ "$(cat "$T/vol/resetvol/kept")" = kept ] || { echo "the volume lost its file"; return 1; }
+    start rst || return 1
+    sh_in rst 'test ! -e /made-here && test -e /etc/group' || { echo "what the container did is still there"; return 1; }
+    [ "$(sh_in rst 'cat /etc/hostname /etc/hosts /etc/resolv.conf')" = "$etc" ] || { echo "/etc is not as create made it"; return 1; }
+    [ "$(sh_in rst 'cat /data/kept')" = kept ] || { echo "the container does not see its volume's file"; return 1; }
+
+    lb stop rst >/dev/null || return 1
+    : > "$C/rst/.creating"
+    lb start rst >/dev/null 2>&1 </dev/null && { echo "a half made container was started"; return 1; }
+    lb reset rst </dev/null || return 1
+    [ ! -e "$C/rst/.creating" ] || { echo "reset left the mark"; return 1; }
+    start rst || return 1
+
+    up rstc --copy || return 1
+    said=$(lb reset rstc 2>&1 </dev/null) && { echo "a copy was reset"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *"is a copy of its base"*) ;; *) return 1 ;; esac
+    [ "$(state_of rstc)" = running ] || { echo "the copy did not run on: $(state_of rstc)"; return 1; }
+}
+
 # --copy: a copy of the base, as before 0.7, with no snapshot of its own.
 t_copy_root() {
     box cp1 --copy || return 1
     [ -z "$(base_of cp1)" ] || { echo "a copy has a base snapshot: $(base_of cp1)"; return 1; }
-    [ -x "$C/cp1/rootfs/bin/busybox" ] || { echo "rootfs/ is not a copy of the base"; return 1; }
+    [ -x "$C/cp1/rootfs$KIT" ] || { echo "rootfs/ is not a copy of the base"; return 1; }
     lb inspect cp1 | grep -x 'storage: copy' && lb inspect cp1 | grep -x 'base: -' || return 1
     start cp1 && [ "$(sh_in cp1 'cat /etc/hostname')" = cp1 ]
 }
@@ -2239,6 +3482,7 @@ t_copy_root() {
 # refuses one that a container uses and removes one that none does; base add
 # takes a new snapshot, which the containers made after it overlay.
 t_base_commands() {
+    OVERLAY=1
     box bu1 || return 1
     old=$(base_of bu1)
     listing=$(lb base ls) || return 1
@@ -2285,7 +3529,8 @@ t_config_in_etc() {
 
 # What a reboot takes: the bridge, every firewall rule and chain, forwarding
 # and run_dir. A start makes the host's side of the network again, as setup
-# makes it, and says so; the container reaches the gateway and the outside.
+# makes it, and says so; the container, of --net outside, reaches the outside
+# and is refused the gateway, as its rules are made again with it.
 t_start_after_a_reboot_of_the_network() {
     box rebuilt || return 1
     ip link delete "$BR" &&
@@ -2296,13 +3541,14 @@ t_start_after_a_reboot_of_the_network() {
     grep -q 'making it again' "$OUT/rebuilt.start" || { echo "start did not say that it made the network again"; return 1; }
     ip -o -4 addr show dev "$BR" | grep -q " $GW/24 " || { echo "the bridge is not there with $GW/24"; return 1; }
     iptables -C FORWARD -j LIGHTBOX-USER && iptables -C FORWARD -j LIGHTBOX-FORWARD &&
+    iptables -C INPUT -j LIGHTBOX-INPUT &&
     iptables -t nat -C POSTROUTING -j LIGHTBOX-POSTROUTING || { echo "lightbox's jumps are not there"; return 1; }
     [ "$(cat /proc/sys/net/ipv4/ip_forward)" = 1 ] && [ "$(iptables -S FORWARD | head -n 1)" = '-P FORWARD DROP' ] ||
         { echo "forwarding is not on with the FORWARD policy at DROP"; return 1; }
-    if [ -e "$T/have_nc" ]; then
-        reaches rebuilt "$GW" && reaches rebuilt "$OUTSIDE"
+    if [ -e "$T/have_nc" ] && [ -e "$T/have_listeners" ]; then
+        rejected rebuilt "$GW" && answered rebuilt "$OUTSIDE"
     else
-        echo "this image has no nc: whether the container reaches anything is not tried"
+        echo "no nc in the suite's busybox, or no python3 for listeners: whether the container reaches anything is not tried"
     fi
 }
 
@@ -2328,7 +3574,15 @@ t_nft_start_after_the_tables_went() {
 }
 
 # iptables as it is, without counters and comments
-saved_rules() { iptables-save | grep -v '^#' | sed -E 's/ \[[0-9]+:[0-9]+\]$//'; }
+# The chains of containers' --net outside and the jumps to them go in as
+# each container starts, or as reload puts them back, in whatever order that
+# is: those lines are compared as a set, and the rest as they stand.
+saved_rules() {
+    local all egress='^(:LO-|-A LO-|-A LIGHTBOX-EGRESS )'
+    all=$(iptables-save | grep -v '^#' | sed -E 's/ \[[0-9]+:[0-9]+\]$//')
+    printf '%s\n' "$all" | grep -Ev "$egress"
+    printf '%s\n' "$all" | grep -E "$egress" | sort
+}
 
 # what a firewall's reload or flush does to lightbox's rules, its policy left
 flush_firewall() {
@@ -2343,13 +3597,19 @@ t_reload_puts_back_what_a_flush_took() {
     need_nc || return 77
     up rlpeer && up rllinked --link rlpeer && up rlalone || return 1
     reaches rllinked "$(addr_of rlpeer)" || { echo "the link did not hold before the flush"; return 1; }
+    # what every running container has, as reload puts it in, whatever
+    # backend an earlier case started it with
+    lb reload >/dev/null 2>&1 || return 1
     before=$(saved_rules)
     flush_firewall || return 1
     ! reaches rllinked "$(addr_of rlpeer)" || { echo "the link held without its rules"; return 1; }
     lb reload >"$OUT/reload" 2>&1 || { cat "$OUT/reload"; return 1; }
     cat "$OUT/reload"
     grep -qx "The links of container 'rllinked' are in again" "$OUT/reload" || return 1
-    ! grep -q "'rlalone'\|'rlpeer'" "$OUT/reload" || { echo "reload put in links of a container that has none"; return 1; }
+    ! grep -q "links of container 'rlalone'\|links of container 'rlpeer'" "$OUT/reload" ||
+        { echo "reload put in links of a container that has none"; return 1; }
+    grep -qx "The --net outside rules of container 'rlalone' are in again" "$OUT/reload" ||
+        { echo "reload did not put back the rules of --net outside"; return 1; }
     [ "$(saved_rules)" = "$before" ] ||
         { echo "the rules are not as they were:"; diff <(printf '%s\n' "$before") <(saved_rules); return 1; }
     reaches rllinked "$(addr_of rlpeer)" && reaches rllinked "$OUTSIDE" || return 1
@@ -2365,9 +3625,10 @@ t_reload_puts_back_what_a_flush_took() {
 t_start_after_a_flush_puts_back_links() {
     need_nc || return 77
     up sfpeer && up sflinked --link sfpeer || return 1
+    lb reload >/dev/null 2>&1 || return 1
     before=$(saved_rules)
     flush_firewall || return 1
-    up sfnew || return 1
+    up sfnew --net nat || return 1
     grep -q 'making it again' "$OUT/sfnew.start" && grep -qx "The links of container 'sflinked' are in again" "$OUT/sfnew.start" ||
         { echo "start did not make the network again and put back the links"; return 1; }
     [ "$(saved_rules)" = "$before" ] ||
@@ -2390,6 +3651,136 @@ t_nft_reload() {
     nft list set bridge lightbox links
     nft list set bridge lightbox links | grep -qF "\"$port\"" || { echo "the link is not in the set"; return 1; }
     reaches nrllinked "$(addr_of nrlpeer)" && reaches nrllinked "$OUTSIDE"
+}
+
+# ─── Cases: user namespaces ─────────────────────────────────────────────────
+
+# --userns on an overlay: the container's ids are the first range of the
+# suite's /etc/subuid and /etc/subgid, on record in its .conf; its init is that
+# uid on the host and root in it. The snapshot's files are its root's, and
+# keep their other ids (4711 stays 4711); what it makes is in its upper layer,
+# owned on the host by its range, and the snapshot stays host root's.
+t_userns_overlay() {
+    need_subids || return 77
+    OVERLAY=1
+    box unover --userns || return 1
+    cat "$C/unover/.conf"
+    u=$(conf_value unover uid_start) g=$(conf_value unover gid_start)
+    [ "$(conf_value unover userns)" = 1 ] && [ "$u" = 2147483647 ] && [ "$g" = 2147483647 ] ||
+        { echo "the range on record is not the first of the suite's"; return 1; }
+    base=$(conf_value unover base)
+    [ -n "$base" ] || { echo "the container is not an overlay"; return 1; }
+    [ "$(stat -c %u:%g "$C/unover/rootfs")" = "$u:$g" ] && [ "$(stat -c %u:%g "$C/unover/rootfs/etc/hostname")" = "$u:$g" ] ||
+        { echo "the upper layer and the files create wrote are not the container root's: $(stat -c %u:%g "$C/unover/rootfs" "$C/unover/rootfs/etc/hostname" | paste -sd' ')"; return 1; }
+    start unover || return 1
+    pid=$(pid_of unover)
+    echo "init on the host: $(host_ids_of "$pid")"
+    [ "$(host_ids_of "$pid")" = "$u $g" ] || { echo "init is not the container's root on the host"; return 1; }
+    map=$(sh_in unover 'cat /proc/self/uid_map /proc/self/gid_map' | awk '{ print $1, $2, $3 }' | paste -sd'|')
+    echo "maps: $map"
+    [ "$map" = "0 $u 65536|0 $g 65536" ] || return 1
+    inside=$(sh_in unover 'id -u; id -g; stat -c %u:%g /bin /etc/hostname /home/lbuser' | paste -sd' ')
+    echo "in it: $inside"
+    [ "$inside" = '0 0 0:0 0:0 4711:4711' ] || return 1
+    sh_in unover 'echo made > /made && mkdir /dir && chown 4711:4712 /dir' || return 1
+    [ "$(stat -c %u:%g "$C/unover/rootfs/made")" = "$u:$g" ] &&
+        [ "$(stat -c %u:%g "$C/unover/rootfs/dir")" = "$((u + 4711)):$((g + 4712))" ] ||
+        { echo "what the container made is not its range's on the host: $(stat -c %u:%g "$C/unover/rootfs/made" "$C/unover/rootfs/dir" | paste -sd' ')"; return 1; }
+    [ "$(stat -c %u "$T/lb/bases/$base/rootfs/bin")" = 0 ] && [ ! -e "$T/lb/bases/$base/rootfs/made" ] ||
+        { echo "the snapshot changed"; return 1; }
+    [ "$(lb exec unover --user 4711 /bin/sh -c 'id -u' </dev/null)" = 4711 ] || { echo "exec --user is not that user in it"; return 1; }
+    lb stop unover >/dev/null && lb rm unover >/dev/null || return 1
+    nothing_left unover
+}
+
+# --userns with --copy: the copy is idmapped as it is, so its files are the
+# container's root's in it and keep the base's ids on the host, and what the
+# container makes is stored with the ids it has in the container.
+t_userns_copy() {
+    need_subids || return 77
+    box uncopy --userns --copy || return 1
+    [ -z "$(conf_value uncopy base)" ] && [ "$(conf_value uncopy userns)" = 1 ] || { echo "not a copy with --userns"; return 1; }
+    u=$(conf_value uncopy uid_start) g=$(conf_value uncopy gid_start)
+    start uncopy || return 1
+    [ "$(host_ids_of "$(pid_of uncopy)")" = "$u $g" ] || { echo "init is not the container's root on the host"; return 1; }
+    inside=$(sh_in uncopy 'id -u; stat -c %u:%g /bin /home/lbuser; echo made > /made' | paste -sd' ')
+    echo "in it: $inside"
+    [ "$inside" = '0 0:0 4711:4711' ] || return 1
+    [ "$(stat -c %u:%g "$C/uncopy/rootfs/made")" = 0:0 ] || { echo "/made is $(stat -c %u:%g "$C/uncopy/rootfs/made") on the host"; return 1; }
+    lb stop uncopy >/dev/null && lb rm uncopy >/dev/null || return 1
+    nothing_left uncopy
+}
+
+# Two containers with --userns get two ranges, the second after the first,
+# and one without it gets none.
+t_userns_ranges_apart() {
+    need_subids || return 77
+    box unone --userns && box untwo --userns && PLAIN=1 box unnone || return 1
+    echo "unone: $(conf_value unone uid_start) $(conf_value unone gid_start); untwo: $(conf_value untwo uid_start) $(conf_value untwo gid_start)"
+    [ "$(conf_value untwo uid_start)" = $(( $(conf_value unone uid_start) + 65536 )) ] &&
+        [ "$(conf_value untwo gid_start)" = $(( $(conf_value unone gid_start) + 65536 )) ] || return 1
+    [ -z "$(conf_value unnone userns)$(conf_value unnone uid_start)" ] || { echo "a container without --userns has a range"; return 1; }
+}
+
+# Without a range for lightbox, create --userns says what to add, and makes
+# nothing.
+t_userns_without_a_range() {
+    need_subids || return 77
+    printf 'someone:100000:65536\n' > "$T/norange"
+    mount --bind "$T/norange" /etc/subuid && echo /etc/subuid >> "$T/shims" || return 1
+    ip=$(next_ip) || return 1
+    said=$(lb create unrange "$ip" --userns 2>&1) && { echo "create --userns went ahead"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *"no range of host ids"*"lightbox:2147483647:2147483648"*) ;; *) return 1 ;; esac
+    [ ! -e "$C/unrange" ] || { echo "it left the container"; return 1; }
+}
+
+# A volume of a --userns container is idmapped to its source's owner
+# (ROADMAP 8.2): the container's root is uid 1000 and gid 1001 there, a file of
+# theirs is root's in it, and what it makes is theirs on the host. No other id
+# is mapped: a file of 2000's is nobody's in it, its root cannot give a file
+# another id, and its uid 4711 makes nothing in it, though the directory lets
+# anyone write. A file volume is idmapped too, and a read-only one stays so.
+t_userns_volume_owner() {
+    need_subids || return 77
+    mkdir -p "$T/vol/work" && echo theirs > "$T/vol/work/theirs" && echo other > "$T/vol/work/other" &&
+        chown 1000:1001 "$T/vol/work" "$T/vol/work/theirs" && chown 2000:2000 "$T/vol/work/other" &&
+        chmod 777 "$T/vol/work" || return 1
+    up unvol --userns --vol "$T/vol/work:/work" --vol "$T/vol/work/theirs:/etc/theirs" --vol "$T/vol/work:/fixed:ro" ||
+        return 1
+    inside=$(sh_in unvol 'stat -c %u:%g /work /work/theirs /work/other /etc/theirs /fixed' | paste -sd' ')
+    echo "in it: $inside"
+    [ "$inside" = '0:0 0:0 65534:65534 0:0 0:0' ] || return 1
+    sh_in unvol 'echo made > /work/made && mkdir /work/dir && echo more >> /etc/theirs' || return 1
+    made=$(stat -c %u:%g "$T/vol/work/made" "$T/vol/work/dir" "$T/vol/work/theirs" | paste -sd' ')
+    echo "on the host: $made"
+    [ "$made" = '1000:1001 1000:1001 1000:1001' ] && [ "$(tail -n 1 "$T/vol/work/theirs")" = more ] || return 1
+    sh_in unvol 'chown 4711 /work/made' && { echo "the container gave a file an id that is not mapped"; return 1; }
+    said=$(lb exec unvol --user 4711 /bin/sh -c 'echo x > /work/by4711' 2>&1 </dev/null) &&
+        { echo "uid 4711 made a file"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *'too large'*) ;; *) echo "uid 4711 is refused for another reason than its id"; return 1 ;; esac
+    sh_in unvol 'echo x > /fixed/x' && { echo "the read-only volume took a file"; return 1; }
+    # what is 1000's on the host is never setuid or setgid
+    sh_in unvol 'chmod u+s /work/made' && { echo "the container made a file of 1000's setuid"; return 1; }
+    [ ! -e "$T/vol/work/by4711" ] && [ ! -e "$T/vol/work/x" ] && [ "$(stat -c %u "$T/vol/work/made")" = 1000 ] &&
+        [ -z "$(find "$T/vol/work/made" -perm /6000)" ]
+}
+
+# A volume whose source is host root's, by its uid or by its gid, is bound as
+# it is: host uid 0 and gid 0 are never mapped, its files are nobody's in the
+# container, and the container's root makes nothing in it.
+t_userns_volume_of_root() {
+    need_subids || return 77
+    mkdir -p "$T/vol/root-uid" "$T/vol/root-gid" && echo root > "$T/vol/root-uid/file" &&
+        chown 1000:0 "$T/vol/root-gid" && chmod 775 "$T/vol/root-gid" || return 1
+    up unrootvol --userns --vol "$T/vol/root-uid:/a" --vol "$T/vol/root-gid:/b" || return 1
+    inside=$(sh_in unrootvol 'stat -c %u:%g /a /a/file /b; cat /a/file' | paste -sd' ')
+    echo "in it: $inside"
+    [ "$inside" = '65534:65534 65534:65534 65534:65534 root' ] || return 1
+    sh_in unrootvol 'echo x > /a/new' && { echo "the container made a file in a volume of host uid 0's"; return 1; }
+    sh_in unrootvol 'echo x > /b/new' && { echo "the container made a file in a volume of host gid 0's"; return 1; }
+    [ ! -e "$T/vol/root-uid/new" ] && [ ! -e "$T/vol/root-gid/new" ]
 }
 
 # setup --teardown does nothing while a container runs, and says which. With
@@ -2423,6 +3814,20 @@ t_setup_teardown() {
 }
 
 # ─── Cases: firewall_backend = nftables ─────────────────────────────────────
+
+# --net outside with firewall_backend = nftables, as with iptables.
+t_nft_net_outside() {
+    nft_setup nftout || return $?
+    net_outside f with_alt_start
+}
+
+# --net proxy with firewall_backend = nftables, as with iptables; links need
+# no br_netfilter here.
+t_nft_net_proxy() {
+    nft_setup nftprx || return $?
+    net_proxy g yes with_alt_start
+}
+with_alt_start() { LIGHTBOX_CONFIG="$ALT_CONF" start "$1"; }
 
 # Can this host have lightbox's tables: nft, and nf_tables with the bridge
 # family and its meta match, in this network namespace?
@@ -2460,9 +3865,24 @@ t_nft_setup() {
     nft list chain ip lightbox forward | grep -qF "oifname \"$BR\" ct state established,related accept" &&
     nft list chain ip lightbox postrouting | grep -qF "ip saddr $SUBNET oifname != \"$BR\" masquerade" &&
     nft list chain bridge lightbox forward | grep -qF "ibrname \"$BR\" iifname . oifname @links accept" &&
-    nft list chain bridge lightbox forward | grep -qF "ibrname \"$BR\" drop" || { echo "a rule is missing"; return 1; }
+    nft list chain bridge lightbox forward | grep -qF "ibrname \"$BR\" drop" &&
+    nft list chain ip lightbox forward | grep -qF "iifname \"$BR\" oifname != \"$BR\" ip saddr @outside jump egress" &&
+    nft list chain ip lightbox input | grep -qF "iifname \"$BR\" ip saddr @outside jump egress_host" &&
+    nft list chain ip lightbox egress_host | grep -qF "reject with tcp reset" &&
+    nft list chain ip lightbox egress_host | grep -qF "reject with icmp admin-prohibited" &&
+    nft list chain ip lightbox forward | grep -qF "iifname \"$BR\" oifname != \"$BR\" ip saddr @proxied jump egress_proxy" &&
+    nft list chain ip lightbox input | grep -qF "iifname \"$BR\" ip saddr @proxied jump egress_proxy" &&
+    nft list chain ip lightbox egress_proxy | grep -qF "ip saddr . ip daddr . tcp dport @proxy_to return" &&
+    nft list chain bridge lightbox forward | grep -qF "ibrname \"$BR\" iifname @sealed drop" &&
+    nft list chain bridge lightbox forward | grep -qF "ibrname \"$BR\" oifname @sealed drop" ||
+        { echo "a rule is missing"; return 1; }
     iptables -n -L LIGHTBOX-FORWARD >/dev/null 2>&1 && { echo "LIGHTBOX-FORWARD is left"; return 1; }
     iptables -n -L LIGHTBOX-LINKS >/dev/null 2>&1 && { echo "LIGHTBOX-LINKS is left"; return 1; }
+    for chain in LIGHTBOX-INPUT LIGHTBOX-EGRESS LIGHTBOX-OUTSIDE; do
+        iptables -n -L "$chain" >/dev/null 2>&1 && { echo "$chain is left"; return 1; }
+    done
+    ! iptables -S | grep -q '^-N LO-' || { echo "a chain of a container's --net outside is left"; return 1; }
+    iptables -C INPUT -j LIGHTBOX-INPUT 2>/dev/null && { echo "the jump to LIGHTBOX-INPUT is left"; return 1; }
     iptables -t nat -n -L LIGHTBOX-POSTROUTING >/dev/null 2>&1 && { echo "LIGHTBOX-POSTROUTING is left"; return 1; }
     iptables -C FORWARD -j LIGHTBOX-USER || { echo "the host's LIGHTBOX-USER lost its jump"; return 1; }
     case $said in *'iptables FORWARD'*'iptables -P FORWARD ACCEPT'*) ;; *) echo "setup did not name the FORWARD policy that drops"; return 1 ;; esac
@@ -2474,7 +3894,8 @@ t_nft_setup() {
     said=$(lb setup 2>&1) || { printf '%s\n' "$said"; return 1; }
     printf '%s\n' "$said"
     ! nft list tables | grep -q ' lightbox$' || { echo "left: $(nft list tables)"; return 1; }
-    iptables -C FORWARD -j LIGHTBOX-FORWARD && iptables -t nat -C POSTROUTING -j LIGHTBOX-POSTROUTING
+    iptables -C FORWARD -j LIGHTBOX-FORWARD && iptables -C INPUT -j LIGHTBOX-INPUT &&
+    iptables -t nat -C POSTROUTING -j LIGHTBOX-POSTROUTING
 }
 
 # Where nothing passes bridged traffic through iptables, linked containers
@@ -2496,7 +3917,8 @@ t_nft_links_without_brnf() {
     alt_lb stop nlinked >/dev/null && nothing_left nlinked
 }
 
-# A start puts in a container's links with one process, nft.
+# A start puts in a container's links with one process, nft, and with them
+# the rules of --net outside, the default.
 t_nft_one_process() {
     command -v strace >/dev/null 2>&1 || { echo "no strace to watch a start with"; return 77; }
     nft_setup nftone; rc=$?; [ $rc = 0 ] || return $rc
@@ -2509,9 +3931,10 @@ t_nft_one_process() {
     settled nonelinked || return 1
     alt_lb stop nonelinked >/dev/null 2>&1 || { echo "stop failed"; return 1; }
     wait "$tracer"
-    # but for the look at whether setup's tables are there, which every start has
+    # but for the look at whether setup's tables are there, which every start
+    # has; the links and the rules of --net outside, the default, go in as one
     tools=$(grep -E 'execve\("[^"]*/(ip6?tables[^"]*|nft)"' "$T/nftlinks.strace" | grep -v ' = -1 ' |
-            grep -v '"list", "tables"')
+            grep -v '"list", "chains"')
     printf '%s\n' "$tools"
     [ "$(printf '%s\n' "$tools" | grep -c .)" = 1 ] && printf '%s\n' "$tools" | grep -q '/nft"'
 }
@@ -2610,7 +4033,8 @@ build_rootfs() {
         echo "  It must be statically linked or come with its libraries, and ${TMPDIR:-/tmp} must not be mounted noexec." >&2
         return 1
     fi
-    if chroot "$BASE" /bin/sh -c 'command -v nc' >/dev/null 2>&1; then : > "$T/have_nc"; fi
+    mkdir -p "$BASE${KIT%/*}" && cp "$BB" "$BASE$KIT" && chmod 755 "$BASE$KIT" || return 1
+    if "$BB" --list | grep -qx nc; then : > "$T/have_nc"; fi
 }
 
 network() {
@@ -2632,7 +4056,11 @@ network() {
     nsenter -t "$outside" -n ip link set lo up &&
     nsenter -t "$outside" -n ip addr add "$OUTSIDE/24" dev lbt-out &&
     nsenter -t "$outside" -n ip link set lbt-out up &&
-    ip route add default via "$OUTSIDE" dev "$WAN"
+    ip route add default via "$OUTSIDE" dev "$WAN" || return 1
+    # from a subshell, so that they are no job of the suite's shell
+    if (tcp_listener 0.0.0.0 "$ECHO_PORT" here >/dev/null) && (tcp_listener 0.0.0.0 "$ECHO_PORT" here "$outside" >/dev/null); then
+        : > "$T/have_listeners"
+    fi
 }
 
 fixture() {
@@ -2652,8 +4080,27 @@ EOF
     echo 1 > "$T/next_ip"
     : > "$T/shims"
     : > "$T/background"
-    build_rootfs && network && links_now > "$T/links.before" && mask_ip_and_nsenter
+    build_rootfs && network && links_now > "$T/links.before" && mask_ip_and_nsenter && subids
 }
+
+# The ranges a container with --userns takes its ids from: the suite's own
+# /etc/subuid and /etc/subgid over the host's, in this mount namespace only,
+# with one range for lightbox, as README says to add it. A host without the
+# two files has nothing to put them over: the cases of --userns skip, and
+# with LIGHTBOX_TEST_USERNS the suite does not run.
+SUBIDS='lightbox:2147483647:2147483648'
+subids() {
+    [ -e /etc/subuid ] && [ -e /etc/subgid ] || return 0
+    printf 'someone:100000:65536\n%s\n' "$SUBIDS" > "$T/subids" &&
+        mount --bind "$T/subids" /etc/subuid && mount --bind "$T/subids" /etc/subgid && : > "$T/have_subids"
+}
+
+need_subids() {
+    [ -e "$T/have_subids" ] || { echo "this host has no /etc/subuid and /etc/subgid for the suite's range"; return 77; }
+}
+
+# a process's uid and gid on the host
+host_ids_of() { awk '/^Uid:/ { u = $2 } /^Gid:/ { g = $2 } END { print u, g }' "/proc/$1/status"; }
 
 # lightbox runs neither ip nor nsenter since 0.7 (ROADMAP 7.2). In this mount
 # namespace both are stand-ins that note who ran them and fail, so that a
@@ -2764,10 +4211,21 @@ if [ "$MODE" = inside ]; then
 
     if [ -e "$BRNF" ]; then filtering="br_netfilter is loaded"; else filtering="br_netfilter is not loaded"; fi
     echo "lifecycle: $(uname -sr) on $(uname -m); $(iptables --version 2>&1 | head -n 1); $filtering"
-    if [ -n "$BB" ]; then
+    if [ -z "${LIGHTBOX_TEST_ROOTFS:-}" ]; then
         echo "lifecycle: root filesystem from $BB ($("$BB" 2>&1 | head -n 1))"
     else
-        echo "lifecycle: root filesystem copied from $LIGHTBOX_TEST_ROOTFS"
+        echo "lifecycle: root filesystem copied from $LIGHTBOX_TEST_ROOTFS ($(chroot "$BASE" "$KIT" sed -n 's/^PRETTY_NAME=//p' /etc/os-release 2>/dev/null | tr -d '"')), and $BB at $KIT"
+    fi
+    SUITE=lifecycle
+    case $USERNS_MODE in
+        overlay) SUITE="lifecycle with --userns"
+                 echo "lifecycle: every container with --userns" ;;
+        copy)    SUITE="lifecycle with --userns --copy"
+                 echo "lifecycle: every container with --userns, and with --copy but in the cases about overlays" ;;
+    esac
+    if [ -n "$SECCOMP_MODE" ]; then
+        SUITE="$SUITE under the $SECCOMP_MODE-list"
+        echo "lifecycle: every container with --seccomp $SECCOMP_MODE, but where a case chooses"
     fi
     echo
 
@@ -2798,7 +4256,7 @@ if [ "$MODE" = inside ]; then
     if [ "$failed" -ne 0 ]; then
         echo
         echo "lifecycle: setup failed, and every other case needs it"
-        summary lifecycle
+        summary "$SUITE"
         exit 1
     fi
     iptables-save > "$T/firewall"
@@ -2819,7 +4277,24 @@ if [ "$MODE" = inside ]; then
     check 'rm -f kills a running container and removes it'                t_rm_force
     check 'ls and inspect show a running container'                       t_queries_show_running
     check 'inspect --json of a running container has its init, as numbers'  t_inspect_json_running
-    check 'exec returns the exit status of the command'                   t_exec_status
+    check "exec returns the command's status, and 125, 126 and 127 for what is not the command's" t_exec_status
+    check 'an exec runs in a cgroup of its own, and stop takes away one that is left' t_exec_cgroup
+    check 'exec --timeout ends the command and all it started, and returns 124' t_exec_timeout
+    check 'exec --timeout holds when the exec is killed or stopped'      t_exec_timeout_without_its_exec
+    check "the cgroup an exec left goes with a container whose init died" t_exec_cgroup_of_a_dead_init
+    check 'a container with --ttl ends on time, with all it started, and is expired' t_ttl
+    check "run prints and returns the command's, and leaves nothing of its box" t_run
+    check 'a box of run goes when run is asked to end, or with the next run when run was killed' t_run_ends
+    check 'each exec writes its start and its end to the audit log, which the box cannot see' t_audit_log
+    check 'a box of --profile agent with a workspace has the profile, and Phase 8 holds for it' t_agent_profile
+    check 'run --profile agent returns the status, runs in the workspace and leaves nothing' t_agent_run
+    check 'doctor --profile agent finds nothing missing, and says that nft is when it is masked' t_agent_doctor
+    check 'a box of --profile agent with --net proxy reaches its proxy and nothing else' t_agent_proxy
+    check "exec --timeout in a box of --profile agent returns 124, and lightbox's own statuses are its own" t_agent_timeout
+    check 'reset of a box of --profile agent leaves its workspace and copies nothing' t_agent_reset
+    check 'a box of --profile agent with --ttl ends on time and is expired' t_agent_ttl
+    check 'the exec and run of a box of --profile agent are in the audit log, which it cannot see' t_agent_audit
+    check "the commands of README's agent section, in the suite's copy, do what it says" t_agent_guide
     check 'exec without a command runs a shell on standard input'         t_exec_default_shell
     check 'a container has its own hostname, processes and root'          t_own_world
     check 'a running container cannot be started again or removed'        t_running_container_is_protected
@@ -2862,6 +4337,8 @@ if [ "$MODE" = inside ]; then
     check 'init mounts everything with the restrictions it should have'   t_mount_table
     check 'a container starts and stops without any mount tool'           t_start_needs_no_mount_tool
     check 'the root filesystem is mounted nodev and nosuid'               t_rootfs_mount_flags
+    check 'nothing in a container makes a file setuid or setgid'          t_no_setuid_or_setgid_bits
+    check '--seccomp allow gives the allow-list, and --seccomp deny the deny-list' t_seccomp_profiles
     check 'an image without /dev, /proc, /sys, /tmp and /run starts'      t_image_without_mount_points
     check 'an image of one static binary starts'                          t_image_with_one_binary
     check 'start runs nothing from the image'                             t_start_runs_nothing_from_the_image
@@ -2870,7 +4347,7 @@ if [ "$MODE" = inside ]; then
     check '--io-max reaches io.max'                                        t_io_limit
     check 'past its memory limit a process is killed, and its container with it' t_past_the_memory_limit
     check 'without io, a container starts and is told once; with an I/O limit, not' t_without_io_controller
-    check 'init and commands run by exec are in the container cgroup'     t_cgroup_membership
+    check "init is in the container's cgroup, and a command run by exec in its exec's below it" t_cgroup_membership
 
     check 'the init hook runs with /tmp and /run mounted'                 t_hook_runs
     check 'a service the hook starts outlives the start command'          t_service_outlives_start
@@ -2902,10 +4379,15 @@ if [ "$MODE" = inside ]; then
     check 'a privileged container is not sandboxed and sees /proc as it is' t_privileged_is_not_sandboxed
     check '/proc is masked and its system trees are read-only'            t_proc_is_masked
     check 'the paths Docker masks are masked and show nothing'            t_docker_masks
+    check 'a container opens the devices of its /dev and no other'       t_device_filter
     check 'another user cannot reach container files'                     t_storage_closed_to_others
 
     check 'a container has loopback, its address and a default route'     t_network_inside
-    check 'a container reaches the bridge address'                        t_reaches_gateway
+    check 'a container of --net outside reaches the outside and its name server, and nothing else' t_net_outside
+    check 'a container of --net none has loopback and nothing else'      t_net_none
+    check 'a container of --net proxy reaches its proxy and nothing else, and has its variables' t_net_proxy
+    check 'contrib/proxy: Squid lets on the names of its list and looks up no other' t_proxy_example
+    check 'a container of --net nat reaches the bridge address'          t_reaches_gateway
     check 'a container reaches an outside address through address translation' t_reaches_outside
     check 'on a /16, a container far from the gateway has its prefix and reaches it' t_wide_subnet
     check 'the host'"'"'s own rules in LIGHTBOX-USER decide first, and setup keeps them' t_user_chain
@@ -2927,6 +4409,8 @@ if [ "$MODE" = inside ]; then
 
     check 'nftables: setup makes the two tables, and takes lightbox'"'"'s iptables chains out' t_nft_setup
     check 'nftables: linked containers reach each other without br_netfilter, a third neither' t_nft_links_without_brnf
+    check 'nftables: a container of --net outside reaches the outside and its name server, and nothing else' t_nft_net_outside
+    check 'nftables: a container of --net proxy reaches its proxy and nothing else' t_nft_net_proxy
     check 'nftables: a start puts in its links with one process'          t_nft_one_process
     check 'nftables: rm of a dead container takes its links out of the set' t_nft_rm_leaves_nothing
     check 'nftables: setup does not turn forwarding on, as Docker does not' t_nft_forwarding
@@ -2937,17 +4421,24 @@ if [ "$MODE" = inside ]; then
     check 'reload puts back what a flush took: setup'"'"'s rules and the links of running containers' t_reload_puts_back_what_a_flush_took
     check 'a start after a flush makes the rules again and puts back running containers'"'"' links' t_start_after_a_flush_puts_back_links
     check 'nftables: reload makes the tables again, with the links of running containers' t_nft_reload
+    check '--userns on an overlay: root in it is its range on the host, and its files are' t_userns_overlay
+    check '--userns with --copy: the copy is idmapped, and init is its range on the host' t_userns_copy
+    check 'containers with --userns get ranges apart, and one without gets none' t_userns_ranges_apart
+    check 'without a range for lightbox, create --userns says what to add'  t_userns_without_a_range
+    check '--userns: a volume is its source'"'"'s owner'"'"'s, whom the container'"'"'s root stands for, and no other id' t_userns_volume_owner
+    check '--userns: a volume of host root'"'"'s is bound as it is, and the container makes nothing in it' t_userns_volume_of_root
     check 'setup --teardown leaves the host as before the first setup'    t_setup_teardown
     check 'without --config or LIGHTBOX_CONFIG, /etc/lightbox/lightbox.conf is read' t_config_in_etc
     check 'a container overlays a snapshot of its base, and keeps its own files apart' t_overlay_root
     check '--copy makes a container a copy of its base'                   t_copy_root
+    check "reset makes a container's root its base's again, and keeps its volume" t_reset
     check 'base ls, base rm and base add manage the snapshots'            t_base_commands
     check 'no case ran ip or nsenter, which were masked in every one'     t_no_ip_or_nsenter_ran
 
     # last: it may leave a kernel setting changed for the rest of this suite's life
     check 'exec works where a memfd may not be executed'                  t_exec_where_memfds_may_not_be_executed
 
-    summary lifecycle
+    summary "$SUITE"
     exit $?
 fi
 
@@ -3001,12 +4492,25 @@ preflight() {
     if [ -n "${LIGHTBOX_TEST_ROOTFS:-}" ]; then
         [ -e "$LIGHTBOX_TEST_ROOTFS/bin/sh" ] || [ -L "$LIGHTBOX_TEST_ROOTFS/bin/sh" ] ||
             stop_early "LIGHTBOX_TEST_ROOTFS=$LIGHTBOX_TEST_ROOTFS has no /bin/sh"
-        LIFECYCLE_BB=
-    else
-        LIFECYCLE_BB=$(find_busybox) || stop_early "no statically linked busybox was found${BUSYBOX:+ at $BUSYBOX}.
-  Install busybox-static, or give one with BUSYBOX=/path, or a root filesystem with LIGHTBOX_TEST_ROOTFS=/path.
-  (${TMPDIR:-/tmp} must not be mounted noexec either.)"
+        [ ! -e "$LIGHTBOX_TEST_ROOTFS${KIT%/*}" ] ||
+            stop_early "LIGHTBOX_TEST_ROOTFS=$LIGHTBOX_TEST_ROOTFS has a ${KIT%/*} of its own, where the suite puts its busybox"
     fi
+    # with an image of yours too, to put in it at /lbt/busybox
+    LIFECYCLE_BB=$(find_busybox) || stop_early "no statically linked busybox was found${BUSYBOX:+ at $BUSYBOX}.
+  Install busybox-static, or give one with BUSYBOX=/path.
+  (${TMPDIR:-/tmp} must not be mounted noexec either.)"
+
+    case ${LIGHTBOX_TEST_USERNS:-} in
+        '') ;;
+        overlay|copy)
+            [ -e /etc/subuid ] && [ -e /etc/subgid ] ||
+                stop_early "LIGHTBOX_TEST_USERNS needs an /etc/subuid and an /etc/subgid to put the suite's own over" ;;
+        *)  stop_early "LIGHTBOX_TEST_USERNS is overlay or copy, not: $LIGHTBOX_TEST_USERNS" ;;
+    esac
+    case ${LIGHTBOX_TEST_SECCOMP:-} in
+        ''|allow|deny) ;;
+        *) stop_early "LIGHTBOX_TEST_SECCOMP is allow or deny, not: $LIGHTBOX_TEST_SECCOMP" ;;
+    esac
 
     if [ "${LIGHTBOX_TEST_MODPROBE:-0}" = 1 ] && [ ! -e "$BRNF" ]; then
         modprobe br_netfilter 2>/dev/null ||

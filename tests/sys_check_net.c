@@ -10,20 +10,33 @@
  */
 
 #define LIGHTBOX_SYS_CHECK 1
+#define _GNU_SOURCE 1      /* the C library names statfs's ST_ flags of access times only so */
 
 #include <stddef.h>
 #include <stdint.h>
 
 #include <linux/if.h>
+#include <sys/statvfs.h>
 
 #include "../lightbox_sys.h"
+#include "../lightbox_seccomp.h"
 
 #define SAME_VALUE(ours, theirs) \
     _Static_assert((ours) == (theirs), #ours " differs from " #theirs)
 
 SAME_VALUE(LB_AF_INET, AF_INET);
+
+/* statfs's flags of access times, which only the C library's headers name */
+SAME_VALUE(LB_ST_NOATIME, ST_NOATIME);
+SAME_VALUE(LB_ST_NODIRATIME, ST_NODIRATIME);
+SAME_VALUE(LB_ST_RELATIME, ST_RELATIME);
 SAME_VALUE(LB_SOCK_DGRAM, SOCK_DGRAM);
 SAME_VALUE(LB_AF_NETLINK, AF_NETLINK);
+/* the families the allow-list's socket and socketpair take */
+SAME_VALUE(LB_SECCOMP_AF_UNIX, AF_UNIX);
+SAME_VALUE(LB_SECCOMP_AF_INET, AF_INET);
+SAME_VALUE(LB_SECCOMP_AF_INET6, AF_INET6);
+SAME_VALUE(LB_SECCOMP_AF_NETLINK, AF_NETLINK);
 SAME_VALUE(LB_SOCK_RAW, SOCK_RAW);
 SAME_VALUE(LB_SOCK_CLOEXEC, SOCK_CLOEXEC);
 SAME_VALUE(LB_IFF_UP, IFF_UP);

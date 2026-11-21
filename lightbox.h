@@ -18,12 +18,20 @@
 
 /* What --version says: the release, set when it is tagged, and "-dev" after
  * it on the way to the next one. */
-#define LIGHTBOX_VERSION "0.7.0"
+#define LIGHTBOX_VERSION "0.8.0"
 
 #define MAX_PATH         512
 #define NAME_MAX_LEN     30
 #define MAX_VOLS         16
 #define MAX_LINKS        8
+#define MAX_DNS          3       /* as many as a resolver reads from resolv.conf */
+
+/* What a container may reach (ROADMAP 8.5, 8.6): today's network, the
+ * internet and its name servers only, nothing at all, or one port of the
+ * gateway, where a proxy listens. A .conf without the line is of a container
+ * made before 0.8, which has today's. */
+enum { NET_NAT = 0, NET_OUTSIDE = 1, NET_NONE = 2, NET_PROXY = 3 };
+#define NET_MODE_TEXT_MAX 12    /* "proxy:65535" and its NUL */
 
 /* The largest legal container .conf: MAX_VOLS volumes of two MAX_PATH paths,
  * MAX_LINKS links and the scalar keys. The reader and the writer of a .conf
@@ -37,6 +45,8 @@ _Static_assert(CONF_MAX > MAX_VOLS * (2 * MAX_PATH + 8) + MAX_LINKS * (NAME_MAX_
 #define MEM_TEXT_MAX    24      /* "<number>[K|M|G|T]" or "max" */
 #define PIDS_TEXT_MAX   12      /* a count or "max" */
 #define CPU_TEXT_MAX    12      /* CPUs, "2" or "0.5" */
+/* --ttl as it is kept: a duration as parse_duration_ms takes it */
+#define DURATION_TEXT_MAX 24
 #define IO_TEXT_MAX     128     /* a line for io.max */
 
 #define PIDS_LIMIT_MAX  4194304         /* the most processes Linux numbers */
@@ -66,6 +76,15 @@ typedef struct {
     char default_cpu[CPU_TEXT_MAX];
     int  default_oom;
     bool default_oom_ok;
+    /* What --profile agent gives a box that no option gives a limit or a
+     * lifetime (ROADMAP 8.10), empty when it cannot be used, as above.
+     * agent_ttl is "none" for no lifetime, and agent_ttl_ok false when it
+     * cannot be used. */
+    char agent_mem[MEM_TEXT_MAX];
+    char agent_pids[PIDS_TEXT_MAX];
+    char agent_cpu[CPU_TEXT_MAX];
+    char agent_ttl[DURATION_TEXT_MAX];
+    bool agent_ttl_ok;
     int  start_timeout;     /* seconds start waits for the init hook; 0: not at all */
     int  stop_timeout;      /* seconds a container gets to end when it is asked to */
     char dns[64];           /* name servers for new containers, as written; empty: the host's */
@@ -106,6 +125,24 @@ typedef struct {
     bool ro;
 } volume_spec;
 
+/* A box's id (ROADMAP 8.9): 16 lowercase hex digits that create draws and
+ * .conf keeps, which the audit log tells a box from a later one of its name
+ * by. A box made before boxes had one has none. */
+#define BOX_ID_LEN 16
+
+/* --profile (ROADMAP 8.10): what a box was made with, kept in .conf as
+ * profile=agent. Each setting the profile gave is kept under its own key
+ * beside it, so that what the profile means later does not change a box
+ * that is there. --workspace binds its directory here, and makes it where
+ * every exec runs. */
+#define PROFILE_NONE  0
+#define PROFILE_AGENT 1
+#define WORKSPACE_DIR "/workspace"
+
+/* What init reports when --ttl ended the container, besides 0 for a stop and
+ * 1 for a failure (ROADMAP 8.8): its state is then "expired". */
+#define INIT_EXPIRED 2
+
 typedef struct {
     int  version;               /* 0: a file from before it had the line */
     char mem[MEM_TEXT_MAX];
@@ -116,7 +153,20 @@ typedef struct {
     int  oom_score;
     bool privileged;
     bool read_only;
+    bool seccomp_allow;         /* the allow-list profile; false: the deny-list */
+    int  net;                   /* NET_NAT, NET_OUTSIDE, NET_NONE or NET_PROXY */
+    int  proxy_port;            /* NET_PROXY: the port of the gateway its proxy listens on */
+    int  ndns;                  /* the name servers create gave it, which outside lets it ask */
+    char dns[MAX_DNS][16];
     char base[13];              /* the snapshot it overlays; empty: a copy of its base */
+    char ttl[DURATION_TEXT_MAX];    /* --ttl as given; empty: none */
+    char id[BOX_ID_LEN + 1];    /* empty: made before boxes had one */
+    int  profile;               /* PROFILE_NONE, or PROFILE_AGENT: made with --profile agent */
+    char workdir[MAX_PATH];     /* where exec runs a command without --workdir; empty: / */
+    int64_t ttl_ms;             /* its lifetime from each start, or 0 */
+    bool userns;                /* uid and gid 0 are uid_start and gid_start on the host */
+    uint32_t uid_start;
+    uint32_t gid_start;
     int  nvols;
     volume_spec vols[MAX_VOLS];
     int  nlinks;
@@ -136,6 +186,12 @@ typedef struct {
  * microseconds of each CPU_PERIOD_US */
 [[nodiscard]] bool parse_cpu_limit(const char *text, int *quota_us);
 [[nodiscard]] bool parse_oom_score(const char *text, int *out);
+/* "allow" or "deny", the seccomp profile, as an option and the file give it */
+[[nodiscard]] bool parse_seccomp_profile(const char *text, bool *allow);
+/* "nat", "outside", "none" or "proxy:<port>", as --net and the file give it,
+ * and the text of one */
+[[nodiscard]] bool parse_net_mode(const char *text, int *mode, int *proxy_port);
+void net_mode_text(char out[NET_MODE_TEXT_MAX], int mode, int proxy_port);
 
 /*
  * A volume as it is written: src:dst[:ro]. NULL when it is one, with both
@@ -177,6 +233,21 @@ int config_volume_at(const container_config *config, const char *dst);
 int config_remove_volumes_at(container_config *config, const char *dst);
 
 void print_str(int32_t fd, const char *s);
+
+/*
+ * The status lightbox ends with when it fails: 1, but for exec, whose status
+ * is its command's (ROADMAP 8.7). There a failure of lightbox's is
+ * EXEC_FAILED, as env and timeout have it, so that a driver can tell it from
+ * what the command did: 126 is a command that could not be executed, 127 one
+ * that is not there, and EXEC_TIMED_OUT one that --timeout ended. Every exit
+ * that is a failure of lightbox's uses failure_status, die and die2 among them.
+ */
+#define EXEC_TIMED_OUT 124
+#define EXEC_FAILED    125
+extern int failure_status;
+/* fn is run before a failure ends this process, die's or fail_now's; NULL: nothing */
+void on_failure(void (*fn)(void));
+[[noreturn]] void fail_now(void);
 [[noreturn]] void die(const char *msg);
 [[noreturn]] void die2(const char *prefix, const char *detail);
 bool streq(const char *a, const char *b);
@@ -218,7 +289,17 @@ bool has_control_chars(const char *s);
 #define START_TIMEOUT_DEFAULT  30
 #define STOP_TIMEOUT_DEFAULT   10
 [[nodiscard]] bool parse_seconds(const char *s, int *out);
+
+/*
+ * A duration in milliseconds, above 0 and at most DURATION_MAX_MS: digits,
+ * up to three more after a point, and a unit, s, m, h or d, or none for
+ * seconds. "2s", "1.5m" and "90" are durations; "0", ".5", "1.", "1.2345s",
+ * "-1", "+1", "1 s", "1ms" and "2x" are not.
+ */
+#define DURATION_MAX_MS ((int64_t)365 * 86400 * 1000)
+[[nodiscard]] bool parse_duration_ms(const char *text, int64_t *ms);
 int fmt_int(char *buf, int val);
+[[nodiscard]] bool random_hex(char *out, size_t bytes);
 int write_file(const char *path, const char *data);
 void require_write_file(const char *path, const char *data);
 
@@ -248,6 +329,11 @@ void require_write_file(const char *path, const char *data);
  * Writing is atomic, and replaces a link of that name with the file. 0 or -1.
  * Reading gives the text and its length, 0 for a file that is not there, and
  * -1 for one that cannot be read, is not a regular file or does not fit. */
+/* The cgroup device program of lightbox_devices.h, loaded (ROADMAP 8.4): its
+ * descriptor, or -errno. A program the kernel refuses is loaded once more
+ * for the verifier to say why, into log, which is empty otherwise. */
+lc_sysret device_program_load(char *log, uint32_t log_size);
+
 [[nodiscard]] int write_file_in_root(const char *root, const char *dir, const char *name,
                                      const char *data, int32_t mode);
 [[nodiscard]] int read_file_in_root(const char *root, const char *dir, const char *name,
@@ -333,6 +419,69 @@ int list_containers(char names[][NAME_MAX_LEN + 1], int max, bool *more);
 /* The entries of a directory that valid takes, directories only, sorted. */
 int list_entries(const char *dir, bool (*valid)(const char *), char names[][NAME_MAX_LEN + 1], int max, bool *more);
 
+/* ─── User namespaces (lightbox_userns.c) ───────────────────────────────── */
+
+/* A container's own ids: USERNS_SIZE uids and gids from the ranges that
+ * /etc/subuid and /etc/subgid give USERNS_OWNER, as Podman's --userns=auto
+ * takes those of "containers". Its uid 0 is uid_start on the host. */
+#define USERNS_SIZE      65536u
+#define USERNS_OWNER     "lightbox"
+#define SUBUID_FILE      "/etc/subuid"
+#define SUBGID_FILE      "/etc/subgid"
+#define SUBID_RANGES_MAX 256
+typedef struct {
+    uint32_t start;
+    uint32_t count;
+} subid_range;
+/* A decimal number of at most 4294967295, without a zero in front. */
+[[nodiscard]] bool parse_u32_text(const char *text, uint32_t *out);
+/* A first id of a range: a number, not 0, whose range ends before 4294967295. */
+[[nodiscard]] bool userns_start_ok(const char *text, uint32_t *start);
+void format_u32(char out[11], uint32_t value);
+/* The ranges that a subid file's text gives owner: how many, or -1 for a
+ * line of owner's that is no usable range, whose number *line then has. */
+int subid_ranges(const char *text, const char *owner, subid_range *out, int max, int *line);
+/* The first range of USERNS_SIZE uids that overlaps none of the ntaken
+ * taken[i][0], and the first of gids that overlaps none of taken[i][1].
+ * NULL, or why there is none. */
+const char *userns_choose(const subid_range *uids, int nu, const subid_range *gids, int ng,
+                          const uint32_t taken[][2], int ntaken, uint32_t *uid_start, uint32_t *gid_start);
+/* How many ranges of USERNS_SIZE uids and gids the two files give lightbox,
+ * taken or not; -1 when one of them has a line that is no range. */
+int userns_range_count(void);
+/* The same from /etc/subuid, /etc/subgid and every container's .conf, under
+ * the store's lock. NULL, or why there is none. */
+const char *userns_allocate(uint32_t *uid_start, uint32_t *gid_start);
+/* One line of a uid_map or gid_map: count ids from inside, in the
+ * namespace, are the ids from outside in the one it was made in. To an
+ * idmapped mount, inside is the id a file has on its filesystem and outside
+ * the one it shows. */
+typedef struct {
+    uint32_t inside;
+    uint32_t outside;
+    uint32_t count;
+} id_map;
+#define ID_MAP_LINE_MAX 36
+/* "<inside> <outside> <count>\n" */
+void id_map_line(char out[ID_MAP_LINE_MAX], const id_map *map);
+/* The maps of a volume of a container with --userns whose source is owned
+ * by owner_uid and owner_gid on the host: they are its root, uid_start and
+ * gid_start, and no other id is mapped. False for a source of host root's,
+ * uid 0 or gid 0, which no container may stand for. */
+[[nodiscard]] bool volume_maps(uint32_t owner_uid, uint32_t owner_gid, uint32_t uid_start, uint32_t gid_start,
+                               id_map *uids, id_map *gids);
+/* uid_map and gid_map of a process in a new user namespace: 0, or minus an errno */
+[[nodiscard]] int userns_write_maps(int pid, uint32_t uid_start, uint32_t gid_start);
+/* A user namespace with a container's maps, for idmapped mounts: a
+ * descriptor, or minus an errno */
+[[nodiscard]] int userns_fd_with(uint32_t uid_start, uint32_t gid_start);
+/* The same with the maps given, a line each */
+[[nodiscard]] int userns_fd_mapped(const id_map *uids, const id_map *gids);
+/* An idmapped, nodev copy of the mount at path, attached nowhere; nosuid
+ * unless privileged. Its descriptor, or minus an errno and *step the call. */
+[[nodiscard]] int idmapped_tree(const char *path, int userns_fd, bool privileged, const char **step);
+[[nodiscard]] int attach_tree(int tree, const char *target);
+
 /* ─── Base snapshots (lightbox_base.c) ──────────────────────────────────── */
 
 #define BASE_ID_LEN  12
@@ -363,8 +512,14 @@ void container_ip_path(char *buf, const char *name);
 /* <run_dir>/<name>/firewall: there while the container may have link rules.
  * container_forget_run leaves it, and so its directory, in place. */
 void container_firewall_path(char *buf, const char *name);
+/* <run_dir>/<name>/egress: the same, for the rules of --net outside */
+void container_egress_path(char *buf, const char *name);
 void container_conf_path(char *buf, const char *name);
 void container_creating_path(char *buf, const char *name);
+/* .resolv: what create wrote in its resolv.conf, which reset writes again */
+void container_resolv_path(char *buf, const char *name);
+/* .runner: the run whose box it is */
+void container_runner_path(char *buf, const char *name);
 /* what the container's init, its hook and its services write to stdout and stderr */
 void container_log_path(char *buf, const char *name);
 
@@ -395,6 +550,8 @@ void set_container_state(const char *name, const char *state);
 void get_container_state(const char *name, char *buf, size_t bufsz);
 int get_container_pid(const char *name);
 int get_container_pid_starttime(const char *name, char *buf, size_t bufsz);
+/* a process's start time, field 22 of /proc/<pid>/stat, as digits: 0, or -1 */
+[[nodiscard]] int proc_starttime(int pid, char *buf, size_t bufsz);
 /* record a running init, its start time before its PID: 0, or -1 */
 [[nodiscard]] int container_record_pid(const char *name, int pid);
 /* forget which process init was and what it said when it ended */
@@ -549,6 +706,29 @@ void rtnl_close(rtnl *nl);
 int firewall_add_links(const char *name, const container_config *config);
 /* What firewall_add_links put in, taken out: 0 when nothing of it is left. */
 int firewall_remove_links(const char *name);
+/* --net outside and --net proxy (ROADMAP 8.5, 8.6): what iptables-restore is
+ * given for the container at ip, whose proxy is at gw, and under nftables
+ * the record of its elements and the text that puts them in or takes them
+ * out. False when it does not fit, or for another --net. */
+[[nodiscard]] bool firewall_egress_text(const char *name, const char *ip, const char *gw,
+                                        const container_config *config, char *out, size_t outsz);
+[[nodiscard]] bool nft_egress_record(const char *name, const char *ip, const char *gw,
+                                     const container_config *config, char *out, size_t outsz);
+[[nodiscard]] bool nft_egress_text(const char *record, bool removal, char *out, size_t outsz);
+/* Whether a --net has rules of its own: outside and proxy. */
+bool net_has_rules(int mode);
+/* The rules of --net outside or proxy for the container at ip put in: 0, or
+ * -1 once said. Nothing for another --net. */
+int firewall_add_egress(const char *name, const char *ip, const container_config *config);
+/* What firewall_add_egress put in, taken out: 0 when nothing of it is left. */
+int firewall_remove_egress(const char *name);
+/* The texts of a container's links and of its --net outside as one, which
+ * either may be empty: nft's in a row, iptables-restore's as one table with
+ * every chain declared before any rule. False when it does not fit. */
+[[nodiscard]] bool firewall_rules_text(bool nftables, const char *links, const char *egress, char *out, size_t outsz);
+/* The links and the --net outside rules of a container, as a start puts them
+ * in: with one process. 0, or -1 once said. */
+int firewall_add_rules(const char *name, const char *ip, const container_config *config);
 /* does iptables see what the bridge switches between containers? */
 bool bridge_traffic_is_filtered(void);
 
@@ -614,12 +794,65 @@ void cmd_setup(void);
 /* setup's part of the network again, and the link rules of the containers
  * that run: what a firewall's reload took */
 void cmd_reload(int argc, char **argv);
-/* the link rules of the containers that run but except, put in again; how
- * many could not be */
+/* the link rules and the rules of --net outside of the containers that run
+ * but except, put in again; how many could not be */
 int put_back_running_links(const char *except);
 void cmd_doctor(int argc, char **argv);
 void cmd_ls(int argc, char **argv);
 void cmd_inspect(int argc, char **argv);
 void cmd_logs(int argc, char **argv);
+
+/* ─── The audit log (lightbox_audit.c, ROADMAP 8.9) ─────────────────────── */
+
+/* <lightbox_dir>/audit.log */
+void audit_log_path(char *buf);
+
+/* s[0..len) as a JSON string in ASCII; out NULL: counted only. At most
+ * JSON_QUOTED_MAX(len) bytes, the number written. */
+#define JSON_QUOTED_MAX(len) ((len) * 6 + 2)
+size_t json_quote(char *out, const char *s, size_t len);
+
+/* "YYYY-MM-DDTHH:MM:SS.mmmZ" */
+#define UTC_TEXT_LEN 24
+void format_utc(char out[UTC_TEXT_LEN + 1], int64_t seconds, int64_t nanoseconds);
+
+/* What the line of an exec's start records: what was asked of the box */
+struct audit_start {
+    const char *box, *box_id;           /* box_id empty or NULL: a box made before boxes had one */
+    const char *exec_id;                /* <pid>-<start time> of the exec, as its cgroup is named */
+    const char *via;                    /* "exec" or "run" */
+    int64_t     uid, loginuid;          /* loginuid -1: none */
+    const char *user, *workdir, *timeout;   /* as given, or NULL */
+    const char *const *env;             /* --env KEY=VALUE, of which the keys are recorded */
+    int         nenv;
+    const char *const *argv;            /* the command, NULL at its end */
+};
+
+/* and of its end */
+struct audit_end {
+    const char *box, *box_id, *exec_id;
+    int         status;                 /* what exec exits with */
+    int64_t     duration_ms;
+    bool        timed_out;
+};
+
+/* The line, with its newline; out NULL: counted only. Its length. */
+size_t audit_start_line(char *out, const struct audit_start *a, const char *time);
+size_t audit_end_line(char *out, const struct audit_end *e, const char *time);
+/* Append the line, stamped with the time now: 0 or a negative errno. */
+[[nodiscard]] int audit_record_start(const struct audit_start *a);
+[[nodiscard]] int audit_record_end(const struct audit_end *e);
+int64_t audit_loginuid(void);
+
+/* The lines of one box, from the log as it is read in pieces */
+enum audit_line_state { AUDIT_LINE_START, AUDIT_LINE_KEPT, AUDIT_LINE_SKIPPED };
+struct audit_filter {
+    char   prefix[NAME_MAX_LEN + 16];   /* {"box":"<name>", */
+    size_t len, matched;
+    enum audit_line_state state;
+};
+void audit_filter_start(struct audit_filter *f, const char *box);
+/* in[0..n) into out, which has room for n + sizeof(f->prefix): the length kept */
+size_t audit_filter(struct audit_filter *f, const char *in, size_t n, char *out);
 
 #endif

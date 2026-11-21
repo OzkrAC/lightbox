@@ -190,6 +190,26 @@ in_mount_namespace() { # script
     return $rc
 }
 
+# The same in a user namespace with 65536 ids besides its root, from this
+# user's range in /etc/subuid and /etc/subgid, for what needs more than one.
+in_namespace_with_ids() { # script
+    local who uids gids dir rc
+    who=$(id -un)
+    uids=$(awk -F: -v a="$who" -v b="$(id -u)" '($1 == a || $1 == b) && $3 >= 65536 { print $2; exit }' /etc/subuid 2>/dev/null)
+    gids=$(awk -F: -v a="$who" -v b="$(id -g)" '($1 == a || $1 == b) && $3 >= 65536 { print $2; exit }' /etc/subgid 2>/dev/null)
+    [ -n "$uids" ] && [ -n "$gids" ] && command -v newuidmap >/dev/null && command -v setpriv >/dev/null &&
+        unshare --map-root-user --map-users="1:$uids:65536" --map-groups="1:$gids:65536" --mount true 2>/dev/null ||
+        { echo "this user has no range of 65536 ids to map, or no newuidmap and setpriv"; return 77; }
+    dir=$(mktemp -d "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    unshare --map-root-user --map-users="1:$uids:65536" --map-groups="1:$gids:65536" --mount -- bash -c '
+        m()    { r=$("$UNIT" mount "$@" 2>&1); [ "$r" = "result 0" ] || { echo "mount $*: $r"; exit 1; }; }
+        UNIT=$1; D=$2
+        '"$1" _ "$UNIT" "$dir"
+    rc=$?
+    rm -rf -- "$dir"
+    return $rc
+}
+
 t_mount_with_flags_and_data() {
     in_mount_namespace '
         mkdir "$D/t"
@@ -294,7 +314,7 @@ t_loopback_up() {
 
 # ─── The sandbox: capabilities, no_new_privs, seccomp, masked paths ─────────
 
-ALLOWED_CAPS=00000000a00405fb       # ALLOWED_CAPS of lightbox.c, as /proc/<pid>/status prints a set
+ALLOWED_CAPS=00000000200405fb       # ALLOWED_CAPS of lightbox.c, as /proc/<pid>/status prints a set
 
 field() { printf '%s\n' "$out" | awk -v k="$1:" '$1 == k { print $2 }'; }
 
@@ -999,6 +1019,39 @@ t_volume_through_a_dangling_link() {
         [ "$(ls -A "$D/root")" = away ] || { echo "something was made in the new root: $(ls -A "$D/root")"; exit 1; }'
 }
 
+# A volume of a container with --userns as start takes it (ROADMAP 8.2), for
+# a container whose root is 2000:2000 here. A source of 1000:1001 is idmapped
+# to it: the files of 1000's are 2000's through it, and what 2000 makes there
+# is 1000's and 1001's. No other id is mapped: a file of 3000's is nobody's,
+# and 2001 makes nothing there though anyone may write. A file is idmapped
+# too. A source of uid 0's or gid 0's is cloned as it is.
+t_userns_volume_taken() {
+    in_namespace_with_ids '
+        m tmpfs "$D" tmpfs - -
+        mkdir "$D/src" "$D/dst" "$D/root" "$D/root-dst" "$D/gid0" "$D/gid0-dst" && : > "$D/file-dst" &&
+            echo theirs > "$D/src/theirs" && echo other > "$D/src/other" &&
+            chown 1000:1001 "$D/src" "$D/src/theirs" && chown 3000:3000 "$D/src/other" && chmod 777 "$D/src" &&
+            chown 1000:0 "$D/gid0" || exit 1
+        for vol in "$D/src:$D/dst" "$D/src/theirs:$D/file-dst" "$D/root:$D/root-dst" "$D/gid0:$D/gid0-dst"; do
+            out=$("$UNIT" userns-volume 2000 2000 "$vol" 2>&1)
+            [ "$out" = attached ] || { echo "$vol: $out"; exit 1; }
+        done
+        got=$(stat -c %u:%g "$D/dst" "$D/dst/theirs" "$D/dst/other" "$D/file-dst" "$D/root-dst" "$D/gid0-dst" | paste -sd" ")
+        echo "through the volumes: $got"
+        [ "$got" = "2000:2000 2000:2000 65534:65534 2000:2000 0:0 1000:0" ] || exit 1
+        setpriv --reuid=2000 --regid=2000 --clear-groups sh -c "echo made > \"$D/dst/made\" && mkdir \"$D/dst/dir\"" || exit 1
+        got=$(stat -c %u:%g "$D/src/made" "$D/src/dir" | paste -sd" ")
+        echo "made by 2000: $got"
+        [ "$got" = "1000:1001 1000:1001" ] || exit 1
+        said=$(setpriv --reuid=2001 --regid=2000 --clear-groups sh -c "echo x > \"$D/dst/x\"" 2>&1) &&
+            { echo "2001 made a file"; exit 1; }
+        echo "2001: $said"
+        case $said in *"too large"*) ;; *) exit 1 ;; esac
+        [ ! -e "$D/src/x" ]
+        out=$("$UNIT" userns-volume 2000 2000 "$D/missing:$D/dst" 2>&1)
+        [ "$out" = "refused: volume source does not exist: $D/missing" ] || { echo "$out"; exit 1; }'
+}
+
 t_volume_that_cannot_be_had() {
     in_mount_namespace '
         m tmpfs "$D" tmpfs - -
@@ -1211,6 +1264,44 @@ h_signals_are_passed_on() {
     [ $rc -eq 129 ]
 }
 
+# At exec's deadline the worker is killed, and what it carried until then
+# came through; a command that ends before it has its own status. In exec
+# the command and all it started go with the worker, by the exec's cgroup,
+# which this suite cannot make: here the command is left to end by itself,
+# and lets go of the streams first, which would keep the capture waiting.
+h_deadline_ends_the_worker() {
+    local began ms out rc
+    began=$(date +%s%N)
+    out=$("$UNIT" relay /dev/ptmx 0.5s -- "$SH_PATH" -c 'echo began; exec sleep 3 >/dev/null 2>&1' </dev/null 2>&1)
+    rc=$?
+    ms=$(( ($(date +%s%N) - began) / 1000000 ))
+    printf '%s\n' "$out"
+    echo "status $rc in $ms ms"
+    [ $rc -eq 137 ] && [ "$ms" -lt 2500 ] && [ "$(printf '%s\n' "$out" | head -n 1)" = began ] &&
+        [ "$(printf '%s\n' "$out" | tail -n 1)" = 'relay: timed out' ] || return 1
+    began=$(date +%s%N)
+    out=$("$UNIT" relay /dev/ptmx 5s -- "$SH_PATH" -c 'echo done; exit 4' </dev/null 2>&1)
+    rc=$?
+    ms=$(( ($(date +%s%N) - began) / 1000000 ))
+    echo "before its deadline: $out, status $rc in $ms ms"
+    [ $rc -eq 4 ] && [ "$out" = done ] && [ "$ms" -lt 2500 ]
+}
+
+# Without cgroup.kill, exec --timeout's worker kills what the exec's
+# cgroup.procs lists, and then itself: here a file lists one process.
+h_keeper_kills_what_is_listed() {
+    local victim rc vrc
+    sleep 1081 &
+    victim=$!
+    echo "$victim" > "$D/procs"
+    "$UNIT" keeper "$D/procs"
+    rc=$?
+    wait "$victim"
+    vrc=$?
+    echo "the worker ended with $rc, the process it listed with $vrc"
+    [ $rc -eq 137 ] && [ $vrc -eq 137 ]
+}
+
 # More than a pipe or a terminal holds at once, in both directions.
 h_plenty_goes_through() {
     seq 1 30000 > "$D/numbers"
@@ -1247,6 +1338,8 @@ t_streams_window()              { in_scratch_dir h_terminal_follows_the_window; 
 t_streams_half_a_terminal()     { in_scratch_dir h_pipes_for_half_a_terminal; }
 t_streams_signals()             { in_scratch_dir h_signals_are_passed_on; }
 t_streams_plenty()              { in_scratch_dir h_plenty_goes_through; }
+t_streams_deadline()            { in_scratch_dir h_deadline_ends_the_worker; }
+t_streams_keeper()              { in_scratch_dir h_keeper_kills_what_is_listed; }
 
 # ─── exec: the binary it runs from ──────────────────────────────────────────
 
@@ -1553,6 +1646,141 @@ t_seconds() {
     return $bad
 }
 
+# exec's --timeout (ROADMAP 8.7): a duration in milliseconds, or refused.
+t_duration() {
+    bad=0
+    for pair in 2s:2000 90:90000 1.5m:90000 0.5:500 0.001:1 0.25s:250 1h:3600000 1d:86400000 \
+                365d:31536000000 31536000:31536000000 31536000s:31536000000 525600m:31536000000 \
+                366d:refused 365.001d:refused 31536001:refused 8760.001h:refused \
+                0:refused 0s:refused 0.000:refused .5:refused 1.:refused 1.2345s:refused \
+                -1:refused +1:refused '1 s:refused' 1ms:refused 2x:refused s:refused 1ss:refused \
+                1s2:refused 99999999999999999999:refused 1e3:refused; do
+        got=$("$UNIT" duration "${pair%:*}")
+        [ "$got" = "${pair##*:}" ] || { echo "'${pair%:*}' -> $got, expected ${pair##*:}"; bad=1; }
+    done
+    got=$("$UNIT" duration '')
+    [ "$got" = refused ] || { echo "an empty value -> $got"; bad=1; }
+    return $bad
+}
+
+# The strings of the audit log (ROADMAP 8.9) are ASCII alone, and give a
+# reader the bytes back exactly: valid UTF-8 as its characters, \uXXXX and a
+# pair above U+FFFF, and each byte of none as \udcXX, Python's
+# surrogateescape. A form longer than needed, a surrogate and what is above
+# U+10FFFF are no characters. The count is what is written.
+t_audit_json() {
+    local bad=0 pair got
+    for pair in '-:""' '616263:"abc"' '225c0a090d080c01:"\"\\\n\t\r\b\f\u0001"' '7f:"\u007f"' \
+                'c3a9:"\u00e9"' 'e282ac:"\u20ac"' 'f09f9880:"\ud83d\ude00"' 'e280ae:"\u202e"' \
+                'c285:"\u0085"' 'ff:"\udcff"' '80:"\udc80"' 'c080:"\udcc0\udc80"' \
+                'eda080:"\udced\udca0\udc80"' 'f4908080:"\udcf4\udc90\udc80\udc80"' \
+                'e28241:"\udce2\udc82A"' 'f0:"\udcf0"'; do
+        got=$("$UNIT" json "${pair%%:*}")
+        [ "$got" = "${pair#*:}" ] || { echo "${pair%%:*} -> $got, expected ${pair#*:}"; bad=1; }
+    done
+    command -v python3 >/dev/null || { echo "no python3 to read them back with"; return 77; }
+    python3 -I - "$UNIT" <<'PYEND' || bad=1
+import json, os, subprocess, sys
+unit, wrong = sys.argv[1], 0
+cases = [os.urandom(n) for n in range(64) for _ in range(8)]
+for b in cases:
+    out = subprocess.run([unit, 'json', b.hex() or '-'], capture_output=True, check=True).stdout[:-1]
+    if any(c < 0x20 or c >= 0x7f for c in out) or json.loads(out).encode('utf-8', 'surrogateescape') != b:
+        print('not read back as it was:', b.hex(), out)
+        wrong += 1
+print(len(cases) - wrong, 'of', len(cases), 'random strings read back as they were')
+sys.exit(1 if wrong else 0)
+PYEND
+    return $bad
+}
+
+# A time in the audit log: UTC as RFC 3339 has it, to the millisecond. A
+# clock before 1970 is shown as 1970 began and one after 9999 as it ends.
+t_audit_time() {
+    local bad=0 pair got
+    for pair in '0 0=1970-01-01T00:00:00.000Z' '951782400 5000000=2000-02-29T00:00:00.005Z' \
+                '951868799 999999999=2000-02-29T23:59:59.999Z' '1795278000 123999999=2026-11-21T16:20:00.123Z' \
+                '4107542400 0=2100-03-01T00:00:00.000Z' '253402300799 999999999=9999-12-31T23:59:59.999Z' \
+                '253402300800 0=9999-12-31T23:59:59.999Z' '-5 0=1970-01-01T00:00:00.000Z' \
+                '60 1000000000=1970-01-01T00:01:00.000Z'; do
+        # shellcheck disable=SC2086  # seconds and nanoseconds
+        got=$("$UNIT" utc ${pair%%=*})
+        [ "$got" = "${pair#*=}" ] || { echo "${pair%%=*} -> $got, expected ${pair#*=}"; bad=1; }
+    done
+    command -v python3 >/dev/null || return $bad
+    python3 -I - "$UNIT" <<'PYEND' || bad=1
+import datetime, os, subprocess, sys
+unit, wrong = sys.argv[1], 0
+for _ in range(200):
+    sec = int.from_bytes(os.urandom(5), 'big') % 253402300800
+    got = subprocess.run([unit, 'utc', str(sec), '7000000'], capture_output=True, text=True, check=True).stdout.strip()
+    want = datetime.datetime.fromtimestamp(sec, datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S') + '.007Z'
+    if got != want:
+        print(sec, got, 'and not', want)
+        wrong += 1
+print(200 - wrong, 'of 200 random times as Python has them')
+sys.exit(1 if wrong else 0)
+PYEND
+    return $bad
+}
+
+# The two lines of an exec: the box first, which logs --audit looks for, its
+# id, and what was asked; --env by its keys only, as values are often
+# credentials; null for what was not given.
+t_audit_lines() {
+    local got
+    got=$("$UNIT" auditline start web 0123456789abcdef 12-34 exec 0 1000 - /tmp 1s 2 A=1 TOKEN=secret /bin/sh -c 'exit 7')
+    echo "$got"
+    [ "$got" = '{"box":"web","box_id":"0123456789abcdef","time":"T","event":"start","exec_id":"12-34","via":"exec","uid":0,"loginuid":1000,"user":null,"workdir":"/tmp","timeout":"1s","env":["A","TOKEN"],"argv":["/bin/sh","-c","exit 7"]}' ] || return 1
+    got=$("$UNIT" auditline start run-0a1b2c3d4e5f - 5-6 run 0 -1 1000:1000 - - 0 "$(printf 'a"\\\001')")
+    echo "$got"
+    [ "$got" = '{"box":"run-0a1b2c3d4e5f","box_id":null,"time":"T","event":"start","exec_id":"5-6","via":"run","uid":0,"loginuid":null,"user":"1000:1000","workdir":null,"timeout":null,"env":[],"argv":["a\"\\\u0001"]}' ] || return 1
+    got=$("$UNIT" auditline end web 0123456789abcdef 12-34 124 1003 yes)
+    echo "$got"
+    [ "$got" = '{"box":"web","box_id":"0123456789abcdef","time":"T","event":"end","exec_id":"12-34","status":124,"duration_ms":1003,"timed_out":true}' ]
+}
+
+# logs --audit prints the lines of one box: those that begin with its name,
+# whole, however the log is cut as it is read, and the last one too when it
+# has no newline yet. A name that only begins with it, a line where it is not
+# first and an empty line are not its.
+audit_filter_lines() {
+    local want got piece bad=0
+    {
+        printf '%s\n' '{"box":"web","a":1}' '{"box":"web2","a":2}' '{"box":"we","a":3}' '' \
+            "{\"box\":\"web\",\"a\":4,\"long\":\"$(head -c 9000 /dev/zero | tr '\0' x)\"}" \
+            'x{"box":"web",' '{"box":"web",}'
+        printf '{"box":"db","a":5}\n{"box":"web","last":1}'
+    } > "$D/log"
+    want=$({ sed -n '1p;5p;7p' "$D/log"; printf '{"box":"web","last":1}'; } | cksum)
+    for piece in 1 2 3 7 13 14 15 64 4096; do
+        got=$("$UNIT" auditfilter web $piece "$D/log" | cksum)
+        [ "$got" = "$want" ] || { echo "read in pieces of $piece, not the lines of web"; bad=1; }
+    done
+    got=$("$UNIT" auditfilter db 5 "$D/log")
+    [ "$got" = '{"box":"db","a":5}' ] || { echo "the lines of db: $got"; bad=1; }
+    [ -z "$("$UNIT" auditfilter nosuch 5 "$D/log")" ] || { echo "lines of a box that has none"; bad=1; }
+    [ $bad = 0 ] && echo "the lines of web, read in pieces of 1 to 4096 bytes"
+    return $bad
+}
+t_audit_filter() { in_config_dir audit_filter_lines; }
+
+# A box of run is removed by the next run once the run its .runner names is
+# gone (ROADMAP 8.8): a PID with that start time, which a later process of
+# the same PID does not have. What is not a record of one names nobody.
+t_runner_record() {
+    local bad=0 start got text
+    start=$(awk '{ sub(/.*\) /, ""); print $20 }' /proc/$$/stat)
+    for pair in "$$ $start:alive" "$$ $start
+:alive" "$$ 1$start:gone" "$$ ${start}9:gone" "999999999 $start:gone" "0 $start:gone" \
+                "$$:gone" "$$  $start:gone" " $$ $start:gone" "x $start:gone" ":gone" "$$ x:gone"; do
+        text=${pair%:*}
+        got=$("$UNIT" runner "$text")
+        [ "$got" = "${pair##*:}" ] || { echo "'$text' -> $got, expected ${pair##*:}"; bad=1; }
+    done
+    return $bad
+}
+
 # Whatever of its three standard streams a caller leaves closed, the first
 # file lightbox opens is not given that number: a message meant for the
 # terminal would be written into the file.
@@ -1834,35 +2062,95 @@ COMMIT'
 }
 
 # firewall_backend = nftables: setup's two tables in one transaction. The
-# chains are flushed and filled again and the set of links is not, as its
-# elements are the running containers'. Between two ports of the bridge, the
-# pairs in links and nothing else; out of the bridge anything, and back what
-# belongs to it; the subnet masqueraded when ip_masq is true.
+# chains are flushed and filled again and the sets of links and of --net
+# outside are not, as their elements are the running containers'; the set of
+# refused ranges is. Between two ports of the bridge, the pairs in links and
+# nothing else; out of the bridge anything, and back what belongs to it; the
+# subnet masqueraded when ip_masq is true. What a container of --net outside
+# sends out of the bridge goes through egress, and what it sends the host
+# through egress_host, which refuses it every address of the host's. What a
+# container of --net proxy sends either way goes through egress_proxy, which
+# lets on what goes to its proxy; the bridge drops what it would switch from
+# or to its port, before any link.
 t_nft_setup_text() {
     got=$("$UNIT" firewall nft-setup 10.9.5.0/16 10.9.0.1 br7 true)
     tab=$(printf '\t')
     want="table ip lightbox {
+${tab}set outside {
+${tab}${tab}type ipv4_addr
+${tab}}
+${tab}set outside_dns {
+${tab}${tab}type ipv4_addr . ipv4_addr
+${tab}}
+${tab}set proxied {
+${tab}${tab}type ipv4_addr
+${tab}}
+${tab}set proxy_to {
+${tab}${tab}type ipv4_addr . ipv4_addr . inet_service
+${tab}}
+${tab}set refused {
+${tab}${tab}type ipv4_addr
+${tab}${tab}flags interval
+${tab}}
+${tab}chain egress {
+${tab}}
+${tab}chain egress_host {
+${tab}}
+${tab}chain egress_proxy {
+${tab}}
 ${tab}chain forward {
 ${tab}${tab}type filter hook forward priority filter; policy accept;
+${tab}}
+${tab}chain input {
+${tab}${tab}type filter hook input priority filter; policy accept;
 ${tab}}
 ${tab}chain postrouting {
 ${tab}${tab}type nat hook postrouting priority srcnat; policy accept;
 ${tab}}
 }
+flush chain ip lightbox egress
+flush chain ip lightbox egress_host
+flush chain ip lightbox egress_proxy
 flush chain ip lightbox forward
+flush chain ip lightbox input
 flush chain ip lightbox postrouting
+flush set ip lightbox refused
+add element ip lightbox refused { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.168.0.0/16, 198.18.0.0/15, 224.0.0.0/3 }
 add rule ip lightbox forward oifname \"br7\" ct state established,related accept
 add rule ip lightbox forward oifname \"br7\" iifname != \"br7\" drop
+add rule ip lightbox forward iifname \"br7\" oifname != \"br7\" ip saddr @outside jump egress
+add rule ip lightbox forward iifname \"br7\" oifname != \"br7\" ip saddr @proxied jump egress_proxy
+add rule ip lightbox input iifname \"br7\" ip saddr @outside jump egress_host
+add rule ip lightbox input iifname \"br7\" ip saddr @proxied jump egress_proxy
+add rule ip lightbox egress ct state established,related return
+add rule ip lightbox egress ip saddr . ip daddr @outside_dns udp dport 53 return
+add rule ip lightbox egress ip saddr . ip daddr @outside_dns tcp dport 53 return
+add rule ip lightbox egress ip daddr @refused meta l4proto tcp reject with tcp reset
+add rule ip lightbox egress ip daddr @refused reject with icmp type admin-prohibited
+add rule ip lightbox egress_host ct state established,related return
+add rule ip lightbox egress_host ip saddr . ip daddr @outside_dns udp dport 53 return
+add rule ip lightbox egress_host ip saddr . ip daddr @outside_dns tcp dport 53 return
+add rule ip lightbox egress_host meta l4proto tcp reject with tcp reset
+add rule ip lightbox egress_host reject with icmp type admin-prohibited
+add rule ip lightbox egress_proxy ct state established,related return
+add rule ip lightbox egress_proxy ip saddr . ip daddr . tcp dport @proxy_to return
+add rule ip lightbox egress_proxy meta l4proto tcp reject with tcp reset
+add rule ip lightbox egress_proxy reject with icmp type admin-prohibited
 add rule ip lightbox postrouting ip saddr 10.9.0.0/16 oifname != \"br7\" masquerade
 table bridge lightbox {
 ${tab}set links {
 ${tab}${tab}type ifname . ifname
+${tab}}
+${tab}set sealed {
+${tab}${tab}type ifname
 ${tab}}
 ${tab}chain forward {
 ${tab}${tab}type filter hook forward priority filter; policy accept;
 ${tab}}
 }
 flush chain bridge lightbox forward
+add rule bridge lightbox forward meta ibrname \"br7\" iifname @sealed drop
+add rule bridge lightbox forward meta ibrname \"br7\" oifname @sealed drop
 add rule bridge lightbox forward meta ibrname \"br7\" iifname . oifname @links accept
 add rule bridge lightbox forward meta ibrname \"br7\" drop"
     [ "$got" = "$want" ] || { printf '%s\n' "$got"; return 1; }
@@ -1870,8 +2158,9 @@ add rule bridge lightbox forward meta ibrname \"br7\" drop"
     [ "$got" = 0 ] || { echo "with ip_masq = false, masquerade rules: $got"; return 1; }
     # bridge_accept_fwmark: accepted before anything is dropped, in both tables
     got=$("$UNIT" firewall nft-setup 10.0.0.0/24 10.0.0.1 br0 true 0x10/0xf0 | grep -n 'mark')
-    [ "$got" = '11:add rule ip lightbox forward meta mark & 0xf0 == 0x10 accept
-24:add rule bridge lightbox forward meta mark & 0xf0 == 0x10 accept' ] || { printf '%s\n' "$got"; return 1; }
+    [ "$got" = '42:add rule ip lightbox forward meta mark & 0xf0 == 0x10 accept
+43:add rule ip lightbox input meta mark & 0xf0 == 0x10 accept
+77:add rule bridge lightbox forward meta mark & 0xf0 == 0x10 accept' ] || { printf '%s\n' "$got"; return 1; }
     got=$("$UNIT" firewall nft-setup 10.0.0.0/24 10.0.0.1 br0 true 0x10 | grep 'mark' | head -n 1)
     [ "$got" = 'add rule ip lightbox forward meta mark 0x10 accept' ] || { echo "a mark without a mask: $got"; return 1; }
     # a bridge whose name would not stay between the quotes gets no rules
@@ -2053,15 +2342,48 @@ t_kernel_floor() {
 # What setup puts in its chains: between two ports of the bridge what a link
 # allows and nothing else; out by any interface but the bridge, and back what
 # belongs to that; masquerading of the subnet, as the network spells it, when
-# ip_masq is true.
+# ip_masq is true. For --net outside (ROADMAP 8.5), what leaves the bridge and
+# what reaches the host from it goes through LIGHTBOX-EGRESS, and
+# LIGHTBOX-OUTSIDE refuses the host's addresses and the ranges that are no
+# one's on the internet.
 t_firewall_setup_text() {
     got=$("$UNIT" firewall setup 10.9.5.0/16 10.9.0.1 br7 true)
     want='*filter
 -F LIGHTBOX-FORWARD
 -A LIGHTBOX-FORWARD -i br7 -o br7 -j LIGHTBOX-LINKS
+-A LIGHTBOX-FORWARD -i br7 ! -o br7 -j LIGHTBOX-EGRESS
 -A LIGHTBOX-FORWARD -i br7 -o br7 -j DROP
 -A LIGHTBOX-FORWARD -i br7 ! -o br7 -j ACCEPT
 -A LIGHTBOX-FORWARD -o br7 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-F LIGHTBOX-INPUT
+-A LIGHTBOX-INPUT -i br7 -j LIGHTBOX-EGRESS
+-F LIGHTBOX-OUTSIDE
+-A LIGHTBOX-OUTSIDE -m addrtype --dst-type LOCAL -p tcp -j REJECT --reject-with tcp-reset
+-A LIGHTBOX-OUTSIDE -m addrtype --dst-type LOCAL -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-OUTSIDE -m addrtype --dst-type BROADCAST -p tcp -j REJECT --reject-with tcp-reset
+-A LIGHTBOX-OUTSIDE -m addrtype --dst-type BROADCAST -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-OUTSIDE -m addrtype --dst-type MULTICAST -p tcp -j REJECT --reject-with tcp-reset
+-A LIGHTBOX-OUTSIDE -m addrtype --dst-type MULTICAST -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-OUTSIDE -d 0.0.0.0/8 -p tcp -j REJECT --reject-with tcp-reset
+-A LIGHTBOX-OUTSIDE -d 0.0.0.0/8 -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-OUTSIDE -d 10.0.0.0/8 -p tcp -j REJECT --reject-with tcp-reset
+-A LIGHTBOX-OUTSIDE -d 10.0.0.0/8 -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-OUTSIDE -d 100.64.0.0/10 -p tcp -j REJECT --reject-with tcp-reset
+-A LIGHTBOX-OUTSIDE -d 100.64.0.0/10 -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-OUTSIDE -d 127.0.0.0/8 -p tcp -j REJECT --reject-with tcp-reset
+-A LIGHTBOX-OUTSIDE -d 127.0.0.0/8 -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-OUTSIDE -d 169.254.0.0/16 -p tcp -j REJECT --reject-with tcp-reset
+-A LIGHTBOX-OUTSIDE -d 169.254.0.0/16 -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-OUTSIDE -d 172.16.0.0/12 -p tcp -j REJECT --reject-with tcp-reset
+-A LIGHTBOX-OUTSIDE -d 172.16.0.0/12 -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-OUTSIDE -d 192.0.0.0/24 -p tcp -j REJECT --reject-with tcp-reset
+-A LIGHTBOX-OUTSIDE -d 192.0.0.0/24 -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-OUTSIDE -d 192.168.0.0/16 -p tcp -j REJECT --reject-with tcp-reset
+-A LIGHTBOX-OUTSIDE -d 192.168.0.0/16 -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-OUTSIDE -d 198.18.0.0/15 -p tcp -j REJECT --reject-with tcp-reset
+-A LIGHTBOX-OUTSIDE -d 198.18.0.0/15 -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-OUTSIDE -d 224.0.0.0/3 -p tcp -j REJECT --reject-with tcp-reset
+-A LIGHTBOX-OUTSIDE -d 224.0.0.0/3 -j REJECT --reject-with icmp-admin-prohibited
 COMMIT
 *nat
 -F LIGHTBOX-POSTROUTING
@@ -2072,6 +2394,161 @@ COMMIT'
     [ "$got" = '*nat
 -F LIGHTBOX-POSTROUTING
 COMMIT' ] || { echo "with ip_masq = false:"; printf '%s\n' "$got"; return 1; }
+}
+
+# --net outside under iptables (ROADMAP 8.5): a chain of the container's
+# own, by a name made from its name, that lets on what answers it and what
+# goes to its name servers on port 53, and sends the rest to
+# LIGHTBOX-OUTSIDE; LIGHTBOX-EGRESS jumps to it for its address. An address
+# that is not one in the form lightbox writes gets no rules.
+t_firewall_egress_text() {
+    got=$("$UNIT" firewall egress web 10.199.0.5 10.0.0.2 1.1.1.1)
+    want='*filter
+:LO-5ea0e1194872 - [0:0]
+-A LO-5ea0e1194872 -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
+-A LO-5ea0e1194872 -d 10.0.0.2 -p udp --dport 53 -j RETURN
+-A LO-5ea0e1194872 -d 10.0.0.2 -p tcp --dport 53 -j RETURN
+-A LO-5ea0e1194872 -d 1.1.1.1 -p udp --dport 53 -j RETURN
+-A LO-5ea0e1194872 -d 1.1.1.1 -p tcp --dport 53 -j RETURN
+-A LO-5ea0e1194872 -j LIGHTBOX-OUTSIDE
+-A LIGHTBOX-EGRESS -s 10.199.0.5 -j LO-5ea0e1194872
+COMMIT'
+    [ "$got" = "$want" ] || { printf '%s\n' "$got"; return 1; }
+    got=$("$UNIT" firewall egress web 10.199.0.5 | grep -c -- '--dport 53')
+    [ "$got" = 0 ] || { echo "rules for name servers without one: $got"; return 1; }
+    for ip in 10.199.0.05 10.199.0.5/32 ' 10.199.0.5' 10.199.0.256 '10.199.0.5 -j ACCEPT' ''; do
+        got=$("$UNIT" firewall egress web "$ip")
+        [ "$got" = 'too long' ] || { echo "address '$ip': $got"; return 1; }
+    done
+    got=$("$UNIT" firewall egress web 10.199.0.5 '1.1.1.1 -j X')
+    [ "$got" = 'too long' ] || { echo "a name server with more in it: $got"; return 1; }
+}
+
+# --net proxy under iptables (ROADMAP 8.6): the container's chain lets on
+# what answers it and what goes to its proxy's port of the gateway, and
+# refuses the rest; at the top of LIGHTBOX-LINKS, before any link's chain,
+# what the bridge switches from it or to it is dropped. An address, a
+# gateway or a port that is not one lightbox writes gets no rules.
+t_firewall_proxy_text() {
+    got=$("$UNIT" firewall egress-proxy web 10.199.0.5 10.199.0.1 3128)
+    want='*filter
+:LO-5ea0e1194872 - [0:0]
+-A LO-5ea0e1194872 -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
+-A LO-5ea0e1194872 -d 10.199.0.1 -p tcp --dport 3128 -j RETURN
+-A LO-5ea0e1194872 -p tcp -j REJECT --reject-with tcp-reset
+-A LO-5ea0e1194872 -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-EGRESS -s 10.199.0.5 -j LO-5ea0e1194872
+-I LIGHTBOX-LINKS 1 -s 10.199.0.5 -j DROP
+-I LIGHTBOX-LINKS 1 -d 10.199.0.5 -j DROP
+COMMIT'
+    [ "$got" = "$want" ] || { printf '%s\n' "$got"; return 1; }
+    for args in '10.199.0.05 10.199.0.1 3128' '10.199.0.5 10.199.0.01 3128' '10.199.0.5 10.199.0.1 0' \
+                '10.199.0.5 10.199.0.1 65536' '10.199.0.5 - 3128'; do
+        # shellcheck disable=SC2086     # the words of a case
+        got=$("$UNIT" firewall egress-proxy web $args)
+        [ "$got" = 'too long' ] || { echo "$args: $got"; return 1; }
+    done
+}
+
+# --net proxy under nftables: the record is one line, of the address, its
+# proxy's address and port and its port on the bridge; from it the elements
+# of the sets proxied, proxy_to and, in the bridge table, sealed. A record
+# that is not one lightbox writes is refused.
+t_nft_proxy_text() {
+    got=$("$UNIT" firewall nft-egress-proxy web 10.199.0.5 10.199.0.1 3128)
+    [ "$got" = 'nftables
+proxy 10.199.0.5 10.199.0.1 3128 vb-5ea0e1194872' ] || { printf '%s\n' "$got"; return 1; }
+    record='nftables
+proxy 10.199.0.5 10.199.0.1 3128 vb-5ea0e1194872
+'
+    elements='element ip lightbox proxied { 10.199.0.5 }
+element ip lightbox proxy_to { 10.199.0.5 . 10.199.0.1 . 3128 }
+element bridge lightbox sealed { "vb-5ea0e1194872" }'
+    got=$("$UNIT" nftegress add "$record")
+    [ "$got" = "$(printf '%s\n' "$elements" | sed 's/^/add /')" ] || { printf '%s\n' "$got"; return 1; }
+    got=$("$UNIT" nftegress remove "$record")
+    [ "$got" = "$(printf '%s\n' "$elements" | sed 's/^/add /'; printf '%s\n' "$elements" | sed 's/^/delete /')" ] ||
+        { printf '%s\n' "$got"; return 1; }
+    for line in 'proxy 10.199.0.5 10.199.0.1 3128' 'proxy 10.199.0.5 10.199.0.1 3128 vb-5ea0e1194872 x' \
+                'proxy 10.199.0.5 10.199.0.1 03128 vb-5ea0e1194872' 'proxy 10.199.0.5 10.199.0.1 0 vb-5ea0e1194872' \
+                'proxy 10.199.0.5 10.199.0.1 65536 vb-5ea0e1194872' 'proxy 10.199.0.5 10.199.0.01 3128 vb-5ea0e1194872' \
+                'proxy 10.199.0.5  10.199.0.1 3128 vb-5ea0e1194872' 'proxy 10.199.0.5 10.199.0.1 3128 vb-5ea0e119487' \
+                'proxy 10.199.0.5 10.199.0.1 3128 vb-5ea0e1194872 }' 'proxy 10.199.0.5 10.199.0.1 3128 eth0' \
+                'proxy 10.199.0.5 10.199.0.1 3128 "vb-5ea0e119487"'; do
+        got=$("$UNIT" nftegress add "nftables
+$line
+")
+        [ "$got" = refused ] || { printf 'record %s: %s\n' "$line" "$got"; return 1; }
+    done
+    for wrong in "${record%?}" "${record}10.0.0.1
+"; do
+        got=$("$UNIT" nftegress add "$wrong")
+        [ "$got" = refused ] || { printf 'record %s: %s\n' "$wrong" "$got"; return 1; }
+    done
+}
+
+# What a start gives iptables-restore for a container with links and --net
+# outside: one table, both chains declared before any rule.
+t_firewall_both_text() {
+    got=$("$UNIT" firewall both web 10.199.0.5 10.0.0.2 db)
+    want='*filter
+:LB-5ea0e1194872 - [0:0]
+:LO-5ea0e1194872 - [0:0]
+-A LB-5ea0e1194872 -m physdev --physdev-in vb-5ea0e1194872 --physdev-out vb-08914e07b53b -j ACCEPT
+-A LB-5ea0e1194872 -m physdev --physdev-in vb-08914e07b53b --physdev-out vb-5ea0e1194872 -j ACCEPT
+-A LIGHTBOX-LINKS -j LB-5ea0e1194872
+-A LO-5ea0e1194872 -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
+-A LO-5ea0e1194872 -d 10.0.0.2 -p udp --dport 53 -j RETURN
+-A LO-5ea0e1194872 -d 10.0.0.2 -p tcp --dport 53 -j RETURN
+-A LO-5ea0e1194872 -j LIGHTBOX-OUTSIDE
+-A LIGHTBOX-EGRESS -s 10.199.0.5 -j LO-5ea0e1194872
+COMMIT'
+    [ "$got" = "$want" ] || { printf '%s\n' "$got"; return 1; }
+}
+
+# --net outside under nftables: the record is the address and the name
+# servers, a line each; from it the elements of the sets outside and
+# outside_dns, put in, or put in and taken out again. A record that is not
+# one lightbox writes is refused.
+t_nft_egress_text() {
+    got=$("$UNIT" firewall nft-egress 10.199.0.5 10.0.0.2 1.1.1.1)
+    [ "$got" = 'nftables
+10.199.0.5
+10.0.0.2
+1.1.1.1' ] || { printf '%s\n' "$got"; return 1; }
+    record=$(printf 'nftables\n10.199.0.5\n10.0.0.2\n1.1.1.1\n')
+    got=$("$UNIT" nftegress add "$record
+")
+    [ "$got" = 'add element ip lightbox outside { 10.199.0.5 }
+add element ip lightbox outside_dns { 10.199.0.5 . 10.0.0.2, 10.199.0.5 . 1.1.1.1 }' ] || { printf '%s\n' "$got"; return 1; }
+    got=$("$UNIT" nftegress remove "$record
+")
+    [ "$got" = 'add element ip lightbox outside { 10.199.0.5 }
+add element ip lightbox outside_dns { 10.199.0.5 . 10.0.0.2, 10.199.0.5 . 1.1.1.1 }
+delete element ip lightbox outside { 10.199.0.5 }
+delete element ip lightbox outside_dns { 10.199.0.5 . 10.0.0.2, 10.199.0.5 . 1.1.1.1 }' ] || { printf '%s\n' "$got"; return 1; }
+    got=$("$UNIT" nftegress add 'nftables
+10.199.0.5
+')
+    [ "$got" = 'add element ip lightbox outside { 10.199.0.5 }' ] || { echo "without name servers: $got"; return 1; }
+    for wrong in '' 'nftables
+' 'iptables
+10.199.0.5
+' 'nftables
+10.199.0.5' 'nftables
+10.199.0.05
+' 'nftables
+10.199.0.5 }
+' 'nftables
+10.199.0.5
+1.1.1.1
+1.1.1.2
+1.1.1.3
+1.1.1.4
+'; do
+        got=$("$UNIT" nftegress add "$wrong")
+        [ "$got" = refused ] || { printf 'record %s: %s\n' "$wrong" "$got"; return 1; }
+    done
 }
 
 t_limits() {
@@ -2199,9 +2676,17 @@ cpu 0.5
 oom_score -300
 privileged 1
 readonly 1
+seccomp deny
+net nat
+dns -
 io 8:0 rbps=1048576
 swap 1G
 base -
+ttl -
+id -
+profile -
+workdir -
+userns -
 vol /srv/data -> /data rw
 vol /etc/app.conf -> /etc/app.conf ro
 link db
@@ -2212,19 +2697,210 @@ link cache'
 t_config_is_read_whole() { in_config_dir config_as_written; }
 
 # userns=0 and uid_start, which lightbox up to 0.5 could write, still read and
-# change nothing; userns=1 is refused with its line, as user namespaces are
-# not supported.
-config_old_userns_keys() {
-    printf 'version=1\nmem=64M\npids=32\ncpu=1\noom_score=0\nuserns=0\nuid_start=100000\n' > "$D/web/.conf"
-    got=$(config)
-    printf '%s\n' "$got"
-    printf '%s\n' "$got" | grep -qx 'mem 64M' || return 1
-    printf 'version=1\nmem=64M\npids=32\ncpu=1\noom_score=0\nuserns=1\nuid_start=100000\n' > "$D/web/.conf"
-    got=$(config)
-    printf '%s\n' "$got"
-    [ "$got" = "refused: $D/web/.conf: line 6: userns=1: user namespaces are not supported yet" ]
+# change nothing. userns=1 is read with a uid_start and a gid_start that start
+# a range of 65536 ids with neither host root nor 4294967295 in it, and
+# refused without them.
+config_userns_keys() {
+    head='version=1\nmem=64M\npids=32\ncpu=1\noom_score=0\n'
+    # shellcheck disable=SC2059     # the head is a format of its own
+    conf() { printf "$head$1" > "$D/web/.conf"; got=$(config); printf '%s\n' "$got"; }
+    conf 'userns=0\nuid_start=100000\n'
+    printf '%s\n' "$got" | grep -qx 'userns -' || return 1
+    conf 'userns=1\nuid_start=100000\ngid_start=2147483647\n'
+    printf '%s\n' "$got" | grep -qx 'userns 100000 2147483647' || return 1
+    conf 'userns=1\nuid_start=4294901759\ngid_start=1\n'
+    printf '%s\n' "$got" | grep -qx 'userns 4294901759 1' || return 1
+    for wrong in 'userns=1\nuid_start=100000\n' 'userns=1\ngid_start=100000\n' 'userns=1\n' \
+                 'userns=1\nuid_start=0\ngid_start=100000\n' 'userns=1\nuid_start=4294901760\ngid_start=100000\n'; do
+        conf "$wrong"
+        [ "$got" = "refused: $D/web/.conf: has userns=1 without a uid_start and a gid_start of a range of 65536 ids that has neither 0 nor 4294967295 in it" ] ||
+            return 1
+    done
+    for wrong in 'uid_start=4294967296\n' 'uid_start=-1\n' 'gid_start=0100\n' 'userns=2\n'; do
+        conf "$wrong"
+        case $got in "refused: $D/web/.conf: line 6: "*) ;; *) return 1 ;; esac
+    done
 }
-t_config_old_userns_keys() { in_config_dir config_old_userns_keys; }
+t_config_userns_keys() { in_config_dir config_userns_keys; }
+
+# seccomp=, the profile (ROADMAP 8.3): allow or deny, and without the line the
+# deny-list; anything else is refused with its line, and so is a second one.
+config_seccomp_key() {
+    head='version=1\nmem=64M\npids=32\ncpu=1\noom_score=0\n'
+    # shellcheck disable=SC2059     # the head is a format of its own
+    conf() { printf "$head$1" > "$D/web/.conf"; got=$(config); printf '%s\n' "$got"; }
+    conf 'seccomp=allow\n'
+    printf '%s\n' "$got" | grep -qx 'seccomp allow' || return 1
+    conf 'seccomp=deny\n'
+    printf '%s\n' "$got" | grep -qx 'seccomp deny' || return 1
+    conf ''
+    printf '%s\n' "$got" | grep -qx 'seccomp deny' || return 1
+    for wrong in allowed ALLOW 1 ''; do
+        conf "seccomp=$wrong\\n"
+        [ "$got" = "refused: $D/web/.conf: line 6: seccomp is not allow or deny" ] || return 1
+    done
+    conf 'seccomp=allow\nseccomp=deny\n'
+    case $got in "refused: $D/web/.conf: line 7: "*) ;; *) return 1 ;; esac
+}
+t_config_seccomp_key() { in_config_dir config_seccomp_key; }
+
+# net= and dns= (ROADMAP 8.5): nat, outside or none, and without the line nat,
+# as a container from before 0.8 has; up to three name servers, each in the
+# form lightbox writes. Anything else is refused with its line, and so is a
+# second of either.
+config_net_keys() {
+    head='version=1\nmem=64M\npids=32\ncpu=1\noom_score=0\n'
+    # shellcheck disable=SC2059     # the head is a format of its own
+    conf() { printf "$head$1" > "$D/web/.conf"; got=$(config); printf '%s\n' "$got"; }
+    for mode in nat outside none proxy:3128 proxy:1 proxy:65535; do
+        conf "net=$mode\\n"
+        printf '%s\n' "$got" | grep -qx "net $mode" || return 1
+    done
+    conf ''
+    printf '%s\n' "$got" | grep -qx 'net nat' && printf '%s\n' "$got" | grep -qx 'dns -' || return 1
+    for wrong in Outside 'nat,' internet '' proxy proxy: proxy:0 proxy:65536 proxy:03128 proxy:+80 proxy:-80 \
+                 'proxy:80 ' proxy:8o proxy:99999999999999999999 Proxy:80 proxy=80; do
+        conf "net=$wrong\\n"
+        [ "$got" = "refused: $D/web/.conf: line 6: net is not nat, outside, none or proxy:<port>" ] ||
+            { echo "net=$wrong"; return 1; }
+    done
+    conf 'net=outside\nnet=nat\n'
+    case $got in "refused: $D/web/.conf: line 7: "*) ;; *) return 1 ;; esac
+    conf 'dns=10.0.0.2,1.1.1.1,8.8.8.8\n'
+    printf '%s\n' "$got" | grep -qx 'dns 10.0.0.2,1.1.1.1,8.8.8.8' || return 1
+    conf 'dns=1.1.1.1\n'
+    printf '%s\n' "$got" | grep -qx 'dns 1.1.1.1' || return 1
+    for wrong in '' '1.1.1.1,' ',1.1.1.1' 1.1.1.01 1.1.1.1,2.2.2.2,3.3.3.3,4.4.4.4 '1.1.1.1 2.2.2.2' 1.1.1.1/32 a; do
+        conf "dns=$wrong\\n"
+        [ "$got" = "refused: $D/web/.conf: line 6: dns is not a list of up to 3 IPv4 addresses" ] ||
+            { echo "dns=$wrong"; return 1; }
+    done
+    conf 'dns=1.1.1.1\ndns=8.8.8.8\n'
+    case $got in "refused: $D/web/.conf: line 7: "*) ;; *) return 1 ;; esac
+}
+t_config_net_keys() { in_config_dir config_net_keys; }
+
+# ttl= (ROADMAP 8.8) is a duration as exec --timeout takes one, kept as it was
+# written, and once at most; without it, none.
+config_ttl_key() {
+    head='version=1\nmem=64M\npids=32\ncpu=1\noom_score=0\n'
+    # shellcheck disable=SC2059     # the head is a format of its own
+    conf() { printf "$head$1" > "$D/web/.conf"; got=$(config); printf '%s\n' "$got"; }
+    conf ''
+    printf '%s\n' "$got" | grep -qx 'ttl -' || return 1
+    for pair in '2s:2000' '30m:1800000' '1.5h:5400000' '90:90000' '365d:31536000000'; do
+        conf "ttl=${pair%%:*}\\n"
+        printf '%s\n' "$got" | grep -qx "ttl ${pair%%:*} ${pair##*:}" || { echo "ttl=${pair%%:*}"; return 1; }
+    done
+    for wrong in '' 0 0s 1ms 366d -1 2x '2 s' .5; do
+        conf "ttl=$wrong\\n"
+        [ "$got" = "refused: $D/web/.conf: line 6: ttl is not a duration from 1 ms to 365 days, such as 30m or 8h" ] ||
+            { echo "ttl=$wrong"; return 1; }
+    done
+    conf 'ttl=2s\nttl=3s\n'
+    case $got in "refused: $D/web/.conf: line 7: "*) ;; *) return 1 ;; esac
+}
+t_config_ttl_key() { in_config_dir config_ttl_key; }
+
+# id= (ROADMAP 8.9) is 16 lowercase hex digits, once at most; without it,
+# none, as for a box made before boxes had one.
+config_id_key() {
+    head='version=1\nmem=64M\npids=32\ncpu=1\noom_score=0\n'
+    # shellcheck disable=SC2059     # the head is a format of its own
+    conf() { printf "$head$1" > "$D/web/.conf"; got=$(config); printf '%s\n' "$got"; }
+    conf ''
+    printf '%s\n' "$got" | grep -qx 'id -' || return 1
+    conf 'id=0123456789abcdef\n'
+    printf '%s\n' "$got" | grep -qx 'id 0123456789abcdef' || return 1
+    for wrong in '' 0123456789ABCDEF 0123456789abcde 0123456789abcdef0 0123456789abcdeg ' 0123456789abcdef'; do
+        conf "id=$wrong\\n"
+        [ "$got" = "refused: $D/web/.conf: line 6: id is not 16 lowercase hex digits" ] || { echo "id=$wrong"; return 1; }
+    done
+    conf 'id=0123456789abcdef\nid=fedcba9876543210\n'
+    case $got in "refused: $D/web/.conf: line 7: "*) ;; *) return 1 ;; esac
+}
+t_config_id_key() { in_config_dir config_id_key; }
+
+# profile=agent and workdir= (ROADMAP 8.10): the profile a box was made with,
+# which is agent or none, and where its commands run, an absolute path; once
+# at most each, and none without them.
+config_profile_keys() {
+    head='version=1\nmem=64M\npids=32\ncpu=1\noom_score=0\n'
+    # shellcheck disable=SC2059     # the head is a format of its own
+    conf() { printf "$head$1" > "$D/web/.conf"; got=$(config); printf '%s\n' "$got"; }
+    conf ''
+    printf '%s\n' "$got" | grep -qx 'profile -' && printf '%s\n' "$got" | grep -qx 'workdir -' || return 1
+    conf 'profile=agent\nworkdir=/workspace\n'
+    printf '%s\n' "$got" | grep -qx 'profile agent' && printf '%s\n' "$got" | grep -qx 'workdir /workspace' || return 1
+    for wrong in '' Agent agent2 none; do
+        conf "profile=$wrong\\n"
+        [ "$got" = "refused: $D/web/.conf: line 6: profile is not agent" ] || { echo "profile=$wrong"; return 1; }
+    done
+    for wrong in '' workspace ./w; do
+        conf "workdir=$wrong\\n"
+        [ "$got" = "refused: $D/web/.conf: line 6: workdir is not an absolute path" ] || { echo "workdir=$wrong"; return 1; }
+    done
+    conf 'profile=agent\nprofile=agent\n'
+    case $got in "refused: $D/web/.conf: line 7: "*) ;; *) return 1 ;; esac
+    conf 'workdir=/a\nworkdir=/b\n'
+    case $got in "refused: $D/web/.conf: line 7: "*) ;; *) return 1 ;; esac
+}
+t_config_profile_keys() { in_config_dir config_profile_keys; }
+
+# The ranges /etc/subuid and /etc/subgid give lightbox, and the one a new
+# container gets: the first pair of 65536 that no container's overlaps, the
+# k-th of each file. Other names' lines, and lines of a range that has host
+# root or 4294967295 in it, are passed over and refused.
+t_userns_ranges() {
+    bad=0
+    expect() { # want, args...
+        local want=$1
+        shift
+        got=$("$UNIT" subid "$@" | paste -sd'|')
+        [ "$got" = "$want" ] || { echo "subid $*: $got, expected $want"; bad=1; }
+    }
+    expect 'uid range 2147483647 2147483648|chose 2147483647 2147483647' \
+        'lightbox:2147483647:2147483648' 'lightbox:2147483647:2147483648'
+    expect 'uid range 200000 131072|chose 265536 300000' \
+        $'someone:100000:65536\nlightbox:200000:131072\n' $'lightbox:300000:65536\nlightbox:400000:65536' 200000:400000
+    expect 'uid range 200000 65536|none: every range of 65536 ids is a container'"'"'s' \
+        'lightbox:200000:65536' 'lightbox:300000:65536' 200000:999999
+    expect 'uid range 200000 65535|none: no range of 65536 ids' 'lightbox:200000:65535' 'lightbox:300000:65536'
+    expect 'none: no range of 65536 ids' $'# nobody\nlightboxes:200000:65536\n' 'lightbox:300000:65536'
+    # a range that a container's overlaps, though it starts elsewhere
+    expect 'uid range 200000 196608|chose 331072 431072' 'lightbox:200000:196608' 'lightbox:300000:196608' 230000:330000
+    expect 'bad uid line 2' $'x:1:2\nlightbox:0:65536' 'lightbox:300000:65536'
+    expect 'bad uid line 1' 'lightbox:4294901760:65536' 'lightbox:300000:65536'
+    expect 'bad gid line 1' 'lightbox:200000:65536' 'lightbox:3e5:65536'
+    expect 'bad uid line 1' 'lightbox:200000' 'lightbox:300000:65536'
+    for start in 1 100000 4294901759; do
+        [ "$("$UNIT" userns-start "$start")" = "ok $start" ] || { echo "$start refused"; bad=1; }
+    done
+    for start in 0 4294901760 4294967295 4294967296 01 '' x -1; do
+        [ "$("$UNIT" userns-start "$start")" = refused ] || { echo "'$start' taken"; bad=1; }
+    done
+    return $bad
+}
+
+# The maps of a volume of a container with --userns (ROADMAP 8.2): one line
+# each, its source's owner and group as the container's root and nothing
+# else; a source of host uid 0 or gid 0 is bound as it is.
+t_volume_maps() {
+    bad=0
+    expect() { # want, args...
+        local want=$1
+        shift
+        got=$("$UNIT" volume-maps "$@" | paste -sd'|')
+        [ "$got" = "$want" ] || { echo "volume-maps $*: $got, expected $want"; bad=1; }
+    }
+    expect 'uid_map 1000 2147483647 1|gid_map 1001 2147483647 1' 1000 1001 2147483647 2147483647
+    expect 'uid_map 4294967294 100000 1|gid_map 1 165536 1' 4294967294 1 100000 165536
+    expect 'uid_map 2147483647 2147483647 1|gid_map 2147483647 2147483647 1' 2147483647 2147483647 2147483647 2147483647
+    expect plain 0 0 2147483647 2147483647
+    expect plain 0 1000 2147483647 2147483647
+    expect plain 1000 0 2147483647 2147483647
+    return $bad
+}
 
 # base=, the snapshot a container overlays: twelve hex digits, read and
 # written back as they are; anything else is refused with its line.
@@ -2254,9 +2930,17 @@ cpu 1
 oom_score 500
 privileged 0
 readonly 0
+seccomp deny
+net nat
+dns -
 io -
 swap -
-base -' ] || return 1
+base -
+ttl -
+id -
+profile -
+workdir -
+userns -' ] || return 1
     # a default that cannot be used is no default: the file must have the limit
     got=$(config nodefaults)
     printf '%s\n' "$got"
@@ -2382,9 +3066,17 @@ cpu 2
 oom_score 100
 privileged 1
 readonly 0
+seccomp deny
+net nat
+dns -
 io -
 swap -
 base -
+ttl -
+id -
+profile -
+workdir -
+userns -
 vol /srv/data -> /data rw
 vol /srv/other -> /data rw
 link db' ] || return 1
@@ -2418,8 +3110,29 @@ vol=/srv/data:/data
 link=db' ] || { echo "the file is not what was put in"; bad=1; }
     [ "$(stat -c %a "$D/web/.conf")" = 600 ] || { echo "the file's mode is $(stat -c %a "$D/web/.conf")"; bad=1; }
     got=$(config | tr '\n' ' ')
-    case $got in 'version 1 mem 1G pids max cpu 0.25 oom_score 500 '*'io 8:0 wbps=1024 swap 64M base - vol /srv/data -> /data rw link db ') ;;
+    case $got in 'version 1 mem 1G pids max cpu 0.25 oom_score 500 '*'seccomp deny net nat dns - io 8:0 wbps=1024 swap 64M base - ttl - id - profile - workdir - userns - vol /srv/data -> /data rw link db ') ;;
         *) echo "read back: $got"; bad=1 ;; esac
+    # --ttl as it was given, read back as the same duration
+    got=$(written mem=1G pids=max cpu=1 ttl=1.5h)
+    [ "$got" = written ] && grep -qx 'ttl=1.5h' "$D/web/.conf" && config | grep -qx 'ttl 1.5h 5400000' ||
+        { echo "a ttl: $got"; cat "$D/web/.conf"; bad=1; }
+    got=$(written mem=1G pids=max cpu=1 'ttl=1.5h ')
+    case $got in 'refused: '*) ;; *) echo "written with a ttl that is not one: $got"; bad=1 ;; esac
+    # the id create drew, read back as written; one that is not an id is not written
+    got=$(written mem=1G pids=max cpu=1 id=0123456789abcdef)
+    [ "$got" = written ] && grep -qx 'id=0123456789abcdef' "$D/web/.conf" && config | grep -qx 'id 0123456789abcdef' ||
+        { echo "an id: $got"; cat "$D/web/.conf"; bad=1; }
+    got=$(written mem=1G pids=max cpu=1 id=0123456789ABCDEF)
+    case $got in 'refused: '*) ;; *) echo "written with an id that is not one: $got"; bad=1 ;; esac
+    # the profile and the workdir, read back as written; a workdir that is not a path is not written
+    got=$(written mem=1G pids=max cpu=1 profile=agent workdir=/workspace)
+    [ "$got" = written ] && grep -qx 'profile=agent' "$D/web/.conf" && grep -qx 'workdir=/workspace' "$D/web/.conf" &&
+        config | grep -qx 'profile agent' && config | grep -qx 'workdir /workspace' ||
+        { echo "a profile and a workdir: $got"; cat "$D/web/.conf"; bad=1; }
+    got=$(written mem=1G pids=max cpu=1 workdir=workspace)
+    case $got in 'refused: '*) ;; *) echo "written with a workdir that is not a path: $got"; bad=1 ;; esac
+    got=$(written mem=1G swap=64M pids=max cpu=0.25 'io=8:0 wbps=1024' src=/srv/data dst=/data link=db)
+    [ "$got" = written ] || { echo "the good configuration, after the ttl: $got"; bad=1; }
 
     before=$(cat "$D/web/.conf")
     nl='
@@ -2441,7 +3154,7 @@ link=db' ] || { echo "the file is not what was put in"; bad=1; }
     case $got in 'refused: '*) ;; *) echo "written with a carriage return: $got"; bad=1 ;; esac
     # values that are one line and still not what a reader takes, or takes as they are
     for value in mem=lots mem=0100M mem= pids=0 pids= cpu=1024 cpu= 'link=a b' link= swap=lots swap=00 \
-                 io=8:0 'io=8:0 rbps=01' 'io=8:0 xbps=1' \
+                 io=8:0 'io=8:0 rbps=01' 'io=8:0 xbps=1' ttl=0 ttl=2x ttl=1ms \
                  src=/srv/ src=/srv/../etc src=srv src=/proc/1; do
         case $value in src=*) got=$(written "$value" dst=/data) ;; *) got=$(written "$value") ;; esac
         case $got in 'refused: '*) ;; *) echo "written with $value: $got"; bad=1 ;; esac
@@ -2673,6 +3386,16 @@ reconcile_cases() {
 }
 t_reconcile() { in_records_dir reconcile_cases; }
 
+# The cgroup device program of lightbox_devices.h, interpreted (ROADMAP 8.4):
+# a program the verifier has no reason to refuse, and the verdict of every
+# kind of device, access and number it tries. Loading it needs root, which
+# the lifecycle suite has.
+t_device_program() {
+    prog="$(dirname "$UNIT")/devices_filter"
+    [ -x "$prog" ] || { echo "$prog was not built (no hosted compiler?)"; return 77; }
+    "$prog"
+}
+
 check 'a program that succeeds gives 0'                          t_success
 check 'a non-zero exit status is returned as it is'              t_exit_status
 check 'a program killed by a signal is a failure, and reported'  t_killed_by_signal
@@ -2737,6 +3460,7 @@ check 'a volume is src:dst[:ro], with paths that mean what they say' t_volume_sp
 check 'volumes are attached after the pivot, inside the new root' t_volumes_are_attached_inside
 check 'a volume through a link that leads nowhere ends the start' t_volume_through_a_dangling_link
 check 'a volume that cannot be had ends the start'               t_volume_that_cannot_be_had
+check 'with --userns a volume is idmapped to its owner, and one of root'"'"'s is not' t_userns_volume_taken
 
 check 'the name servers of a host are the ones a container can ask' t_name_servers_of_the_host
 
@@ -2748,6 +3472,8 @@ check 'the command'"'"'s terminal follows the size of the caller'"'"'s'    t_str
 check 'a pipe stands in where only one side is a terminal'       t_streams_half_a_terminal
 check 'a signal that asks exec to end reaches the command'       t_streams_signals
 check 'plenty of data goes through, both ways'                   t_streams_plenty
+check "at exec's deadline the worker is killed; before it, the status is the command's" t_streams_deadline
+check "without cgroup.kill, the worker of exec --timeout kills what its cgroup lists, then itself" t_streams_keeper
 
 check 'exec executes itself again from a sealed copy in memory'  t_exec_runs_from_a_sealed_copy
 check 'a read-only mount of the binary does where memfds may not' t_exec_sealing_by_a_read_only_mount
@@ -2762,6 +3488,12 @@ check 'a command gets every argument, its directory, and what follows --' t_comm
 check 'exec'"'"'s options are checked, and a missing value names its option' t_command_options_are_checked
 
 check 'a number of seconds is digits within the limit'           t_seconds
+check "a duration is exec's --timeout, from 1 ms to 365 days, in s, m, h or d" t_duration
+check "a .runner names a run by its PID and start time, and nothing else does" t_runner_record
+check "the audit log's strings are ASCII, and give back the bytes they were, UTF-8 or not" t_audit_json
+check "the audit log's time is UTC, to the millisecond, from 1970 to 9999" t_audit_time
+check "an exec's two lines in the audit log name the box first, and --env by its keys only" t_audit_lines
+check "logs --audit keeps the lines of one box, whole, however the log is cut as it is read" t_audit_filter
 check 'a file never gets the number of a closed standard stream' t_standard_streams_are_reserved
 check 'a start has one way out once it has changed the host'      t_start_has_one_way_out
 
@@ -2776,6 +3508,11 @@ check 'a record of link rules names a chain of lightbox'"'"'s or is refused' t_l
 check 'a container'"'"'s link rules are a chain of its own, by port and not address' t_firewall_links_text
 check 'setup'"'"'s rules: links between ports, out by any interface, masquerade if set' t_firewall_setup_text
 check 'nftables: setup'"'"'s two tables, flushed chains, a set of links that is kept' t_nft_setup_text
+check '--net outside under iptables: a chain of the container'"'"'s own, its name servers and the rest refused' t_firewall_egress_text
+check '--net outside under nftables: a record of the address and name servers, and the sets'"'"' elements' t_nft_egress_text
+check '--net proxy under iptables: its proxy'"'"'s port of the gateway, the rest refused, and no link' t_firewall_proxy_text
+check '--net proxy under nftables: a record of the address, the proxy and the port, and the sets'"'"' elements' t_nft_proxy_text
+check 'a start puts in links and --net outside as one table, the chains before the rules' t_firewall_both_text
 check 'nftables: a container'"'"'s links are elements of the set, each once, taken out safely' t_nft_link_elements
 check 'nftables: a record that is not lightbox'"'"'s is not given to nft'  t_nft_records_refused
 check 'bridge_accept_fwmark: a mark nft reads as written, and none that matches all' t_fwmarks
@@ -2787,7 +3524,14 @@ check 'subnet and gw are one network, and an address on it is one a container ca
 check 'no prefix is written into the source: subnet gives it'      t_no_prefix_of_its_own
 check 'a .conf is read into one structure, whole'                t_config_is_read_whole
 check 'what a .conf leaves out is the default, if that is usable' t_config_defaults
-check 'userns=0 and uid_start of 0.5 are read, and userns=1 is refused' t_config_old_userns_keys
+check 'userns=1 is read with a uid_start and a gid_start, and refused without' t_config_userns_keys
+check 'seccomp= is allow or deny, and the deny-list without it' t_config_seccomp_key
+check 'net= is nat, outside or none, nat without it, and dns= up to three addresses' t_config_net_keys
+check 'ttl= is a duration from 1 ms to 365 days, once at most, and none without it' t_config_ttl_key
+check 'id= is 16 lowercase hex digits, once at most, and none without it' t_config_id_key
+check 'profile= is agent and workdir= an absolute path, each once at most, and none without them' t_config_profile_keys
+check 'a new container gets the first range of /etc/subuid and /etc/subgid that is free' t_userns_ranges
+check "a volume's maps make the container's root its source's owner, and never host root" t_volume_maps
 check 'base= is a snapshot'"'"'s id, read as it is, or refused'          t_config_base_key
 check 'a .conf with a version is read strictly, by line'         t_config_is_read_strictly
 check 'a .conf from before the version line is still read'       t_config_from_before_the_version_line
@@ -2797,5 +3541,6 @@ check 'a runtime record makes its directory when a reboot took it'  t_run_dir_is
 check 'a file is removed for good, or said not to be'             t_remove_durably
 check 'init says how it ends, and nothing it starts can look into it' t_init_reports_its_end
 check 'a container that ended without a stop is cleared away, and how it ended recorded' t_reconcile
+check 'the device program lets a container open its own devices and nothing else' t_device_program
 
 summary unit

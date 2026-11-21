@@ -52,12 +52,20 @@ jobs:
       - name: Install the toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build ${{ matrix.packages }}
+          sudo apt-get install -y ninja-build uidmap ${{ matrix.packages }}
       # Ubuntu's AppArmor keeps unprivileged processes from using user
       # namespaces. The seccomp suite makes one to watch the filter refuse
       # the next; with the restriction on, it skips that case.
       - name: Allow unprivileged user namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      # The unit suite's case of a --userns volume needs a user namespace with
+      # ids besides its root's: newuidmap, from uidmap, and a range of the
+      # runner's in /etc/subuid and /etc/subgid. Without them it skips.
+      - name: Give the runner a range of ids
+        run: |
+          for f in /etc/subuid /etc/subgid; do
+              grep -q "^$(id -un):" "$f" 2>/dev/null || echo "$(id -un):100000:65536" | sudo tee -a "$f" >/dev/null
+          done
       - name: Build
         run: make CC=${{ matrix.cc }}
       - name: Check
@@ -68,37 +76,52 @@ jobs:
 
   # The suite that starts containers: tests/lifecycle.sh, as root. It works in
   # private network, mount and PID namespaces and fails if it leaves anything
-  # on the runner.
+  # on the runner. It runs six times on each architecture: on the suite's own
+  # image as it is, with every container made with --userns, with --userns
+  # --copy and with --seccomp deny; and on the Alpine and the Debian image
+  # that the allow-list, the default, is fitted to.
   lifecycle:
-    name: Lifecycle suite (${{ matrix.name }})
+    name: Lifecycle suite (${{ matrix.arch }}${{ matrix.mode.name && format(', {0}', matrix.mode.name) || '' }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
+        arch: [x86_64, aarch64]
+        mode:
+          - { name: '',             userns: '',      seccomp: '',   image: '' }
+          - { name: userns overlay, userns: overlay, seccomp: '',   image: '' }
+          - { name: userns copy,    userns: copy,    seccomp: '',   image: '' }
+          - { name: seccomp deny,   userns: '',      seccomp: deny, image: '' }
+          - { name: Alpine,         userns: '',      seccomp: '',   image: alpine }
+          - { name: Debian,         userns: '',      seccomp: '',   image: debian }
         include:
-          - name: x86_64
+          - arch: x86_64
             runner: ubuntu-24.04
-          - name: aarch64
+          - arch: aarch64
             runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
+      # Squid for contrib/proxy's example, which the suite runs in its own
+      # namespaces: the service that the package starts is not needed.
       - name: Install the toolchain and what the suite needs
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build gcc-14 busybox-static iproute2 iptables nftables util-linux strace
+          sudo apt-get install -y ninja-build gcc-14 busybox-static iproute2 iptables nftables util-linux strace squid
+          sudo systemctl disable --now squid || true
       - name: Build
         run: make CC=gcc-14
       # The suite makes bridge and veth interfaces, and lightbox's firewall
-      # rules use the state match and masquerading, in iptables and in
-      # nftables, whose bridge family needs nft_meta_bridge. Runner kernels
-      # keep some modules in a package of extras.
+      # rules use the state match, masquerading and, for --net outside, the
+      # address type match and rejection, in iptables and in nftables, whose
+      # bridge family needs nft_meta_bridge. Runner kernels keep some modules
+      # in a package of extras.
       - name: Kernel modules
         run: |
           missing=
-          for m in bridge veth br_netfilter xt_state xt_conntrack xt_MASQUERADE nf_nat nf_tables nft_meta_bridge nft_masq nft_chain_nat nft_ct; do
+          for m in bridge veth br_netfilter xt_state xt_conntrack xt_MASQUERADE xt_addrtype ipt_REJECT nf_nat nf_tables nft_meta_bridge nft_masq nft_chain_nat nft_ct nft_reject_ipv4; do
             sudo modprobe -n "$m" 2>/dev/null || missing="$missing $m"
           done
           if [ -n "$missing" ]; then
@@ -119,14 +142,23 @@ jobs:
           busybox | head -n 1
           unshare --version
           echo "loaded: $(lsmod | awk '{ print $1 }' | grep -E '^(bridge|veth|br_netfilter|nf_tables|nft_compat|nf_nat|xt_.*)$' | sort | tr '\n' ' ')"
+      # The image, pinned by its SHA-256 in the script, which fails the job if
+      # the file it gets is another.
+      - name: Fetch the image
+        if: ${{ matrix.mode.image != '' }}
+        run: sudo tests/fetch_image.sh ${{ matrix.mode.image }} "$RUNNER_TEMP/image"
       # sudo drops the environment, so the suite's options are make variables.
       - name: Lifecycle suite
-        run: sudo make CC=gcc-14 test-lifecycle GITHUB_ACTIONS=true LIGHTBOX_TEST_MODPROBE=1
+        run: >-
+          sudo make CC=gcc-14 test-lifecycle GITHUB_ACTIONS=true LIGHTBOX_TEST_MODPROBE=1
+          LIGHTBOX_TEST_USERNS=${{ matrix.mode.userns }} LIGHTBOX_TEST_SECCOMP=${{ matrix.mode.seccomp }}
+          LIGHTBOX_TEST_ROOTFS=${{ matrix.mode.image && format('{0}/image', runner.temp) || '' }}
       # Wall time of the basic commands, the processes one start makes and
       # creates from a base of 1 GB. A shared runner's clock is rough, so this
       # reports and compares nothing. The numbers are a notice on the run's
       # page.
       - name: Timing
+        if: ${{ matrix.mode.name == '' }}
         run: sudo make CC=gcc-14 bench GITHUB_ACTIONS=true
       - name: Kernel log
         if: ${{ failure() }}

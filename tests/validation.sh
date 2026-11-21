@@ -236,6 +236,96 @@ t_stopped_container_cannot_stop_or_exec() {
     refused lb stop web && refused lb exec web /bin/true
 }
 
+# exec's status is its command's (ROADMAP 8.7), so a failure of lightbox's
+# own is 125 there, wherever it comes from: the options, --timeout among
+# them, root, a lightbox.conf that cannot be read. For every other command it
+# is 1, as it was.
+t_exec_failures_are_125() {
+    local bad=0 want rc long
+    expect_status() { # status, words...
+        want=$1
+        shift
+        lb "$@" >/dev/null 2>"$W/said"
+        rc=$?
+        echo "lightbox $*: $rc, $(head -n 1 "$W/said")"
+        [ "$rc" -eq "$want" ] || bad=1
+    }
+    expect_status 125 exec
+    expect_status 125 exec web --bogus
+    expect_status 125 exec web --timeout
+    expect_status 125 exec web --timeout 0 /bin/true
+    expect_status 125 exec web --timeout 1ms /bin/true
+    expect_status 125 exec web --timeout 366d /bin/true
+    expect_status 125 exec web --workdir relative /bin/true
+    expect_status 125 exec 'not a name' /bin/true
+    expect_status 125 exec web /bin/true
+    expect_status 125 exec web --timeout 2s -- /bin/true
+    grep -qx 'Error: lightbox exec must be run as root' "$W/said" || { echo "a valid --timeout is not taken"; bad=1; }
+    expect_status 0 exec --help
+    expect_status 1 start web
+    expect_status 1 stop web
+    expect_status 1 create 'not a name'
+    lb exec web --timeout 2x /bin/true 2>&1 | grep -qx 'Error: --timeout takes a duration above 0 and up to 365d, such as 30s, 5m or 1.5h: 2x' ||
+        { echo "--timeout does not say what it takes"; bad=1; }
+    long=$(printf '/%0600d' 0)
+    printf 'container_dir = %s\n' "$long" > "$W/long.conf"
+    HOME="$W/home" LIGHTBOX_CONFIG="$W/long.conf" "$LB" exec web /bin/true >/dev/null 2>&1
+    rc=$?
+    echo "exec with a lightbox.conf it cannot take: $rc"
+    [ "$rc" -eq 125 ] || bad=1
+    HOME="$W/home" LIGHTBOX_CONFIG="$W/long.conf" "$LB" ls >/dev/null 2>&1
+    rc=$?
+    echo "ls with it: $rc"
+    [ "$rc" -eq 1 ] || bad=1
+    return $bad
+}
+
+# run (ROADMAP 8.8) tells create's options and exec's from its command: each
+# option that create --help names, and exec's, gets past it to the question
+# of root, with a value where it takes one. Unknown options, missing values
+# and exec's options that are not right are refused first, with 125, and as
+# an ordinary user nothing is made.
+t_run_options() {
+    [ "$(id -u)" -ne 0 ] || return 77
+    local bad=0 opt kind msg rc count=0 before
+    before=$(kept_sum)
+    root='Error: lightbox run must be run as root'
+    while read -r opt kind; do
+        count=$((count + 1))
+        if [ "$kind" = value ]; then
+            msg=$(lb run "$opt" x -- /bin/true 2>&1)
+        else
+            msg=$(lb run "$opt" -- /bin/true 2>&1)
+        fi
+        rc=$?
+        [ "$msg" = "$root" ] && [ $rc -eq 125 ] || { echo "run $opt: $rc, $msg"; bad=1; }
+    done <<EOF
+$(lb create --help | awk '$1 ~ /^--/ { print $1, (($2 ~ /^</ || $2 ~ /\|/) ? "value" : "flag") }')
+EOF
+    echo "create's options that run takes: $count"
+    [ "$count" -ge 17 ] || { echo "create --help names fewer than 17"; bad=1; }
+    msg=$(lb run --user nobody -u 0 --env A=b -e B=c --workdir / -w /tmp --timeout 1s -- /bin/true 2>&1)
+    [ "$msg" = "$root" ] || { echo "exec's options: $msg"; bad=1; }
+    msg=$(lb run --mem 64M --ttl 2s --net none --userns /bin/echo hi 2>&1)
+    [ "$msg" = "$root" ] || { echo "a command without --: $msg"; bad=1; }
+    expect_125() { # message, words...
+        local want=$1
+        shift
+        msg=$(lb "$@" 2>&1)
+        rc=$?
+        [ "$msg" = "$want" ] && [ $rc -eq 125 ] || { echo "lightbox $*: $rc, $msg"; bad=1; }
+    }
+    expect_125 'Error: unknown option: --bogus
+A command that begins with a dash goes after --.' run --bogus /bin/true
+    expect_125 'Error: option --mem requires a value' run --mem
+    expect_125 'Error: option --timeout requires a value' run --timeout
+    expect_125 'Error: --timeout takes a duration above 0 and up to 365d, such as 30s, 5m or 1.5h: 0' run --timeout 0 -- /bin/true
+    expect_125 'Error: --workdir takes an absolute path: tmp' run --workdir tmp -- /bin/true
+    expect_125 'Error: --env takes KEY=VALUE: A' run --env A -- /bin/true
+    [ "$before" = "$(kept_sum)" ] || { echo "run as an ordinary user changed what lightbox keeps"; bad=1; }
+    return $bad
+}
+
 t_unknown_command_prints_usage() {
     usage=$(lb frobnicate 2>&1)
     [ $? -ne 0 ] && printf '%s\n' "$usage" | grep -q '^Usage: lightbox' &&
@@ -479,6 +569,226 @@ privileged=1'; do
     done
 }
 
+# --seccomp takes allow and deny (ROADMAP 8.3). allow, as no option, is
+# stored and shown; deny leaves the file without the line, which is the
+# deny-list, as in a .conf made before 0.8; a privileged container has no
+# profile to show. Anything else is refused, and a .conf with another value
+# cannot be used.
+t_seccomp_option() {
+    lb create a --seccomp allow && lb create b --seccomp deny && lb create c && lb create d --privileged --seccomp allow ||
+        return 1
+    conf_has a 'seccomp=allow' && conf_has c 'seccomp=allow' || return 1
+    ! grep -q '^seccomp=' "$C/b/.conf" || { echo "a deny-list is stored"; return 1; }
+    shown=$(for n in a b c d; do lb inspect "$n" | grep '^seccomp: '; done | paste -sd'|')
+    echo "$shown"
+    [ "$shown" = 'seccomp: allow|seccomp: deny|seccomp: allow|seccomp: -' ] || return 1
+    command -v python3 >/dev/null 2>&1 && {
+        lb inspect a --json | python3 -I -c 'import json, sys; assert json.load(sys.stdin)[0]["seccomp"] == "allow"' &&
+        lb inspect d --json | python3 -I -c 'import json, sys; assert json.load(sys.stdin)[0]["seccomp"] is None' ||
+            { echo "inspect --json does not say it"; return 1; }
+    }
+    for value in Allow deny-list '' 1 'allow
+privileged=1'; do
+        msg=$(lb create e --seccomp "$value" 2>&1) && { echo "--seccomp '$value' was taken"; return 1; }
+        case $msg in 'Error: --seccomp takes allow or deny, not: '*) ;; *) echo "--seccomp '$value': $msg"; return 1 ;; esac
+        [ ! -e "$C/e" ] || { echo "--seccomp '$value' left a container"; return 1; }
+    done
+    echo 'seccomp=none' >> "$C/b/.conf"
+    msg=$(lb inspect b 2>&1) && { echo "a .conf of seccomp=none was used"; return 1; }
+    printf '%s\n' "$msg"
+    case $msg in *'seccomp is not allow or deny'*) ;; *) return 1 ;; esac
+}
+
+# --net takes nat, outside and none (ROADMAP 8.5). outside, the default, is
+# stored with the name servers it may ask; nat, as a .conf from before 0.8,
+# leaves the file without either line; none is stored, has no address and
+# takes neither an address nor --link. With firewall = false lightbox makes
+# no rules, and so no container of outside. Anything else is refused and
+# makes nothing, and a .conf of another net cannot be used.
+# --ttl (ROADMAP 8.8): a duration, stored as it was given and shown by
+# inspect; none without it. What is not a duration is refused, and leaves no
+# container.
+t_ttl_option() {
+    local msg value
+    lb create a --ttl 1.5h && lb create b || return 1
+    conf_has a 'ttl=1.5h' && ! grep -q '^ttl=' "$C/b/.conf" || { echo "the ttl is not stored as given"; return 1; }
+    lb inspect a | grep -qx 'ttl: 1.5h' && lb inspect b | grep -qx 'ttl: -' || { echo "inspect does not show it"; return 1; }
+    command -v python3 >/dev/null 2>&1 && {
+        lb inspect a --json | python3 -I -c 'import json, sys; assert json.load(sys.stdin)[0]["ttl"] == "1.5h"' &&
+        lb inspect b --json | python3 -I -c 'import json, sys; assert json.load(sys.stdin)[0]["ttl"] is None' ||
+            { echo "inspect --json does not say it"; return 1; }
+    }
+    for value in 0 0s 1ms 366d 2x -1 '' '2 s'; do
+        msg=$(lb create e --ttl "$value" 2>&1) && { echo "--ttl '$value' was taken"; return 1; }
+        [ "$msg" = "Error: --ttl takes a duration above 0 and up to 365d, such as 30m or 8h: $value" ] ||
+            { echo "--ttl '$value': $msg"; return 1; }
+        [ ! -e "$C/e" ] || { echo "--ttl '$value' left a container"; return 1; }
+    done
+    msg=$(lb create e --ttl 2>&1) && return 1
+    echo "--ttl without a value: $msg"
+    [ ! -e "$C/e" ]
+}
+
+# create draws an id for each box (ROADMAP 8.9), which .conf keeps as id= and
+# inspect shows, and by which the audit log tells a box from a later one of
+# its name. inspect names the audit log too.
+t_box_id() {
+    local one two again
+    lb create a && lb create b || return 1
+    one=$(sed -n 's/^id=//p' "$C/a/.conf")
+    two=$(sed -n 's/^id=//p' "$C/b/.conf")
+    echo "the ids of a and b: $one $two"
+    printf '%s\n%s\n' "$one" "$two" | grep -Ecx '[0-9a-f]{16}' | grep -qx 2 && [ "$one" != "$two" ] ||
+        { echo "not two ids of 16 hex digits"; return 1; }
+    lb inspect a | grep -qx "id: $one" && lb inspect a | grep -qx "audit_path: $W/data/audit.log" ||
+        { echo "inspect does not show the id and the audit log"; return 1; }
+    command -v python3 >/dev/null 2>&1 && {
+        lb inspect a --json | python3 -I -c 'import json, sys; c = json.load(sys.stdin)[0]; assert c["id"] == sys.argv[1] and c["audit_path"].endswith("/data/audit.log")' "$one" ||
+            { echo "inspect --json does not say them"; return 1; }
+    }
+    lb rm a && lb create a || return 1
+    again=$(sed -n 's/^id=//p' "$C/a/.conf")
+    echo "a made again: $again"
+    [ -n "$again" ] && [ "$again" != "$one" ]
+}
+
+# create --profile agent (ROADMAP 8.10) refuses what would undo it, each by
+# its name and whichever comes first, and takes what tightens it, as far as
+# asking for root, which it needs for its user namespace; nothing is made
+# before that. Its agent_* settings are checked as the default_* ones are,
+# and refused where a box would have needed one. What it stores is the
+# lifecycle suite's to see, as root.
+t_profile_option() {
+    [ "$(id -u)" -ne 0 ] || return 77
+    local before msg opt setting key root='Error: lightbox create --profile agent must be run as root'
+    before=$(kept_sum)
+    for opt in '--privileged:--privileged' '--link db:--link' '--net nat:--net nat' \
+               '--seccomp deny:--seccomp deny' '--copy:--copy: its root is an overlay of its base'; do
+        # shellcheck disable=SC2086     # the option and its value
+        msg=$(lb create a --profile agent ${opt%%:*} 2>&1) && { echo "--profile agent took ${opt%%:*}"; return 1; }
+        [ "$msg" = "Error: --profile agent refuses ${opt#*:}" ] || { echo "${opt%%:*}: $msg"; return 1; }
+        # shellcheck disable=SC2086
+        msg=$(lb create a ${opt%%:*} --profile agent 2>&1) && return 1
+        [ "$msg" = "Error: --profile agent refuses ${opt#*:}" ] || { echo "${opt%%:*} first: $msg"; return 1; }
+    done
+    echo "refused, each by its name: --privileged, --link, --net nat, --seccomp deny, --copy"
+    for opt in '' --read-only '--net none' '--net outside' '--net proxy:3128' '--seccomp allow' --userns \
+               '--mem 512M --pids 64 --cpu 1 --ttl 1h' "--workspace $W/vol"; do
+        # shellcheck disable=SC2086
+        msg=$(lb create a --profile agent $opt 2>&1) && { echo "--profile agent $opt made a box"; return 1; }
+        [ "$msg" = "$root" ] || { echo "--profile agent $opt: $msg"; return 1; }
+    done
+    msg=$(lb create a --profile other 2>&1) && return 1
+    [ "$msg" = 'Error: --profile takes agent, not: other' ] || { echo "--profile other: $msg"; return 1; }
+    msg=$(lb create a --profile 2>&1) && return 1
+    [ "$msg" = 'Error: option --profile requires a value' ] || { echo "--profile without a value: $msg"; return 1; }
+    for setting in 'agent_mem = 1Gb' 'agent_pids = lots' 'agent_cpu = 1024' 'agent_ttl = 0'; do
+        printf '%s\n' "$setting" >> "$CONF"
+        key=${setting%% *}
+        lb ls 2>&1 >/dev/null | grep -q "^Warning: $key in lightbox.conf is not " || { echo "no warning for $setting"; return 1; }
+        msg=$(lb create a --profile agent 2>&1) && return 1
+        case $msg in *"Error: $key: "*) ;; *) echo "the refusal does not name $key: $msg"; return 1 ;; esac
+        # given every limit and the lifetime, the box needs none of them
+        msg=$(lb create a --profile agent --mem 64M --pids 5 --cpu 1 --ttl 1h 2>&1 | tail -n 1)
+        [ "$msg" = "$root" ] || { echo "with all four given and $setting: $msg"; return 1; }
+        sed -i '$d' "$CONF"
+    done
+    printf 'agent_ttl = none\n' >> "$CONF"
+    msg=$(lb ls 2>&1 >/dev/null)
+    sed -i '$d' "$CONF"
+    [ -z "$msg" ] || { echo "agent_ttl = none: $msg"; return 1; }
+    echo "agent_mem, agent_pids, agent_cpu and agent_ttl: said when wrong, and refused where needed"
+    [ "$before" = "$(kept_sum)" ] || { echo "what lightbox keeps changed"; return 1; }
+}
+
+# --workspace <dir> (ROADMAP 8.10) is a volume at /workspace, where every
+# exec runs: .conf has the volume and workdir=, and inspect shows it. A
+# directory that is not there, a relative path, one with a colon, a second
+# --workspace and a --vol at /workspace are refused, and nothing is made.
+t_workspace_option() {
+    local msg want
+    mkdir -p "$W/vol/ws" "$W/vol/a:b"
+    lb create w --workspace "$W/vol/ws" && lb create plain || return 1
+    conf_has w "vol=$W/vol/ws:/workspace" && conf_has w 'workdir=/workspace' || { cat "$C/w/.conf"; return 1; }
+    ! grep -q '^workdir=\|^profile=' "$C/w/.conf" "$C/plain/.conf" | grep -v 'w/.conf:workdir=' ||
+        { echo "a profile, or a workdir where there is no workspace"; return 1; }
+    lb inspect w | grep -qx 'workdir: /workspace' && lb inspect w | grep -qx 'profile: -' &&
+        lb inspect plain | grep -qx 'workdir: -' || { echo "inspect does not show them"; return 1; }
+    command -v python3 >/dev/null 2>&1 && {
+        lb inspect w --json | python3 -I -c 'import json, sys; c = json.load(sys.stdin)[0]; assert c["workdir"] == "/workspace" and c["profile"] is None' ||
+            { echo "inspect --json does not say them"; return 1; }
+    }
+    for want in "$W/vol/none:Error: --workspace takes a directory that is there: $W/vol/none" \
+                "ws:Error: --workspace takes an absolute path: ws"; do
+        msg=$(lb create x --workspace "${want%%:*}" 2>&1) && return 1
+        [ "$msg" = "${want#*:}" ] || { echo "--workspace ${want%%:*}: $msg"; return 1; }
+    done
+    msg=$(lb create x --workspace "$W/vol/a:b" 2>&1) && return 1
+    [ "$msg" = "Error: --workspace takes a directory whose path has no ':', as a volume's has none: $W/vol/a:b" ] ||
+        { echo "a path with a colon: $msg"; return 1; }
+    msg=$(lb create x --workspace "$W/vol/ws" --workspace "$W/vol/ws" 2>&1) && return 1
+    [ "$msg" = 'Error: --workspace is given once: a box has one workspace' ] || { echo "two: $msg"; return 1; }
+    msg=$(lb create x --vol "$W/vol/ws:/workspace" --workspace "$W/vol/ws" 2>&1) && return 1
+    [ "$msg" = "Error: --workspace: $W/vol/ws: there is already a volume at that destination" ] ||
+        { echo "with a --vol at /workspace: $msg"; return 1; }
+    [ ! -e "$C/x" ] || { echo "a refused box is there"; return 1; }
+}
+
+t_net_option() {
+    lb create a && lb create b --net nat && lb create c --net none &&
+        lb create d --net outside --dns 10.0.0.2 --dns 1.1.1.1 && lb create p --net proxy:3128 || return 1
+    conf_has a 'net=outside' && grep -q '^dns=[0-9]' "$C/a/.conf" || { echo "a: no net=outside and dns="; return 1; }
+    ! grep -q '^net=\|^dns=' "$C/b/.conf" || { echo "nat is stored"; return 1; }
+    conf_has c 'net=none' && ! grep -q '^dns=' "$C/c/.conf" && [ ! -e "$C/c/.ip" ] ||
+        { echo "none is not stored, or has an address"; return 1; }
+    conf_has d 'dns=10.0.0.2,1.1.1.1' || { echo "the name servers of --dns are not stored"; return 1; }
+    # --net proxy: no name server to ask, on record or in resolv.conf
+    conf_has p 'net=proxy:3128' && ! grep -q '^dns=' "$C/p/.conf" && [ -s "$C/p/.ip" ] ||
+        { echo "proxy is not stored, or has name servers, or no address"; return 1; }
+    echo "p's resolv.conf: $(paste -sd'|' "$C/p/rootfs/etc/resolv.conf")"
+    ! grep -q nameserver "$C/p/rootfs/etc/resolv.conf" || { echo "a container of --net proxy has a name server"; return 1; }
+    shown=$(for n in a b c d p; do lb inspect "$n" | grep '^net: '; done | paste -sd'|')
+    echo "$shown"
+    [ "$shown" = 'net: outside|net: nat|net: none|net: outside|net: proxy:3128' ] || return 1
+    lb inspect c | grep -qx 'ip: -' || { echo "inspect shows c with an address"; return 1; }
+    command -v python3 >/dev/null 2>&1 && {
+        lb inspect a --json | python3 -I -c 'import json, sys; assert json.load(sys.stdin)[0]["net"] == "outside"' &&
+        lb inspect c --json | python3 -I -c 'import json, sys; c = json.load(sys.stdin)[0]; assert c["net"] == "none" and c["ip"] is None' &&
+        lb inspect p --json | python3 -I -c 'import json, sys; assert json.load(sys.stdin)[0]["net"] == "proxy:3128"' ||
+            { echo "inspect --json does not say it"; return 1; }
+    }
+    expect_refused() { # what it says, create arguments...
+        local want=$1
+        shift
+        msg=$(lb create e "$@" 2>&1) && { echo "create e $* was taken"; return 1; }
+        [ "$msg" = "$want" ] || { echo "create e $*: $msg"; return 1; }
+        [ ! -e "$C/e" ] || { echo "create e $* left a container"; return 1; }
+    }
+    expect_refused 'Error: a container with --net none has no address: 10.0.0.9' 10.0.0.9 --net none || return 1
+    expect_refused 'Error: a container with --net none has no network for --link' --net none --link a || return 1
+    expect_refused 'Error: a container with --net proxy reaches its proxy and nothing else: no --link' \
+        --net proxy:3128 --link a || return 1
+    expect_refused 'Error: a container with --net proxy has its proxy look up names: no --dns' \
+        --net proxy:3128 --dns 1.1.1.1 || return 1
+    expect_refused 'Error: --link names a container of --net proxy, which reaches its proxy and nothing else: p' \
+        --link p || return 1
+    for value in Outside internet '' nat,none proxy proxy: proxy:0 proxy:65536 proxy:03128 proxy:+3128 'proxy:3128 ' \
+                 proxy:3128,3129 Proxy:3128; do
+        expect_refused "Error: --net takes nat, outside, none or proxy:<port>, not: $value" --net "$value" || return 1
+    done
+    cp "$CONF" "$W/conf.good"
+    echo 'firewall = false' >> "$CONF"
+    expect_refused 'Error: --net outside, the default, needs lightbox'"'"'s firewall rules, and lightbox.conf has
+firewall = false; create the container with --net nat or --net none' || { cp "$W/conf.good" "$CONF"; return 1; }
+    expect_refused 'Error: --net proxy needs lightbox'"'"'s firewall rules, and lightbox.conf has firewall = false' \
+        --net proxy:3128 || { cp "$W/conf.good" "$CONF"; return 1; }
+    lb create f --net nat >/dev/null && lb create g --net none >/dev/null || { cp "$W/conf.good" "$CONF"; return 1; }
+    cp "$W/conf.good" "$CONF"
+    echo 'net=internet' >> "$C/b/.conf"
+    msg=$(lb inspect b 2>&1) && { echo "a .conf of net=internet was used"; return 1; }
+    case $msg in *'net is not nat, outside, none or proxy:<port>'*) ;; *) echo "$msg"; return 1 ;; esac
+}
+
 # A whole disk of this host, as <major>:<minor>; with "partition", one of its
 # partitions instead.
 block_device() {
@@ -523,7 +833,7 @@ privileged=1'; do
 }
 
 t_missing_value_is_named() {
-    for option in --mem --swap --pids --cpu --oom-score --io-max --vol --dns --link --rootfs; do
+    for option in --mem --swap --pids --cpu --oom-score --io-max --vol --dns --link --rootfs --seccomp --net; do
         msg=$(lb create web 10.0.0.2 "$option" 2>&1) && { echo "$option without a value was accepted"; return 1; }
         printf '%s\n' "$msg"
         [ "$msg" = "Error: option $option requires a value" ] || return 1
@@ -902,7 +1212,9 @@ t_runtime_records_are_apart() {
     lb create web 10.0.0.2 || return 1
     echo "the container's directory: $(ls -A "$C/web" | tr '\n' ' ')"
     echo "run_dir: $(ls -A "$R" | tr '\n' ' ')"
-    [ "$(ls -A "$C/web" | tr '\n' ' ')" = '.conf .ip rootfs ' ] || { echo "create left more than a container is made of"; return 1; }
+    [ "$(ls -A "$C/web" | tr '\n' ' ')" = '.conf .ip .resolv rootfs ' ] || { echo "create left more than a container is made of"; return 1; }
+    [ "$(cat "$C/web/.resolv")" = "$(cat "$C/web/rootfs/etc/resolv.conf")" ] || { echo ".resolv is not what create wrote"; return 1; }
+    [ "$(mode_of "$C/web/.resolv")" = 600 ] || { echo ".resolv is $(mode_of "$C/web/.resolv")"; return 1; }
     [ -z "$(ls -A "$R")" ] || { echo "create made a runtime record"; return 1; }
     report=$(lb inspect web)
     for line in 'state: stopped' 'running: no' 'pid: -' "pid_path: $R/web/pid" "pid_start_path: $R/web/pid_start" \
@@ -1080,7 +1392,7 @@ t_root_is_asked_for_first() {
     chmod 755 "$W/data" "$C"
     before=$(kept_sum)
     bad=0
-    for words in setup 'setup --teardown' reload 'start web' 'stop web' 'exec web /bin/true'; do
+    for words in setup 'setup --teardown' reload 'start web' 'stop web' 'exec web /bin/true' 'reset web'; do
         # shellcheck disable=SC2086
         msg=$(lb $words 2>&1) && { echo "lightbox $words succeeded"; bad=1; }
         echo "lightbox $words: $msg"
@@ -1281,7 +1593,8 @@ want = {"name": "web", "ip": "10.0.0.2", "state": "stopped", "running": False, "
 bad = [k for k in want if c.get(k) != want[k]]
 assert not bad, "differ: " + ", ".join("%s=%r" % (k, c.get(k)) for k in bad)
 assert c["log_path"].endswith("/web/console.log") and c["host_interface"].startswith("vb-"), "paths"
-assert "userns" not in c and "uid_start" not in c, "user namespace keys"
+assert c["userns"] is False and c["uid_start"] is None and c["gid_start"] is None, "user namespace keys"
+assert c["seccomp"] == "allow", "the profile"
 ' "$W/vol" || return 1
     echo 'colour=blue' >> "$C/web/.conf"
     out=$(lb inspect web --json 2>"$W/err") && { echo "inspect --json of a configuration that cannot be used succeeded"; return 1; }
@@ -1514,7 +1827,7 @@ try:
 except ValueError as e:
     wrong(e)
 checks = {c["check"]: c for c in d["checks"]}
-for name in ("root", "kernel", "syscalls", "network", "cgroup2", "path.rootfs", "bin.cp", "bin.rm", "exec_sealing"):
+for name in ("root", "kernel", "syscalls", "network", "cgroup2", "device_filter", "path.rootfs", "bin.cp", "bin.rm", "exec_sealing"):
     if name not in checks:
         wrong("no check " + name)
 for name in ("bin.ip", "bin.nsenter"):
@@ -1538,6 +1851,50 @@ sys.exit(0 if d["overall"] == "ok" else 1)
     [ $verdict = "$rc" ] || { echo "the exit status $rc is not that of the overall verdict, $verdict"; return 1; }
     said=$(lb doctor --json --bogus 2>&1) && return 1
     [ "$said" = 'Error: unknown option: --bogus' ]
+}
+
+# doctor --profile agent (ROADMAP 8.11): after the checks of every container,
+# five of what a box of the profile needs, in text and in --json, each one
+# that fails followed by its fix. An ordinary user cannot make an idmapped
+# mount, and is told that whether one works is not known. Without the option
+# there are none of them, and a value that is not agent, or none, is refused.
+t_doctor_profile() {
+    [ "$(id -u)" -ne 0 ] || { echo "run as root: what an ordinary user is told is not shown"; return 77; }
+    command -v python3 >/dev/null 2>&1 || { echo "no python3 to decode JSON with"; return 77; }
+    local report names json rc said
+    report=$(lb doctor --profile agent 2>&1) && { printf '%s\n' "$report"; echo "doctor exited 0 for an ordinary user"; return 1; }
+    printf '%s\n' "$report" | sed -n '/^agent\./,$p'
+    names=$(printf '%s\n' "$report" | sed -n 's/^\(agent\.[a-z_]*\): .*/\1/p' | paste -sd' ')
+    [ "$names" = 'agent.kernel agent.userns_ranges agent.idmap agent.nft agent.cgroup_kill' ] ||
+        { echo "the profile's checks: $names"; return 1; }
+    printf '%s\n' "$report" | grep -Eqx 'agent\.kernel: (yes|no) \(.+; the profile needs Linux 5\.19 or later, for an overlay on an idmapped layer\)' ||
+        { echo "agent.kernel does not say what it needs"; return 1; }
+    [ "$(printf '%s\n' "$report" | grep -A1 '^agent\.idmap: ' | paste -sd'|')" = \
+      'agent.idmap: no (not known: only root may make an idmapped mount)|  to fix: sudo lightbox doctor --profile agent' ] ||
+        { echo "agent.idmap does not say that only root can tell"; return 1; }
+    printf '%s\n' "$report" | grep -Eqx 'agent\.nft: (ok|missing) \(/.+/nft\)' || { echo "agent.nft does not name nft"; return 1; }
+    printf '%s\n' "$report" | awk '/^agent\./ { on = 1 }
+        on && want { if ($0 !~ /^  to fix: ./) { print "no fix after " name; bad = 1 } want = 0; next }
+        on && /^agent\.[a-z_]+: (no|missing)( |$)/ { want = 1; name = $1 }
+        END { if (want) { print "no fix after " name; bad = 1 } exit bad }' || return 1
+    ! lb doctor 2>&1 | grep -q '^agent\.' || { echo "doctor without --profile has the profile's checks"; return 1; }
+    json=$(lb doctor --json --profile agent)
+    rc=$?
+    printf '%s' "$json" | python3 -I -c '
+import json, sys
+d = json.load(sys.stdin)
+names = [c["check"] for c in d["checks"] if c["check"].startswith("agent.")]
+assert names == ["agent.kernel", "agent.userns_ranges", "agent.idmap", "agent.nft", "agent.cgroup_kill"], names
+for c in d["checks"]:
+    assert isinstance(c["ok"], bool) and (c["fix"] is None) == c["ok"], c
+    assert c["text"].startswith(("yes", "no", "ok", "missing", "unusable")) or c["check"] == "network", c
+assert d["overall"] == "degraded", d["overall"]
+' || return 1
+    [ "$rc" = 1 ] || { echo "doctor --json --profile agent exited $rc"; return 1; }
+    said=$(lb doctor --profile 2>&1) && return 1
+    [ "$said" = 'Error: option --profile requires a value' ] || { echo "--profile alone: $said"; return 1; }
+    said=$(lb doctor --profile other 2>&1) && return 1
+    [ "$said" = 'Error: --profile takes agent, not: other' ] || { echo "--profile other: $said"; return 1; }
 }
 
 # update takes --mem, --pids and --cpu, held to what create holds them to,
@@ -1566,6 +1923,10 @@ t_update_restart_rm_options() {
     expect 'Usage: lightbox restart <name>... [-t <seconds>]' restart
     expect 'Usage: lightbox rm [-f] <name>...' rm -f
     expect 'Error: unknown option: --forcefully' rm --forcefully web
+    expect 'Usage: lightbox reset <name>... [-t <seconds>]' reset
+    expect 'Error: not a number of seconds from 0 to 86400: soon' reset web -t soon
+    expect 'Error: unknown option: --hard' reset web --hard
+    expect 'Error: container name must only contain [a-zA-Z0-9_-]' reset 'we b'
     if [ "$(id -u)" -ne 0 ]; then
         expect 'Error: lightbox update must be run as root' update web --mem 64M
         expect 'Error: lightbox restart must be run as root' restart web
@@ -1600,6 +1961,31 @@ t_update_rewrites_the_conf() {
         grep -qx "$line" "$C/web/.conf" || { echo "the .conf has no $line"; return 1; }
     done
     [ ! -e "$C/gone" ] || { echo "rm -f left the container"; return 1; }
+}
+
+# create --userns gives out host ids, which root alone may do: an ordinary
+# user is refused before anything is made. A .conf with userns=1 and its
+# range is read, and inspect shows the range, as numbers in JSON. doctor says
+# how many ranges /etc/subuid and /etc/subgid give lightbox.
+t_userns_as_a_user_sees_it() {
+    [ "$(id -u)" -ne 0 ] || return 77
+    msg=$(lb create web 10.0.0.2 --userns 2>&1) && { echo "create --userns succeeded"; return 1; }
+    echo "$msg"
+    [ "$msg" = 'Error: lightbox create --userns must be run as root' ] && [ ! -e "$C/web" ] || return 1
+    lb create web 10.0.0.2 >/dev/null 2>&1 || return 1
+    printf 'userns=1\nuid_start=2147483647\ngid_start=2147549183\n' >> "$C/web/.conf"
+    report=$(lb inspect web) || { echo "inspect failed"; return 1; }
+    printf '%s\n' "$report" | grep -E '^(userns|uid_start|gid_start): '
+    [ "$(printf '%s\n' "$report" | grep -E '^(userns|uid_start|gid_start): ' | paste -sd'|')" = \
+      'userns: 1|uid_start: 2147483647|gid_start: 2147549183' ] || return 1
+    lb inspect web --json | python3 -c '
+import json, sys
+c = json.load(sys.stdin)[0]
+assert c["userns"] is True and c["uid_start"] == 2147483647 and c["gid_start"] == 2147549183, c
+' || return 1
+    said=$(lb doctor 2>&1 | grep '^userns_ranges: ')
+    echo "$said"
+    case $said in 'userns_ranges: '[0-9]*' ('*|'userns_ranges: unreadable ('*) ;; *) return 1 ;; esac
 }
 
 # base ls, add and rm, as an ordinary user can have them: a snapshot of a
@@ -1679,6 +2065,34 @@ two" ] || return 1
     # the log is never followed through a link
     ln -sf "$CONF" "$C/web/console.log"
     refused lb logs web
+}
+
+# logs --audit prints the lines of the audit log about one box (ROADMAP 8.9),
+# and those of a box that is gone; nothing where no exec ran. The log is one
+# for the host, and never read through a link.
+t_logs_audit() {
+    local out msg
+    lb create web || return 1
+    [ -z "$(lb logs web --audit)" ] && [ -z "$(lb logs --audit gone)" ] || { echo "lines where no exec ran"; return 1; }
+    printf '%s\n' '{"box":"web","event":"start"}' '{"box":"web2","event":"start"}' '{"box":"gone","event":"end"}' \
+        '{"box":"web","event":"end"}' > "$W/data/audit.log"
+    out=$(lb logs --audit web) || return 1
+    printf '%s\n' "$out"
+    [ "$out" = '{"box":"web","event":"start"}
+{"box":"web","event":"end"}' ] || { echo "not the lines of web"; return 1; }
+    [ "$(lb logs gone --audit)" = '{"box":"gone","event":"end"}' ] || { echo "not the lines of a box that is gone"; return 1; }
+    # a box that does not run has nothing to follow
+    out=$(HOME="$W/home" LIGHTBOX_CONFIG="$CONF" timeout 5 "$LB" logs --audit -f web | wc -l) && [ "$out" = 2 ] ||
+        { echo "logs --audit -f of a stopped box did not end by itself"; return 1; }
+    msg=$(lb logs --audit 2>&1) && return 1
+    [ "$msg" = 'Usage: lightbox logs <name> [-f] [--audit]' ] || { echo "without a name: $msg"; return 1; }
+    msg=$(lb logs web --audit extra 2>&1) && return 1
+    [ "$msg" = 'Error: unexpected argument: extra' ] || { echo "a word too many: $msg"; return 1; }
+    refused lb logs --audit 'a@b' 2>/dev/null || return 1
+    ln -sf "$CONF" "$W/data/audit.log"
+    msg=$(lb logs --audit web 2>&1) && return 1
+    echo "through a link: $msg"
+    case $msg in "Error: cannot read the audit log $W/data/audit.log (errno "*) ;; *) return 1 ;; esac
 }
 
 # logs -f goes on while the container runs and ends when it has ended, with
@@ -1826,6 +2240,8 @@ check 'commands fail for a container that does not exist'   t_missing_container_
 check 'add-vol appends a volume'                            t_addvol_appends
 check 'rm removes the container directory'                  t_rm_removes
 check 'stop and exec refuse a stopped container'            t_stopped_container_cannot_stop_or_exec
+check "exec's own failures are 125, and other commands' 1"  t_exec_failures_are_125
+check "run takes create's options and exec's, and refuses others first" t_run_options
 check 'an unknown command prints usage and fails'           t_unknown_command_prints_usage
 check 'ls writes nothing'                                   t_ls_writes_nothing
 check 'a PID record is a number and nothing else'           t_pid_record_is_a_number
@@ -1837,13 +2253,14 @@ check 'rm clears away a container that ended without a stop' t_rm_of_a_dead_cont
 check 'inspect writes nothing'                              t_inspect_writes_nothing
 check 'a process owned by another user is not gone'         t_other_users_process_is_not_gone
 check 'a dead container is shown as exited'                 t_dead_container_shown_as_exited
-check 'setup, start, stop and exec ask for root first'      t_root_is_asked_for_first
+check 'setup, start, stop, exec and reset ask for root first' t_root_is_asked_for_first
 check 'eight add-vol at once all take effect'               t_commands_take_turns
 check 'a command waits for a lock and says so; ls does not' t_lock_is_waited_for
 check 'start checks its options before it does anything'    t_start_options_are_checked
 check 'a timeout setting that cannot be read is a warning'  t_start_timeout_setting
 check 'stop checks its options before it does anything'     t_stop_options_are_checked
 check 'logs prints the log, and nothing where there is none' t_logs_prints_the_log
+check 'logs --audit prints the lines of one box, of one that is gone too, and never through a link' t_logs_audit
 check 'logs -f follows a running container and ends with it' t_logs_follows
 check 'a command with its standard streams closed is harmless' t_closed_streams_are_harmless
 check 'create writes name servers, hostname and hosts'      t_create_writes_names
@@ -1884,6 +2301,12 @@ check 'subnet and gw that are no network are refused'         t_network_settings
 check 'an address with a zero in front of a number is refused' t_address_with_leading_zeros_refused
 check 'two creates at once get two addresses'                 t_creates_at_once_get_two_addresses
 check '--swap takes what --mem does and 0, and is none unless given' t_swap_option
+check '--seccomp takes allow or deny, allow is the default, and it is stored and shown' t_seccomp_option
+check '--net takes nat, outside, none or proxy:<port>, outside is the default, and it is stored and shown' t_net_option
+check '--ttl takes a duration, which is stored as given and shown'  t_ttl_option
+check 'create draws an id for each box, which is stored and shown'  t_box_id
+check '--profile agent refuses what would undo it by its name, and its agent_* settings are checked' t_profile_option
+check '--workspace is a volume at /workspace and the workdir, and what is not a directory is refused' t_workspace_option
 check '--io-max is a line of io.max for a whole disk that is there' t_io_max_option
 check 'the firewall settings are Docker'"'"'s, and a wrong one keeps the built-in' t_firewall_settings
 check 'firewall_backend and bridge_accept_fwmark: Docker'"'"'s, and a wrong one is not taken' t_firewall_backend_settings
@@ -1905,8 +2328,10 @@ check 'rm takes several names, and names those it did not remove'      t_rm_hand
 check 'a surplus argument is an error that names it'                    t_surplus_arguments_are_errors
 check 'doctor says how to fix each thing it finds missing'              t_doctor_says_how_to_fix
 check 'doctor --json: settings and checks, typed'                       t_doctor_json
-check 'update, restart and rm -f check their options before anything'  t_update_restart_rm_options
+check 'doctor --profile agent: what the profile needs, and its fixes'   t_doctor_profile
+check 'update, restart, rm -f and reset check their options before anything'  t_update_restart_rm_options
 check 'update writes the limits into a stopped container'"'"'s .conf'       t_update_rewrites_the_conf
+check 'create --userns is root'"'"'s, and inspect and doctor show the ranges' t_userns_as_a_user_sees_it
 check 'base add, ls and rm manage the snapshots of bases'              t_base_snapshots
 check 'start without root is a clean error'                   t_start_without_root_is_a_clean_error
 

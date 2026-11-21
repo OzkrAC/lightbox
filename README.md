@@ -7,9 +7,9 @@ A minimal, secure Linux container runtime: one static binary of about 150 KB, wi
 - **Kernel:** Linux 5.10 or later, the floor lightc sets, with namespaces and cgroup v2 offering the `cpu`, `memory` and `pids` controllers, and `io` for `--io-max`. For the network: bridge and veth; with iptables, `iptables` with the conntrack, physdev and MASQUERADE matches and targets, and `br_netfilter` with `net.bridge.bridge-nf-call-iptables=1` for containers created with `--link`; with nftables, nf_tables with NAT, masquerading, conntrack and the bridge family (`CONFIG_NF_TABLES_BRIDGE`, `nft_meta_bridge`), and no `br_netfilter`
 - **Building:** GCC 13 or later, which CI builds with, make and ninja, which builds lightc
 - **Host tools:** `iptables` and `iptables-restore`, or with `firewall_backend = nftables` `nft`, and `cp` and `rm`. Since 0.7 lightbox runs neither `ip` nor `nsenter`
-- **Root:** `setup`, `start`, `stop`, `restart`, `update` and `exec` run as root. A container's root is the host's root, as lightbox has no user namespaces yet (see [Threat model](#threat-model))
+- **Root:** `setup`, `start`, `stop`, `restart`, `reset`, `update`, `exec` and `run` run as root, and so does `create --userns`. A container's root is the host's root, unless it was created with `--userns` (see [User namespaces](#user-namespaces) and [Threat model](#threat-model))
 
-`lightbox doctor` checks all of this on the host it runs on: root, the kernel and the system calls lightbox makes, cgroup v2 and its controllers, the tools, the base root filesystem, and with nftables that forwarding is on. Each check that fails is followed by what fixes it, and `doctor` then exits 1; `doctor --json` gives the same to scripts.
+`lightbox doctor` checks all of this on the host it runs on: root, the kernel and the system calls lightbox makes, cgroup v2 and its controllers, that the kernel loads the cgroup device program a container starts with (`CONFIG_CGROUP_BPF`), the tools, the base root filesystem, and with nftables that forwarding is on. Each check that fails is followed by what fixes it, and `doctor` then exits 1; `doctor --json` gives the same to scripts. `doctor --profile agent` checks what a box of the agent profile needs as well (see [Running an agent in a box](#running-an-agent-in-a-box)).
 
 ## Building
 
@@ -43,11 +43,11 @@ runs everything that needs no root:
 
 | Target | What it does |
 | --- | --- |
-| `make check-sys` | Compiles `tests/sys_check.c` and `tests/sys_check_net.c`, which compare every private syscall number, constant and structure in `lightbox_sys.h`, and every number in the seccomp table of `lightbox_seccomp.h`, with the kernel's headers, for x86_64 and aarch64 |
+| `make check-sys` | Compiles `tests/sys_check.c` and `tests/sys_check_net.c`, which compare every private syscall number, constant and structure in `lightbox_sys.h`, every number in the seccomp tables of `lightbox_seccomp.h`, and every constant and layout of the device program of `lightbox_devices.h`, with the kernel's headers, for x86_64 and aarch64 |
 | `make analyze` | Compiles every file with `-fanalyzer` and a strict warning set; any diagnostic is an error |
-| `make test-unit` | Runs lightbox's own helpers from the command line. The one that starts programs: exit statuses, signals, missing programs, quiet and captured output. The ones that mount, make directories and bring up loopback: in a user namespace of their own |
+| `make test-unit` | Runs lightbox's own helpers from the command line. The one that starts programs: exit statuses, signals, missing programs, quiet and captured output. The ones that mount, make directories and bring up loopback: in a user namespace of their own. The cgroup device program, interpreted: the verifier's rules and its verdict for every kind of device, access and a range of numbers |
 | `make test-validation` | Runs the built binary as an ordinary user against a temporary directory tree |
-| `make test-seccomp` | Installs lightbox's real seccomp profile and probes every syscall in its deny table; also interprets the x86_64 and the aarch64 filter program for every syscall number |
+| `make test-seccomp` | Installs each of lightbox's real seccomp profiles and probes every syscall in its deny table, every call that sets a file's mode with the setuid or setgid bit and without, and `socket` of families it takes and does not, and for the allow-list a call it does not name; runs git, Python, Node.js and a C compiler under each, where the host has them; and interprets the x86_64 and the aarch64 program of each profile for every syscall number, every bit of a mode and every family of a socket |
 
 In the test suites an open finding from `ROADMAP.md` is an expected failure that names its ledger id. When a fix makes one pass, the suite fails until the case is changed from `xfail` to `check`.
 
@@ -57,7 +57,7 @@ One more suite starts real containers, so it needs root:
 sudo make test-lifecycle
 ```
 
-It covers `setup`, `create`, `start`, `exec`, `stop` and `rm`, volumes, limits, the init hook, the sandbox and the network between containers. It needs a kernel with bridge, veth and cgroup v2, a statically linked busybox to build the containers' root filesystem from (`busybox-static` on Debian, Ubuntu and Void), and iproute2's `ip` and util-linux's `nsenter`, which the suite looks with; for lightbox's own commands it masks both. `LIGHTBOX_TEST_ROOTFS=/path` uses a copy of a root filesystem of yours instead.
+It covers `setup`, `create`, `start`, `exec`, `stop` and `rm`, volumes, limits, the init hook, the sandbox and the network between containers. It needs a kernel with bridge, veth and cgroup v2, a statically linked busybox to build the containers' root filesystem from (`busybox-static` on Debian, Ubuntu and Void), and iproute2's `ip` and util-linux's `nsenter`, which the suite looks with; for lightbox's own commands it masks both. `LIGHTBOX_TEST_ROOTFS=/path` uses a copy of a root filesystem of yours instead; `sudo tests/fetch_image.sh alpine <dir>`, or `debian <dir>`, fetches one of the two images the allow-list is fitted to, pinned by its SHA-256, and unpacks it there, as CI does. The busybox goes into every image at `/lbt/busybox` too, and the cases that look at the network from inside a container run its `nc`, `ip` and `hostname`, which images do not all have; everything else they run is the image's own. `LIGHTBOX_TEST_USERNS=overlay` makes every container of the suite with `--userns`, and `LIGHTBOX_TEST_USERNS=copy` with `--userns --copy`, but in the cases about overlays; the suite puts an `/etc/subuid` and an `/etc/subgid` of its own over the host's, in its mount namespace only. `LIGHTBOX_TEST_SECCOMP=deny` makes every container with `--seccomp deny`, but where a case chooses the profile, alone or with either of the two.
 
 The suite works in private network, mount and PID namespaces with a configuration of its own, so your bridge, firewall rules and containers are not touched. Its cgroups live under `/sys/fs/cgroup/lightbox-test-<pid>` and are removed at the end, and the run fails if the host's virtual interfaces, firewall rules or cgroups differ afterwards. A network card that the machine itself gains or loses during the run, as a cloud VM can, is reported and does not count. Kernel modules that get loaded on the way stay loaded.
 
@@ -65,7 +65,7 @@ sudo drops the environment, so options go on make's command line: `sudo make tes
 
 `sudo make bench` works in the same namespaces and measures the wall time of `create`, `start`, `exec`, `stop` and `rm`, the number of processes one start makes, and `create` from a base of 1 GB. CI runs it on every push and puts its numbers on the run's page: on GitHub's runners a start takes 9 to 13 ms at 0.7.0, where it took 535 to 542 before Phase 1 of the roadmap.
 
-`.github/workflows/ci.yml` runs `make check`, the lifecycle suite and the timing on every push to `main` and every pull request, on x86_64 and on aarch64. A run's page lists each suite's totals, the cases it skipped and why each expected failure fails, without opening a log.
+`.github/workflows/ci.yml` runs `make check`, the lifecycle suite in its three ways and the timing on every push to `main` and every pull request, on x86_64 and on aarch64. A run's page lists each suite's totals, the cases it skipped and why each expected failure fails, without opening a log.
 
 ## Quick start
 
@@ -145,6 +145,8 @@ It refuses while a container runs, and names it. Otherwise it removes lightbox's
 
 # See what the container's services have printed; -f keeps following
 ./lightbox logs mybox
+# and what exec and run asked of it
+./lightbox logs --audit mybox
 
 # List all containers, and look at one
 ./lightbox ls
@@ -214,7 +216,7 @@ If the image has an `/init.sh`, the container's init runs it once the container 
 What the hook gets:
 
 - It runs as `/bin/sh /init.sh`, as root, in `/`, with `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, `HOME=/root` and `TERM=xterm` and nothing else of the environment `start` was given. The container is complete by then: its mounts, its `/dev`, its address and default route, its cgroup and limits, and the container is on record, so `stop` and `ls` find it.
-- It has the container's sandbox: 12 capabilities, the seccomp filter and no_new_privs, the masked and read-only parts of `/proc`. A hook that mounts filesystems or configures the network needs `--privileged`. Its root is the host's root (see [Threat model](#threat-model)).
+- It has the container's sandbox: 11 capabilities, the seccomp filter and no_new_privs, the masked and read-only parts of `/proc`. A hook that mounts filesystems or configures the network needs `--privileged`. Its root is the host's root (see [Threat model](#threat-model)).
 - The hook and everything it starts read from `/dev/null` and write to the container's log, not to the terminal `start` was typed on. `lightbox logs <name>` shows the log, and `logs -f` follows it until the container stops.
 - A hook that exits with a status other than 0 fails the start: `start` says which status it was, and the container is stopped and cleaned up. A hook that fails after `start` has returned stops the container as well.
 - `start` waits 30 seconds for the hook. If the hook is still running then, for instance because it runs its service in the foreground, `start` says so and returns; the container stays up. `start <name> -t <seconds>` or `start_timeout` in `lightbox.conf` sets the wait, and 0 does not wait at all.
@@ -260,6 +262,14 @@ default_mem = 256M
 default_pids = 128
 default_cpu = 1
 default_oom = 500
+
+# What create --profile agent and run --profile agent give a box that no
+# option gives a limit or a lifetime: what --mem, --pids, --cpu and --ttl
+# take, and agent_ttl none for no lifetime
+agent_mem = 2G
+agent_pids = 512
+agent_cpu = 2
+agent_ttl = 8h
 
 # Seconds that start waits for a container's /init.sh; 0 does not wait
 start_timeout = 30
@@ -361,14 +371,24 @@ Commands:
                                 riops or wiops (default: none)
          --vol  <src:dst[:ro]>  Bind mount (repeatable)
          --rootfs <path>         Base rootfs to copy (default: $LIGHTBOX_ROOTFS or lightbox.conf)
-         --userns               Future improvement; not supported yet
-         --uid-start <n>        Future improvement; not supported yet
+         --userns               A user namespace of its own: its root is an unprivileged uid
+                                on the host, from the range of /etc/subuid; as root
          --read-only            Read-only root filesystem
          --copy                 A copy of the base, and not an overlay of its snapshot
          --privileged           Disable security sandbox
+         --seccomp allow|deny   The seccomp profile: the allow-list, or the deny-list
+                                (default: allow)
          --oom-score <n>        OOM score adjustment (default: 500)
+         --ttl <duration>       How long it may run from each start, such as 30m or 8h; then
+                                it stops as stop stops it, and is expired
          --link <name>          Allow network to another container
          --dns <address>        A name server for the container (up to 3; default: the host's)
+         --profile <name>       agent: a user namespace, the allow-list, an overlay, and the
+                                network of --net none unless --net outside or proxy:<port> is
+                                given, with the limits and lifetime of the agent_* settings. As
+                                root; it refuses --privileged, --link, --net nat, --seccomp deny
+                                and --copy
+         --workspace <dir>      The directory at /workspace, where every exec runs
   start  <name>... [-t <seconds>]  Start stopped containers, one after the other
          -t <seconds>            How long to wait for /init.sh (default: 30, 0: do not wait)
   stop   <name>... [-t <seconds>]  Stop running containers, one after the other
@@ -376,6 +396,8 @@ Commands:
   add-vol <name> <src:dst[:ro]> Add a volume to an existing container
   rm-vol <name> <dst>           Remove the volume at a destination
   restart <name>... [-t <seconds>]  Stop containers that run, as stop does, and start them
+  reset  <name>... [-t <seconds>]  Make the root filesystem of containers their base's again,
+                                without a copy; one that runs is stopped first. Volumes are kept
   update <name> [--mem <limit>] [--pids <limit>] [--cpu <num>]
                                 Change a container's limits, live if it runs and from its next
                                 start in any case
@@ -384,10 +406,21 @@ Commands:
          --user <name|uid[:gid]> Who to run it as (default: root)
          --env <KEY=VALUE>       Set a variable in its environment (repeatable)
          --workdir <dir>         The directory to run it in (default: /)
-  logs   <name> [-f]            Show what the container has printed; -f follows it
+         --timeout <duration>    End it, and all it started, after this long, such as 30s,
+                                 5m or 1.5h; exec then exits with 124
+         exec exits with the command's status, or 128 plus the signal that ended it; with
+         125 when lightbox failed, 126 when the command could not be run, 127 when not found
+  run    [create options] [exec options] [--] [cmd [args...]]
+                                Create a box, start it, run a command in it as exec runs it,
+                                and remove it; run exits as exec does. A box whose run was
+                                killed is removed by the next run
+  logs   <name> [-f] [--audit]  Show what the container has printed; -f follows it. --audit
+                                shows what exec and run asked of it, kept after it is removed
   inspect <name> [--json]       Show a container's configuration and state; --json as JSON
-  doctor [--json]               Check what lightbox needs of this host, and say how to fix what
-                                is missing; --json as JSON
+  doctor [--json] [--profile agent]
+                                Check what lightbox needs of this host, and say how to fix what
+                                is missing; --json as JSON. --profile agent checks what a box of
+                                that profile needs too
   ls [--json]                   List all containers
   base ls                       List the snapshots of bases that containers overlay
   base add <dir>                Take a new snapshot of a base, for the containers made after it
@@ -418,14 +451,18 @@ A container's name is 1 to 30 characters of `a-z`, `A-Z`, `0-9`, `_` and `-`.
 | `--cpu <num>` | `1` | CPUs, 0.01 to 512, with up to two decimals: `2`, `0.5`, `1.25` |
 | `--io-max "<major>:<minor> <key>=<value>..."` | none | I/O limit for one whole disk of the host, as `io.max` takes it: `"8:0 wbps=10485760 riops=1000"`, with `rbps`, `wbps`, `riops` and `wiops`, each a number or `max` |
 | `--vol <src>:<dst>[:ro]` | — | Bind mount (repeatable, up to 16, one at a destination) |
-| `--userns` | — | Future improvement; not supported yet |
-| `--uid-start <n>` | — | Future improvement; not supported yet |
+| `--userns` | off | A user namespace of its own: its root is an unprivileged uid on the host (see [User namespaces](#user-namespaces)); `create` runs as root |
 | `--read-only` | off | Read-only root filesystem |
 | `--copy` | off | A full copy of the base, as before 0.7, and not an overlay of its snapshot |
 | `--privileged` | off | Disable security sandbox |
+| `--seccomp allow\|deny` | `allow` | The seccomp profile: `allow` for the allow-list, which answers every syscall it does not name with ENOSYS, or `deny` for the deny-list (see [Security](#security)) |
 | `--oom-score <n>` | `500` | OOM score adjustment, -1000 to 1000 |
+| `--ttl <duration>` | none | How long the container may run from each start: a duration as `exec --timeout` takes one, from 1 ms to 365 days, such as `30m` or `8h`, counted on the clock of the time since boot, which goes on while the host is suspended. At the end init shuts the container down as `stop` does, with all it runs, the commands of `exec` among them, and writes why in its log; `ls` and `inspect` show it as `expired`, and the next `start`, `stop` or `rm` clears away what it left. Init keeps the time, in the container: no process there can send it a signal it does not handle, trace it or set its clock, but a kernel flaw past the sandbox could, so the lifetime is a guard against containers that are forgotten or run away, and not a security boundary |
+| `--net nat\|outside\|none\|proxy:<port>` | `outside` | What it may reach: `outside` the internet and its name servers only, `nat` the network every container had before 0.8, with the host and its networks, `none` loopback alone, with no address, or `proxy:<port>` that TCP port of the gateway and nothing else, where a proxy of the host's listens, with no name server and no `--link` (see [Security](#security) and [contrib/proxy](contrib/proxy/README.md)) |
 | `--link <name>` | — | Allow network to another container (repeatable) |
 | `--dns <address>` | the host's | A name server for the container (IPv4, up to 3) |
+| `--profile agent` | none | Everything Phase 8 built for a box that holds an AI agent's session, with one switch: `--userns`, the allow-list seccomp filter, an overlay root, and `--net none` unless `--net outside` or `--net proxy:<port>` is given; the limits and the lifetime that no option gives come from the `agent_mem`, `agent_pids`, `agent_cpu` and `agent_ttl` settings, 2G, 512, 2 CPUs and 8h unless `lightbox.conf` says otherwise. It refuses `--privileged`, `--link`, `--net nat`, `--seccomp deny` and `--copy`, and names the one it refused; what tightens a box further, such as `--read-only` or a smaller `--mem`, is taken. The box's `.conf` has each setting under its own key and `profile=agent` beside them, so a later change to what the profile means, or to the settings, does not change a box that is there. As root, for the user namespace |
+| `--workspace <dir>` | none | A directory of the host's at `/workspace`, as a volume that with `--userns` is its owner's, so that what the box writes there is the owner's on the host; and the directory every `exec` runs in that is given no `--workdir`. The `.conf` keeps it as the volume and `workdir=/workspace`. The directory has to be there, and its path has to be absolute and have no `:` |
 
 A value that is not what its option takes ends `create` with the option named, and nothing is made: no value is shortened or stored to be found wrong at the next start. An option that is given without its value says so.
 
@@ -441,7 +478,8 @@ Options come before the command. A command that begins with a dash goes after `-
 |------|---------|-------------|
 | `--user <name\|uid[:gid]>`, `-u` | root | Who the command runs as. A name is looked up in the container's `/etc/passwd`. A value that begins with a digit must be a uid, or a uid and a gid, and nothing else |
 | `--env <KEY=VALUE>`, `-e` | — | Set a variable in the command's environment (repeatable; the later of two for one variable wins) |
-| `--workdir <dir>`, `-w` | `/` | The directory the command runs in, as an absolute path in the container |
+| `--workdir <dir>`, `-w` | `/`, or `/workspace` in a box with a workspace | The directory the command runs in, as an absolute path in the container |
+| `--timeout <duration>` | none | How long the command may run: digits, up to three more after a point, and `s`, `m`, `h` or `d`, or no unit for seconds, from 1 ms to 365 days, such as `30s`, `5m` or `1.5h`. At the deadline the command and everything it started are ended, in the background and in sessions of their own too, and `exec` exits with 124. A command that ends before it takes along what it left running. Two processes keep the time, the `exec` process and its worker, which the container cannot reach: when the `exec` process ends while the command runs, killed for one, the worker ends everything at once, and when it is held up, stopped for one, the worker does so a second past the deadline. Only root on the host, killing both, can let a command outlive its limit |
 
 What the command gets as its standard streams depends on what `exec` itself was given, and is never a terminal of yours:
 
@@ -451,7 +489,95 @@ What the command gets as its standard streams depends on what `exec` itself was 
 
 In every case the command leads a session of its own and is given nothing else that was open where `exec` was run. SIGINT, SIGTERM, SIGHUP and SIGQUIT sent to `exec` are passed on to the command.
 
-The command is found as a shell finds it: a name without a slash is looked for in the directories of `PATH`. Its environment is `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, `HOME`, `USER` and `LOGNAME` for its user, and the `TERM` of the terminal `exec` was typed on; nothing else of your environment goes into the container. Its groups are the ones the container's `/etc/group` lists for its user, and none for a uid the container has no account for. `exec` exits with the command's status, with 127 when the command is not there and 126 when it cannot be run.
+The command is found as a shell finds it: a name without a slash is looked for in the directories of `PATH`. Its environment is `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, `HOME`, `USER` and `LOGNAME` for its user, and the `TERM` of the terminal `exec` was typed on; nothing else of your environment goes into the container. Its groups are the ones the container's `/etc/group` lists for its user, and none for a uid the container has no account for.
+
+`exec` exits with the command's status, or 128 plus the number of the signal that ended it. Its own statuses are those of `env` and `timeout`, so that a program that drives a container can tell what the command did from what lightbox did: 124 when `--timeout` ended the command, 125 when lightbox failed before the command ran, such as for an option it does not take or a container that is not running, 126 when the command could not be run, as a file that is not executable or a `--workdir` that is not there, and 127 when it is not there. A command can return those numbers too; every other command of lightbox's fails with 1.
+
+Every `exec` runs in a cgroup of its own, `exec-<pid>-<start time>` of the `exec` that made it, below the container's, whose limits hold for it. Nothing in the container can reach cgroupfs to leave it, so what a command starts is in it until it ends. Without `--timeout`, what a command left running in the background goes on in that cgroup after `exec` returns, and the cgroup is removed once it is empty, by the next `exec` or by `stop`. `--timeout` ends what is in it with `cgroup.kill`, or, on a kernel before 5.14, by killing what it lists until nothing is left.
+
+### run
+
+`lightbox run [create options] [exec options] [--] [cmd [args...]]` is a box for one command: it creates a container under a name of its own, `run-` and 12 hex digits, starts it, runs the command in it as `exec` runs it, and removes it, whatever the command did. Every option of `create` and of `exec` goes before the command, `--timeout` among them, which ends the command with 124 as it does for `exec`; without a command, `run` runs `/bin/sh`.
+
+```sh
+sudo ./lightbox run --net none --timeout 10m -- /bin/sh -c 'make test'
+# the same in a box of the agent profile, in this directory
+sudo ./lightbox run --profile agent --workspace "$PWD" --timeout 10m -- make test
+```
+
+What `run` prints is the command's: `create`, `start` and `rm` say nothing but their errors. It exits as `exec` does, with the command's status, 124, 126 or 127, and with 125 when the box could not be made or started. SIGINT, SIGTERM and SIGHUP sent to `run` go on to the command; one that comes while the box is made stops `run` there. The box is removed once the command has ended, or when it has not within `stop_timeout`, and the removal is in a session of its own, which a terminal's keys do not reach. A `run` killed outright cannot remove its box, which runs on: the box's `.runner` names that `run`, its PID and start time, and the next `run` removes every box whose `run` is gone, and says so. A box that must not outlive a killed `run` for long gets a `--ttl`, as `--timeout` keeps its command to its time in any case.
+
+### Audit log
+
+Every `exec`, and so the command of every `run`, appends two lines to `<lightbox_dir>/audit.log`: one as the command is about to start, and one when it has ended. Each is one JSON object, written with one `write` on a descriptor opened to append, so that the lines of commands that run at once do not mix. `lightbox logs --audit <name>` prints the lines of a box, and still does after the box is removed; with `-f` it follows them while the box runs.
+
+```json
+{"box":"web","box_id":"8c1f0e7a5d3b2a19","time":"2026-11-21T16:39:23.123Z","event":"start","exec_id":"4242-981234","via":"exec","uid":0,"loginuid":1000,"user":null,"workdir":"/srv","timeout":"10m","env":["CI"],"argv":["make","test"]}
+{"box":"web","box_id":"8c1f0e7a5d3b2a19","time":"2026-11-21T16:41:02.456Z","event":"end","exec_id":"4242-981234","status":0,"duration_ms":99333,"timed_out":false}
+```
+
+- `box_id` is the id that `create` draws for a box, kept in its `.conf` as `id=` and shown by `inspect`: it tells a box from a later one of the same name. A box created before 0.8 has none, and its lines have `null`.
+- `exec_id` is the PID and start time of the `exec`, as its cgroup is named, and pairs a start with its end. `via` is `exec` or `run`.
+- `uid` is the caller's, which is 0 under `sudo`, and `loginuid` that of the user who logged in, from `/proc/self/loginuid`, which `sudo` and `su` keep; `null` when no login set one.
+- `user`, `workdir` and `timeout` are as given, and `null` when not given: a command that runs in a box's workspace because it was given no `--workdir` has `null`. `env` has the keys of `--env` and not their values, which are often credentials. `argv` is the command as given, or `/bin/sh`.
+- `status` is what `exec` exits with, 124 to 127 among them, `duration_ms` how long it took from the moment `exec` began, and `timed_out` whether `--timeout` ended the command.
+- Every string is ASCII: a character outside it as `\uXXXX`, and a byte that is not part of UTF-8 as `\udcXX`, Python's `surrogateescape`, so `json.loads(line)["argv"][0].encode("utf-8", "surrogateescape")` gives back the bytes that were given. No control sequence or reordering mark in an argument reaches a terminal that shows the log.
+
+An `exec` whose start cannot be written in the log does not run, and exits with 125; one whose end cannot be written says so and exits as it would have. A start with no end is an `exec` whose process was killed.
+
+The log is mode 0600 in `lightbox_dir`, mode 0700, which no box has mounted: what runs in a box can neither read it nor change it. It records what was asked of a box, not what the command then did; what left a box through a proxy is in the proxy's log. The arguments are recorded as given, so the log is as sensitive as the commands are. Root on the host can change it, and it is not rotated yet.
+
+## Running an agent in a box
+
+An AI agent runs commands, and text it reads, a web page or a file in a repository, can steer which ones. A box for an agent's working session therefore treats every command as possibly hostile. `--profile agent` on `create` and `run` turns on what lightbox has against such a command with one switch (see [Create options](#create-options)), and `doctor --profile agent` checks that the host has what the profile needs.
+
+What it defends against, the likeliest first:
+
+- **Sending files or credentials out.** A box of the profile has `--net none` unless it is given `--net proxy:<port>` or `--net outside`: loopback and nothing else. With `--net proxy:<port>` it reaches one TCP port of the gateway and no name server, so what leaves it is what a proxy on the host lets through, to the names on the proxy's list, and a lookup cannot carry data out. Credentials stay outside the box, with a harness outside it or with a proxy that adds them to requests, and are never mounted in the box or given to it in its environment: a key the box can read is a key it can send wherever it can reach, or leave in its workspace.
+- **Damaging what it can write.** Its root is an overlay of its base, which `reset` makes the base's again without copying anything. On the host it writes in its workspace alone, as the workspace's owner and not as root.
+- **Running away with resources.** 2 GB of memory, 512 processes, 2 CPUs and a lifetime of 8 hours unless `agent_mem`, `agent_pids`, `agent_cpu` and `agent_ttl` in `lightbox.conf`, or an option, say otherwise; `exec --timeout` ends a command and everything it started.
+- **Reaching the host.** Its uid 0 is an unprivileged uid of the host's, the allow-list seccomp filter answers every system call it does not name with ENOSYS, and the device program keeps it to its own `/dev`. The profile refuses `--privileged`, `--link`, `--net nat`, `--seccomp deny` and `--copy`.
+- **Doing it unseen.** Every `exec` and `run` is in the [audit log](#audit-log), which no box can read.
+
+Where it stops:
+
+- **The kernel is the host's.** A box is a container, and a flaw in the kernel that a system call on the allow-list reaches is a way out of it, which no profile rules out. Code from third parties you do not trust, such as a repository you have not read, a package nobody has reviewed or an agent that browses the web, belongs in a virtual machine with lightbox inside it, so that a way out of a box ends in the machine. That is also how lightbox runs on macOS, in a Linux virtual machine, and on Windows, in WSL2.
+- **The workspace comes back untrusted.** What the box wrote in it runs when its owner runs it: git runs the hooks in `.git/hooks` and commands that `.git/config` names, `make` its Makefile, `npm` and `pip` the scripts of a package, an editor the tasks of a folder. Read what changed before anything on the host builds, opens or runs it, and give a box a workspace whose history it does not need without its `.git`.
+- **What a proxy lets through.** A name on the proxy's list is a way out for anything sent to it, and an API that the box may use with a key is one it may use for its own ends. Keep the list short, and the keys that reach the box's requests ones you can revoke.
+
+The harness, the program that talks to the model, can run in one of two places.
+
+**The harness outside the box** drives it through `exec`, with the model's credentials on the host. The box needs no network, which is the profile's default. The workspace is a directory of yours, not root's, which the box writes in as you:
+
+```sh
+sudo ./lightbox doctor --profile agent
+mkdir -p ~/agent-work
+sudo ./lightbox create agent --profile agent --workspace ~/agent-work
+sudo ./lightbox start agent
+sudo ./lightbox exec agent --timeout 10m -- /bin/sh -c 'id -u; pwd; echo done > result.txt'
+cat ~/agent-work/result.txt
+sudo ./lightbox logs --audit agent
+sudo ./lightbox reset agent
+sudo ./lightbox rm agent
+```
+
+Each command of the harness is an `exec`, which exits with the command's status, and with 124 to 127 for what lightbox did (see [Exec options](#exec-options)). `reset` throws away all the box did outside its workspace, between tasks. A box for one command is `run`, which leaves nothing:
+
+```sh
+sudo ./lightbox run --profile agent --workspace ~/agent-work --timeout 10m -- /bin/sh -c 'cat result.txt'
+```
+
+**The harness inside the box** runs as one long `exec`, and reaches the model through a proxy on the host with `--net proxy:<port>`. [contrib/proxy](contrib/proxy/README.md) has one for Squid, which listens on the gateway's port 3128 and lets through the names on its list; add the model's API and the package registries the agent needs. `exec` gives the harness the proxy in `HTTP_PROXY` and `HTTPS_PROXY`. A key that the harness needs is in the box once the harness has it; it stays out only where something outside adds it to the requests, such as a proxy that ends their TLS connection itself, which contrib/proxy's does not:
+
+```sh
+sudo ./lightbox create agent --profile agent --net proxy:3128 --workspace ~/agent-work
+sudo ./lightbox start agent
+sudo ./lightbox exec agent -- /bin/sh -c 'echo "$HTTPS_PROXY"'
+sudo ./lightbox stop agent
+sudo ./lightbox rm agent
+```
+
+The harness then runs as `sudo ./lightbox exec agent --timeout 8h -- <harness>`, and ends with the box at the latest, when its lifetime is over.
 
 ## Security
 
@@ -461,52 +587,57 @@ The sandbox covers everything in a container: init, the `/init.sh` hook and all 
 
 | Feature | Implementation |
 |---------|---------------|
-| Capability dropping | The bounding, effective and permitted sets are reduced to 12 capabilities: Docker's default 14 without `NET_RAW` and `MKNOD`. The inheritable and ambient sets are emptied |
-| Seccomp | BPF filter denying 56 syscalls on x86_64 (47 on aarch64), the x32 range, and `clone` with namespace flags |
+| Capability dropping | The bounding, effective and permitted sets are reduced to 11 capabilities: Docker's default 14 without `NET_RAW`, `MKNOD` and `SETFCAP`. The inheritable and ambient sets are emptied |
+| Seccomp | One of two BPF filters, chosen with `create --seccomp` and shown by `inspect`. Both deny 60 syscalls on x86_64 (51 on aarch64), the x32 range, `clone` with namespace flags, and a mode with the setuid or setgid bit in `chmod`, `fchmod`, `fchmodat`, `fchmodat2`, `mknod`, `mknodat`, `creat`, and `open` and `openat` that make a file; `openat2`, whose mode they cannot read, answers ENOSYS so that callers use `openat`. Both keep `socket` to `AF_UNIX`, `AF_INET`, `AF_INET6` and `AF_NETLINK`, and `socketpair` to `AF_UNIX`; another family answers EAFNOSUPPORT, as one the kernel lacks would: `AF_PACKET`, `AF_ALG`, `AF_VSOCK`, which no network namespace confines, and the families of old and rare protocols. The allow-list, the default, allows 247 other syscalls on both architectures and 34 more on x86_64 alone, Docker's list fitted to what agents run: a shell, git, Python, Node.js, a C compiler and a package manager. It answers every syscall it does not name with ENOSYS, as an older kernel would, so a program falls back: among them `mount`, `pivot_root`, `sethostname` and `syslog`, which need a capability a container does not have, `modify_ldt`, and every call newer than Linux 6.8 or than the list. The deny-list allows every other syscall; a container created before 0.8 has it |
 | no_new_privs | Prevents SUID escalation |
 | /proc and /sys masking | The paths Docker masks by default are covered, files with `/dev/null` and directories with an empty read-only tmpfs. A mask that cannot be made fails the start |
 | /proc read-only | Remounts /proc/sys, /proc/bus, /proc/fs, /proc/irq read-only |
 | Root filesystem | Mounted `nodev`, and `nosuid` unless privileged. Devices come from the `/dev` that lightbox builds |
-| Container isolation | A container without `--link` has an isolated port on the bridge: it reaches the host and the outside, and no other container. IPv6 is off inside containers. A container with `--link` shares the bridge, and is kept to its links by firewall rules that name the two ports of each link: with iptables it does not start unless `br_netfilter` lets iptables see bridged traffic, and with nftables a table of the bridge family sees it without. A link holds whichever of the two starts first, and a container's link rules go with it when it stops, is removed or is found dead |
+| Devices | A cgroup device program, attached to a container's cgroup before init is in it, lets its processes open the devices of its `/dev` and no other: `null`, `zero`, `full`, `tty`, its devpts' `ptmx` and terminals, and `random` and `urandom` for reading only. A node of any other device is refused with EPERM wherever it is, and no device can be made; a privileged container has no program. `start` fails when the kernel does not load it, and `doctor` says whether it does |
+| Network | `create --net` chooses what a container may reach, as rules in lightbox's chains or tables, and `inspect` shows it. `outside`, the default, reaches the internet and the name servers it was created with, on port 53, and is refused at once, TCP with a reset, which a client says as a refused connection, and the rest with an ICMP "administratively prohibited", which it says as no route to the host: the host on every address of its, which `nat` leaves to the host's own firewall; and beyond the host `0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10`, `127.0.0.0/8`, `169.254.0.0/16`, the metadata address of the clouds among it, `172.16.0.0/12`, `192.0.0.0/24`, `192.168.0.0/16`, `198.18.0.0/15` and multicast and above. `nat` reaches the host and the outside, as before 0.8, and so does a container created before. `none` has loopback and no interface, address or rule. `proxy:<port>` reaches that TCP port of the gateway and is refused everything else at once, name servers included; its `resolv.conf` names none, so names are its proxy's to look up, and `exec` and the init hook have `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY` in both spellings. lightbox ships no proxy: what a container may reach through one is the proxy's configuration, and [contrib/proxy](contrib/proxy/README.md) has one for Squid that allows a list of names and looks up no other. The bridge drops what it would switch to or from a container of `proxy`, so a `--link` to it reaches nothing. The rules hold a container by its address, which one that is not privileged cannot change; a privileged container can |
+| Container isolation | A container without `--link` has an isolated port on the bridge: it reaches the host and the outside, and no other container, as far as its `--net` lets it reach either. IPv6 is off inside containers. A container with `--link` shares the bridge, and is kept to its links by firewall rules that name the two ports of each link: with iptables it does not start unless `br_netfilter` lets iptables see bridged traffic, and with nftables a table of the bridge family sees it without. A link holds whichever of the two starts first, and a container's link rules go with it when it stops, is removed or is found dead |
 | The terminal of whoever runs `exec` | A command never holds it. Typed at a terminal, `exec` gives the command a pseudo-terminal of the container and carries the bytes; where only one of its streams is a terminal, a pipe stands in for it |
 | The binary `exec` enters with | `exec` executes itself again from a sealed copy in memory before it enters a container, so the processes it puts there are never the installed binary. Where the kernel refuses executable memfds (`vm.memfd_noexec=2`) it takes the binary through a read-only mount of its own instead. Its worker is not dumpable. `lightbox doctor` says which of the two is in use |
-| User namespaces | Not yet: a container's root is the host's root |
+| User namespaces | With `--userns`: a container's root is an unprivileged uid of the host's, from a range of `lightbox`'s in `/etc/subuid` and `/etc/subgid`, and its root filesystem and its volumes idmapped mounts, a volume to its source's owner and never to host root (see [User namespaces](#user-namespaces)). Without it, a container's root is the host's root |
 | OOM priority | Containers scored higher for OOM killer |
 
 ### Threat model
 
 lightbox keeps what runs in a container away from the host and from the other containers, as far as the kernel's namespaces, the sandbox and the firewall can:
 
-- **The host from a container's processes:** their own PID, mount, UTS, IPC and network namespaces; 12 capabilities and a seccomp filter of Docker's kind, with no_new_privs; the paths of `/proc` and `/sys` that Docker masks, masked, and the rest of `/proc`'s system trees read-only; a root filesystem that is `nodev` and `nosuid`; and limits on memory, swap, processes, CPU and, with `--io-max`, I/O.
+- **The host from a container's processes:** their own PID, mount, UTS, IPC and network namespaces, and with `--userns` a user namespace in which root is an unprivileged uid of the host's; 11 capabilities and a seccomp filter of Docker's kind, with no_new_privs; the paths of `/proc` and `/sys` that Docker masks, masked, and the rest of `/proc`'s system trees read-only; a root filesystem that is `nodev` and `nosuid`, and a device program that lets them open the devices of the container's `/dev` and no other; and limits on memory, swap, processes, CPU and, with `--io-max`, I/O.
+- **The host from what a container leaves in a volume:** nothing in a container that is not privileged gives a file the setuid or the setgid bit or a file capability, so no program it leaves in a volume, or in its own files, runs on the host with the rights of their owner, the volume's owner or root. Inside the container they would mean nothing, as its root is `nosuid` and no_new_privs is set. A package that installs such a program, such as `passwd`, `mount` or `sudo`, or that runs `setcap`, such as `iputils-ping`, fails to install in a container: update it in the base on the host, or give the container `--privileged`.
 - **Containers from each other:** each on an isolated port of the bridge, and with `--link` kept to its links by firewall rules that lightbox owns and takes away with the container.
+- **The host, its networks and the clouds' metadata from a container's traffic:** with `--net outside`, the default, a container reaches the internet and its name servers and nothing of the host's, of a private network or of the metadata services; with `--net proxy:<port>`, its proxy's port and nothing else; with `--net none`, nothing.
 - **The host's terminal and the installed binary from a container:** `exec` gives a command a terminal of the container's, not yours, and enters from a sealed copy of itself.
 
 What it does not keep out, and what to do about it:
 
-- **A container's root is the host's root.** There are no user namespaces yet. What keeps a container's root in is the namespaces and the sandbox; a flaw in the kernel past them would be a flaw on the host. Run as root in a container only what you would run as root on the host, and run the rest with `exec --user`.
-- **`--privileged` turns the sandbox off.** Such a container has all capabilities and no seccomp filter; give it only to what needs that, such as a hook that mounts filesystems.
-- **The host itself is in reach.** The firewall rules decide what the bridge forwards, not what a container sends to the host: services of the host that listen on the bridge's address, or on all addresses, answer containers. Keep them to the addresses they are for, or filter `INPUT` on the bridge in the host's firewall.
-- **Disk is not limited.** A container's copy of its image and its `console.log`, which is not rotated, take what the disk has.
+- **Without `--userns`, a container's root is the host's root.** What keeps it in is the namespaces and the sandbox; a flaw in the kernel past them would be a flaw on the host. Create a container with `--userns` (see [User namespaces](#user-namespaces)), or run as root in it only what you would run as root on the host, and the rest with `exec --user`.
+- **`--privileged` turns the sandbox off.** Such a container has all capabilities, no seccomp filter and no device program; give it only to what needs that, such as a hook that mounts filesystems.
+- **With `--net nat` the host itself is in reach,** as it was for every container before 0.8: services of the host that listen on the bridge's address, or on all addresses, answer such a container, and so do the host's networks. Give it `--net outside`, the default, unless it needs them, or keep the services to the addresses they are for.
+- **Disk is not limited.** A container's copy of its image and its `console.log`, which is not rotated, take what the disk has, and so does the audit log.
 - **Whoever runs lightbox is root.** lightbox does not decide who may use it: giving someone `sudo lightbox` is giving them root.
 - **Images are trusted as files.** `create` copies an image as it is; what it contains runs in the sandbox, with the container's root.
 
 ## How it works
 
-- **Namespaces**: `clone()` with PID, mount, UTS, IPC and network namespace flags
+- **Namespaces**: `clone()` with PID, mount, UTS, IPC and network namespace flags, and with `--userns` a user namespace, whose maps `start` writes before init does anything. `start` makes the idmapped root in a mount namespace of its own, which init's is copied from, and init binds it onto itself, mounts `/proc` and `/sys` while the host's are still there, and becomes the container's root before it builds the rest
 - **Filesystem**: each container lives under `<container_dir>/<name>/` with `rootfs/` for its own files, `.conf` and `.ip` for what it is configured with and `console.log` for its output. Init mounts an overlay of the base's snapshot and `rootfs/` in the container's mount namespace, or takes `rootfs/` as it is for a copy, and `pivot_root`s into it (see [Storage](#storage))
 - **Runtime records**: what is known about a container while it runs is in `<run_dir>/<name>/`: `pid` and `pid_start` for its init, `state`, and `exit`, where init writes its exit status as the last thing it does. These are written without waiting for a disk, and a reboot takes them away with everything else in `/run`; a container without them is stopped. `start` makes the directory again when it is missing, for root alone
-- **States**: `ls` and `inspect` show `stopped`, `running`, `starting` and `stopping` while a command is at work, `exited` for a container that ended by itself, `failed` for one that was killed or whose start or hook failed, and `creating` for one that `create` did not finish. A half-made container is not started: remove it and create it again
-- **A container that ended without a stop**: when init is killed, or is told to stop by a signal from somewhere other than `lightbox stop`, from inside the container too, nobody is there to clear up. `ls` shows such a container as `exited` and changes nothing. The next `start`, `stop` or `rm` clears away what it left, its cgroup, its interface and the firewall rules of its links, says that it did, and records `exited` if init had ended with status 0 and `failed` otherwise
+- **States**: `ls` and `inspect` show `stopped`, `running`, `starting` and `stopping` while a command is at work, `exited` for a container that ended by itself, `expired` for one whose `--ttl` ran out, `failed` for one that was killed or whose start or hook failed, and `creating` for one that `create` did not finish. A half-made container is not started: remove it and create it again
+- **A container that ended without a stop**: when init is killed, or is told to stop by a signal from somewhere other than `lightbox stop`, from inside the container too, nobody is there to clear up. `ls` shows such a container as `exited` and changes nothing. The next `start`, `stop` or `rm` clears away what it left, its cgroup, its interface and the firewall rules of its links, says that it did, and records `exited` if init had ended with status 0, `expired` if its `--ttl` ended it, and `failed` otherwise
 - **A container's configuration**: `.conf` is lines of `key=value` that begin with `version=1`. One piece of code reads it and one writes it; a command reads it once, and `start` hands it to init. A file with the version line is read strictly: an unknown key, a key given twice or a value that is not one is an error that names the file and the line, and a file written by a newer lightbox is refused, not guessed at. A file from before the version line is still read as it was, and is written in the new form at the next `add-vol` or `rm-vol`. `rm` does not need the file, so a container whose configuration is damaged can always be removed
 - **Devices**: bind-mounted from host (`/dev/null`, `/dev/zero`, `/dev/random`, etc.)
 - **Networking**: veth pair per container connected to a host bridge with NAT. The container's end is `eth0`, made in the container's namespace. lightbox makes the bridge, the pair and the port, and takes them away, with rtnetlink requests of its own, and init gives `eth0` its address and the default route from inside the container: nothing enters the container's namespace from the host, and no tool is run for any of it. The host's end is `vb-` and twelve hex digits of a hash of the container's name, the same for a name every time, with the alias `lightbox:<name>`; `inspect` shows it as `host_interface`. lightbox removes only interfaces that carry its alias, and `start` refuses a container whose name on the host is taken by an interface it did not make, which it leaves alone. The alias is given as the interface joins the bridge, a moment after it is made: one that a `start` killed in that moment left has none, is left alone the same way, and goes with `ip link delete <interface>`. `create` writes the container's `/etc/resolv.conf`, `/etc/hostname` and a line for its own name in `/etc/hosts` among the container's own files, through its overlay or into its copy, where a link in the image cannot send them anywhere else
 - **Resource limits**: cgroups v2 (memory, PIDs, CPU, I/O)
 - **Init**: lightbox remains PID 1 inside the container. It reaps children and handles shutdown from the moment the container is built, and runs `/init.sh`, if the rootfs has one, as one of its children: after `/tmp` and `/run` are mounted, with the sandbox on, and only once the container is on record, so `stop` and `ls` always find a container whose hook runs
-- **Stopping**: `stop` sends init a SIGTERM that carries the number of seconds the container may take. Init passes SIGTERM on to every process in the container, the ones `exec` put there included, reaps them, and exits when none is left or the time is over; the kernel kills whatever remains with it. `stop` waits for init through a pidfd, so it returns as soon as the container has ended. It then kills anything still in the cgroup, waits until the kernel reports the cgroup empty, and removes it. A SIGTERM sent to init by other means has the same effect, with the `stop_timeout` that was set when the container started
+- **Stopping**: `stop` sends init a SIGTERM that carries the number of seconds the container may take. Init passes SIGTERM on to every process in the container, the ones `exec` put there included, reaps them, and exits when none is left or the time is over; the kernel kills whatever remains with it. `stop` waits for init through a pidfd, so it returns as soon as the container has ended. It then kills anything still in the cgroup and in the cgroups of its execs below it, waits until the kernel reports the cgroup empty, and removes those and then it. A SIGTERM sent to init by other means has the same effect, with the `stop_timeout` that was set when the container started
 - **Output**: init leads a session of its own and keeps nothing that was open in the command that started it. Its standard output and error, and those of the hook and every service, are appended to `<container_dir>/<name>/console.log`, which only root can read. The log is kept from one start to the next and is not rotated or limited yet, so a container that prints without end fills the disk it is on
+- **Audit**: `exec` and `run` append what they ask of a box to `<lightbox_dir>/audit.log`, one for the host, which only root can read and no box has mounted, so that a box's record outlives the box (see [Audit log](#audit-log))
 - **Starting**: `start` and init talk over two pipes. Init builds the container when `start` has set up its cgroup and network, and reports back when it is built and again when the hook has ended. If either side goes away the other notices: an init whose `start` was killed exits before it runs anything
 - **External tools**: on the host, `iptables` and `iptables-restore`, or `nft`, make the firewall (a start with links runs one of them once, and every start looks at the firewall with one), and `cp` and `rm` take a snapshot or a copy of a base and remove a container. Everything else lightbox does with system calls of its own, rtnetlink for the network among them, and nothing from the image is run before `/init.sh`
-- **One command at a time**: `start`, `stop`, `restart`, `update`, `rm`, `add-vol` and `rm-vol` take a lock on the container they change, and `create` and `setup` one on the whole store, so two commands on one container do their work one after the other. A command that has to wait says so. `ls` and `inspect` never wait. `setup`, `start`, `stop`, `restart`, `update` and `exec` need root and say so before they touch anything
+- **One command at a time**: `start`, `stop`, `restart`, `reset`, `update`, `rm`, `add-vol` and `rm-vol` take a lock on the container they change, and `create` and `setup` one on the whole store, so two commands on one container do their work one after the other. A command that has to wait says so. `ls` and `inspect` never wait. `setup`, `start`, `stop`, `restart`, `reset`, `update`, `exec` and `run` need root and say so before they touch anything
 - **Configuration**: optional `/etc/lightbox/lightbox.conf`, or the file `--config` or `LIGHTBOX_CONFIG` names, for all paths and defaults
 
 ## Storage
@@ -517,7 +648,25 @@ A container's root is an overlay: a snapshot of its base, which containers of th
 - `<container_dir>/<name>/rootfs/` holds the container's own files: what `create` wrote in `/etc`, and what the container writes. What it takes out of the base is marked there, the way overlayfs marks it. The overlay is mounted in the container's mount namespace only; on the host, `rootfs/` shows the container's own files and nothing of the base.
 - A file of the base that you change from the host has to be in `rootfs/` first: appending to `rootfs/etc/passwd` while the container has the base's makes a file of only what you appended. Change it inside the container, with `exec`, or copy it into `rootfs/` and change the copy.
 - `lightbox base ls` lists the snapshots, with their base and the containers on them. `lightbox base add <dir>` takes a new snapshot of a base, for the containers made after it, as after an update of the base; the containers made before keep theirs. `lightbox base rm <id>` removes a snapshot that no container uses.
+- `lightbox reset <name>` makes a container's root filesystem its base's again, as it was after `create`: what the container wrote, changed and took out is gone, and nothing is copied. Its `rootfs/` and the overlay's work directory are replaced by empty ones, and the files that `create` wrote in `/etc` are written again, the same ones, as `create` keeps what it wrote in `resolv.conf` in `.resolv` beside `.conf`. A container made before that gets the `resolv.conf` that `create` would write now, and is told so. A container that runs is stopped first, as `stop` stops it, and `-t` is `stop`'s. Its volumes, configuration, address and `console.log` are not touched. A container that is a copy of its base is refused. A reset cut short leaves the container half made, as `create` marks it: `start` refuses it, and `reset` again makes it whole.
 - `--copy` makes the container a full copy of its base in `rootfs/`, as every container was before 0.7. So does every `create` where an overlay cannot be mounted, without overlayfs in the kernel or without the right to mount, and it says so; `doctor` says whether the kernel has overlayfs. Containers made before 0.7 are copies, and stay as they are.
+
+## User namespaces
+
+A container created with `--userns` has a user namespace of its own, and its root is not the host's: uid 0 in it is an unprivileged uid on the host, and so are its other users. Its ids are a range of 65536 uids and 65536 gids that nothing else on the host has, taken, as rootful Podman's `--userns=auto` takes its own from the name `containers`, from the ranges that `/etc/subuid` and `/etc/subgid` give the name `lightbox`. Add one to both before the first such container, as large as you like:
+
+```bash
+echo lightbox:2147483647:2147483648 >> /etc/subuid
+echo lightbox:2147483647:2147483648 >> /etc/subgid
+```
+
+- `create --userns` runs as root, and gives the container the first range of 65536 of each file that no container has. Its `.conf` records it as `userns=1`, `uid_start` and `gid_start`, the host's uid and gid of its root, and `inspect` shows them. `doctor` says how many ranges the two files hold. Without a range for `lightbox`, `create --userns` says what to add, and makes nothing.
+- The container's root is an idmapped mount of its base, so that the base's files, owned by host root, are its root's and keep their other ids, and nothing is chowned. That needs Linux 5.12 and a filesystem with idmapped mounts, such as ext4, xfs, btrfs or tmpfs from 6.3 on; an overlay on an idmapped snapshot needs Linux 5.19. Where the kernel or the filesystem cannot, `create --userns` says so and makes nothing: there is no fallback that chowns.
+- An overlay container's own files, `rootfs/`, belong on the host to its range: what its root makes there is the first uid of the range's, and the snapshot stays host root's. A `--copy` container's files keep the base's ids on disk, root's included, as the copy is idmapped as it is; its directory is root's alone, as every container's is.
+- `exec` joins the user namespace first, and its command runs as the container's user, which is a uid of the range on the host.
+- A volume is an idmapped mount of its source, for the source's owner: the container's root stands for the owner and group of the source on the host, and no other id is mapped. A file the container's root makes in it belongs on the host to that owner and group, and theirs are root's in the container. Files of other ids show as owned by nobody, the container's other users make nothing in it, and its root cannot give a file another id, nor the setuid or setgid bit (see [Security](#security)).
+- A volume whose source is host root's, by its uid or by its gid, is bound as it is: no container stands for root. Its files show as nobody's, and the container writes in it only where anyone on the host may.
+- `start` takes the volumes itself, as host root, and init attaches them. An idmapped volume needs a filesystem with idmapped mounts, as the root does: where the source's has none, `start` says so and the container does not start.
 
 ## Volume Notes
 

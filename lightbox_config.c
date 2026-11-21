@@ -38,11 +38,18 @@ void cfg_global_init(void) {
         { cfg_global.default_mem,   sizeof(cfg_global.default_mem),  "256M" },
         { cfg_global.default_pids,  sizeof(cfg_global.default_pids), "128" },
         { cfg_global.default_cpu,   sizeof(cfg_global.default_cpu),  "1" },
+        /* what a box of --profile agent needs to build and test with: a
+         * compiler, Node or Python and git, for a working day at most */
+        { cfg_global.agent_mem,     sizeof(cfg_global.agent_mem),    "2G" },
+        { cfg_global.agent_pids,    sizeof(cfg_global.agent_pids),   "512" },
+        { cfg_global.agent_cpu,     sizeof(cfg_global.agent_cpu),    "2" },
+        { cfg_global.agent_ttl,     sizeof(cfg_global.agent_ttl),    "8h" },
     };
     for (size_t i = 0; i < sizeof(built_in) / sizeof(built_in[0]); i++)
         str_copy_or_die(built_in[i].setting, built_in[i].value, built_in[i].max, "a built-in setting");
     cfg_global.default_oom = 500;
     cfg_global.default_oom_ok = true;
+    cfg_global.agent_ttl_ok = true;
     cfg_global.start_timeout = START_TIMEOUT_DEFAULT;
     cfg_global.stop_timeout = STOP_TIMEOUT_DEFAULT;
     cfg_global.dns[0] = '\0';
@@ -102,7 +109,7 @@ static void cfg_set_text(const char *key, const char *val, char *setting, size_t
     print_str(STDERR, " in lightbox.conf is too long: ");
     print_str(STDERR, val);
     print_str(STDERR, "\n");
-    lc_kernel_exit(1);
+    lc_kernel_exit(failure_status);
 }
 
 /*
@@ -160,6 +167,22 @@ static bool cfg_set(const char *key, const char *val, bool derived[3]) {
         cfg_set_default(key, val, cfg_global.default_cpu, sizeof(cfg_global.default_cpu),
                         parse_cpu_limit(val, &number),
                         "a number of CPUs from 0.01 to " STRINGIFY(CPU_LIMIT_MAX));
+    } else if (streq(key, "agent_mem")) {
+        cfg_set_default(key, val, cfg_global.agent_mem, sizeof(cfg_global.agent_mem),
+                        mem_limit_ok(val), "<number>[K|M|G|T] or max");
+    } else if (streq(key, "agent_pids")) {
+        cfg_set_default(key, val, cfg_global.agent_pids, sizeof(cfg_global.agent_pids),
+                        pids_limit_ok(val), "a number from 1 to " STRINGIFY(PIDS_LIMIT_MAX) " or max");
+    } else if (streq(key, "agent_cpu")) {
+        cfg_set_default(key, val, cfg_global.agent_cpu, sizeof(cfg_global.agent_cpu),
+                        parse_cpu_limit(val, &number),
+                        "a number of CPUs from 0.01 to " STRINGIFY(CPU_LIMIT_MAX));
+    } else if (streq(key, "agent_ttl")) {
+        int64_t ms;
+        cfg_set_default(key, val, cfg_global.agent_ttl, sizeof(cfg_global.agent_ttl),
+                        streq(val, "none") || parse_duration_ms(val, &ms),
+                        "a duration from 1 ms to 365 days, such as 8h, or none");
+        cfg_global.agent_ttl_ok = cfg_global.agent_ttl[0] != '\0';
     } else if (streq(key, "default_oom")) {
         char unused[2];
         cfg_global.default_oom_ok = parse_oom_score(val, &cfg_global.default_oom);
@@ -231,7 +254,7 @@ static void require_short_directories(void) {
                           " characters a directory setting may have: ");
         print_str(STDERR, dirs[i].value);
         print_str(STDERR, "\n");
-        lc_kernel_exit(1);
+        lc_kernel_exit(failure_status);
     }
 }
 
