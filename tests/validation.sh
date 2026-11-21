@@ -1853,6 +1853,50 @@ sys.exit(0 if d["overall"] == "ok" else 1)
     [ "$said" = 'Error: unknown option: --bogus' ]
 }
 
+# doctor --profile agent (ROADMAP 8.11): after the checks of every container,
+# five of what a box of the profile needs, in text and in --json, each one
+# that fails followed by its fix. An ordinary user cannot make an idmapped
+# mount, and is told that whether one works is not known. Without the option
+# there are none of them, and a value that is not agent, or none, is refused.
+t_doctor_profile() {
+    [ "$(id -u)" -ne 0 ] || { echo "run as root: what an ordinary user is told is not shown"; return 77; }
+    command -v python3 >/dev/null 2>&1 || { echo "no python3 to decode JSON with"; return 77; }
+    local report names json rc said
+    report=$(lb doctor --profile agent 2>&1) && { printf '%s\n' "$report"; echo "doctor exited 0 for an ordinary user"; return 1; }
+    printf '%s\n' "$report" | sed -n '/^agent\./,$p'
+    names=$(printf '%s\n' "$report" | sed -n 's/^\(agent\.[a-z_]*\): .*/\1/p' | paste -sd' ')
+    [ "$names" = 'agent.kernel agent.userns_ranges agent.idmap agent.nft agent.cgroup_kill' ] ||
+        { echo "the profile's checks: $names"; return 1; }
+    printf '%s\n' "$report" | grep -Eqx 'agent\.kernel: (yes|no) \(.+; the profile needs Linux 5\.19 or later, for an overlay on an idmapped layer\)' ||
+        { echo "agent.kernel does not say what it needs"; return 1; }
+    [ "$(printf '%s\n' "$report" | grep -A1 '^agent\.idmap: ' | paste -sd'|')" = \
+      'agent.idmap: no (not known: only root may make an idmapped mount)|  to fix: sudo lightbox doctor --profile agent' ] ||
+        { echo "agent.idmap does not say that only root can tell"; return 1; }
+    printf '%s\n' "$report" | grep -Eqx 'agent\.nft: (ok|missing) \(/.+/nft\)' || { echo "agent.nft does not name nft"; return 1; }
+    printf '%s\n' "$report" | awk '/^agent\./ { on = 1 }
+        on && want { if ($0 !~ /^  to fix: ./) { print "no fix after " name; bad = 1 } want = 0; next }
+        on && /^agent\.[a-z_]+: (no|missing)( |$)/ { want = 1; name = $1 }
+        END { if (want) { print "no fix after " name; bad = 1 } exit bad }' || return 1
+    ! lb doctor 2>&1 | grep -q '^agent\.' || { echo "doctor without --profile has the profile's checks"; return 1; }
+    json=$(lb doctor --json --profile agent)
+    rc=$?
+    printf '%s' "$json" | python3 -I -c '
+import json, sys
+d = json.load(sys.stdin)
+names = [c["check"] for c in d["checks"] if c["check"].startswith("agent.")]
+assert names == ["agent.kernel", "agent.userns_ranges", "agent.idmap", "agent.nft", "agent.cgroup_kill"], names
+for c in d["checks"]:
+    assert isinstance(c["ok"], bool) and (c["fix"] is None) == c["ok"], c
+    assert c["text"].startswith(("yes", "no", "ok", "missing", "unusable")) or c["check"] == "network", c
+assert d["overall"] == "degraded", d["overall"]
+' || return 1
+    [ "$rc" = 1 ] || { echo "doctor --json --profile agent exited $rc"; return 1; }
+    said=$(lb doctor --profile 2>&1) && return 1
+    [ "$said" = 'Error: option --profile requires a value' ] || { echo "--profile alone: $said"; return 1; }
+    said=$(lb doctor --profile other 2>&1) && return 1
+    [ "$said" = 'Error: --profile takes agent, not: other' ] || { echo "--profile other: $said"; return 1; }
+}
+
 # update takes --mem, --pids and --cpu, held to what create holds them to,
 # and refuses anything else before it looks at the container; restart takes
 # -t, and rm -f; each needs root as the command it is made of does.
@@ -2284,6 +2328,7 @@ check 'rm takes several names, and names those it did not remove'      t_rm_hand
 check 'a surplus argument is an error that names it'                    t_surplus_arguments_are_errors
 check 'doctor says how to fix each thing it finds missing'              t_doctor_says_how_to_fix
 check 'doctor --json: settings and checks, typed'                       t_doctor_json
+check 'doctor --profile agent: what the profile needs, and its fixes'   t_doctor_profile
 check 'update, restart, rm -f and reset check their options before anything'  t_update_restart_rm_options
 check 'update writes the limits into a stopped container'"'"'s .conf'       t_update_rewrites_the_conf
 check 'create --userns is root'"'"'s, and inspect and doctor show the ranges' t_userns_as_a_user_sees_it

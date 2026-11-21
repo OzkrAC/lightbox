@@ -830,6 +830,246 @@ t_agent_run() {
     [ "$rc" = 143 ] && ! running_cmd 'sleep 1118' && run_left "$name"
 }
 
+# ─── The agent group (ROADMAP 8.11) ─────────────────────────────────────────
+#
+# Phase 8's exit conditions for boxes of --profile agent, with t_agent_profile
+# and t_agent_run above: what doctor --profile agent says, the proxy, exec
+# --timeout and lightbox's own statuses, reset, --ttl and the audit log; and
+# the commands of README's "Running an agent in a box", in a copy of the
+# suite's own. The boxes are made with lb create and not box, whose
+# mode_options would give them --seccomp deny or --copy, which the profile
+# refuses.
+
+# A box of the profile, created with lb create: what create said on failure.
+agent_box() { # name [address] [create options]
+    local name=$1
+    shift
+    lb create "$name" "$@" --profile agent >"$OUT/$name.create" 2>&1 </dev/null || { cat "$OUT/$name.create"; return 1; }
+    port_of "$name" >/dev/null
+}
+
+# doctor --profile agent finds nothing missing on a host set up for the
+# profile; with nft masked it exits 1, and says that agent.nft is missing and
+# what fixes it.
+t_agent_doctor() {
+    need_subids || return 77
+    local said rc nft check
+    said=$(lb doctor --profile agent 2>&1)
+    rc=$?
+    printf '%s\n' "$said" | grep -A1 '^agent\.'
+    [ "$rc" = 0 ] || { echo "doctor --profile agent exited $rc on a host set up for the profile"; return 1; }
+    for check in kernel userns_ranges idmap nft cgroup_kill; do
+        printf '%s\n' "$said" | grep -Eq "^agent\.$check: (yes|ok) " || { echo "agent.$check does not pass"; return 1; }
+    done
+    nft=$(printf '%s\n' "$said" | sed -n 's/^agent\.nft: ok (\(.*\))$/\1/p')
+    nft=$(readlink -f "$nft") && [ -n "$nft" ] || { echo "the path of nft is not said"; return 1; }
+    mount --bind /dev/null "$nft" || return 1
+    said=$(lb doctor --profile agent 2>&1)
+    rc=$?
+    umount "$nft" || return 1
+    printf '%s\n' "$said" | grep -A1 '^agent\.nft: '
+    [ "$rc" = 1 ] || { echo "doctor --profile agent exited $rc with nft masked"; return 1; }
+    printf '%s\n' "$said" | grep -A1 '^agent\.nft: missing (' | tail -n 1 | grep -q '^  to fix: install nftables' ||
+        { echo "agent.nft is not said to be missing, with its fix"; return 1; }
+    lb doctor --profile agent >/dev/null || { echo "doctor --profile agent fails with nft back"; return 1; }
+}
+
+# With --net proxy:<port>, a box of the profile reaches that port of the
+# gateway and nothing else: another port of the gateway, the proxy's port on
+# the host's other address, the outside and a name server on TCP, each with
+# a listener, are refused within a second; its resolv.conf names no name
+# server. A listener on the gateway stands in for the proxy.
+t_agent_proxy() {
+    need_subids || return 77
+    need_nc || return 77
+    need_listeners || return 77
+    private_addresses || return 1
+    local proxy tcp53 try said rc=0
+    agent_box aprx "$(next_ip)" --net "proxy:$PROXY_PORT" || return 1
+    [ "$(conf_value aprx net)" = "proxy:$PROXY_PORT" ] && [ -s "$C/aprx/.ip" ] || { cat "$C/aprx/.conf"; return 1; }
+    proxy=$(tcp_listener 0.0.0.0 "$PROXY_PORT" 'the proxy here') &&
+        tcp53=$(tcp_listener 0.0.0.0 53 'a name server on TCP' "$(cat "$T/outside")") || return 1
+    start aprx || rc=1
+    if [ "$rc" = 0 ]; then
+        for try in 1 2 3 4 5; do
+            answers aprx "$GW" "$PROXY_PORT" 'the proxy here' && break
+            [ "$try" = 5 ] && { echo "the box did not reach its proxy"; rc=1; }
+            sleep 0.3
+        done
+    fi
+    if [ "$rc" = 0 ]; then
+        rejected aprx "$GW" && rejected aprx 192.0.2.2 "$PROXY_PORT" && rejected aprx "$OUTSIDE" &&
+            rejected aprx "$PRIVATE_DNS" 53 || { echo "it was not refused within a second"; rc=1; }
+        said=$(sh_in aprx 'cat /etc/resolv.conf')
+        echo "its resolv.conf: $said"
+        printf '%s\n' "$said" | grep -q nameserver && { echo "it names a name server"; rc=1; }
+    fi
+    kill "$proxy" "$tcp53" 2>/dev/null
+    port_free() { ! ss -ltn | grep -q ":$PROXY_PORT "; }
+    wait_until 5 port_free || { echo "the listener on port $PROXY_PORT is still there"; rc=1; }
+    [ "$rc" = 0 ] && lb stop aprx >/dev/null && nothing_left aprx && lb rm aprx >/dev/null
+}
+
+# In a box of the profile, exec --timeout ends the command and all it
+# started, a process in a session of its own among them, and returns 124; a
+# command's own status is its own, one that is not there is 127, and an exec
+# into a box that does not run is 125, lightbox's own.
+t_agent_timeout() {
+    need_subids || return 77
+    local began ms rc
+    agent_box atime && start atime || return 1
+    began=$(date +%s%N)
+    lb exec atime --timeout 2s /bin/sh -c "$KIT setsid sleep 1123 & sleep 1124" >/dev/null 2>"$OUT/atime.err" </dev/null
+    rc=$?
+    ms=$(( ($(date +%s%N) - began) / 1000000 ))
+    cat "$OUT/atime.err"
+    echo "--timeout 2s: status $rc in $ms ms"
+    [ "$rc" = 124 ] && [ "$ms" -lt 3000 ] || return 1
+    none_running 'sleep 1123' 'sleep 1124' || { echo "a sleep is left"; return 1; }
+    [ -z "$(exec_cgroups atime)" ] || { echo "left: $(exec_cgroups atime)"; return 1; }
+    lb exec atime /bin/sh -c 'exit 3' </dev/null
+    rc=$?
+    lb exec atime /not-there </dev/null 2>/dev/null
+    rc="$rc $?"
+    lb stop atime >/dev/null || return 1
+    lb exec atime /bin/true </dev/null 2>"$OUT/atime.err"
+    rc="$rc $?"
+    echo "exit 3, a command that is not there, and an exec into a box that does not run: $rc; $(cat "$OUT/atime.err")"
+    [ "$rc" = '3 127 125' ] && nothing_left atime && lb rm atime >/dev/null
+}
+
+# reset of a box of the profile: what it wrote outside its workspace is gone
+# and nothing of its base was copied, as its rootfs/ has no more than what
+# create wrote; what it wrote in its workspace stays.
+t_agent_reset() {
+    need_subids || return 77
+    local own more
+    mkdir -p "$T/vol/agentreset" && chown 2345:2346 "$T/vol/agentreset" || return 1
+    agent_box arst --workspace "$T/vol/agentreset" && start arst || return 1
+    sh_in arst 'echo mine > /made-here && echo kept > kept && rm /etc/group' || return 1
+    lb reset arst </dev/null || return 1
+    nothing_left arst || return 1
+    own=$(cd "$C/arst/rootfs" && find . -type f | sort | paste -sd' ' -)
+    echo "its own files: $own"
+    more=$(cd "$C/arst/rootfs" && find . -type f ! -path ./etc/hostname ! -path ./etc/hosts ! -path ./etc/resolv.conf)
+    [ -z "$more" ] || { echo "rootfs/ has more than create wrote: $more"; return 1; }
+    [ "$(cat "$T/vol/agentreset/kept")" = kept ] || { echo "the workspace lost its file"; return 1; }
+    start arst || return 1
+    [ "$(sh_in arst 'test ! -e /made-here && test -e /etc/group && cat kept')" = kept ] ||
+        { echo "what the box did is still there, or its workspace is not"; return 1; }
+    lb stop arst >/dev/null && lb rm arst >/dev/null
+}
+
+# A box of the profile with --ttl 2s ends on time, with what it started, and
+# is expired; the --ttl given is its, not agent_ttl's.
+t_agent_ttl() {
+    need_subids || return 77
+    local began ms
+    agent_box attl --ttl 2s || return 1
+    [ "$(conf_value attl ttl)" = 2s ] || { echo "ttl=$(conf_value attl ttl)"; return 1; }
+    began=$(date +%s%N)
+    start attl || return 1
+    sh_in attl "$KIT setsid sleep 1125 >/dev/null 2>&1 </dev/null &" || return 1
+    wait_until 5 running_cmd 'sleep 1125' || { echo "what the exec started is not running"; return 1; }
+    shows_expired() { lb ls | grep -Eq '^attl +[^ ]+ +expired'; }
+    wait_until 6 shows_expired || { lb ls; echo "ls does not show it as expired"; return 1; }
+    ms=$(( ($(date +%s%N) - began) / 1000000 ))
+    lb ls
+    echo "expired $ms ms after its start began"
+    [ "$ms" -ge 2000 ] && [ "$ms" -lt 4000 ] || return 1
+    ! running_cmd 'sleep 1125' || { echo "a process is left"; return 1; }
+    lb stop attl >/dev/null 2>&1
+    nothing_left attl && [ "$(state_of attl)" = expired ] && lb rm attl >/dev/null
+}
+
+# The exec of a box of the profile and the command of a run --profile agent
+# are each in the audit log, start and end, by the box's name and id; and no
+# file the box can read has the log's lines, but the one it wrote itself,
+# which the search has to find.
+t_agent_audit() {
+    need_subids || return 77
+    local id name rc found
+    agent_box aaud && start aaud || return 1
+    id=$(conf_value aaud id)
+    lb exec aaud /bin/sh -c 'exit 5' agentmarker4712 </dev/null
+    rc=$?
+    name=$(lb run --profile agent -- /bin/sh -c hostname </dev/null) || return 1
+    echo "exec: $rc; run of $name; their lines:"
+    { lb logs --audit aaud; lb logs --audit "$name"; } | tee "$OUT/aaud.lines"
+    [ "$rc" = 5 ] || return 1
+    python3 -I -c '
+import json, sys
+box_id, run = sys.argv[2], sys.argv[3]
+lines = [json.loads(l) for l in open(sys.argv[1])]
+assert len(lines) == 4, "%d lines" % len(lines)
+a, b, c, d = lines
+assert [l["event"] for l in lines] == ["start", "end", "start", "end"], "the events"
+assert a["box"] == b["box"] == "aaud" and a["box_id"] == b["box_id"] == box_id, "the box"
+assert a["via"] == "exec" and a["argv"] == ["/bin/sh", "-c", "exit 5", "agentmarker4712"] and b["status"] == 5, "the exec"
+assert c["box"] == d["box"] == run and c["box_id"] == d["box_id"] != box_id, "the box of run"
+assert c["via"] == "run" and c["argv"] == ["/bin/sh", "-c", "hostname"] and d["status"] == 0, "the command of run"
+' "$OUT/aaud.lines" "$id" "$name" || return 1
+    found=$(LB_TIMEOUT=120 lb exec aaud /bin/sh -c \
+        "echo agentmarker4712 > /tmp/control; for d in /*; do case \$d in /proc|/sys|/dev) ;;
+         *) $KIT find \"\$d\" -type f -exec $KIT grep -l 'agentmarke[r]4712' {} + ;; esac; done" \
+        </dev/null 2>/dev/null)
+    echo "files in the box with what the log has: $found"
+    [ "$found" = /tmp/control ] && lb stop aaud >/dev/null && lb rm aaud >/dev/null
+}
+
+# README's "Running an agent in a box", its fenced commands in the order it
+# has them, kept in step with it by hand, as no case reads README. Here lb
+# stands for sudo ./lightbox, guide for the name agent, and a directory of
+# the case's, owned by an unprivileged uid as one of the reader's is, for
+# ~/agent-work.
+t_agent_guide() {
+    need_subids || return 77
+    local ws=$T/vol/agentguide said
+    # sudo ./lightbox doctor --profile agent
+    lb doctor --profile agent >"$OUT/guide.doctor" 2>&1 || { cat "$OUT/guide.doctor"; return 1; }
+    # mkdir -p ~/agent-work
+    mkdir -p "$ws" && chown 2345:2346 "$ws" || return 1
+    # sudo ./lightbox create agent --profile agent --workspace ~/agent-work
+    lb create guide --profile agent --workspace "$ws" </dev/null || return 1
+    port_of guide >/dev/null
+    # sudo ./lightbox start agent
+    start guide || return 1
+    # sudo ./lightbox exec agent --timeout 10m -- /bin/sh -c 'id -u; pwd; echo done > result.txt'
+    said=$(lb exec guide --timeout 10m -- /bin/sh -c 'id -u; pwd; echo done > result.txt' </dev/null | paste -sd' ')
+    echo "exec: $said"
+    [ "$said" = '0 /workspace' ] || return 1
+    # cat ~/agent-work/result.txt
+    [ "$(cat "$ws/result.txt")" = done ] && [ "$(stat -c %u:%g "$ws/result.txt")" = 2345:2346 ] ||
+        { echo "result.txt: $(cat "$ws/result.txt"), $(stat -c %u:%g "$ws/result.txt")"; return 1; }
+    # sudo ./lightbox logs --audit agent
+    said=$(lb logs --audit guide)
+    printf '%s\n' "$said"
+    [ "$(printf '%s\n' "$said" | grep -c '"box":"guide"')" = 2 ] || { echo "not the start and the end of the exec"; return 1; }
+    # sudo ./lightbox reset agent
+    lb reset guide </dev/null || return 1
+    # sudo ./lightbox rm agent
+    lb rm guide </dev/null || return 1
+    [ ! -e "$C/guide" ] || { echo "the box is still there"; return 1; }
+    # sudo ./lightbox run --profile agent --workspace ~/agent-work --timeout 10m -- /bin/sh -c 'cat result.txt'
+    said=$(lb run --profile agent --workspace "$ws" --timeout 10m -- /bin/sh -c 'cat result.txt' </dev/null)
+    echo "run: $said"
+    [ "$said" = done ] || return 1
+    # sudo ./lightbox create agent --profile agent --net proxy:3128 --workspace ~/agent-work
+    lb create guide --profile agent --net proxy:3128 --workspace "$ws" </dev/null || return 1
+    port_of guide >/dev/null
+    # sudo ./lightbox start agent
+    start guide || return 1
+    # sudo ./lightbox exec agent -- /bin/sh -c 'echo "$HTTPS_PROXY"'
+    said=$(lb exec guide -- /bin/sh -c 'echo "$HTTPS_PROXY"' </dev/null)
+    echo "HTTPS_PROXY in the box: $said"
+    [ "$said" = "http://$GW:3128" ] || return 1
+    # sudo ./lightbox stop agent
+    lb stop guide </dev/null || return 1
+    nothing_left guide || return 1
+    # sudo ./lightbox rm agent
+    lb rm guide </dev/null && [ ! -e "$C/guide" ]
+}
+
 # Every exec writes two lines to the audit log of the host (ROADMAP 8.9): one
 # as its command starts and one when it has ended. They parse as JSON, name
 # the box by its name and id, and carry what was asked, --env by its keys
@@ -4048,6 +4288,13 @@ if [ "$MODE" = inside ]; then
     check 'each exec writes its start and its end to the audit log, which the box cannot see' t_audit_log
     check 'a box of --profile agent with a workspace has the profile, and Phase 8 holds for it' t_agent_profile
     check 'run --profile agent returns the status, runs in the workspace and leaves nothing' t_agent_run
+    check 'doctor --profile agent finds nothing missing, and says that nft is when it is masked' t_agent_doctor
+    check 'a box of --profile agent with --net proxy reaches its proxy and nothing else' t_agent_proxy
+    check "exec --timeout in a box of --profile agent returns 124, and lightbox's own statuses are its own" t_agent_timeout
+    check 'reset of a box of --profile agent leaves its workspace and copies nothing' t_agent_reset
+    check 'a box of --profile agent with --ttl ends on time and is expired' t_agent_ttl
+    check 'the exec and run of a box of --profile agent are in the audit log, which it cannot see' t_agent_audit
+    check "the commands of README's agent section, in the suite's copy, do what it says" t_agent_guide
     check 'exec without a command runs a shell on standard input'         t_exec_default_shell
     check 'a container has its own hostname, processes and root'          t_own_world
     check 'a running container cannot be started again or removed'        t_running_container_is_protected

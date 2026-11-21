@@ -9,7 +9,7 @@ A minimal, secure Linux container runtime: one static binary of about 150 KB, wi
 - **Host tools:** `iptables` and `iptables-restore`, or with `firewall_backend = nftables` `nft`, and `cp` and `rm`. Since 0.7 lightbox runs neither `ip` nor `nsenter`
 - **Root:** `setup`, `start`, `stop`, `restart`, `reset`, `update`, `exec` and `run` run as root, and so does `create --userns`. A container's root is the host's root, unless it was created with `--userns` (see [User namespaces](#user-namespaces) and [Threat model](#threat-model))
 
-`lightbox doctor` checks all of this on the host it runs on: root, the kernel and the system calls lightbox makes, cgroup v2 and its controllers, that the kernel loads the cgroup device program a container starts with (`CONFIG_CGROUP_BPF`), the tools, the base root filesystem, and with nftables that forwarding is on. Each check that fails is followed by what fixes it, and `doctor` then exits 1; `doctor --json` gives the same to scripts.
+`lightbox doctor` checks all of this on the host it runs on: root, the kernel and the system calls lightbox makes, cgroup v2 and its controllers, that the kernel loads the cgroup device program a container starts with (`CONFIG_CGROUP_BPF`), the tools, the base root filesystem, and with nftables that forwarding is on. Each check that fails is followed by what fixes it, and `doctor` then exits 1; `doctor --json` gives the same to scripts. `doctor --profile agent` checks what a box of the agent profile needs as well (see [Running an agent in a box](#running-an-agent-in-a-box)).
 
 ## Building
 
@@ -417,8 +417,10 @@ Commands:
   logs   <name> [-f] [--audit]  Show what the container has printed; -f follows it. --audit
                                 shows what exec and run asked of it, kept after it is removed
   inspect <name> [--json]       Show a container's configuration and state; --json as JSON
-  doctor [--json]               Check what lightbox needs of this host, and say how to fix what
-                                is missing; --json as JSON
+  doctor [--json] [--profile agent]
+                                Check what lightbox needs of this host, and say how to fix what
+                                is missing; --json as JSON. --profile agent checks what a box of
+                                that profile needs too
   ls [--json]                   List all containers
   base ls                       List the snapshots of bases that containers overlay
   base add <dir>                Take a new snapshot of a base, for the containers made after it
@@ -524,6 +526,58 @@ Every `exec`, and so the command of every `run`, appends two lines to `<lightbox
 An `exec` whose start cannot be written in the log does not run, and exits with 125; one whose end cannot be written says so and exits as it would have. A start with no end is an `exec` whose process was killed.
 
 The log is mode 0600 in `lightbox_dir`, mode 0700, which no box has mounted: what runs in a box can neither read it nor change it. It records what was asked of a box, not what the command then did; what left a box through a proxy is in the proxy's log. The arguments are recorded as given, so the log is as sensitive as the commands are. Root on the host can change it, and it is not rotated yet.
+
+## Running an agent in a box
+
+An AI agent runs commands, and text it reads, a web page or a file in a repository, can steer which ones. A box for an agent's working session therefore treats every command as possibly hostile. `--profile agent` on `create` and `run` turns on what lightbox has against such a command with one switch (see [Create options](#create-options)), and `doctor --profile agent` checks that the host has what the profile needs.
+
+What it defends against, the likeliest first:
+
+- **Sending files or credentials out.** A box of the profile has `--net none` unless it is given `--net proxy:<port>` or `--net outside`: loopback and nothing else. With `--net proxy:<port>` it reaches one TCP port of the gateway and no name server, so what leaves it is what a proxy on the host lets through, to the names on the proxy's list, and a lookup cannot carry data out. Credentials stay outside the box, with a harness outside it or with a proxy that adds them to requests, and are never mounted in the box or given to it in its environment: a key the box can read is a key it can send wherever it can reach, or leave in its workspace.
+- **Damaging what it can write.** Its root is an overlay of its base, which `reset` makes the base's again without copying anything. On the host it writes in its workspace alone, as the workspace's owner and not as root.
+- **Running away with resources.** 2 GB of memory, 512 processes, 2 CPUs and a lifetime of 8 hours unless `agent_mem`, `agent_pids`, `agent_cpu` and `agent_ttl` in `lightbox.conf`, or an option, say otherwise; `exec --timeout` ends a command and everything it started.
+- **Reaching the host.** Its uid 0 is an unprivileged uid of the host's, the allow-list seccomp filter answers every system call it does not name with ENOSYS, and the device program keeps it to its own `/dev`. The profile refuses `--privileged`, `--link`, `--net nat`, `--seccomp deny` and `--copy`.
+- **Doing it unseen.** Every `exec` and `run` is in the [audit log](#audit-log), which no box can read.
+
+Where it stops:
+
+- **The kernel is the host's.** A box is a container, and a flaw in the kernel that a system call on the allow-list reaches is a way out of it, which no profile rules out. Code from third parties you do not trust, such as a repository you have not read, a package nobody has reviewed or an agent that browses the web, belongs in a virtual machine with lightbox inside it, so that a way out of a box ends in the machine. That is also how lightbox runs on macOS, in a Linux virtual machine, and on Windows, in WSL2.
+- **The workspace comes back untrusted.** What the box wrote in it runs when its owner runs it: git runs the hooks in `.git/hooks` and commands that `.git/config` names, `make` its Makefile, `npm` and `pip` the scripts of a package, an editor the tasks of a folder. Read what changed before anything on the host builds, opens or runs it, and give a box a workspace whose history it does not need without its `.git`.
+- **What a proxy lets through.** A name on the proxy's list is a way out for anything sent to it, and an API that the box may use with a key is one it may use for its own ends. Keep the list short, and the keys that reach the box's requests ones you can revoke.
+
+The harness, the program that talks to the model, can run in one of two places.
+
+**The harness outside the box** drives it through `exec`, with the model's credentials on the host. The box needs no network, which is the profile's default. The workspace is a directory of yours, not root's, which the box writes in as you:
+
+```sh
+sudo ./lightbox doctor --profile agent
+mkdir -p ~/agent-work
+sudo ./lightbox create agent --profile agent --workspace ~/agent-work
+sudo ./lightbox start agent
+sudo ./lightbox exec agent --timeout 10m -- /bin/sh -c 'id -u; pwd; echo done > result.txt'
+cat ~/agent-work/result.txt
+sudo ./lightbox logs --audit agent
+sudo ./lightbox reset agent
+sudo ./lightbox rm agent
+```
+
+Each command of the harness is an `exec`, which exits with the command's status, and with 124 to 127 for what lightbox did (see [Exec options](#exec-options)). `reset` throws away all the box did outside its workspace, between tasks. A box for one command is `run`, which leaves nothing:
+
+```sh
+sudo ./lightbox run --profile agent --workspace ~/agent-work --timeout 10m -- /bin/sh -c 'cat result.txt'
+```
+
+**The harness inside the box** runs as one long `exec`, and reaches the model through a proxy on the host with `--net proxy:<port>`. [contrib/proxy](contrib/proxy/README.md) has one for Squid, which listens on the gateway's port 3128 and lets through the names on its list; add the model's API and the package registries the agent needs. `exec` gives the harness the proxy in `HTTP_PROXY` and `HTTPS_PROXY`. A key that the harness needs is in the box once the harness has it; it stays out only where something outside adds it to the requests, such as a proxy that ends their TLS connection itself, which contrib/proxy's does not:
+
+```sh
+sudo ./lightbox create agent --profile agent --net proxy:3128 --workspace ~/agent-work
+sudo ./lightbox start agent
+sudo ./lightbox exec agent -- /bin/sh -c 'echo "$HTTPS_PROXY"'
+sudo ./lightbox stop agent
+sudo ./lightbox rm agent
+```
+
+The harness then runs as `sudo ./lightbox exec agent --timeout 8h -- <harness>`, and ends with the box at the latest, when its lifetime is over.
 
 ## Security
 

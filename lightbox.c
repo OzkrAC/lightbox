@@ -5713,8 +5713,10 @@ static const struct { const char *name; const char *text; } command_help[] = {
     { "inspect",
         "  inspect <name> [--json]       Show a container's configuration and state; --json as JSON\n" },
     { "doctor",
-        "  doctor [--json]               Check what lightbox needs of this host, and say how to fix what\n"
-        "                                is missing; --json as JSON\n" },
+        "  doctor [--json] [--profile agent]\n"
+        "                                Check what lightbox needs of this host, and say how to fix what\n"
+        "                                is missing; --json as JSON. --profile agent checks what a box of\n"
+        "                                that profile needs too\n" },
     { "ls",
         "  ls [--json]                   List all containers\n" },
     { "base",
