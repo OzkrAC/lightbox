@@ -1264,6 +1264,29 @@ h_signals_are_passed_on() {
     [ $rc -eq 129 ]
 }
 
+# At exec's deadline the worker is killed, and what it carried until then
+# came through; a command that ends before it has its own status. In exec
+# the command and all it started go with the worker, by the exec's cgroup,
+# which this suite cannot make: here the command is left to end by itself,
+# and lets go of the streams first, which would keep the capture waiting.
+h_deadline_ends_the_worker() {
+    local began ms out rc
+    began=$(date +%s%N)
+    out=$("$UNIT" relay /dev/ptmx 0.5s -- "$SH_PATH" -c 'echo began; exec sleep 3 >/dev/null 2>&1' </dev/null 2>&1)
+    rc=$?
+    ms=$(( ($(date +%s%N) - began) / 1000000 ))
+    printf '%s\n' "$out"
+    echo "status $rc in $ms ms"
+    [ $rc -eq 137 ] && [ "$ms" -lt 2500 ] && [ "$(printf '%s\n' "$out" | head -n 1)" = began ] &&
+        [ "$(printf '%s\n' "$out" | tail -n 1)" = 'relay: timed out' ] || return 1
+    began=$(date +%s%N)
+    out=$("$UNIT" relay /dev/ptmx 5s -- "$SH_PATH" -c 'echo done; exit 4' </dev/null 2>&1)
+    rc=$?
+    ms=$(( ($(date +%s%N) - began) / 1000000 ))
+    echo "before its deadline: $out, status $rc in $ms ms"
+    [ $rc -eq 4 ] && [ "$out" = done ] && [ "$ms" -lt 2500 ]
+}
+
 # More than a pipe or a terminal holds at once, in both directions.
 h_plenty_goes_through() {
     seq 1 30000 > "$D/numbers"
@@ -1300,6 +1323,7 @@ t_streams_window()              { in_scratch_dir h_terminal_follows_the_window; 
 t_streams_half_a_terminal()     { in_scratch_dir h_pipes_for_half_a_terminal; }
 t_streams_signals()             { in_scratch_dir h_signals_are_passed_on; }
 t_streams_plenty()              { in_scratch_dir h_plenty_goes_through; }
+t_streams_deadline()            { in_scratch_dir h_deadline_ends_the_worker; }
 
 # ─── exec: the binary it runs from ──────────────────────────────────────────
 
@@ -1603,6 +1627,23 @@ t_seconds() {
     done
     got=$(result_of "$("$UNIT" seconds '')")
     [ "$got" = -1 ] || { echo "an empty value -> $got"; bad=1; }
+    return $bad
+}
+
+# exec's --timeout (ROADMAP 8.7): a duration in milliseconds, or refused.
+t_duration() {
+    bad=0
+    for pair in 2s:2000 90:90000 1.5m:90000 0.5:500 0.001:1 0.25s:250 1h:3600000 1d:86400000 \
+                365d:31536000000 31536000:31536000000 31536000s:31536000000 525600m:31536000000 \
+                366d:refused 365.001d:refused 31536001:refused 8760.001h:refused \
+                0:refused 0s:refused 0.000:refused .5:refused 1.:refused 1.2345s:refused \
+                -1:refused +1:refused '1 s:refused' 1ms:refused 2x:refused s:refused 1ss:refused \
+                1s2:refused 99999999999999999999:refused 1e3:refused; do
+        got=$("$UNIT" duration "${pair%:*}")
+        [ "$got" = "${pair##*:}" ] || { echo "'${pair%:*}' -> $got, expected ${pair##*:}"; bad=1; }
+    done
+    got=$("$UNIT" duration '')
+    [ "$got" = refused ] || { echo "an empty value -> $got"; bad=1; }
     return $bad
 }
 
@@ -3197,6 +3238,7 @@ check 'the command'"'"'s terminal follows the size of the caller'"'"'s'    t_str
 check 'a pipe stands in where only one side is a terminal'       t_streams_half_a_terminal
 check 'a signal that asks exec to end reaches the command'       t_streams_signals
 check 'plenty of data goes through, both ways'                   t_streams_plenty
+check "at exec's deadline the worker is killed; before it, the status is the command's" t_streams_deadline
 
 check 'exec executes itself again from a sealed copy in memory'  t_exec_runs_from_a_sealed_copy
 check 'a read-only mount of the binary does where memfds may not' t_exec_sealing_by_a_read_only_mount
@@ -3211,6 +3253,7 @@ check 'a command gets every argument, its directory, and what follows --' t_comm
 check 'exec'"'"'s options are checked, and a missing value names its option' t_command_options_are_checked
 
 check 'a number of seconds is digits within the limit'           t_seconds
+check "a duration is exec's --timeout, from 1 ms to 365 days, in s, m, h or d" t_duration
 check 'a file never gets the number of a closed standard stream' t_standard_streams_are_reserved
 check 'a start has one way out once it has changed the host'      t_start_has_one_way_out
 

@@ -303,7 +303,7 @@ void cmd_base(int argc, char **argv) {
         (void)store_lock();
         char id[BASE_ID_TEXT];
         if (base_take(source, id) != 0)
-            lc_kernel_exit(1);
+            lc_kernel_exit(failure_status);
         print_str(STDOUT, "Base ");
         print_str(STDOUT, id);
         print_str(STDOUT, " taken of ");
@@ -344,7 +344,7 @@ void cmd_base(int argc, char **argv) {
             print_str(STDOUT, " removed\n");
         }
         if (failed)
-            lc_kernel_exit(1);
+            lc_kernel_exit(failure_status);
         return;
     }
     die2("Error: unknown base command: ", argv[0]);

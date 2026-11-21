@@ -204,7 +204,7 @@ int get_container_pid(const char *name) {
     return parse_int_in(buf, 1, PIDS_LIMIT_MAX, &pid) ? pid : -1;
 }
 
-static int read_proc_starttime(int pid, char *buf, size_t bufsz) {
+int proc_starttime(int pid, char *buf, size_t bufsz) {
     char path[64], statbuf[512];
     if (!proc_pid_path(path, sizeof(path), pid, "/stat") ||
         read_file(path, statbuf, sizeof(statbuf)) <= 0)
@@ -247,7 +247,7 @@ static int read_proc_starttime(int pid, char *buf, size_t bufsz) {
 int container_record_pid(const char *name, int pid) {
     char path[MAX_PATH], pidbuf[16], started[32];
 
-    if (read_proc_starttime(pid, started, sizeof(started)) < 0)
+    if (proc_starttime(pid, started, sizeof(started)) < 0)
         return -1;
     if (container_run_dir_make(name) != 0)
         return -1;
@@ -301,7 +301,7 @@ container_liveness container_probe(const char *name) {
     char expected_start[32], actual_start[32];
     if (get_container_pid_starttime(name, expected_start, sizeof(expected_start)) < 0)
         return CONTAINER_DEAD;
-    if (read_proc_starttime(pid, actual_start, sizeof(actual_start)) < 0)
+    if (proc_starttime(pid, actual_start, sizeof(actual_start)) < 0)
         return may_look ? CONTAINER_DEAD : CONTAINER_RUNNING;
     if (!streq(expected_start, actual_start))
         return CONTAINER_DEAD;
@@ -427,7 +427,7 @@ void require_root(const char *command) {
     print_str(STDERR, "Error: lightbox ");
     print_str(STDERR, command);
     print_str(STDERR, " must be run as root\n");
-    lc_kernel_exit(1);
+    lc_kernel_exit(failure_status);
 }
 
 /* ─── Listing ───────────────────────────────────────────────────────────── */

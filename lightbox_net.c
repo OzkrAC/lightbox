@@ -19,7 +19,7 @@ static void require_cmd(const char *prog, const char *const argv[]) {
     print_str(STDERR, " (errno ");
     print_str(STDERR, digits);
     print_str(STDERR, ")\n");
-    lc_kernel_exit(1);
+    lc_kernel_exit(failure_status);
 }
 
 static int iptables_check(const char *const argv[]) {
@@ -162,7 +162,7 @@ void container_network_load_or_die(container_network *net) {
         print_str(STDERR, ")");
     }
     lc_print_char(STDERR, '\n');
-    lc_kernel_exit(1);
+    lc_kernel_exit(failure_status);
 }
 
 const char *address_unusable(const container_network *net, uint32_t addr) {
@@ -1703,7 +1703,7 @@ static void nft_firewall_setup(const container_network *net) {
         "lightbox needs cgroup v2. On a cgroup v1 or hybrid host, boot with\n"
         "cgroup_no_v1=all, or set cgroup_root to a cgroup2 mount or to an empty\n"
         "directory for lightbox to mount one on.\n");
-    lc_kernel_exit(1);
+    lc_kernel_exit(failure_status);
 }
 
 /*
@@ -1992,7 +1992,7 @@ static void setup_or_reload(bool reload) {
 
     if (failed) {
         print_str(STDERR, "Error: the links or --net rules of some running containers are not in again\n");
-        lc_kernel_exit(1);
+        lc_kernel_exit(failure_status);
     }
     print_str(STDOUT, "Host networking ready\n");
 }

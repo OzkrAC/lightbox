@@ -116,7 +116,7 @@ static void parse_volume_spec_or_die(const char *spec, volume_spec *vol) {
         print_str(STDERR, ": ");
         print_str(STDERR, spec);
         lc_print_char(STDERR, '\n');
-        lc_kernel_exit(1);
+        lc_kernel_exit(failure_status);
     }
 }
 
@@ -465,38 +465,130 @@ static bool cgroup_is_empty(const char *cg) {
 #define CGROUP_EMPTY_MS 5000
 
 /*
- * Remove a container's cgroup: kill what is left in it, wait until the
- * kernel says it is empty, and only then remove the directory. 0, or -1 with
- * the reason reported when the directory is still there.
- *
- * cgroup.kill (Linux 5.14) ends everything in the cgroup at once, including
- * what is forked while it does. Without it, what the list shows is killed,
- * again and again until the list is empty.
+ * How deep below a container's cgroup there are cgroups to take away. Its
+ * processes cannot reach cgroupfs, so there are only those of its execs, one
+ * level down; a privileged container could make more of its own.
+ */
+#define CGROUP_DEPTH_MAX 4
+
+/* struct linux_dirent64, as getdents64 fills a buffer with it */
+#define CG_DIRENT_RECLEN 16     /* uint16_t */
+#define CG_DIRENT_TYPE   18     /* uint8_t; cgroupfs always gives it */
+#define CG_DIRENT_NAME   19
+#define CG_DIRENT_DIR    4      /* DT_DIR */
+
+/*
+ * fn(path, entry) for every cgroup below cg, to depth levels, each after the
+ * ones below it, and not for cg itself.
+ */
+static void each_cgroup_below(const char *cg, int depth, void (*fn)(const char *path, const char *entry)) {
+    if (depth <= 0)
+        return;
+    lc_sysret fd = lc_kernel_open_file(cg, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+    if (fd < 0)
+        return;
+    char buf[1024];
+    for (;;) {
+        lc_sysret n = lc_kernel_read_directory((int32_t)fd, buf, sizeof(buf));
+        if (n <= 0)
+            break;
+        for (lc_sysret pos = 0; pos < n; ) {
+            uint16_t reclen;
+            lc_bytes_copy(&reclen, buf + pos + CG_DIRENT_RECLEN, sizeof(reclen));
+            if (reclen == 0)
+                break;
+            uint8_t type = (uint8_t)buf[pos + CG_DIRENT_TYPE];
+            const char *entry = buf + pos + CG_DIRENT_NAME;
+            pos += reclen;
+            bool dot = entry[0] == '.' && (entry[1] == '\0' || (entry[1] == '.' && entry[2] == '\0'));
+            char path[MAX_PATH];
+            if (dot || type != CG_DIRENT_DIR || !path_join(path, sizeof(path), cg, entry))
+                continue;
+            each_cgroup_below(path, depth - 1, fn);
+            fn(path, entry);
+        }
+    }
+    lc_kernel_close_file((int32_t)fd);
+}
+
+static void kill_listed_in(const char *path, const char *entry) {
+    (void)entry;
+    char procs[MAX_PATH];
+    if (path_join(procs, sizeof(procs), path, "cgroup.procs"))
+        (void)each_listed_pid(procs, kill_pid);
+}
+
+static void remove_cgroup_dir(const char *path, const char *entry) {
+    (void)entry;
+    (void)lc_kernel_unlinkat(AT_FDCWD, path, AT_REMOVEDIR);
+}
+
+/*
+ * End everything in a cgroup and the cgroups below it once: cgroup.kill
+ * (Linux 5.14) ends it all at once, including what is forked while it does,
+ * and without it, what the lists show is killed. True when cgroup.kill did.
+ */
+static bool cgroup_kill_all(const char *cg) {
+    if (cgroup_write(cg, "cgroup.kill", "1") == 0)
+        return true;
+    char procs[MAX_PATH];
+    if (path_join(procs, sizeof(procs), cg, "cgroup.procs"))
+        (void)each_listed_pid(procs, kill_pid);
+    each_cgroup_below(cg, CGROUP_DEPTH_MAX, kill_listed_in);
+    return false;
+}
+
+/*
+ * End everything in a cgroup and below it, and wait until the kernel says
+ * that nothing is left, or until the deadline. Without cgroup.kill the lists
+ * are killed again and again until they are empty. True when it is empty.
+ */
+static bool cgroup_end_all(const char *cg, int64_t deadline) {
+    bool at_once = cgroup_kill_all(cg);
+    while (!cgroup_is_empty(cg) && monotonic_ms() < deadline) {
+        sleep_ms(10);
+        if (!at_once)
+            (void)cgroup_kill_all(cg);
+    }
+    return cgroup_is_empty(cg);
+}
+
+/*
+ * Remove an empty cgroup with the cgroups below it, those first: the result
+ * of the last rmdir. EBUSY is retried until the deadline: the last process
+ * can be gone before the kernel has finished with it, and an exec that began
+ * as the container was being stopped can have made a cgroup meanwhile.
+ */
+static lc_sysret cgroup_remove_all(const char *cg, int64_t deadline) {
+    for (;;) {
+        each_cgroup_below(cg, CGROUP_DEPTH_MAX, remove_cgroup_dir);
+        lc_sysret rc = lc_kernel_unlinkat(AT_FDCWD, cg, AT_REMOVEDIR);
+        if (rc != -LB_EBUSY || monotonic_ms() >= deadline)
+            return rc;
+        sleep_ms(10);
+        if (!cgroup_is_empty(cg))
+            (void)cgroup_kill_all(cg);
+    }
+}
+
+/*
+ * Remove a container's cgroup: kill what is left in it and in the cgroups of
+ * its execs, wait until the kernel says it is empty, and only then remove
+ * the directories, theirs first. 0, or -1 with the reason reported when the
+ * container's is still there.
  */
 static int cgroup_destroy(const char *name) {
-    char cg[MAX_PATH], tmp[MAX_PATH];
-    if (!cgroup_path(cg, name) || !path_join(tmp, MAX_PATH, cg, "cgroup.procs")) {
+    char cg[MAX_PATH];
+    if (!cgroup_path(cg, name)) {
         print_str(STDERR, "Error: the path of the container's cgroup is too long\n");
         return -1;
     }
 
     if (!path_exists(cg)) return 0;
 
-    bool at_once = cgroup_write(cg, "cgroup.kill", "1") == 0;
-
     int64_t deadline = monotonic_ms() + CGROUP_EMPTY_MS;
-    while (!cgroup_is_empty(cg) && monotonic_ms() < deadline) {
-        if (!at_once)
-            (void)each_listed_pid(tmp, kill_pid);
-        sleep_ms(10);
-    }
-
-    lc_sysret rc = lc_kernel_unlinkat(AT_FDCWD, cg, AT_REMOVEDIR);
-    while (rc == -LB_EBUSY && monotonic_ms() < deadline) {
-        /* the last process is gone and the kernel has not finished with it */
-        sleep_ms(10);
-        rc = lc_kernel_unlinkat(AT_FDCWD, cg, AT_REMOVEDIR);
-    }
+    (void)cgroup_end_all(cg, deadline);
+    lc_sysret rc = cgroup_remove_all(cg, deadline);
     if (rc < 0 && rc != -LB_ENOENT) {
         char digits[16];
         fmt_int(digits, (int)-rc);
@@ -510,11 +602,100 @@ static int cgroup_destroy(const char *name) {
     return 0;
 }
 
-static void cgroup_join_self(const char *name) {
-    char cg[MAX_PATH], pidbuf[16];
+/*
+ * Every exec runs in a cgroup of its own below the container's (ROADMAP 8.7),
+ * made by the process that ran exec: "exec-<pid>-<start time>" of that
+ * process, a name no other process has had since boot. The container's
+ * limits hold for it, as they hold for everything below, and the container
+ * cannot reach cgroupfs to leave it: what the command starts, in the
+ * background or in a session of its own, is in it until it ends.
+ */
+#define EXEC_CGROUP_PREFIX "exec-"
+
+/* Is entry the cgroup of an exec: the PID and the start time of its own? */
+static bool exec_cgroup_owner(const char *entry, int *pid, const char **started) {
+    size_t prefix = lc_string_length(EXEC_CGROUP_PREFIX);
+    if (!lc_string_starts_with(entry, lc_string_length(entry), EXEC_CGROUP_PREFIX, prefix))
+        return false;
+    const char *p = entry + prefix;
+    int64_t value = 0;
+    size_t digits = 0;
+    for (; p[digits] >= '0' && p[digits] <= '9'; digits++) {
+        value = value * 10 + (p[digits] - '0');
+        if (value > INT32_MAX)
+            return false;
+    }
+    if (digits == 0 || value == 0 || p[digits] != '-' || p[digits + 1] == '\0')
+        return false;
+    for (const char *t = p + digits + 1; *t; t++)
+        if (*t < '0' || *t > '9')
+            return false;
+    *pid = (int)value;
+    *started = p + digits + 1;
+    return true;
+}
+
+/* An exec's cgroup that is left when its exec is over: removed when nothing
+ * is in it. One whose exec is still running is left alone, as it can be
+ * there before anything has joined it. */
+static void remove_exec_cgroup_left(const char *path, const char *entry) {
+    int pid;
+    const char *started;
+    if (!exec_cgroup_owner(entry, &pid, &started))
+        return;
+    char now[32];
+    if (proc_starttime(pid, now, sizeof(now)) == 0 && streq(now, started))
+        return;
+    (void)lc_kernel_unlinkat(AT_FDCWD, path, AT_REMOVEDIR);     /* EBUSY while something is in it */
+}
+
+/* Make this process's exec cgroup below the container's: its path in cg. */
+static void exec_cgroup_make(const char *name, char cg[MAX_PATH]) {
+    char container_cg[MAX_PATH], self[16], started[32], entry[64];
+    int pid = lc_kernel_get_process_id();
+    fmt_int(self, pid);
+    if (proc_starttime(pid, started, sizeof(started)) < 0)
+        die("Error: cannot read the start time of this process for the cgroup of the exec");
+    bool cut = false;
+    size_t at = str_append(entry, 0, EXEC_CGROUP_PREFIX, sizeof(entry), &cut);
+    at = str_append(entry, at, self, sizeof(entry), &cut);
+    at = str_append(entry, at, "-", sizeof(entry), &cut);
+    (void)str_append(entry, at, started, sizeof(entry), &cut);
+    if (cut || !cgroup_path(container_cg, name) || !path_join(cg, MAX_PATH, container_cg, entry))
+        die("Error: the path of the exec's cgroup is too long");
+    lc_sysret rc = lc_kernel_mkdirat(AT_FDCWD, cg, 0755);
+    if (rc < 0) {
+        char digits[16];
+        fmt_int(digits, (int)-rc);
+        print_str(STDERR, "Error: cannot make the cgroup of the exec (errno ");
+        print_str(STDERR, digits);
+        die(")");
+    }
+}
+
+/*
+ * The end of an exec's cgroup, in the process that ran exec once its worker
+ * is gone. With a time limit nothing the command started outlives it: what
+ * is left is ended. Without one it goes on, and the cgroup stays until it
+ * has ended too; it is removed then by a later exec, or by stop. The cgroups
+ * that earlier execs left and that are empty now go as well.
+ */
+static void exec_cgroup_end(const char *name, const char *cg, bool limited) {
+    if (limited)
+        (void)cgroup_end_all(cg, monotonic_ms() + CGROUP_EMPTY_MS);
+    if (cgroup_is_empty(cg))
+        (void)cgroup_remove_all(cg, monotonic_ms() + 1000);
+    char container_cg[MAX_PATH];
+    if (cgroup_path(container_cg, name))
+        each_cgroup_below(container_cg, 1, remove_exec_cgroup_left);
+}
+
+/* Move this process into a cgroup, the one of its exec. */
+static void cgroup_join_self(const char *cg) {
+    char pidbuf[16];
     fmt_int(pidbuf, lc_kernel_get_process_id());
-    if (!cgroup_path(cg, name) || cgroup_write(cg, "cgroup.procs", pidbuf) < 0)
-        die2("Error: cannot join the cgroup of container ", name);
+    if (cgroup_write(cg, "cgroup.procs", pidbuf) < 0)
+        die2("Error: cannot join the cgroup of the exec: ", cg);
 }
 
 /* ─── Security: capabilities ────────────────────────────────────────────── */
@@ -669,7 +850,7 @@ static const char *option_value(int argc, char **argv, int *i) {
         print_str(STDERR, "Error: option ");
         print_str(STDERR, argv[*i]);
         print_str(STDERR, " requires a value\n");
-        lc_kernel_exit(1);
+        lc_kernel_exit(failure_status);
     }
     return argv[++*i];
 }
@@ -681,7 +862,7 @@ static const char *option_value(int argc, char **argv, int *i) {
     print_str(STDERR, ": ");
     print_str(STDERR, what);
     lc_print_char(STDERR, '\n');
-    lc_kernel_exit(1);
+    lc_kernel_exit(failure_status);
 }
 
 /* ─── cmd_create ────────────────────────────────────────────────────────── */
@@ -708,7 +889,7 @@ static const char *io_disk_problem(const char *limit) {
     print_str(STDERR, ": ");
     print_str(STDERR, why);
     lc_print_char(STDERR, '\n');
-    lc_kernel_exit(1);
+    lc_kernel_exit(failure_status);
 }
 
 /*
@@ -743,7 +924,7 @@ static void choose_address(const container_network *net, const uint32_t *asked, 
             print_str(STDERR, ": it is the address of the container '");
             print_str(STDERR, names[holder[i]]);
             print_str(STDERR, "'\n");
-            lc_kernel_exit(1);
+            lc_kernel_exit(failure_status);
         }
         return;
     }
@@ -909,13 +1090,13 @@ static int in_overlay(const struct overlay_job *job) {
         if (rc == 0)
             rc = lc_kernel_mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
         if (rc == 0 && job->lower && idmap_in_place(job->lower, job->uid_start, job->gid_start, false) != 0)
-            lc_kernel_exit(1);
+            lc_kernel_exit(failure_status);
         if (rc == 0)
             rc = lc_kernel_mount("overlay", job->merged, "overlay", MS_NODEV | MS_NOSUID, job->options);
         if (rc < 0 && job->lower) {
             say_with_number("Error: an overlay cannot be put on an idmapped layer here (errno ", (int)-rc,
                             "): that needs Linux 5.19; --copy makes a container with --userns that needs 5.12\n");
-            lc_kernel_exit(1);
+            lc_kernel_exit(failure_status);
         }
         if (rc < 0) {
             say_with_number("Note: an overlay cannot be mounted here (errno ", (int)-rc,
@@ -927,19 +1108,19 @@ static int in_overlay(const struct overlay_job *job) {
          * lightbox's above the overlay, so from inside it. */
         if (job->name && lc_kernel_chdir(job->merged) < 0) {
             print_str(STDERR, "Error: cannot enter the container's overlay\n");
-            lc_kernel_exit(1);
+            lc_kernel_exit(failure_status);
         }
         if (job->name && job->lower &&
             (lc_kernel_setgroups(0, NULL) < 0 || lc_kernel_setgid(job->gid_start) < 0 || lc_kernel_setuid(job->uid_start) < 0)) {
             print_str(STDERR, "Error: cannot write the container's files as its root\n");
-            lc_kernel_exit(1);
+            lc_kernel_exit(failure_status);
         }
         const char *wrong = job->name ? write_etc_files(".", job->name, job->ip, job->resolv) : NULL;
         if (wrong) {
             print_str(STDERR, "Error: ");
             print_str(STDERR, wrong);
             lc_print_char(STDERR, '\n');
-            lc_kernel_exit(1);
+            lc_kernel_exit(failure_status);
         }
         lc_kernel_exit(0);
     }
@@ -1203,7 +1384,7 @@ static void cmd_create(int argc, char **argv) {
             print_str(STDERR, why);
             print_str(STDERR, "\nAdd one of at least 65536 ids for " USERNS_OWNER " to both " SUBUID_FILE " and " SUBGID_FILE
                               ", such as:\n  " USERNS_OWNER ":2147483647:2147483648\n");
-            lc_kernel_exit(1);
+            lc_kernel_exit(failure_status);
         }
     }
 
@@ -1380,7 +1561,7 @@ fail_create:
     }
     if (created_dir)
         require_rm_rf(cdir);
-    lc_kernel_exit(1);
+    lc_kernel_exit(failure_status);
 }
 
 /* ─── Starting: what the command and init say to each other ─────────────── */
@@ -1538,7 +1719,7 @@ static void init_begin(const struct child_args *ca) {
     close_all_but(keep, nkeep);
 
     if (!go_received(ca->go_rd))
-        lc_kernel_exit(1);
+        lc_kernel_exit(failure_status);
 }
 
 /* Reap every child that has ended. True when the hook was one of them, with
@@ -1773,7 +1954,7 @@ static int init_main(const struct child_args *ca) {
     /* Without a command to hear this, or without its answer, no record names
      * this container: it must not run anything. */
     if (!report_to_starter(ca->report_wr, START_READY, 0) || !go_received(ca->go_rd))
-        lc_kernel_exit(1);
+        lc_kernel_exit(failure_status);
     lc_kernel_close_file(ca->go_rd);
 
     int32_t hook_pid = 0;
@@ -1815,12 +1996,12 @@ static int netns_disable_ipv6(int target_pid) {
     if (child == 0) {
         int fd = open_target_path(target_pid, "/ns/net");
         if (fd < 0 || lc_kernel_setns(fd, CLONE_NEWNET) < 0)
-            lc_kernel_exit(1);
+            lc_kernel_exit(failure_status);
         if (!path_exists("/proc/sys/net/ipv6/conf"))
             lc_kernel_exit(0);      /* a kernel without IPv6 has nothing to switch off */
         if (write_file("/proc/sys/net/ipv6/conf/all/disable_ipv6", "1") < 0 ||
             write_file("/proc/sys/net/ipv6/conf/default/disable_ipv6", "1") < 0)
-            lc_kernel_exit(1);
+            lc_kernel_exit(failure_status);
         lc_kernel_exit(0);
     }
 
@@ -1853,6 +2034,8 @@ struct exec_request {
     const char  *env[MAX_EXEC_ENV];     /* --env, in the order given */
     int          nenv;
     const char  *workdir;               /* --workdir, or NULL */
+    int64_t      timeout_ms;            /* --timeout, or 0 */
+    const char  *timeout_text;          /* as it was given */
     const char  *term;                  /* the caller's TERM, or NULL */
     const char  *proxy[PROXY_ENV_COUNT];    /* --net proxy: where its proxy is */
     int          nproxy;
@@ -2318,15 +2501,20 @@ static int parse_exec_options(int argc, char **argv, int first, struct exec_requ
         bool user = streq(arg, "--user") || streq(arg, "-u");
         bool env = streq(arg, "--env") || streq(arg, "-e");
         bool workdir = streq(arg, "--workdir") || streq(arg, "-w");
-        if (!user && !env && !workdir) {
+        bool timeout = streq(arg, "--timeout");
+        if (!user && !env && !workdir && !timeout) {
             print_str(STDERR, "Error: unknown option: ");
             print_str(STDERR, arg);
             print_str(STDERR, "\nA command that begins with a dash goes after --.\n");
-            lc_kernel_exit(1);
+            lc_kernel_exit(failure_status);
         }
         const char *value = option_value(argc, argv, &i);
 
-        if (user) {
+        if (timeout) {
+            if (!parse_duration_ms(value, &req->timeout_ms))
+                die2("Error: --timeout takes a duration above 0 and up to 365d, such as 30s, 5m or 1.5h: ", value);
+            req->timeout_text = value;
+        } else if (user) {
             if (!parse_user_spec(value, req))
                 die2("Error: --user takes a name, a uid or uid:gid, and this is none of them: ", value);
         } else if (env) {
@@ -2518,7 +2706,7 @@ static void run_sealed(void) {
     say_with_number("Error: exec enters a container only from a copy of lightbox that the container cannot\n"
                     "write to, and could not make one here (errno ", (int)-failed,
                     "). lightbox doctor says more.\n");
-    lc_kernel_exit(1);
+    lc_kernel_exit(failure_status);
 }
 
 /* ─── exec: the command's standard streams ──────────────────────────────── */
@@ -2866,13 +3054,33 @@ static int32_t hold_relay_signals(void) {
  * In the process that ran exec: wait for the worker, and pass on what asks
  * it to end. A signal that the terminal sent has reached the worker by
  * itself, since both are in the terminal's foreground, so only the ones a
- * process sent are passed on. The worker's wait status.
+ * process sent are passed on. At the deadline, when there is one, everything
+ * in the exec's cgroup is ended, the worker with it, and *timed_out is set.
+ * The worker's wait status.
  */
-static int32_t attend_worker(int32_t worker, int32_t signal_fd) {
+static int32_t attend_worker(int32_t worker, int32_t signal_fd, const char *cg, int64_t deadline,
+                             bool *timed_out) {
     int32_t status = 0;
     for (;;) {
+        lc_timespec left, *wait = NULL;
+        if (deadline && !*timed_out) {
+            int64_t ms = deadline - monotonic_ms();
+            if (ms <= 0) {
+                /* a command that ended just now has its own status */
+                if (lc_kernel_wait_for_child(worker, &status, WNOHANG) == worker)
+                    return status;
+                *timed_out = true;
+                if (cg)
+                    (void)cgroup_kill_all(cg);
+                lc_kernel_send_signal(worker, SIGKILL);     /* whatever the cgroup's lists said */
+                continue;
+            }
+            left.seconds = ms / 1000;
+            left.nanoseconds = (ms % 1000) * 1000000;
+            wait = &left;
+        }
         struct lb_pollfd one = { .fd = signal_fd, .events = LB_POLLIN, .revents = 0 };
-        lc_sysret ready = lb_sys_ppoll(&one, 1, NULL);
+        lc_sysret ready = lb_sys_ppoll(&one, 1, wait);
         if (ready < 0 && ready != -LB_EINTR)
             die("Error: failed to wait for the exec worker");
         if (ready <= 0)
@@ -2890,12 +3098,16 @@ static int32_t attend_worker(int32_t worker, int32_t signal_fd) {
 }
 
 /*
- * The rest of what the process that ran exec does: attend to the worker, put
- * the terminal's modes back as they were before the worker touched them, and
- * give the exit status to end with. modes is NULL when stdin is no terminal.
+ * The rest of what the process that ran exec does with its worker: attend to
+ * it until the deadline, when there is one (0: none), put the terminal's
+ * modes back as they were before the worker touched them, and give the exit
+ * status the worker had. modes is NULL when stdin is no terminal; cg is the
+ * exec's cgroup, or NULL for none.
  */
-static int finish_exec(int32_t worker, int32_t signal_fd, const struct lb_termios *modes) {
-    int32_t status = attend_worker(worker, signal_fd);
+static int finish_exec(int32_t worker, int32_t signal_fd, const struct lb_termios *modes,
+                       const char *cg, int64_t deadline, bool *timed_out) {
+    *timed_out = false;
+    int32_t status = attend_worker(worker, signal_fd, cg, deadline, timed_out);
     if (modes) {
         struct lb_termios back = *modes;
         lc_kernel_device_control(STDIN, LB_TCSETS, &back);
@@ -2905,7 +3117,7 @@ static int finish_exec(int32_t worker, int32_t signal_fd, const struct lb_termio
 
 /* ─── exec: entering the container ──────────────────────────────────────── */
 
-static int exec_inside_container(const char *name, int target_pid, int privileged, bool userns,
+static int exec_inside_container(const char *cg, int target_pid, int privileged, bool userns,
                                  bool seccomp_allow, int oom_score, const struct exec_request *req) {
     /* From here to the command's execve this process, and the child it
      * forks, are lightbox inside a container. Not dumpable, their memory and
@@ -2929,8 +3141,9 @@ static int exec_inside_container(const char *name, int target_pid, int privilege
     if (mntfd < 0 || utsfd < 0 || ipcfd < 0 || netfd < 0 || pidfd < 0)
         die("Error: failed to open target namespace fd");
 
-    /* Join the host-side container cgroup before switching mount namespaces. */
-    cgroup_join_self(name);
+    /* Join the exec's cgroup, below the container's, before switching mount
+     * namespaces: what is forked from here on is in it. */
+    cgroup_join_self(cg);
     /* and when memory runs short, be what the container's processes are to
      * the kernel, not what the caller of exec was */
     {
@@ -3311,7 +3524,7 @@ static void open_volume(const volume_spec *vol, struct volume_mount *out) {
         say_with_number("Error: cannot take the volume's source (errno ", (int)(tree < 0 ? -tree : 0), "): ");
         print_str(STDERR, vol->src);
         lc_print_char(STDERR, '\n');
-        lc_kernel_exit(1);
+        lc_kernel_exit(failure_status);
     }
 
     out->tree = (int32_t)tree;
@@ -3432,13 +3645,13 @@ static void attach_volumes(const struct volume_mount *vols, int count) {
         /* something to mount on, of the kind the source is */
         if (vols[i].is_dir) {
             if (make_dirs(dst) != 0)
-                lc_kernel_exit(1);
+                lc_kernel_exit(failure_status);
         } else {
             char parent[MAX_PATH];
             if (!parent_dir(parent, sizeof(parent), dst))
                 die2("Error: invalid path: ", dst);
             if (make_dirs(parent) != 0)
-                lc_kernel_exit(1);
+                lc_kernel_exit(failure_status);
             lc_sysret fd = lc_kernel_open_file(dst, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
             if (fd < 0)
                 die2("Error: failed to create volume target file: ", dst);
@@ -3451,7 +3664,7 @@ static void attach_volumes(const struct volume_mount *vols, int count) {
             say_with_number("Error: cannot mount the volume (errno ", (int)-rc, ") at ");
             print_str(STDERR, dst);
             lc_print_char(STDERR, '\n');
-            lc_kernel_exit(1);
+            lc_kernel_exit(failure_status);
         }
         lc_kernel_close_file(vols[i].tree);
 
@@ -3615,7 +3828,7 @@ static void build_container(const struct child_args *ca) {
      * what init may do. */
     if (loopback_up() != 0 ||
         (ca->address && container_interface_up(ca->address, ca->prefix, ca->gateway) != 0))
-        lc_kernel_exit(1);
+        lc_kernel_exit(failure_status);
 }
 
 /* What the clone that becomes a container's init runs. */
@@ -3788,7 +4001,7 @@ static void start_one(const char *name, int hook_wait) {
         print_str(STDERR, config.net == NET_PROXY ? "lightbox's rules keep it to its proxy, so it is not started without them\n"
                                                   : "lightbox's rules keep it to the internet and its name servers, so it is not\n"
                                                     "started without them\n");
-        lc_kernel_exit(1);
+        lc_kernel_exit(failure_status);
     }
     bool read_only = config.read_only;
     int oom_score = config.oom_score;
@@ -3821,7 +4034,7 @@ static void start_one(const char *name, int hook_wait) {
         print_str(STDERR, "' has links, and firewall = false in lightbox.conf. A linked container\n"
                           "shares the bridge with the others, and only lightbox's rules keep it to its\n"
                           "links, so it is not started without them\n");
-        lc_kernel_exit(1);
+        lc_kernel_exit(failure_status);
     }
     bool nftables = cfg_global.firewall_backend == FIREWALL_NFTABLES;
     bool ruled = linked || net_has_rules(config.net);
@@ -3839,7 +4052,7 @@ static void start_one(const char *name, int hook_wait) {
             "then start the container again:\n"
             "  modprobe br_netfilter && sysctl -w net.bridge.bridge-nf-call-iptables=1\n"
             "or set firewall_backend = nftables in lightbox.conf, which needs no br_netfilter\n");
-        lc_kernel_exit(1);
+        lc_kernel_exit(failure_status);
     }
 
     int32_t signal_fd = hold_signals();
@@ -4268,7 +4481,7 @@ static void stop_one(const char *name, int seconds) {
         print_str(STDERR, "Error: container '");
         print_str(STDERR, name);
         print_str(STDERR, "' is stopped, but not everything of it could be removed\n");
-        lc_kernel_exit(1);
+        lc_kernel_exit(failure_status);
     }
     print_str(STDOUT,"Container '");
     print_str(STDOUT,name);
@@ -4309,7 +4522,7 @@ static bool stop_if_running(const char *name, int seconds) {
 static void restart_one(const char *name, int seconds) {
     require_root("restart");
     if (!stop_if_running(name, seconds))
-        lc_kernel_exit(1);
+        lc_kernel_exit(failure_status);
     start_one(name, cfg_global.start_timeout);
 }
 
@@ -4388,7 +4601,7 @@ static void cmd_update(int argc, char **argv) {
         }
     }
     if (failed)
-        lc_kernel_exit(1);
+        lc_kernel_exit(failure_status);
 }
 
 static void cmd_add_vol(int argc, char **argv) {
@@ -4481,7 +4694,7 @@ static void cmd_rm_vol(int argc, char **argv) {
 static void rm_one(const char *name, int force) {
     /* with --force, one that runs is killed first, as docker rm -f does */
     if (force && !stop_if_running(name, 0))
-        lc_kernel_exit(1);
+        lc_kernel_exit(failure_status);
     container_lock(name);
 
     if (is_running(name)) die2("Error: container is running (stop it first): ", name);
@@ -4531,8 +4744,10 @@ static void request_term(struct exec_request *req) {
 }
 
 static void cmd_exec(int argc, char **argv) {
+    /* from the first moment the time limit can be counted from */
+    int64_t started = monotonic_ms();
     if (argc < 1)
-        die("Usage: lightbox exec <name> [--user <name|uid[:gid]>] [--env KEY=VALUE]... [--workdir <dir>] [--] [cmd [args...]]");
+        die("Usage: lightbox exec <name> [--user <name|uid[:gid]>] [--env KEY=VALUE]... [--workdir <dir>] [--timeout <duration>] [--] [cmd [args...]]");
     const char *name = argv[0];
     validate_name(name);
 
@@ -4575,22 +4790,39 @@ static void cmd_exec(int argc, char **argv) {
     struct lb_termios modes;
     bool restore = lc_kernel_device_control(STDIN, LB_TCGETS, &modes) >= 0;
 
+    static char cg[MAX_PATH];
+    exec_cgroup_make(name, cg);
+
     int32_t signal_fd = hold_relay_signals();
-    if (signal_fd < 0)
+    if (signal_fd < 0) {
+        exec_cgroup_end(name, cg, false);
         die("Error: failed to take over the signals of an exec");
+    }
 
     lc_sysret worker = lc_kernel_fork();
-    if (worker < 0)
+    if (worker < 0) {
+        exec_cgroup_end(name, cg, false);
         die("Error: failed to fork exec worker");
+    }
 
     if (worker == 0) {
         lc_kernel_close_file(signal_fd);
-        int status = exec_inside_container(name, pid, privileged, config.userns, config.seccomp_allow,
+        int status = exec_inside_container(cg, pid, privileged, config.userns, config.seccomp_allow,
                                            config.oom_score, &req);
         lc_kernel_exit(exit_code_from_status(status));
     }
 
-    lc_kernel_exit(finish_exec((int32_t)worker, signal_fd, restore ? &modes : NULL));
+    bool timed_out;
+    int code = finish_exec((int32_t)worker, signal_fd, restore ? &modes : NULL, cg,
+                           req.timeout_ms ? started + req.timeout_ms : 0, &timed_out);
+    exec_cgroup_end(name, cg, req.timeout_ms != 0);
+    if (timed_out) {
+        print_str(STDERR, "Error: the command ran past its time limit, --timeout ");
+        print_str(STDERR, req.timeout_text);
+        print_str(STDERR, ", and it and all it started were ended\n");
+        code = EXEC_TIMED_OUT;
+    }
+    lc_kernel_exit(code);
 }
 
 /* ─── cmd_ls ────────────────────────────────────────────────────────────── */
@@ -4685,7 +4917,11 @@ static const struct { const char *name; const char *text; } command_help[] = {
         "  exec   <name> [options] [--] [cmd [args...]]  Run a command in a running container\n"
         "         --user <name|uid[:gid]> Who to run it as (default: root)\n"
         "         --env <KEY=VALUE>       Set a variable in its environment (repeatable)\n"
-        "         --workdir <dir>         The directory to run it in (default: /)\n" },
+        "         --workdir <dir>         The directory to run it in (default: /)\n"
+        "         --timeout <duration>    End it, and all it started, after this long, such as 30s,\n"
+        "                                 5m or 1.5h; exec then exits with 124\n"
+        "         exec exits with the command's status, or 128 plus the signal that ended it; with\n"
+        "         125 when lightbox failed, 126 when the command could not be run, 127 when not found\n" },
     { "logs",
         "  logs   <name> [-f]            Show what the container has printed; -f follows it\n" },
     { "inspect",
@@ -4746,7 +4982,7 @@ static void print_usage(int32_t fd, const char *command) {
 /* A command line that is not one: the usage on standard error, and an error. */
 [[noreturn]] static void usage(void) {
     print_usage(STDERR, NULL);
-    lc_kernel_exit(1);
+    lc_kernel_exit(failure_status);
 }
 
 [[noreturn]] static void version(void) {
@@ -4801,6 +5037,10 @@ int main(int argc, char **argv, char **envp) {
     if (argc <= first) usage();
     char **args = argv + first;
     int nargs = argc - first;
+    /* exec's status is its command's, and lightbox's own failures have
+     * one of their own there, from here on */
+    if (streq(args[0], "exec"))
+        failure_status = EXEC_FAILED;
 
     /* help and the version need no configuration, and get none of its warnings */
     if (asks_for_help(args[0]) || streq(args[0], "help")) {

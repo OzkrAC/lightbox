@@ -236,6 +236,50 @@ t_stopped_container_cannot_stop_or_exec() {
     refused lb stop web && refused lb exec web /bin/true
 }
 
+# exec's status is its command's (ROADMAP 8.7), so a failure of lightbox's
+# own is 125 there, wherever it comes from: the options, --timeout among
+# them, root, a lightbox.conf that cannot be read. For every other command it
+# is 1, as it was.
+t_exec_failures_are_125() {
+    local bad=0 want rc long
+    expect_status() { # status, words...
+        want=$1
+        shift
+        lb "$@" >/dev/null 2>"$W/said"
+        rc=$?
+        echo "lightbox $*: $rc, $(head -n 1 "$W/said")"
+        [ "$rc" -eq "$want" ] || bad=1
+    }
+    expect_status 125 exec
+    expect_status 125 exec web --bogus
+    expect_status 125 exec web --timeout
+    expect_status 125 exec web --timeout 0 /bin/true
+    expect_status 125 exec web --timeout 1ms /bin/true
+    expect_status 125 exec web --timeout 366d /bin/true
+    expect_status 125 exec web --workdir relative /bin/true
+    expect_status 125 exec 'not a name' /bin/true
+    expect_status 125 exec web /bin/true
+    expect_status 125 exec web --timeout 2s -- /bin/true
+    grep -qx 'Error: lightbox exec must be run as root' "$W/said" || { echo "a valid --timeout is not taken"; bad=1; }
+    expect_status 0 exec --help
+    expect_status 1 start web
+    expect_status 1 stop web
+    expect_status 1 create 'not a name'
+    lb exec web --timeout 2x /bin/true 2>&1 | grep -qx 'Error: --timeout takes a duration above 0 and up to 365d, such as 30s, 5m or 1.5h: 2x' ||
+        { echo "--timeout does not say what it takes"; bad=1; }
+    long=$(printf '/%0600d' 0)
+    printf 'container_dir = %s\n' "$long" > "$W/long.conf"
+    HOME="$W/home" LIGHTBOX_CONFIG="$W/long.conf" "$LB" exec web /bin/true >/dev/null 2>&1
+    rc=$?
+    echo "exec with a lightbox.conf it cannot take: $rc"
+    [ "$rc" -eq 125 ] || bad=1
+    HOME="$W/home" LIGHTBOX_CONFIG="$W/long.conf" "$LB" ls >/dev/null 2>&1
+    rc=$?
+    echo "ls with it: $rc"
+    [ "$rc" -eq 1 ] || bad=1
+    return $bad
+}
+
 t_unknown_command_prints_usage() {
     usage=$(lb frobnicate 2>&1)
     [ $? -ne 0 ] && printf '%s\n' "$usage" | grep -q '^Usage: lightbox' &&
@@ -1943,6 +1987,7 @@ check 'commands fail for a container that does not exist'   t_missing_container_
 check 'add-vol appends a volume'                            t_addvol_appends
 check 'rm removes the container directory'                  t_rm_removes
 check 'stop and exec refuse a stopped container'            t_stopped_container_cannot_stop_or_exec
+check "exec's own failures are 125, and other commands' 1"  t_exec_failures_are_125
 check 'an unknown command prints usage and fails'           t_unknown_command_prints_usage
 check 'ls writes nothing'                                   t_ls_writes_nothing
 check 'a PID record is a number and nothing else'           t_pid_record_is_a_number

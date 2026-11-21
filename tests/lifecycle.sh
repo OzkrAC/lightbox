@@ -677,14 +677,111 @@ t_queries_show_running() {
     lb inspect shown | grep -qx "pid: $pid"
 }
 
+# exec's status (ROADMAP 8.7) is the command's, or 128 and its signal; 126
+# and 127 are a command that could not be run, and 125 a failure of
+# lightbox's own, such as a container that is not running.
 t_exec_status() {
     up status || return 1
     sh_in status 'exit 0';         a=$?
     sh_in status 'exit 7';         b=$?
     sh_in status 'kill -TERM $$';  c=$?
     lb exec status /no/such/program </dev/null; d=$?
-    echo "exit 0 -> $a, exit 7 -> $b, killed by SIGTERM -> $c, a missing program -> $d"
-    [ $a -eq 0 ] && [ $b -eq 7 ] && [ $c -eq 143 ] && [ $d -ne 0 ]
+    sh_in status ': > /not-executable'
+    lb exec status /not-executable </dev/null; e=$?
+    lb exec status --workdir /no/such/dir /bin/true </dev/null; f=$?
+    lb stop status >/dev/null || return 1
+    lb exec status /bin/true </dev/null; g=$?
+    echo "exit 0 -> $a, exit 7 -> $b, killed by SIGTERM -> $c, a missing program -> $d," \
+         "a file that cannot be executed -> $e, a --workdir that is not there -> $f, a stopped container -> $g"
+    [ $a -eq 0 ] && [ $b -eq 7 ] && [ $c -eq 143 ] && [ $d -eq 127 ] && [ $e -eq 126 ] && [ $f -eq 126 ] && [ $g -eq 125 ]
+}
+
+# Is a process running with this command line, its words joined by spaces?
+running_cmd() { # words
+    local f
+    for f in /proc/[0-9]*/cmdline; do
+        [ "$(tr '\0' ' ' < "$f" 2>/dev/null)" = "$1 " ] && return 0
+    done
+    return 1
+}
+exec_cgroups() { ls -d "$CG/$1"/exec-* 2>/dev/null; }    # name
+cgroup_empty() { grep -qx 'populated 0' "$1/cgroup.events"; }  # path
+
+# Every exec runs in a cgroup of its own below the container's, which goes
+# when the command ends. Without --timeout what it starts in the background
+# goes on, in that cgroup, which stays until it has ended and is then taken
+# away by the next exec; stop takes away one that still has a process.
+t_exec_cgroup() {
+    local said kept
+    up excg || return 1
+    said=$(sh_in excg 'cat /proc/self/cgroup')
+    echo "the cgroup of an exec: $said"
+    printf '%s\n' "$said" | grep -Eq '/excg/exec-[0-9]+-[0-9]+$' || { echo "it is not in a cgroup of its own"; return 1; }
+    [ -z "$(exec_cgroups excg)" ] || { echo "left after the exec: $(exec_cgroups excg)"; return 1; }
+    sh_in excg "$KIT setsid sleep 1071 >/dev/null 2>&1 </dev/null &" || return 1
+    wait_until 5 running_cmd 'sleep 1071' || { echo "what it started is not running"; return 1; }
+    kept=$(exec_cgroups excg)
+    echo "left with a process in it: $kept"
+    [ "$(printf '%s\n' "$kept" | grep -c .)" = 1 ] && running_cmd 'sleep 1071' &&
+        [ -n "$(cat "$kept/cgroup.procs")" ] || { echo "what it started is not there, in its cgroup"; return 1; }
+    kill $(cat "$kept/cgroup.procs")
+    wait_until 5 cgroup_empty "$kept" || { echo "the process did not end"; return 1; }
+    sh_in excg true || return 1
+    [ ! -d "$kept" ] || { echo "the next exec did not take away the empty cgroup $kept"; return 1; }
+    sh_in excg "$KIT setsid sleep 1072 >/dev/null 2>&1 </dev/null &" || return 1
+    wait_until 5 running_cmd 'sleep 1072' || { echo "the second is not running"; return 1; }
+    [ -n "$(exec_cgroups excg)" ] || { echo "no cgroup was left with the second"; return 1; }
+    lb stop excg >/dev/null || return 1
+    ! running_cmd 'sleep 1072' || { echo "stop left what the exec started"; return 1; }
+    nothing_left excg
+}
+
+# exec --timeout ends the command and all it started, in the background and
+# in sessions of their own, at the deadline, and exec returns 124. A command
+# that ends before it returns its own status, and what it left in the
+# background is ended with it.
+t_exec_timeout() {
+    local began ms rc
+    up extime || return 1
+    began=$(date +%s%N)
+    lb exec extime --timeout 2s /bin/sh -c "$KIT setsid sleep 1073 & sleep 1074" >"$OUT/extime.out" 2>"$OUT/extime.err" </dev/null
+    rc=$?
+    ms=$(( ($(date +%s%N) - began) / 1000000 ))
+    cat "$OUT/extime.err"
+    echo "status $rc in $ms ms"
+    [ "$rc" = 124 ] && [ "$ms" -lt 3000 ] || return 1
+    grep -q 'ran past its time limit, --timeout 2s' "$OUT/extime.err" || { echo "exec did not say why"; return 1; }
+    [ -z "$(exec_cgroups extime)" ] || { echo "left: $(exec_cgroups extime)"; return 1; }
+    ! running_cmd 'sleep 1073' && ! running_cmd 'sleep 1074' || { echo "a sleep is left"; return 1; }
+    began=$(date +%s%N)
+    # the second's sleep has begun when the shell ends
+    lb exec extime --timeout 30s /bin/sh -c "$KIT setsid sleep 1075 >/dev/null 2>&1 </dev/null & sleep 1; exit 3" </dev/null
+    rc=$?
+    ms=$(( ($(date +%s%N) - began) / 1000000 ))
+    echo "a command that ended before its deadline: status $rc in $ms ms"
+    [ "$rc" = 3 ] && [ "$ms" -lt 5000 ] || return 1
+    ! running_cmd 'sleep 1075' || { echo "what it left in the background goes on"; return 1; }
+    [ -z "$(exec_cgroups extime)" ] || { echo "left: $(exec_cgroups extime)"; return 1; }
+    [ "$(state_of extime)" = running ] || { echo "the container: $(state_of extime)"; return 1; }
+}
+
+# A container whose init died with an exec's cgroup left below its own is
+# cleared away whole, the exec's cgroup first.
+t_exec_cgroup_of_a_dead_init() {
+    local pid
+    up exdead || return 1
+    sh_in exdead "$KIT setsid sleep 1076 >/dev/null 2>&1 </dev/null &" || return 1
+    wait_until 5 running_cmd 'sleep 1076' || { echo "what it started is not running"; return 1; }
+    [ -n "$(exec_cgroups exdead)" ] || { echo "no cgroup was left"; return 1; }
+    pid=$(pid_of exdead)
+    kill -KILL "$pid"
+    wait_until 5 gone "$pid" || return 1
+    # stop clears it away and says that it does not run
+    lb stop exdead >"$OUT/exdead.stop" 2>&1
+    cat "$OUT/exdead.stop"
+    grep -q "had ended without a stop; what it left has been cleared away" "$OUT/exdead.stop" || return 1
+    ! running_cmd 'sleep 1076' || { echo "the sleep is left"; return 1; }
+    nothing_left exdead
 }
 
 t_exec_default_shell() {
@@ -1573,7 +1670,8 @@ t_cgroup_membership() {
     grep -qx "$(pid_of member)" "$CG/member/cgroup.procs" || { echo "init is not in the container's cgroup"; return 1; }
     where=$(sh_in member 'cat /proc/self/cgroup')
     echo "a command run by exec is in: $where"
-    case $where in *"/${CG##*/}/member") ;; *) return 1 ;; esac
+    # the exec's own, below the container's (ROADMAP 8.7)
+    case $where in *"/${CG##*/}/member/exec-"[0-9]*-[0-9]*) ;; *) return 1 ;; esac
 }
 
 # ─── Cases: the init hook, starting and stopping ────────────────────────────
@@ -3609,7 +3707,10 @@ if [ "$MODE" = inside ]; then
     check 'rm -f kills a running container and removes it'                t_rm_force
     check 'ls and inspect show a running container'                       t_queries_show_running
     check 'inspect --json of a running container has its init, as numbers'  t_inspect_json_running
-    check 'exec returns the exit status of the command'                   t_exec_status
+    check "exec returns the command's status, and 125, 126 and 127 for what is not the command's" t_exec_status
+    check 'an exec runs in a cgroup of its own, and stop takes away one that is left' t_exec_cgroup
+    check 'exec --timeout ends the command and all it started, and returns 124' t_exec_timeout
+    check "the cgroup an exec left goes with a container whose init died" t_exec_cgroup_of_a_dead_init
     check 'exec without a command runs a shell on standard input'         t_exec_default_shell
     check 'a container has its own hostname, processes and root'          t_own_world
     check 'a running container cannot be started again or removed'        t_running_container_is_protected
@@ -3662,7 +3763,7 @@ if [ "$MODE" = inside ]; then
     check '--io-max reaches io.max'                                        t_io_limit
     check 'past its memory limit a process is killed, and its container with it' t_past_the_memory_limit
     check 'without io, a container starts and is told once; with an I/O limit, not' t_without_io_controller
-    check 'init and commands run by exec are in the container cgroup'     t_cgroup_membership
+    check "init is in the container's cgroup, and a command run by exec in its exec's below it" t_cgroup_membership
 
     check 'the init hook runs with /tmp and /run mounted'                 t_hook_runs
     check 'a service the hook starts outlives the start command'          t_service_outlives_start

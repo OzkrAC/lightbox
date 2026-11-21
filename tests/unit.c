@@ -254,6 +254,17 @@ static void put_line(const char *label, const char *text) {
     put("\n");
 }
 
+/* a number of 64 bits on a line of its own: the harness prints ints */
+static void put_int64(int64_t number) {
+    if (number < 0) put("-");
+    uint64_t magnitude = number < 0 ? 0 - (uint64_t)number : (uint64_t)number;
+    char digits[24];
+    int at = (int)sizeof(digits);
+    digits[--at] = '\0';
+    do { digits[--at] = (char)('0' + magnitude % 10); magnitude /= 10; } while (magnitude);
+    put_line("", digits + at);
+}
+
 static uint32_t ipv4_arg(const char *text) {
     uint32_t addr;
     if (!parse_ipv4(text, &addr))
@@ -1093,14 +1104,15 @@ int main(int argc, char **argv, char **envp) {
             put("refused\n");
             return 0;
         }
-        /* in two halves: the harness prints ints */
-        if (number < 0) put("-");
-        uint64_t magnitude = number < 0 ? 0 - (uint64_t)number : (uint64_t)number;
-        char digits[24];
-        int at = (int)sizeof(digits);
-        digits[--at] = '\0';
-        do { digits[--at] = (char)('0' + magnitude % 10); magnitude /= 10; } while (magnitude);
-        put_line("", digits + at);
+        put_int64(number);
+        return 0;
+    }
+    if (argc == 3 && streq(argv[1], "duration")) {
+        int64_t ms;
+        if (parse_duration_ms(argv[2], &ms))
+            put_int64(ms);
+        else
+            put("refused\n");
         return 0;
     }
     if (argc == 4 && streq(argv[1], "limit")) {
@@ -1350,7 +1362,16 @@ int main(int argc, char **argv, char **envp) {
             unit_probe(argv[i]);
         return 0;
     }
-    if (argc >= 5 && streq(argv[1], "relay") && streq(argv[3], "--")) {
+    /* relay <pty> [<duration>] -- <command>: with a duration, the deadline of
+     * exec's --timeout, after which the worker is killed and "relay: timed
+     * out" is the last line on standard output */
+    bool limited = argc >= 6 && streq(argv[1], "relay") && streq(argv[4], "--");
+    if ((argc >= 5 && streq(argv[1], "relay") && streq(argv[3], "--")) || limited) {
+        int64_t limit_ms = 0;
+        if (limited && !parse_duration_ms(argv[3], &limit_ms))
+            die2("unit: not a duration: ", argv[3]);
+        int64_t deadline = limited ? monotonic_ms() + limit_ms : 0;
+        char **command_argv = argv + (limited ? 5 : 4);
         struct lb_termios modes;
         bool restore = lc_kernel_device_control(STDIN, LB_TCGETS, &modes) >= 0;
         int32_t signal_fd = hold_relay_signals();
@@ -1370,13 +1391,18 @@ int main(int argc, char **argv, char **envp) {
                 die("unit: cannot start the command");
             if (command == 0) {
                 take_streams(&streams);
-                exec_program(argv[4], (const char *const *)(uintptr_t)(argv + 4), (const char *const *)(uintptr_t)envp);
-                die2("unit: cannot execute ", argv[4]);
+                exec_program(command_argv[0], (const char *const *)(uintptr_t)command_argv,
+                             (const char *const *)(uintptr_t)envp);
+                die2("unit: cannot execute ", command_argv[0]);
             }
             lc_kernel_exit(exit_code_from_status(serve_command(&streams, (int32_t)command, worker_signals)));
         }
 
-        return finish_exec((int32_t)worker, signal_fd, restore ? &modes : NULL);
+        bool timed_out;
+        int code = finish_exec((int32_t)worker, signal_fd, restore ? &modes : NULL, NULL, deadline, &timed_out);
+        if (timed_out)
+            put_line("relay: ", "timed out");
+        return code;
     }
     if (argc >= 2 && streq(argv[1], "sealed")) {
         run_sealed();

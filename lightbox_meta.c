@@ -156,7 +156,7 @@ void cmd_logs(int argc, char **argv) {
             print_str(STDERR, "' (errno ");
             print_str(STDERR, digits);
             print_str(STDERR, ")\n");
-            lc_kernel_exit(1);
+            lc_kernel_exit(failure_status);
         }
 
         /* a container that was never started has no log, which is an empty one */
@@ -169,7 +169,7 @@ void cmd_logs(int argc, char **argv) {
             if (n == 0)
                 break;
             if (lc_kernel_write_all(STDOUT, buf, (size_t)n) < 0)
-                lc_kernel_exit(1);          /* nobody reads this any more */
+                lc_kernel_exit(failure_status);          /* nobody reads this any more */
             got_some = true;
         }
 
@@ -798,5 +798,5 @@ void cmd_doctor(int argc, char **argv) {
         print_kv("overall", d->failed == 0 ? "ok" : "degraded");
     }
     if (d->failed != 0)
-        lc_kernel_exit(1);
+        lc_kernel_exit(failure_status);
 }

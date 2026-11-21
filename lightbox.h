@@ -199,6 +199,18 @@ int config_volume_at(const container_config *config, const char *dst);
 int config_remove_volumes_at(container_config *config, const char *dst);
 
 void print_str(int32_t fd, const char *s);
+
+/*
+ * The status lightbox ends with when it fails: 1, but for exec, whose status
+ * is its command's (ROADMAP 8.7). There a failure of lightbox's is
+ * EXEC_FAILED, as env and timeout have it, so that a driver can tell it from
+ * what the command did: 126 is a command that could not be executed, 127 one
+ * that is not there, and EXEC_TIMED_OUT one that --timeout ended. Every exit
+ * that is a failure of lightbox's uses failure_status, die and die2 among them.
+ */
+#define EXEC_TIMED_OUT 124
+#define EXEC_FAILED    125
+extern int failure_status;
 [[noreturn]] void die(const char *msg);
 [[noreturn]] void die2(const char *prefix, const char *detail);
 bool streq(const char *a, const char *b);
@@ -240,6 +252,15 @@ bool has_control_chars(const char *s);
 #define START_TIMEOUT_DEFAULT  30
 #define STOP_TIMEOUT_DEFAULT   10
 [[nodiscard]] bool parse_seconds(const char *s, int *out);
+
+/*
+ * A duration in milliseconds, above 0 and at most DURATION_MAX_MS: digits,
+ * up to three more after a point, and a unit, s, m, h or d, or none for
+ * seconds. "2s", "1.5m" and "90" are durations; "0", ".5", "1.", "1.2345s",
+ * "-1", "+1", "1 s", "1ms" and "2x" are not.
+ */
+#define DURATION_MAX_MS ((int64_t)365 * 86400 * 1000)
+[[nodiscard]] bool parse_duration_ms(const char *text, int64_t *ms);
 int fmt_int(char *buf, int val);
 int write_file(const char *path, const char *data);
 void require_write_file(const char *path, const char *data);
@@ -487,6 +508,8 @@ void set_container_state(const char *name, const char *state);
 void get_container_state(const char *name, char *buf, size_t bufsz);
 int get_container_pid(const char *name);
 int get_container_pid_starttime(const char *name, char *buf, size_t bufsz);
+/* a process's start time, field 22 of /proc/<pid>/stat, as digits: 0, or -1 */
+[[nodiscard]] int proc_starttime(int pid, char *buf, size_t bufsz);
 /* record a running init, its start time before its PID: 0, or -1 */
 [[nodiscard]] int container_record_pid(const char *name, int pid);
 /* forget which process init was and what it said when it ended */
