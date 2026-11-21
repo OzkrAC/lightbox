@@ -1950,13 +1950,16 @@ add rule ip lightbox input iifname \"br7\" ip saddr @proxied jump egress_proxy
 add rule ip lightbox egress ct state established,related return
 add rule ip lightbox egress ip saddr . ip daddr @outside_dns udp dport 53 return
 add rule ip lightbox egress ip saddr . ip daddr @outside_dns tcp dport 53 return
+add rule ip lightbox egress ip daddr @refused meta l4proto tcp reject with tcp reset
 add rule ip lightbox egress ip daddr @refused reject with icmp type admin-prohibited
 add rule ip lightbox egress_host ct state established,related return
 add rule ip lightbox egress_host ip saddr . ip daddr @outside_dns udp dport 53 return
 add rule ip lightbox egress_host ip saddr . ip daddr @outside_dns tcp dport 53 return
+add rule ip lightbox egress_host meta l4proto tcp reject with tcp reset
 add rule ip lightbox egress_host reject with icmp type admin-prohibited
 add rule ip lightbox egress_proxy ct state established,related return
 add rule ip lightbox egress_proxy ip saddr . ip daddr . tcp dport @proxy_to return
+add rule ip lightbox egress_proxy meta l4proto tcp reject with tcp reset
 add rule ip lightbox egress_proxy reject with icmp type admin-prohibited
 add rule ip lightbox postrouting ip saddr 10.9.0.0/16 oifname != \"br7\" masquerade
 table bridge lightbox {
@@ -1982,7 +1985,7 @@ add rule bridge lightbox forward meta ibrname \"br7\" drop"
     got=$("$UNIT" firewall nft-setup 10.0.0.0/24 10.0.0.1 br0 true 0x10/0xf0 | grep -n 'mark')
     [ "$got" = '42:add rule ip lightbox forward meta mark & 0xf0 == 0x10 accept
 43:add rule ip lightbox input meta mark & 0xf0 == 0x10 accept
-74:add rule bridge lightbox forward meta mark & 0xf0 == 0x10 accept' ] || { printf '%s\n' "$got"; return 1; }
+77:add rule bridge lightbox forward meta mark & 0xf0 == 0x10 accept' ] || { printf '%s\n' "$got"; return 1; }
     got=$("$UNIT" firewall nft-setup 10.0.0.0/24 10.0.0.1 br0 true 0x10 | grep 'mark' | head -n 1)
     [ "$got" = 'add rule ip lightbox forward meta mark 0x10 accept' ] || { echo "a mark without a mask: $got"; return 1; }
     # a bridge whose name would not stay between the quotes gets no rules
@@ -2180,18 +2183,31 @@ t_firewall_setup_text() {
 -F LIGHTBOX-INPUT
 -A LIGHTBOX-INPUT -i br7 -j LIGHTBOX-EGRESS
 -F LIGHTBOX-OUTSIDE
+-A LIGHTBOX-OUTSIDE -m addrtype --dst-type LOCAL -p tcp -j REJECT --reject-with tcp-reset
 -A LIGHTBOX-OUTSIDE -m addrtype --dst-type LOCAL -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-OUTSIDE -m addrtype --dst-type BROADCAST -p tcp -j REJECT --reject-with tcp-reset
 -A LIGHTBOX-OUTSIDE -m addrtype --dst-type BROADCAST -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-OUTSIDE -m addrtype --dst-type MULTICAST -p tcp -j REJECT --reject-with tcp-reset
 -A LIGHTBOX-OUTSIDE -m addrtype --dst-type MULTICAST -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-OUTSIDE -d 0.0.0.0/8 -p tcp -j REJECT --reject-with tcp-reset
 -A LIGHTBOX-OUTSIDE -d 0.0.0.0/8 -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-OUTSIDE -d 10.0.0.0/8 -p tcp -j REJECT --reject-with tcp-reset
 -A LIGHTBOX-OUTSIDE -d 10.0.0.0/8 -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-OUTSIDE -d 100.64.0.0/10 -p tcp -j REJECT --reject-with tcp-reset
 -A LIGHTBOX-OUTSIDE -d 100.64.0.0/10 -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-OUTSIDE -d 127.0.0.0/8 -p tcp -j REJECT --reject-with tcp-reset
 -A LIGHTBOX-OUTSIDE -d 127.0.0.0/8 -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-OUTSIDE -d 169.254.0.0/16 -p tcp -j REJECT --reject-with tcp-reset
 -A LIGHTBOX-OUTSIDE -d 169.254.0.0/16 -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-OUTSIDE -d 172.16.0.0/12 -p tcp -j REJECT --reject-with tcp-reset
 -A LIGHTBOX-OUTSIDE -d 172.16.0.0/12 -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-OUTSIDE -d 192.0.0.0/24 -p tcp -j REJECT --reject-with tcp-reset
 -A LIGHTBOX-OUTSIDE -d 192.0.0.0/24 -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-OUTSIDE -d 192.168.0.0/16 -p tcp -j REJECT --reject-with tcp-reset
 -A LIGHTBOX-OUTSIDE -d 192.168.0.0/16 -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-OUTSIDE -d 198.18.0.0/15 -p tcp -j REJECT --reject-with tcp-reset
 -A LIGHTBOX-OUTSIDE -d 198.18.0.0/15 -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-OUTSIDE -d 224.0.0.0/3 -p tcp -j REJECT --reject-with tcp-reset
 -A LIGHTBOX-OUTSIDE -d 224.0.0.0/3 -j REJECT --reject-with icmp-admin-prohibited
 COMMIT
 *nat
@@ -2244,6 +2260,7 @@ t_firewall_proxy_text() {
 :LO-5ea0e1194872 - [0:0]
 -A LO-5ea0e1194872 -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
 -A LO-5ea0e1194872 -d 10.199.0.1 -p tcp --dport 3128 -j RETURN
+-A LO-5ea0e1194872 -p tcp -j REJECT --reject-with tcp-reset
 -A LO-5ea0e1194872 -j REJECT --reject-with icmp-admin-prohibited
 -A LIGHTBOX-EGRESS -s 10.199.0.5 -j LO-5ea0e1194872
 -I LIGHTBOX-LINKS 1 -s 10.199.0.5 -j DROP

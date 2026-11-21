@@ -306,14 +306,35 @@ reaches() { # name address
     case $answer in *[Rr]efused*) return 0 ;; *) return 1 ;; esac
 }
 
-# Does the firewall refuse a TCP connection from the container to that
-# address at once, as --net outside does? It answers with "administratively
-# prohibited", which a client says as no route to the host.
-rejected() { # name address
+# Listeners on port 7 of the host and of the namespace that stands for the
+# internet, on every address of theirs, which answer "here": started with
+# the network, for as long as the suite runs. The firewall refuses TCP with a
+# reset, as a port that nothing listens on does, so a refusal is the
+# firewall's only where a listener is.
+ECHO_PORT=7
+need_listeners() { [ -e "$T/have_listeners" ] || { echo "no python3 for the listeners on port $ECHO_PORT"; return 77; }; }
+
+# Does the listener at that address and port answer the container with that
+# line?
+answers() { # name address port line
     local answer
-    answer=$(sh_in "$1" "$KIT nc -w 3 $2 9 </dev/null" 2>&1)
-    printf '%s -> %s: %s\n' "$1" "$2" "${answer:-no answer}"
-    case $answer in *'No route to host'*) return 0 ;; *) return 1 ;; esac
+    answer=$(sh_in "$1" "$KIT nc -w 3 $2 $3 </dev/null" 2>&1)
+    printf '%s -> %s port %s: %s\n' "$1" "$2" "$3" "${answer:-no answer}"
+    [ "$answer" = "$4" ]
+}
+answered() { answers "$1" "$2" "$ECHO_PORT" here; }   # name address
+
+# Does the firewall refuse a TCP connection from the container to that port,
+# where a listener is, at once, as --net outside and proxy do: a reset,
+# which a client says as refused, within a second, exec's own time with it?
+rejected() { # name address [port]
+    local answer t0 t1 ms port=${3:-$ECHO_PORT}
+    t0=$(date +%s%N)
+    answer=$(sh_in "$1" "$KIT nc -w 3 $2 $port </dev/null" 2>&1)
+    t1=$(date +%s%N)
+    ms=$(( (t1 - t0) / 1000000 ))
+    printf '%s -> %s port %s: %s, in %s ms\n' "$1" "$2" "$port" "${answer:-no answer}" "$ms"
+    case $answer in *[Rr]efused*) [ "$ms" -lt 1000 ] ;; *) return 1 ;; esac
 }
 
 # Addresses beyond the host that a container of --net outside may not reach,
@@ -404,19 +425,6 @@ PYTHON
     echo $!
 }
 
-# Is a TCP connection from the container to that port refused at once, as
-# by the rules of --net proxy, within a second? "No route to host", and the
-# milliseconds it took, exec's own time with it.
-refused_fast() { # name address port
-    local answer t0 t1 ms
-    t0=$(date +%s%N)
-    answer=$(sh_in "$1" "$KIT nc -w 3 $2 $3 </dev/null" 2>&1)
-    t1=$(date +%s%N)
-    ms=$(( (t1 - t0) / 1000000 ))
-    printf '%s -> %s port %s: %s, in %s ms\n' "$1" "$2" "$3" "${answer:-no answer}" "$ms"
-    case $answer in *'No route to host'*) [ "$ms" -lt 1000 ] ;; *) return 1 ;; esac
-}
-
 # Whether bridged traffic passes through iptables in this network namespace.
 # Fails when the kernel cannot do it (br_netfilter is not loaded).
 brnf() { # 0 | 1
@@ -469,7 +477,9 @@ t_setup() {
         { echo "INPUT does not begin with the jump to LIGHTBOX-INPUT"; iptables -S INPUT; return 1; }
     iptables -C LIGHTBOX-FORWARD -i "$BR" ! -o "$BR" -j LIGHTBOX-EGRESS &&
     iptables -C LIGHTBOX-INPUT -i "$BR" -j LIGHTBOX-EGRESS &&
+    iptables -C LIGHTBOX-OUTSIDE -m addrtype --dst-type LOCAL -p tcp -j REJECT --reject-with tcp-reset &&
     iptables -C LIGHTBOX-OUTSIDE -m addrtype --dst-type LOCAL -j REJECT --reject-with icmp-admin-prohibited &&
+    iptables -C LIGHTBOX-OUTSIDE -d 169.254.0.0/16 -p tcp -j REJECT --reject-with tcp-reset &&
     iptables -C LIGHTBOX-OUTSIDE -d 169.254.0.0/16 -j REJECT --reject-with icmp-admin-prohibited ||
         { echo "a rule of --net outside is missing:"; iptables-save; return 1; }
     # nothing names the interface the default route leaves by
@@ -2181,15 +2191,16 @@ net_outside() { # prefix, starter...
     local p=$1 dns_pid said a
     shift
     need_nc || return 77
+    need_listeners || return 77
     private_addresses || return 1
     box "${p}out" --dns "$PRIVATE_DNS" && box "${p}nat" --net nat --dns "$PRIVATE_DNS" || return 1
     [ "$(conf_value "${p}out" net)" = outside ] || { echo "the default is not outside: $(conf_value "${p}out" net)"; return 1; }
     "$@" "${p}out" && "$@" "${p}nat" || return 1
     for a in "$GW" 192.0.2.2 "$PRIVATE" "$METADATA" "$PRIVATE_DNS"; do
-        reaches "${p}nat" "$a" || { echo "the container of --net nat does not reach $a"; return 1; }
+        answered "${p}nat" "$a" || { echo "the container of --net nat does not reach $a"; return 1; }
         rejected "${p}out" "$a" || { echo "$a was not refused at once"; return 1; }
     done
-    reaches "${p}out" "$OUTSIDE" || { echo "the container of --net outside does not reach the outside"; return 1; }
+    answered "${p}out" "$OUTSIDE" || { echo "the container of --net outside does not reach the outside"; return 1; }
     if dns_pid=$(dns_responder "$PRIVATE_DNS"); then
         sleep 0.5
         said=$(sh_in "${p}out" "$KIT nslookup lbt.example $PRIVATE_DNS" 2>&1)
@@ -2235,19 +2246,20 @@ PROXY_PORT=3128
 
 # --net proxy:<port> (ROADMAP 8.6), with a listener on the gateway standing
 # in for the proxy: the container reaches that port of the gateway and
-# nothing else. Another port of the gateway, the host's other address, the
-# outside and a name server are each refused within a second, and a name
-# server on UDP does not answer it; its resolv.conf names none; exec and the
-# hook have the variables of its proxy, and --env replaces one. A container
-# of --net nat beside it reaches all of them. With links, that one names it
-# with --link, made before it so that create could not refuse the link, and
-# neither reaches the other. Then stopped, nothing of its rules is left.
-# links: whether links can be had here; starter: what starts a container.
+# nothing else. Another port of the gateway, the proxy's port on the host's
+# other address, the outside and a name server on TCP, each with a listener,
+# are refused within a second, and a name server on UDP does not answer it;
+# its resolv.conf names none; exec and the hook have the variables of its
+# proxy, and --env replaces one. A container of --net nat beside it reaches
+# all of them. With links, that one names it with --link, made before it so
+# that create could not refuse the link, and neither reaches the other. Then
+# stopped, nothing of its rules is left. links: whether links can be had
+# here; starter: what starts a container.
 net_proxy() { # prefix, links (yes|no), starter...
-    local p=$1 links=$2 listener dns_pid said a v url
+    local p=$1 links=$2 rc=0
     shift 2
     need_nc || return 77
-    command -v python3 >/dev/null 2>&1 || { echo "no python3 for a listener in place of the proxy"; return 77; }
+    need_listeners || return 77
     private_addresses || return 1
     if [ "$links" = yes ]; then
         box "${p}lnk" --net nat --link "${p}prx" || return 1
@@ -2259,24 +2271,29 @@ net_proxy() { # prefix, links (yes|no), starter...
     hook "${p}prx" <<'EOF'
 env > /hook.env
 EOF
-    listener=$(tcp_listener "$GW" "$PROXY_PORT" 'the proxy here') || return 1
-    "$@" "${p}lnk" && "$@" "${p}prx" || { kill "$listener"; return 1; }
-    said=
-    for _ in 1 2 3 4 5; do
-        said=$(sh_in "${p}prx" "$KIT nc -w 3 $GW $PROXY_PORT </dev/null" 2>&1)
-        [ "$said" = 'the proxy here' ] && break
+    # in place of the proxy, on every address of the host; and a name server
+    # on TCP beyond it
+    local proxy tcp53
+    proxy=$(tcp_listener 0.0.0.0 "$PROXY_PORT" 'the proxy here') &&
+        tcp53=$(tcp_listener 0.0.0.0 53 'a name server on TCP' "$(cat "$T/outside")") || return 1
+    "$@" "${p}lnk" && "$@" "${p}prx" && net_proxy_checks "$p" "$links" || rc=1
+    kill "$proxy" "$tcp53" 2>/dev/null
+    port_free() { ! ss -ltn | grep -q ":$PROXY_PORT "; }
+    wait_until 5 port_free || { echo "the listener on port $PROXY_PORT is still there"; rc=1; }
+    [ "$rc" = 0 ] && lb stop "${p}prx" >/dev/null && nothing_left "${p}prx"
+}
+net_proxy_checks() { # prefix, links
+    local p=$1 links=$2 said v url dns_pid try
+    for try in 1 2 3 4 5; do
+        answers "${p}prx" "$GW" "$PROXY_PORT" 'the proxy here' && break
+        [ "$try" = 5 ] && { echo "the container did not reach its proxy"; return 1; }
         sleep 0.3
     done
-    kill "$listener" 2>/dev/null
-    echo "${p}prx -> $GW port $PROXY_PORT: $said"
-    [ "$said" = 'the proxy here' ] || { echo "the container did not reach its proxy"; return 1; }
-    for a in "$GW 9" "192.0.2.2 $PROXY_PORT" "$OUTSIDE 80" "$PRIVATE_DNS 53"; do
-        # shellcheck disable=SC2086     # an address and a port
-        refused_fast "${p}prx" $a || { echo "$a was not refused within a second"; return 1; }
-    done
-    for a in "$GW" 192.0.2.2 "$OUTSIDE" "$PRIVATE_DNS"; do
-        reaches "${p}lnk" "$a" || { echo "the container of --net nat does not reach $a"; return 1; }
-    done
+    answered "${p}lnk" "$GW" && answers "${p}lnk" 192.0.2.2 "$PROXY_PORT" 'the proxy here' &&
+    answered "${p}lnk" "$OUTSIDE" && answers "${p}lnk" "$PRIVATE_DNS" 53 'a name server on TCP' ||
+        { echo "the container of --net nat does not reach one of them"; return 1; }
+    rejected "${p}prx" "$GW" && rejected "${p}prx" 192.0.2.2 "$PROXY_PORT" && rejected "${p}prx" "$OUTSIDE" &&
+    rejected "${p}prx" "$PRIVATE_DNS" 53 || { echo "it was not refused within a second"; return 1; }
     if dns_pid=$(dns_responder "$PRIVATE_DNS"); then
         sleep 0.5
         said=$(sh_in "${p}lnk" "$KIT nslookup lbt.example $PRIVATE_DNS" 2>&1)
@@ -2299,11 +2316,12 @@ EOF
     [ "$said" = 'HTTP_PROXY=http://elsewhere:1' ] || { echo "--env did not replace it: $said"; return 1; }
     sh_in "${p}lnk" env | grep -qi '_proxy=' && { echo "a container of --net nat has the variables"; return 1; }
     if [ "$links" = yes ]; then
-        # nothing listens on port 9 of either, so a refusal is what reaching it is
+        # nothing listens on port 9 of either: reaching it is a refusal, and
+        # what the bridge drops gets no answer at all
         reaches "${p}lnk" "$(addr_of "${p}prx")" && { echo "a container linked to it reached it"; return 1; }
         reaches "${p}prx" "$(addr_of "${p}lnk")" && { echo "it reached a container linked to it"; return 1; }
     fi
-    lb stop "${p}prx" >/dev/null && nothing_left "${p}prx"
+    return 0
 }
 t_net_proxy() {
     local links=yes
@@ -2366,8 +2384,10 @@ EOF
         said=$(sh_in sqprx "$KIT wget -q -O - http://allowed.lbt.test/" 2>&1)
         echo "http://allowed.lbt.test/: $said"
         [ "$said" = 'from the outside' ] || { echo "a name on the list was not reached on port 80"; rc=1; }
+        # nc's input stays open a while: at its end nc half-closes the
+        # connection, which Squid takes for the client giving up
         connect() { # authority
-            printf 'CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n' "$1" "$1" |
+            { printf 'CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n' "$1" "$1"; sleep 2; } |
                 lb exec sqprx /bin/sh -c "$KIT nc -w 3 $GW $PROXY_PORT" 2>&1 | tr -d '\r'
         }
         said=$(connect allowed.lbt.test:443)
@@ -2854,10 +2874,10 @@ t_start_after_a_reboot_of_the_network() {
     iptables -t nat -C POSTROUTING -j LIGHTBOX-POSTROUTING || { echo "lightbox's jumps are not there"; return 1; }
     [ "$(cat /proc/sys/net/ipv4/ip_forward)" = 1 ] && [ "$(iptables -S FORWARD | head -n 1)" = '-P FORWARD DROP' ] ||
         { echo "forwarding is not on with the FORWARD policy at DROP"; return 1; }
-    if [ -e "$T/have_nc" ]; then
-        rejected rebuilt "$GW" && reaches rebuilt "$OUTSIDE"
+    if [ -e "$T/have_nc" ] && [ -e "$T/have_listeners" ]; then
+        rejected rebuilt "$GW" && answered rebuilt "$OUTSIDE"
     else
-        echo "the suite's busybox has no nc: whether the container reaches anything is not tried"
+        echo "no nc in the suite's busybox, or no python3 for listeners: whether the container reaches anything is not tried"
     fi
 }
 
@@ -3177,6 +3197,7 @@ t_nft_setup() {
     nft list chain bridge lightbox forward | grep -qF "ibrname \"$BR\" drop" &&
     nft list chain ip lightbox forward | grep -qF "iifname \"$BR\" oifname != \"$BR\" ip saddr @outside jump egress" &&
     nft list chain ip lightbox input | grep -qF "iifname \"$BR\" ip saddr @outside jump egress_host" &&
+    nft list chain ip lightbox egress_host | grep -qF "reject with tcp reset" &&
     nft list chain ip lightbox egress_host | grep -qF "reject with icmp admin-prohibited" &&
     nft list chain ip lightbox forward | grep -qF "iifname \"$BR\" oifname != \"$BR\" ip saddr @proxied jump egress_proxy" &&
     nft list chain ip lightbox input | grep -qF "iifname \"$BR\" ip saddr @proxied jump egress_proxy" &&
@@ -3364,7 +3385,11 @@ network() {
     nsenter -t "$outside" -n ip link set lo up &&
     nsenter -t "$outside" -n ip addr add "$OUTSIDE/24" dev lbt-out &&
     nsenter -t "$outside" -n ip link set lbt-out up &&
-    ip route add default via "$OUTSIDE" dev "$WAN"
+    ip route add default via "$OUTSIDE" dev "$WAN" || return 1
+    # from a subshell, so that they are no job of the suite's shell
+    if (tcp_listener 0.0.0.0 "$ECHO_PORT" here >/dev/null) && (tcp_listener 0.0.0.0 "$ECHO_PORT" here "$outside" >/dev/null); then
+        : > "$T/have_listeners"
+    fi
 }
 
 fixture() {

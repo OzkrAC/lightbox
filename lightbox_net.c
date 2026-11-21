@@ -305,6 +305,13 @@ static const char *const OUTSIDE_REFUSED[] = {
     "192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15", "224.0.0.0/3",
 };
 #define NOUTSIDE_REFUSED (sizeof(OUTSIDE_REFUSED) / sizeof(OUTSIDE_REFUSED[0]))
+/* How what is refused is refused, at once: TCP with a reset, the rest with
+ * ICMP "administratively prohibited". Not TCP with the ICMP: it comes back
+ * across the veth while connect() still holds its socket, and the kernel
+ * then keeps it as a soft error, so that the connection fails only when a
+ * second SYN is refused, a second later. A reset waits for the socket. Each
+ * match is two rules, the reset's first. */
+#define OUTSIDE_REJECT_TCP " -p tcp -j REJECT --reject-with tcp-reset\n"
 #define OUTSIDE_REJECT " -j REJECT --reject-with icmp-admin-prohibited\n"
 
 /*
@@ -376,14 +383,18 @@ bool firewall_setup_text(const container_network *net, char *text, size_t max) {
     out_put(&out, " -j LIGHTBOX-EGRESS\n-F LIGHTBOX-OUTSIDE\n");
     static const char *const types[] = { "LOCAL", "BROADCAST", "MULTICAST" };
     for (size_t i = 0; i < 3; i++) {
-        out_put(&out, "-A LIGHTBOX-OUTSIDE -m addrtype --dst-type ");
-        out_put(&out, types[i]);
-        out_put(&out, OUTSIDE_REJECT);
+        for (int tcp = 1; tcp >= 0; tcp--) {
+            out_put(&out, "-A LIGHTBOX-OUTSIDE -m addrtype --dst-type ");
+            out_put(&out, types[i]);
+            out_put(&out, tcp ? OUTSIDE_REJECT_TCP : OUTSIDE_REJECT);
+        }
     }
     for (size_t i = 0; i < NOUTSIDE_REFUSED; i++) {
-        out_put(&out, "-A LIGHTBOX-OUTSIDE -d ");
-        out_put(&out, OUTSIDE_REFUSED[i]);
-        out_put(&out, OUTSIDE_REJECT);
+        for (int tcp = 1; tcp >= 0; tcp--) {
+            out_put(&out, "-A LIGHTBOX-OUTSIDE -d ");
+            out_put(&out, OUTSIDE_REFUSED[i]);
+            out_put(&out, tcp ? OUTSIDE_REJECT_TCP : OUTSIDE_REJECT);
+        }
     }
     out_put(&out, "COMMIT\n");
     out_put(&out, "*nat\n-F LIGHTBOX-POSTROUTING\n");
@@ -546,6 +557,9 @@ bool firewall_egress_text(const char *name, const char *ip, const char *gw, cons
         out_put(&out, " -p tcp --dport ");
         out_put(&out, port);
         out_put(&out, " -j RETURN\n-A ");
+        out_put(&out, chain);
+        out_put(&out, OUTSIDE_REJECT_TCP);
+        out_put(&out, "-A ");
         out_put(&out, chain);
         out_put(&out, OUTSIDE_REJECT);
     } else {
@@ -1213,14 +1227,18 @@ bool nft_setup_text(const container_network *net, char *text, size_t max) {
             out_put(&out, chain);
             out_put(&out, allowed[i]);
         }
-        out_put(&out, "add rule ip lightbox ");
-        out_put(&out, chain);
-        out_put(&out, host ? " reject with icmp type admin-prohibited\n"
-                           : " ip daddr @refused reject with icmp type admin-prohibited\n");
+        /* refused as OUTSIDE_REJECT_TCP says, TCP with a reset */
+        for (int tcp = 1; tcp >= 0; tcp--) {
+            out_put(&out, "add rule ip lightbox ");
+            out_put(&out, chain);
+            out_put(&out, host ? "" : " ip daddr @refused");
+            out_put(&out, tcp ? " meta l4proto tcp reject with tcp reset\n" : " reject with icmp type admin-prohibited\n");
+        }
     }
     out_put(&out,
         "add rule ip lightbox egress_proxy ct state established,related return\n"
         "add rule ip lightbox egress_proxy ip saddr . ip daddr . tcp dport @proxy_to return\n"
+        "add rule ip lightbox egress_proxy meta l4proto tcp reject with tcp reset\n"
         "add rule ip lightbox egress_proxy reject with icmp type admin-prohibited\n");
     if (cfg_global.ip_masq) {
         out_put(&out, "add rule ip lightbox postrouting ip saddr "); out_put(&out, subnet);
