@@ -1087,8 +1087,8 @@ static void cmd_create(int argc, char **argv) {
                 die2("Error: --seccomp takes allow or deny, not: ", value);
         } else if (streq(opt, "--net")) {
             const char *value = option_value(argc, argv, &i);
-            if (!parse_net_mode(value, &cfg.net))
-                die2("Error: --net takes nat, outside or none, not: ", value);
+            if (!parse_net_mode(value, &cfg.net, &cfg.proxy_port))
+                die2("Error: --net takes nat, outside, none or proxy:<port>, not: ", value);
         } else if (streq(opt, "--rootfs")) {
             str_copy_or_die(cfg_global.rootfs, option_value(argc, argv, &i), MAX_PATH, "--rootfs");
         } else if (streq(opt, "--copy")) {
@@ -1141,10 +1141,21 @@ static void cmd_create(int argc, char **argv) {
         if (cfg.nlinks > 0)
             die("Error: a container with --net none has no network for --link");
     }
-    /* --net outside is lightbox's firewall rules: without them it would be nat */
+    /* --net proxy: one port of the gateway, and no link or name server to
+     * reach besides; its names are the proxy's to look up (ROADMAP 8.6) */
+    if (cfg.net == NET_PROXY) {
+        if (cfg.nlinks > 0)
+            die("Error: a container with --net proxy reaches its proxy and nothing else: no --link");
+        if (ndns > 0)
+            die("Error: a container with --net proxy has its proxy look up names: no --dns");
+    }
+    /* --net outside and proxy are lightbox's firewall rules: without them
+     * each would be nat */
     if (cfg.net == NET_OUTSIDE && !cfg_global.firewall)
         die("Error: --net outside, the default, needs lightbox's firewall rules, and lightbox.conf has\n"
             "firewall = false; create the container with --net nat or --net none");
+    if (cfg.net == NET_PROXY && !cfg_global.firewall)
+        die("Error: --net proxy needs lightbox's firewall rules, and lightbox.conf has firewall = false");
 
     /* check if container already exists */
     char cdir[MAX_PATH], root[MAX_PATH];
@@ -1171,6 +1182,17 @@ static void cmd_create(int argc, char **argv) {
     /* One create at a time: what one decides about names and addresses holds
      * until it is done. */
     store_lock();
+    /* A link to a container of --net proxy would be a way out of it. The
+     * firewall drops what the bridge would switch to or from one, whatever
+     * links name it; one that is there already is refused here. */
+    for (int i = 0; i < cfg.nlinks; i++) {
+        static container_config peer;
+        char peer_dir[MAX_PATH];
+        container_dir_path(peer_dir, cfg.links[i]);
+        if (path_exists(peer_dir) && container_config_load(cfg.links[i], &peer) == NULL && peer.net == NET_PROXY)
+            die2("Error: --link names a container of --net proxy, which reaches its proxy and nothing else: ",
+                 cfg.links[i]);
+    }
     char ip[IPV4_TEXT_MAX] = "";
     if (cfg.net != NET_NONE)
         choose_address(&net, address_given ? &asked : NULL, ip);
@@ -1218,7 +1240,12 @@ static void cmd_create(int argc, char **argv) {
      * public ones.
      */
     char resolv[4096];
-    {
+    if (cfg.net == NET_PROXY) {
+        /* none: a lookup of its own could carry data out, and its proxy looks
+         * names up */
+        static const char proxy_resolv[] = "# --net proxy: the proxy looks up names\n";
+        lc_bytes_copy(resolv, proxy_resolv, sizeof(proxy_resolv));
+    } else {
         if (ndns == 0 && cfg_global.dns[0]) {
             ndns = name_servers_listed(cfg_global.dns, dns);
             if (ndns <= 0) {
@@ -1540,12 +1567,43 @@ static void say_with_number(const char *before, int number, const char *after) {
 }
 
 /*
+ * --net proxy (ROADMAP 8.6): where its proxy is, for the programs of the
+ * init hook and of exec, as HTTP_PROXY, HTTPS_PROXY and NO_PROXY in both
+ * spellings, as programs read one or the other. How many it wrote in vars:
+ * PROXY_ENV_COUNT, or 0 for another --net. Only where they connect to is
+ * the firewall's to keep them to; the variables tell them where that is.
+ */
+#define PROXY_ENV_COUNT 6
+#define PROXY_VAR_MAX   48      /* "HTTPS_PROXY=http://255.255.255.255:65535" and its NUL */
+static int proxy_environment(const container_config *config, uint32_t gateway,
+                             char vars[PROXY_ENV_COUNT][PROXY_VAR_MAX]) {
+    if (!config || config->net != NET_PROXY)
+        return 0;
+    char url[32] = "http://", address[IPV4_TEXT_MAX], port[8];
+    bool cut = false;
+    format_ipv4(address, gateway);
+    fmt_int(port, config->proxy_port);
+    size_t pos = str_append(url, 7, address, sizeof(url), &cut);
+    pos = str_append(url, pos, ":", sizeof(url), &cut);
+    str_append(url, pos, port, sizeof(url), &cut);
+    static const char *const names[PROXY_ENV_COUNT] = {
+        "HTTP_PROXY=", "HTTPS_PROXY=", "http_proxy=", "https_proxy=", "NO_PROXY=", "no_proxy=",
+    };
+    for (int i = 0; i < PROXY_ENV_COUNT; i++) {
+        pos = str_append(vars[i], 0, names[i], PROXY_VAR_MAX, &cut);
+        str_append(vars[i], pos, i < 4 ? url : "localhost,127.0.0.1,::1", PROXY_VAR_MAX, &cut);
+    }
+    return cut ? 0 : PROXY_ENV_COUNT;
+}
+
+/*
  * Run the image's hook as a child of init: its PID, or -1 once the failure
  * has been reported. Like every program lightbox starts it begins with no
  * signal blocked. Init's own descriptors are close-on-exec and do not reach
- * it.
+ * it. Its environment is PATH, HOME and TERM, and where the proxy of a
+ * container of --net proxy is.
  */
-static int32_t start_hook(const char *script) {
+static int32_t start_hook(const char *script, const container_config *config, uint32_t gateway) {
     lc_sysret pid = lc_kernel_fork();
     if (pid < 0) {
         say_with_number("Error: cannot start the init hook (fork failed, errno ", (int)-pid, ")\n");
@@ -1556,7 +1614,12 @@ static int32_t start_hook(const char *script) {
         lc_kernel_set_signal_mask(LC_SIG_SETMASK, &no_signals, NULL);
 
         const char *a[] = { "/bin/sh", script, NULL };
-        const char *e[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "HOME=/root", "TERM=xterm", NULL };
+        static char proxy[PROXY_ENV_COUNT][PROXY_VAR_MAX];
+        const char *e[3 + PROXY_ENV_COUNT + 1] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "HOME=/root", "TERM=xterm" };
+        int n = proxy_environment(config, gateway, proxy);
+        for (int i = 0; i < n; i++)
+            e[3 + i] = proxy[i];
+        e[3 + n] = NULL;
         lc_sysret failed = exec_program("/bin/sh", a, e);
         say_with_number("Error: cannot execute /bin/sh for the init hook (errno ", (int)-failed, ")\n");
         lc_kernel_exit(127);
@@ -1715,7 +1778,7 @@ static int init_main(const struct child_args *ca) {
 
     int32_t hook_pid = 0;
     if (ca->hook && path_exists(ca->hook)) {
-        hook_pid = start_hook(ca->hook);
+        hook_pid = start_hook(ca->hook, ca->config, ca->gateway);
         if (hook_pid < 0) {
             (void)report_to_starter(ca->report_wr, START_HOOK_DONE, 126);
             return 1;
@@ -1791,6 +1854,8 @@ struct exec_request {
     int          nenv;
     const char  *workdir;               /* --workdir, or NULL */
     const char  *term;                  /* the caller's TERM, or NULL */
+    const char  *proxy[PROXY_ENV_COUNT];    /* --net proxy: where its proxy is */
+    int          nproxy;
     const char *const *argv;            /* the command, NULL at its end */
 };
 
@@ -2173,8 +2238,8 @@ static bool same_variable(const char *a, const char *b) {
  * environment, its directory, and the command itself. Does not return.
  *
  * The environment is PATH, HOME, TERM, and USER and LOGNAME for a uid that
- * has a name; --env adds to it and replaces what it names, the later of two
- * for the same variable winning.
+ * has a name, and with --net proxy where its proxy is; --env adds to it and
+ * replaces what it names, the later of two for the same variable winning.
  */
 [[noreturn]] static void run_command(const struct exec_request *req, const struct identity *id) {
     bool cut = false;
@@ -2195,7 +2260,7 @@ static bool same_variable(const char *a, const char *b) {
     if (cut)
         die("Error: the command's environment does not fit");
 
-    const char *base[5];
+    const char *base[5 + PROXY_ENV_COUNT];
     int nbase = 0;
     base[nbase++] = "PATH=/usr/bin:/bin:/usr/sbin:/sbin";
     base[nbase++] = home_env;
@@ -2204,8 +2269,10 @@ static bool same_variable(const char *a, const char *b) {
         base[nbase++] = user_env;
         base[nbase++] = logname_env;
     }
+    for (int i = 0; i < req->nproxy; i++)
+        base[nbase++] = req->proxy[i];
 
-    const char *envp[5 + MAX_EXEC_ENV + 1];
+    const char *envp[5 + PROXY_ENV_COUNT + MAX_EXEC_ENV + 1];
     int n = 0;
     for (int i = 0; i < nbase; i++) {
         bool replaced = false;
@@ -3708,14 +3775,19 @@ static void start_one(const char *name, int hook_wait) {
             die_about_address(ip, why);
     }
 
-    /* --net outside is lightbox's firewall rules, which it is not started
-     * without */
-    if (config.net == NET_OUTSIDE && !cfg_global.firewall) {
+    /* --net outside and proxy are lightbox's firewall rules, which it is not
+     * started without */
+    if (net_has_rules(config.net) && !cfg_global.firewall) {
+        char mode[NET_MODE_TEXT_MAX];
+        net_mode_text(mode, config.net, config.proxy_port);
         print_str(STDERR, "Error: container '");
         print_str(STDERR, name);
-        print_str(STDERR, "' has --net outside, and firewall = false in lightbox.conf. Only\n"
-                          "lightbox's rules keep it to the internet and its name servers, so it is not\n"
-                          "started without them\n");
+        print_str(STDERR, "' has --net ");
+        print_str(STDERR, mode);
+        print_str(STDERR, ", and firewall = false in lightbox.conf. Only\n");
+        print_str(STDERR, config.net == NET_PROXY ? "lightbox's rules keep it to its proxy, so it is not started without them\n"
+                                                  : "lightbox's rules keep it to the internet and its name servers, so it is not\n"
+                                                    "started without them\n");
         lc_kernel_exit(1);
     }
     bool read_only = config.read_only;
@@ -3752,7 +3824,7 @@ static void start_one(const char *name, int hook_wait) {
         lc_kernel_exit(1);
     }
     bool nftables = cfg_global.firewall_backend == FIREWALL_NFTABLES;
-    bool ruled = linked || config.net == NET_OUTSIDE;
+    bool ruled = linked || net_has_rules(config.net);
     if (ruled && nftables)
         require_tool("nft", tool_path_nft());
     else if (ruled)
@@ -4021,7 +4093,7 @@ static void start_one(const char *name, int hook_wait) {
         goto fail_start;
     }
     if (firewall_add_rules(name, ip, &config) != 0) {
-        start_err = "failed to put in the firewall rules of the container's links or --net outside";
+        start_err = "failed to put in the firewall rules of the container's links or --net";
         goto fail_start;
     }
 
@@ -4420,7 +4492,7 @@ static void rm_one(const char *name, int force) {
     if (firewall_remove_links(name) != 0)
         die2("Error: the container is not removed while the firewall rules of its links are there: ", name);
     if (firewall_remove_egress(name) != 0)
-        die2("Error: the container is not removed while the firewall rules of its --net outside are there: ", name);
+        die2("Error: the container is not removed while the firewall rules of its --net are there: ", name);
 
     char cdir[MAX_PATH];
     container_dir_path(cdir, name);
@@ -4484,6 +4556,16 @@ static void cmd_exec(int argc, char **argv) {
     container_config_load_or_die(name, &config);
     int pid = get_container_pid(name);
     bool privileged = config.privileged;
+    /* where its proxy is: the gateway that it started with, as lightbox.conf
+     * has it, which start sees to */
+    static char proxy[PROXY_ENV_COUNT][PROXY_VAR_MAX];
+    if (config.net == NET_PROXY) {
+        container_network net;
+        container_network_load_or_die(&net);
+        req.nproxy = proxy_environment(&config, net.gateway, proxy);
+        for (int i = 0; i < req.nproxy; i++)
+            req.proxy[i] = proxy[i];
+    }
 
     /* The terminal's modes as they are now. The worker makes the terminal
      * raw while a command has a terminal of its own, and puts the modes back;
@@ -4574,8 +4656,10 @@ static const struct { const char *name; const char *text; } command_help[] = {
         "         --privileged           Disable security sandbox\n"
         "         --seccomp allow|deny   The seccomp profile: the allow-list, or the deny-list\n"
         "                                (default: allow)\n"
-        "         --net nat|outside|none What it may reach: the network as before 0.8, the internet\n"
-        "                                and its name servers only, or nothing (default: outside)\n"
+        "         --net <mode>           What it may reach: outside, the internet and its name servers\n"
+        "                                only (the default); nat, the network as before 0.8; none,\n"
+        "                                nothing; proxy:<port>, that port of the gateway, where a\n"
+        "                                proxy listens, and nothing else\n"
         "         --oom-score <n>        OOM score adjustment (default: 500)\n"
         "         --link <name>          Allow network to another container\n"
         "         --dns <address>        A name server for the container (up to 3; default: the host's)\n" },

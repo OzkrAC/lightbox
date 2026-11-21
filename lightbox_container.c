@@ -179,18 +179,36 @@ bool parse_seccomp_profile(const char *text, bool *allow) {
 
 static const char *const NET_MODE_NAMES[] = { [NET_NAT] = "nat", [NET_OUTSIDE] = "outside", [NET_NONE] = "none" };
 
-bool parse_net_mode(const char *text, int *mode) {
+#define NET_PROXY_PREFIX "proxy:"
+
+/* proxy:<port>: a port from 1 to 65535 in decimal, as fmt_int writes it */
+bool parse_net_mode(const char *text, int *mode, int *proxy_port) {
     for (int i = 0; i < (int)(sizeof(NET_MODE_NAMES) / sizeof(NET_MODE_NAMES[0])); i++) {
         if (streq(text, NET_MODE_NAMES[i])) {
             *mode = i;
+            *proxy_port = 0;
             return true;
         }
     }
-    return false;
+    size_t head = sizeof(NET_PROXY_PREFIX) - 1;
+    int64_t port;
+    if (!lc_string_starts_with(text, lc_string_length(text), NET_PROXY_PREFIX, head) ||
+        text[head] < '1' || text[head] > '9' || !parse_number(text + head, 1, 65535, &port))
+        return false;
+    *mode = NET_PROXY;
+    *proxy_port = (int)port;
+    return true;
 }
 
-const char *net_mode_name(int mode) {
-    return mode >= NET_NAT && mode <= NET_NONE ? NET_MODE_NAMES[mode] : "?";
+void net_mode_text(char out[NET_MODE_TEXT_MAX], int mode, int proxy_port) {
+    if (mode == NET_PROXY && proxy_port >= 1 && proxy_port <= 65535) {
+        size_t head = sizeof(NET_PROXY_PREFIX) - 1;
+        lc_bytes_copy(out, NET_PROXY_PREFIX, head);
+        fmt_int(out + head, proxy_port);
+        return;
+    }
+    const char *name = mode >= NET_NAT && mode <= NET_NONE ? NET_MODE_NAMES[mode] : "?";
+    lc_bytes_copy(out, name, lc_string_length(name) + 1);
 }
 
 /* "a,b,c": one to MAX_DNS IPv4 addresses, each in the form format_ipv4 writes */
@@ -552,7 +570,8 @@ static const char *config_line(container_config *config, char *line, unsigned *s
         case KEY_SECCOMP:
             return parse_seccomp_profile(value, &config->seccomp_allow) ? NULL : "seccomp is not allow or deny";
         case KEY_NET:
-            return parse_net_mode(value, &config->net) ? NULL : "net is not nat, outside or none";
+            return parse_net_mode(value, &config->net, &config->proxy_port)
+                   ? NULL : "net is not nat, outside, none or proxy:<port>";
         case KEY_DNS:
             return parse_dns_list(value, config) ? NULL : "dns is not a list of up to " STRINGIFY(MAX_DNS) " IPv4 addresses";
         default:    /* KEY_IO */
@@ -696,7 +715,11 @@ const char *container_config_save(const char *name, const container_config *conf
     if (config->seccomp_allow) put_line(&out, "seccomp", "allow");
     /* without the line, nat: what create --net nat makes, and what every
      * container had before 0.8 */
-    if (config->net != NET_NAT) put_line(&out, "net", net_mode_name(config->net));
+    if (config->net != NET_NAT) {
+        char mode[NET_MODE_TEXT_MAX];
+        net_mode_text(mode, config->net, config->proxy_port);
+        put_line(&out, "net", mode);
+    }
     if (config->ndns > 0) {
         put(&out, "dns=");
         for (int i = 0; i < config->ndns; i++) {

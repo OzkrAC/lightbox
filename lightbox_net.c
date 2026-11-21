@@ -477,7 +477,9 @@ int firewall_remove_links(const char *name) {
     return 0;
 }
 
-/* ─── --net outside, per container ──────────────────────────────────────── */
+/* ─── --net outside and --net proxy, per container ──────────────────────── */
+
+bool net_has_rules(int mode) { return mode == NET_OUTSIDE || mode == NET_PROXY; }
 
 /* An address as format_ipv4 writes it, and no other text. */
 static bool plain_ipv4(const char *text) {
@@ -489,54 +491,120 @@ static bool plain_ipv4(const char *text) {
     return streq(back, text);
 }
 
+/* A port as fmt_int writes it, from 1 to 65535, and no other text. */
+static bool plain_port(const char *text) {
+    int64_t port;
+    return text[0] >= '1' && text[0] <= '9' && parse_number(text, 1, 65535, &port);
+}
+
+/* The gateway of lightbox.conf, as format_ipv4 writes it: where the proxy of
+ * a container of --net proxy listens. */
+static bool gateway_text(char out[IPV4_TEXT_MAX]) {
+    container_network net;
+    const char *setting;
+    if (container_network_parse(cfg_global.subnet, cfg_global.gw, &net, &setting) != NULL)
+        return false;
+    format_ipv4(out, net.gateway);
+    return true;
+}
+
 /*
  * iptables: a chain of the container's own, which LIGHTBOX-EGRESS jumps to
- * for what comes from its address. What answers what it was asked goes on,
- * and so does a question to one of its name servers on port 53; the rest
- * goes to LIGHTBOX-OUTSIDE, which refuses the host and the ranges that are no
- * one's on the internet, and lets the rest of it go on.
+ * for what comes from its address. What answers what it was asked goes on.
+ * With --net outside, so does a question to one of its name servers on port
+ * 53, and the rest goes to LIGHTBOX-OUTSIDE, which refuses the host and the
+ * ranges that are no one's on the internet, and lets the rest of it go on.
+ * With --net proxy, what goes to its proxy's port of the gateway goes on, and
+ * the rest is refused; and at the top of LIGHTBOX-LINKS, before the chain of
+ * any link, what the bridge switches from it or to it is dropped, so that a
+ * container that names it with --link reaches it no more than it reaches
+ * that one.
  */
-bool firewall_egress_text(const char *name, const char *ip, const container_config *config, char *text, size_t max) {
+bool firewall_egress_text(const char *name, const char *ip, const char *gw, const container_config *config,
+                          char *text, size_t max) {
     struct text_out out = { .text = text, .max = max, .pos = 0, .cut = false };
     char chain[IFNAME_TEXT_MAX];
     egress_chain_name(name, chain);
     text[0] = '\0';
-    if (!plain_ipv4(ip))
+    bool proxy = config->net == NET_PROXY;
+    if (!net_has_rules(config->net) || !plain_ipv4(ip))
+        return false;
+    if (proxy && (!plain_ipv4(gw) || config->proxy_port < 1 || config->proxy_port > 65535))
         return false;
     out_put(&out, "*filter\n:");
     out_put(&out, chain);
     out_put(&out, " - [0:0]\n-A ");
     out_put(&out, chain);
     out_put(&out, " -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN\n");
-    for (int i = 0; i < config->ndns; i++) {
-        if (!plain_ipv4(config->dns[i]))
-            return false;
-        for (int tcp = 0; tcp < 2; tcp++) {
-            out_put(&out, "-A ");
-            out_put(&out, chain);
-            out_put(&out, " -d ");
-            out_put(&out, config->dns[i]);
-            out_put(&out, tcp ? " -p tcp --dport 53 -j RETURN\n" : " -p udp --dport 53 -j RETURN\n");
+    if (proxy) {
+        char port[8];
+        fmt_int(port, config->proxy_port);
+        out_put(&out, "-A ");
+        out_put(&out, chain);
+        out_put(&out, " -d ");
+        out_put(&out, gw);
+        out_put(&out, " -p tcp --dport ");
+        out_put(&out, port);
+        out_put(&out, " -j RETURN\n-A ");
+        out_put(&out, chain);
+        out_put(&out, OUTSIDE_REJECT);
+    } else {
+        for (int i = 0; i < config->ndns; i++) {
+            if (!plain_ipv4(config->dns[i]))
+                return false;
+            for (int tcp = 0; tcp < 2; tcp++) {
+                out_put(&out, "-A ");
+                out_put(&out, chain);
+                out_put(&out, " -d ");
+                out_put(&out, config->dns[i]);
+                out_put(&out, tcp ? " -p tcp --dport 53 -j RETURN\n" : " -p udp --dport 53 -j RETURN\n");
+            }
         }
+        out_put(&out, "-A ");
+        out_put(&out, chain);
+        out_put(&out, " -j LIGHTBOX-OUTSIDE\n");
     }
-    out_put(&out, "-A ");
-    out_put(&out, chain);
-    out_put(&out, " -j LIGHTBOX-OUTSIDE\n-A LIGHTBOX-EGRESS -s ");
+    out_put(&out, "-A LIGHTBOX-EGRESS -s ");
     out_put(&out, ip);
     out_put(&out, " -j ");
     out_put(&out, chain);
-    out_put(&out, "\nCOMMIT\n");
+    out_put(&out, "\n");
+    if (proxy) {
+        for (int to = 0; to < 2; to++) {
+            out_put(&out, to ? "-I LIGHTBOX-LINKS 1 -d " : "-I LIGHTBOX-LINKS 1 -s ");
+            out_put(&out, ip);
+            out_put(&out, " -j DROP\n");
+        }
+    }
+    out_put(&out, "COMMIT\n");
     return !out.cut;
 }
 
-/* nftables: the record is the container's address, then its name servers,
- * a line each. */
-bool nft_egress_record(const char *ip, const container_config *config, char *text, size_t max) {
+/* What begins the one line of a record of --net proxy under nftables. */
+#define NFT_PROXY_LINE "proxy "
+
+/* nftables: the record of --net outside is the container's address, then
+ * its name servers, a line each; of --net proxy one line: "proxy", the
+ * container's address, its proxy's address and port, and its port on the
+ * bridge. */
+bool nft_egress_record(const char *name, const char *ip, const char *gw, const container_config *config,
+                       char *text, size_t max) {
     struct text_out out = { .text = text, .max = max, .pos = 0, .cut = false };
     text[0] = '\0';
-    if (!plain_ipv4(ip))
+    if (!net_has_rules(config->net) || !plain_ipv4(ip))
         return false;
     out_put(&out, NFT_RECORD_HEAD);
+    if (config->net == NET_PROXY) {
+        if (!plain_ipv4(gw) || config->proxy_port < 1 || config->proxy_port > 65535)
+            return false;
+        char port[8], ifname[IFNAME_TEXT_MAX];
+        fmt_int(port, config->proxy_port);
+        host_port_name(name, ifname);
+        const char *const fields[] = { NFT_PROXY_LINE, ip, " ", gw, " ", port, " ", ifname, "\n" };
+        for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++)
+            out_put(&out, fields[i]);
+        return !out.cut;
+    }
     out_put(&out, ip);
     out_put(&out, "\n");
     for (int i = 0; i < config->ndns; i++) {
@@ -548,16 +616,16 @@ bool nft_egress_record(const char *ip, const container_config *config, char *tex
     return !out.cut;
 }
 
-/* From a record, the elements of the two sets; with removal, put in and
- * taken out again in one transaction, so that what is gone already does not
- * keep the rest in. */
-bool nft_egress_text(const char *record, bool removal, char *text, size_t max) {
-    size_t head = lc_string_length(NFT_RECORD_HEAD);
-    if (!lc_string_starts_with(record, lc_string_length(record), NFT_RECORD_HEAD, head))
-        return false;
+/* Is the record, after its head, one of --net proxy? */
+static bool nft_record_is_proxy(const char *body) {
+    return lc_string_starts_with(body, lc_string_length(body), NFT_PROXY_LINE, sizeof(NFT_PROXY_LINE) - 1);
+}
+
+/* The elements of a record of --net outside, a line for each set. */
+static bool outside_elements(const char *body, struct text_out *list) {
     char addrs[1 + MAX_DNS][IPV4_TEXT_MAX];
     int n = 0;
-    for (const char *line = record + head; *line; ) {
+    for (const char *line = body; *line; ) {
         const char *end = line;
         while (*end && *end != '\n') end++;
         size_t len = (size_t)(end - line);
@@ -572,22 +640,73 @@ bool nft_egress_text(const char *record, bool removal, char *text, size_t max) {
     }
     if (n == 0)
         return false;
+    out_put(list, "element ip lightbox outside { ");
+    out_put(list, addrs[0]);
+    out_put(list, " }\n");
+    if (n > 1) {
+        out_put(list, "element ip lightbox outside_dns { ");
+        for (int i = 1; i < n; i++) {
+            out_put(list, i > 1 ? ", " : "");
+            out_put(list, addrs[0]);
+            out_put(list, " . ");
+            out_put(list, addrs[i]);
+        }
+        out_put(list, " }\n");
+    }
+    return true;
+}
+
+/* The elements of a record of --net proxy: the container in the set of
+ * those, its address with its proxy's address and port in the set of what
+ * they may reach, and its port on the bridge in the set of the ports that
+ * the bridge switches nothing from or to. */
+static bool proxy_elements(const char *body, struct text_out *list) {
+    char line[80];
+    size_t len = 0;
+    while (body[len] && body[len] != '\n')
+        len++;
+    if (body[len] != '\n' || body[len + 1] != '\0' || len >= sizeof(line))
+        return false;
+    lc_bytes_copy(line, body, len);
+    line[len] = '\0';
+    char *fields[4];
+    int n = 0;
+    char *p = line + sizeof(NFT_PROXY_LINE) - 1;
+    for (;;) {
+        if (n == 4)
+            return false;
+        fields[n++] = p;
+        while (*p && *p != ' ')
+            p++;
+        if (!*p)
+            break;
+        *p++ = '\0';
+    }
+    if (n != 4 || !plain_ipv4(fields[0]) || !plain_ipv4(fields[1]) || !plain_port(fields[2]) || !host_port_ok(fields[3]))
+        return false;
+    const char *const parts[] = {
+        "element ip lightbox proxied { ", fields[0], " }\n",
+        "element ip lightbox proxy_to { ", fields[0], " . ", fields[1], " . ", fields[2], " }\n",
+        "element bridge lightbox sealed { \"", fields[3], "\" }\n",
+    };
+    for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); i++)
+        out_put(list, parts[i]);
+    return true;
+}
+
+/* From a record, the elements of the sets; with removal, put in and taken
+ * out again in one transaction, so that what is gone already does not keep
+ * the rest in. */
+bool nft_egress_text(const char *record, bool removal, char *text, size_t max) {
+    size_t head = lc_string_length(NFT_RECORD_HEAD);
+    if (!lc_string_starts_with(record, lc_string_length(record), NFT_RECORD_HEAD, head))
+        return false;
     static char sets[512];
     struct text_out list = { .text = sets, .max = sizeof(sets), .pos = 0, .cut = false };
     sets[0] = '\0';
-    out_put(&list, "element ip lightbox outside { ");
-    out_put(&list, addrs[0]);
-    out_put(&list, " }\n");
-    if (n > 1) {
-        out_put(&list, "element ip lightbox outside_dns { ");
-        for (int i = 1; i < n; i++) {
-            out_put(&list, i > 1 ? ", " : "");
-            out_put(&list, addrs[0]);
-            out_put(&list, " . ");
-            out_put(&list, addrs[i]);
-        }
-        out_put(&list, " }\n");
-    }
+    const char *body = record + head;
+    if (!(nft_record_is_proxy(body) ? proxy_elements(body, &list) : outside_elements(body, &list)))
+        return false;
     struct text_out out = { .text = text, .max = max, .pos = 0, .cut = list.cut };
     text[0] = '\0';
     /* each line of the sets, as "add <line>" and with removal "delete <line>" after */
@@ -612,7 +731,7 @@ bool nft_egress_text(const char *record, bool removal, char *text, size_t max) {
 static int nft_remove_egress(const char *record, const char *recorded) {
     static char text[FIREWALL_TEXT_MAX];
     if (!nft_egress_text(recorded, true, text, sizeof(text))) {
-        print_str(STDERR, "Error: the record of the container's --net outside rules is not one lightbox writes: ");
+        print_str(STDERR, "Error: the record of the container's --net rules is not one lightbox writes: ");
         print_str(STDERR, record);
         lc_print_char(STDERR, '\n');
         return -1;
@@ -621,11 +740,12 @@ static int nft_remove_egress(const char *record, const char *recorded) {
     bool gone = run_cmd_input(tool_path_nft(), nft, text, true) == 0;
     if (!gone) {
         /* without lightbox's set nothing of them is left */
-        const char *look[] = { "nft", "list", "set", "ip", "lightbox", "outside", NULL };
+        bool proxy = nft_record_is_proxy(recorded + lc_string_length(NFT_RECORD_HEAD));
+        const char *look[] = { "nft", "list", "set", "ip", "lightbox", proxy ? "proxied" : "outside", NULL };
         gone = run_cmd_quiet(tool_path_nft(), look) != 0;
     }
     if (!gone) {
-        print_str(STDERR, "Error: cannot take the container out of the nftables sets of --net outside\n");
+        print_str(STDERR, "Error: cannot take the container out of the nftables sets of its --net\n");
         return -1;
     }
     lc_kernel_unlinkat(AT_FDCWD, record, 0);
@@ -643,30 +763,43 @@ int firewall_remove_egress(const char *name) {
         lc_string_starts_with(recorded, (size_t)n, NFT_RECORD_HEAD, lc_string_length(NFT_RECORD_HEAD)))
         return nft_remove_egress(record, recorded);
 
-    /* "<chain> <address>\n": what a start put in, whatever lightbox started it */
-    char *chain = recorded, *ip = NULL;
+    /* "<chain> <address>\n", and " proxy" before the end for --net proxy:
+     * what a start put in, whatever lightbox started it */
+    char *chain = recorded, *ip = NULL, *kind = NULL;
     if (n > 0 && chain[n - 1] == '\n')
         chain[--n] = '\0';
     for (int i = 0; n > 0 && i < n; i++) {
         if (chain[i] == ' ') {
             chain[i] = '\0';
-            ip = chain + i + 1;
-            break;
+            if (!ip) {
+                ip = chain + i + 1;
+            } else if (!kind) {
+                kind = chain + i + 1;
+            } else {
+                ip = NULL;          /* more than three words */
+                break;
+            }
         }
     }
-    if (!ip || !egress_chain_ok(chain) || !plain_ipv4(ip)) {
-        print_str(STDERR, "Error: the record of the container's --net outside rules does not name a chain of lightbox's: ");
+    bool proxy = kind && streq(kind, "proxy");
+    if (!ip || (kind && !proxy) || !egress_chain_ok(chain) || !plain_ipv4(ip)) {
+        print_str(STDERR, "Error: the record of the container's --net rules does not name a chain of lightbox's: ");
         print_str(STDERR, record);
         lc_print_char(STDERR, '\n');
         return -1;
     }
-    static char text[256];
+    static char text[512];
     struct text_out out = { .text = text, .max = sizeof(text), .pos = 0, .cut = false };
     text[0] = '\0';
     out_put(&out, "*filter\n-D LIGHTBOX-EGRESS -s "); out_put(&out, ip); out_put(&out, " -j "); out_put(&out, chain);
     out_put(&out, "\n-F "); out_put(&out, chain);
     out_put(&out, "\n-X "); out_put(&out, chain);
-    out_put(&out, "\nCOMMIT\n");
+    out_put(&out, "\n");
+    if (proxy) {
+        out_put(&out, "-D LIGHTBOX-LINKS -s "); out_put(&out, ip); out_put(&out, " -j DROP\n");
+        out_put(&out, "-D LIGHTBOX-LINKS -d "); out_put(&out, ip); out_put(&out, " -j DROP\n");
+    }
+    out_put(&out, "COMMIT\n");
     const char *restore[] = { "iptables-restore", "--noflush", NULL };
     bool gone = !out.cut && run_cmd_input(tool_path_iptables_restore(), restore, text, true) == 0;
     if (!gone) {
@@ -674,13 +807,22 @@ int firewall_remove_egress(const char *name) {
         const char *flush[] = { "iptables", "-F", chain, NULL };
         const char *drop[] = { "iptables", "-X", chain, NULL };
         const char *look[] = { "iptables", "-n", "-L", chain, NULL };
+        const char *from[] = { "iptables", "-D", "LIGHTBOX-LINKS", "-s", ip, "-j", "DROP", NULL };
+        const char *to[] = { "iptables", "-D", "LIGHTBOX-LINKS", "-d", ip, "-j", "DROP", NULL };
+        const char *has_from[] = { "iptables", "-C", "LIGHTBOX-LINKS", "-s", ip, "-j", "DROP", NULL };
+        const char *has_to[] = { "iptables", "-C", "LIGHTBOX-LINKS", "-d", ip, "-j", "DROP", NULL };
         (void)iptables_delete_all(jump);
         (void)run_cmd_quiet(tool_path_iptables(), flush);
         (void)run_cmd_quiet(tool_path_iptables(), drop);
-        gone = run_cmd_quiet(tool_path_iptables(), look) != 0;
+        if (proxy) {
+            (void)iptables_delete_all(from);
+            (void)iptables_delete_all(to);
+        }
+        gone = run_cmd_quiet(tool_path_iptables(), look) != 0 &&
+               (!proxy || (iptables_check(has_from) != 0 && iptables_check(has_to) != 0));
     }
     if (!gone) {
-        print_str(STDERR, "Error: cannot remove the firewall chain of the container's --net outside: ");
+        print_str(STDERR, "Error: cannot remove the firewall rules of the container's --net: ");
         print_str(STDERR, chain);
         lc_print_char(STDERR, '\n');
         return -1;
@@ -711,8 +853,11 @@ static bool links_plan(const char *name, const container_config *config, bool nf
 
 static bool egress_plan(const char *name, const char *ip, const container_config *config, bool nftables,
                         struct rules_plan *plan) {
+    char gw[IPV4_TEXT_MAX];
+    if (!gateway_text(gw))
+        return false;
     if (nftables)
-        return nft_egress_record(ip, config, plan->record, sizeof(plan->record)) &&
+        return nft_egress_record(name, ip, gw, config, plan->record, sizeof(plan->record)) &&
                nft_egress_text(plan->record, false, plan->text, sizeof(plan->text));
     char chain[IFNAME_TEXT_MAX];
     bool cut = false;
@@ -720,11 +865,13 @@ static bool egress_plan(const char *name, const char *ip, const container_config
     size_t pos = str_append(plan->record, 0, chain, sizeof(plan->record), &cut);
     pos = str_append(plan->record, pos, " ", sizeof(plan->record), &cut);
     pos = str_append(plan->record, pos, ip, sizeof(plan->record), &cut);
+    if (config->net == NET_PROXY)
+        pos = str_append(plan->record, pos, " proxy", sizeof(plan->record), &cut);
     str_append(plan->record, pos, "\n", sizeof(plan->record), &cut);
-    return !cut && firewall_egress_text(name, ip, config, plan->text, sizeof(plan->text));
+    return !cut && firewall_egress_text(name, ip, gw, config, plan->text, sizeof(plan->text));
 }
 
-/* The text of a container's links and of its --net outside, as one: nft's
+/* The text of a container's links and of the rules of its --net, as one: nft's
  * one after the other; for iptables-restore one table, the chains of both
  * declared before the rules of either. False when it does not fit. */
 bool firewall_rules_text(bool nftables, const char *links, const char *egress, char *text, size_t max) {
@@ -764,7 +911,7 @@ bool firewall_rules_text(bool nftables, const char *links, const char *egress, c
 }
 
 /*
- * The links and the --net outside rules of a container, either or both, put
+ * The links and the --net rules of a container, either or both, put
  * in with one process: what an earlier run left of them taken out, then on
  * record before they are there, so that a command that is killed in between
  * leaves the record and the next one takes away what it names. 0, or -1 once
@@ -789,7 +936,7 @@ static int put_in(const char *name, struct rules_plan *links, struct rules_plan 
     if (egress) {
         container_egress_path(record, name);
         if (write_file_volatile(record, egress->record) != 0) {
-            print_str(STDERR, "Error: cannot record the firewall rules of the container's --net outside\n");
+            print_str(STDERR, "Error: cannot record the firewall rules of the container's --net\n");
             return -1;
         }
     }
@@ -805,7 +952,7 @@ static int put_in(const char *name, struct rules_plan *links, struct rules_plan 
     if (nftables) {
         const char *nft[] = { "nft", "-f", "-", NULL };
         if (run_cmd_input(tool_path_nft(), nft, text, false) != 0) {
-            print_str(STDERR, "Error: the container's links or --net outside could not be put in the nftables sets\n"
+            print_str(STDERR, "Error: the container's links or --net rules could not be put in the nftables sets\n"
                               "of lightbox's tables; lightbox setup makes them\n");
             return -1;
         }
@@ -813,7 +960,7 @@ static int put_in(const char *name, struct rules_plan *links, struct rules_plan 
     }
     const char *restore[] = { "iptables-restore", "--noflush", NULL };
     if (run_cmd_input(tool_path_iptables_restore(), restore, text, false) != 0) {
-        print_str(STDERR, "Error: the firewall rules of the container's links or --net outside could not be put in;\n"
+        print_str(STDERR, "Error: the firewall rules of the container's links or --net could not be put in;\n"
                           "lightbox setup makes the chains they go into\n");
         return -1;
     }
@@ -823,18 +970,18 @@ static int put_in(const char *name, struct rules_plan *links, struct rules_plan 
 int firewall_add_rules(const char *name, const char *ip, const container_config *config) {
     bool nftables = cfg_global.firewall_backend == FIREWALL_NFTABLES;
     static struct rules_plan links, egress;
-    bool linked = config->nlinks > 0, outside = config->net == NET_OUTSIDE;
-    if (!linked && !outside)
+    bool linked = config->nlinks > 0, ruled = net_has_rules(config->net);
+    if (!linked && !ruled)
         return 0;
     if (linked && !links_plan(name, config, nftables, &links)) {
         print_str(STDERR, "Error: the firewall rules of the container's links are too long\n");
         return -1;
     }
-    if (outside && !egress_plan(name, ip, config, nftables, &egress)) {
-        print_str(STDERR, "Error: the firewall rules of the container's --net outside are too long\n");
+    if (ruled && !egress_plan(name, ip, config, nftables, &egress)) {
+        print_str(STDERR, "Error: the firewall rules of the container's --net are too long\n");
         return -1;
     }
-    return put_in(name, linked ? &links : NULL, outside ? &egress : NULL);
+    return put_in(name, linked ? &links : NULL, ruled ? &egress : NULL);
 }
 
 int firewall_add_links(const char *name, const container_config *config) {
@@ -849,11 +996,11 @@ int firewall_add_links(const char *name, const container_config *config) {
 }
 
 int firewall_add_egress(const char *name, const char *ip, const container_config *config) {
-    if (config->net != NET_OUTSIDE)
+    if (!net_has_rules(config->net))
         return 0;
     static struct rules_plan egress;
     if (!egress_plan(name, ip, config, cfg_global.firewall_backend == FIREWALL_NFTABLES, &egress)) {
-        print_str(STDERR, "Error: the firewall rules of the container's --net outside are too long\n");
+        print_str(STDERR, "Error: the firewall rules of the container's --net are too long\n");
         return -1;
     }
     return put_in(name, NULL, &egress);
@@ -1006,20 +1153,28 @@ bool nft_setup_text(const container_network *net, char *text, size_t max) {
      * as they are the running containers'. What one sends out of the bridge
      * goes through egress, and what it sends the host through egress_host,
      * which refuses it the host's every address: all that reaches input is
-     * the host's own, broadcast or multicast. */
+     * the host's own, broadcast or multicast. --net proxy: the containers'
+     * addresses, and each with its proxy's address and port, the same way;
+     * what one sends out of the bridge or to the host goes through
+     * egress_proxy, which lets through what goes to its proxy and refuses the
+     * rest. */
     out_put(&out,
         "table ip lightbox {\n"
         "\tset outside {\n\t\ttype ipv4_addr\n\t}\n"
         "\tset outside_dns {\n\t\ttype ipv4_addr . ipv4_addr\n\t}\n"
+        "\tset proxied {\n\t\ttype ipv4_addr\n\t}\n"
+        "\tset proxy_to {\n\t\ttype ipv4_addr . ipv4_addr . inet_service\n\t}\n"
         "\tset refused {\n\t\ttype ipv4_addr\n\t\tflags interval\n\t}\n"
         "\tchain egress {\n\t}\n"
         "\tchain egress_host {\n\t}\n"
+        "\tchain egress_proxy {\n\t}\n"
         "\tchain forward {\n\t\ttype filter hook forward priority filter; policy accept;\n\t}\n"
         "\tchain input {\n\t\ttype filter hook input priority filter; policy accept;\n\t}\n"
         "\tchain postrouting {\n\t\ttype nat hook postrouting priority srcnat; policy accept;\n\t}\n"
         "}\n"
         "flush chain ip lightbox egress\n"
         "flush chain ip lightbox egress_host\n"
+        "flush chain ip lightbox egress_proxy\n"
         "flush chain ip lightbox forward\n"
         "flush chain ip lightbox input\n"
         "flush chain ip lightbox postrouting\n"
@@ -1040,8 +1195,12 @@ bool nft_setup_text(const container_network *net, char *text, size_t max) {
     out_put(&out, "\" iifname != \""); out_put(&out, br); out_put(&out, "\" drop\n");
     out_put(&out, "add rule ip lightbox forward iifname \""); out_put(&out, br);
     out_put(&out, "\" oifname != \""); out_put(&out, br); out_put(&out, "\" ip saddr @outside jump egress\n");
+    out_put(&out, "add rule ip lightbox forward iifname \""); out_put(&out, br);
+    out_put(&out, "\" oifname != \""); out_put(&out, br); out_put(&out, "\" ip saddr @proxied jump egress_proxy\n");
     out_put(&out, "add rule ip lightbox input iifname \""); out_put(&out, br);
     out_put(&out, "\" ip saddr @outside jump egress_host\n");
+    out_put(&out, "add rule ip lightbox input iifname \""); out_put(&out, br);
+    out_put(&out, "\" ip saddr @proxied jump egress_proxy\n");
     for (int host = 0; host < 2; host++) {
         const char *chain = host ? "egress_host" : "egress";
         static const char *const allowed[] = {
@@ -1059,6 +1218,10 @@ bool nft_setup_text(const container_network *net, char *text, size_t max) {
         out_put(&out, host ? " reject with icmp type admin-prohibited\n"
                            : " ip daddr @refused reject with icmp type admin-prohibited\n");
     }
+    out_put(&out,
+        "add rule ip lightbox egress_proxy ct state established,related return\n"
+        "add rule ip lightbox egress_proxy ip saddr . ip daddr . tcp dport @proxy_to return\n"
+        "add rule ip lightbox egress_proxy reject with icmp type admin-prohibited\n");
     if (cfg_global.ip_masq) {
         out_put(&out, "add rule ip lightbox postrouting ip saddr "); out_put(&out, subnet);
         out_put(&out, " oifname != \""); out_put(&out, br); out_put(&out, "\" masquerade\n");
@@ -1066,11 +1229,18 @@ bool nft_setup_text(const container_network *net, char *text, size_t max) {
     out_put(&out,
         "table bridge lightbox {\n"
         "\tset links {\n\t\ttype ifname . ifname\n\t}\n"
+        "\tset sealed {\n\t\ttype ifname\n\t}\n"
         "\tchain forward {\n\t\ttype filter hook forward priority filter; policy accept;\n\t}\n"
         "}\n"
         "flush chain bridge lightbox forward\n");
     if (cfg_global.accept_fwmark_set)
         out_mark_accept(&out, "bridge", "forward");
+    /* the ports of containers of --net proxy, before any link: what names
+     * one with --link does not reach it */
+    for (int to = 0; to < 2; to++) {
+        out_put(&out, "add rule bridge lightbox forward meta ibrname \""); out_put(&out, br);
+        out_put(&out, to ? "\" oifname @sealed drop\n" : "\" iifname @sealed drop\n");
+    }
     out_put(&out, "add rule bridge lightbox forward meta ibrname \""); out_put(&out, br);
     out_put(&out, "\" iifname . oifname @links accept\n");
     out_put(&out, "add rule bridge lightbox forward meta ibrname \""); out_put(&out, br);
@@ -1734,17 +1904,22 @@ int put_back_running_links(const char *except) {
                         failed++;
                     }
                 }
-                char ip[IPV4_TEXT_MAX];
-                if (config.net != NET_OUTSIDE) {
+                char ip[IPV4_TEXT_MAX], mode[NET_MODE_TEXT_MAX];
+                net_mode_text(mode, config.net, config.proxy_port);
+                if (!net_has_rules(config.net)) {
                     /* nothing to put back */
                 } else if (read_container_ip(names[i], ip, sizeof(ip)) != 0 ||
                            firewall_add_egress(names[i], ip, &config) != 0) {
-                    print_str(STDERR, "Error: the --net outside rules of running container '");
+                    print_str(STDERR, "Error: the --net ");
+                    print_str(STDERR, mode);
+                    print_str(STDERR, " rules of running container '");
                     print_str(STDERR, names[i]);
                     print_str(STDERR, "' are not in again\n");
                     failed++;
                 } else {
-                    print_str(STDOUT, "The --net outside rules of container '");
+                    print_str(STDOUT, "The --net ");
+                    print_str(STDOUT, mode);
+                    print_str(STDOUT, " rules of container '");
                     print_str(STDOUT, names[i]);
                     print_str(STDOUT, "' are in again\n");
                 }
@@ -1798,7 +1973,7 @@ static void setup_or_reload(bool reload) {
             "  modprobe br_netfilter && sysctl -w net.bridge.bridge-nf-call-iptables=1\n");
 
     if (failed) {
-        print_str(STDERR, "Error: the links or --net outside rules of some running containers are not in again\n");
+        print_str(STDERR, "Error: the links or --net rules of some running containers are not in again\n");
         lc_kernel_exit(1);
     }
     print_str(STDOUT, "Host networking ready\n");
@@ -1838,9 +2013,9 @@ static bool bridge_present(void) {
 
 /* lightbox's firewall rules: the jumps to LIGHTBOX-FORWARD and
  * LIGHTBOX-INPUT with iptables; with nftables, looked at with one process,
- * both tables and the chain of --net outside, which a setup before 0.8 did
- * not make. A flush by a firewall service that loads its own rules takes
- * those as well. */
+ * both tables and the chain of --net proxy, which the setup that made it
+ * made with all of 0.8's others, and a setup before that did not. A flush by
+ * a firewall service that loads its own rules takes those as well. */
 static bool firewall_present(void) {
     if (!cfg_global.firewall)
         return true;
@@ -1859,7 +2034,7 @@ static bool firewall_present(void) {
                 in_ip = streq(line, "table ip lightbox {");
                 ip = ip || in_ip;
                 bridge = bridge || streq(line, "table bridge lightbox {");
-            } else if (in_ip && streq(line, "\tchain egress_host {")) {
+            } else if (in_ip && streq(line, "\tchain egress_proxy {")) {
                 egress = true;
             }
             line = last ? end : end + 1;

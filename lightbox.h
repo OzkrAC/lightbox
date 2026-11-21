@@ -26,10 +26,12 @@
 #define MAX_LINKS        8
 #define MAX_DNS          3       /* as many as a resolver reads from resolv.conf */
 
-/* What a container may reach (ROADMAP 8.5): today's network, the internet
- * and its name servers only, or nothing at all. A .conf without the line is
- * of a container made before 0.8, which has today's. */
-enum { NET_NAT = 0, NET_OUTSIDE = 1, NET_NONE = 2 };
+/* What a container may reach (ROADMAP 8.5, 8.6): today's network, the
+ * internet and its name servers only, nothing at all, or one port of the
+ * gateway, where a proxy listens. A .conf without the line is of a container
+ * made before 0.8, which has today's. */
+enum { NET_NAT = 0, NET_OUTSIDE = 1, NET_NONE = 2, NET_PROXY = 3 };
+#define NET_MODE_TEXT_MAX 12    /* "proxy:65535" and its NUL */
 
 /* The largest legal container .conf: MAX_VOLS volumes of two MAX_PATH paths,
  * MAX_LINKS links and the scalar keys. The reader and the writer of a .conf
@@ -123,7 +125,8 @@ typedef struct {
     bool privileged;
     bool read_only;
     bool seccomp_allow;         /* the allow-list profile; false: the deny-list */
-    int  net;                   /* NET_NAT, NET_OUTSIDE or NET_NONE */
+    int  net;                   /* NET_NAT, NET_OUTSIDE, NET_NONE or NET_PROXY */
+    int  proxy_port;            /* NET_PROXY: the port of the gateway its proxy listens on */
     int  ndns;                  /* the name servers create gave it, which outside lets it ask */
     char dns[MAX_DNS][16];
     char base[13];              /* the snapshot it overlays; empty: a copy of its base */
@@ -151,9 +154,10 @@ typedef struct {
 [[nodiscard]] bool parse_oom_score(const char *text, int *out);
 /* "allow" or "deny", the seccomp profile, as an option and the file give it */
 [[nodiscard]] bool parse_seccomp_profile(const char *text, bool *allow);
-/* "nat", "outside" or "none", as --net and the file give it, and its name */
-[[nodiscard]] bool parse_net_mode(const char *text, int *mode);
-const char *net_mode_name(int mode);
+/* "nat", "outside", "none" or "proxy:<port>", as --net and the file give it,
+ * and the text of one */
+[[nodiscard]] bool parse_net_mode(const char *text, int *mode, int *proxy_port);
+void net_mode_text(char out[NET_MODE_TEXT_MAX], int mode, int proxy_port);
 
 /*
  * A volume as it is written: src:dst[:ro]. NULL when it is one, with both
@@ -637,15 +641,19 @@ void rtnl_close(rtnl *nl);
 int firewall_add_links(const char *name, const container_config *config);
 /* What firewall_add_links put in, taken out: 0 when nothing of it is left. */
 int firewall_remove_links(const char *name);
-/* --net outside (ROADMAP 8.5): what iptables-restore is given for the
- * container at ip, and under nftables the record of its elements and the
- * text that puts them in or takes them out. False when it does not fit. */
-[[nodiscard]] bool firewall_egress_text(const char *name, const char *ip, const container_config *config,
-                                        char *out, size_t outsz);
-[[nodiscard]] bool nft_egress_record(const char *ip, const container_config *config, char *out, size_t outsz);
+/* --net outside and --net proxy (ROADMAP 8.5, 8.6): what iptables-restore is
+ * given for the container at ip, whose proxy is at gw, and under nftables
+ * the record of its elements and the text that puts them in or takes them
+ * out. False when it does not fit, or for another --net. */
+[[nodiscard]] bool firewall_egress_text(const char *name, const char *ip, const char *gw,
+                                        const container_config *config, char *out, size_t outsz);
+[[nodiscard]] bool nft_egress_record(const char *name, const char *ip, const char *gw,
+                                     const container_config *config, char *out, size_t outsz);
 [[nodiscard]] bool nft_egress_text(const char *record, bool removal, char *out, size_t outsz);
-/* The rules of --net outside for the container at ip put in: 0, or -1 once
- * said. Nothing for another --net. */
+/* Whether a --net has rules of its own: outside and proxy. */
+bool net_has_rules(int mode);
+/* The rules of --net outside or proxy for the container at ip put in: 0, or
+ * -1 once said. Nothing for another --net. */
 int firewall_add_egress(const char *name, const char *ip, const container_config *config);
 /* What firewall_add_egress put in, taken out: 0 when nothing of it is left. */
 int firewall_remove_egress(const char *name);

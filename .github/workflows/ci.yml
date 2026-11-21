@@ -104,10 +104,13 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
+      # Squid for contrib/proxy's example, which the suite runs in its own
+      # namespaces: the service that the package starts is not needed.
       - name: Install the toolchain and what the suite needs
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build gcc-14 busybox-static iproute2 iptables nftables util-linux strace
+          sudo apt-get install -y ninja-build gcc-14 busybox-static iproute2 iptables nftables util-linux strace squid
+          sudo systemctl disable --now squid || true
       - name: Build
         run: make CC=gcc-14
       # The suite makes bridge and veth interfaces, and lightbox's firewall

@@ -332,7 +332,9 @@ static void put_config(const container_config *config) {
     put_number("privileged", config->privileged);
     put_number("readonly", config->read_only);
     put_line("seccomp ", config->seccomp_allow ? "allow" : "deny");
-    put_line("net ", net_mode_name(config->net));
+    char mode[NET_MODE_TEXT_MAX];
+    net_mode_text(mode, config->net, config->proxy_port);
+    put_line("net ", mode);
     put(config->ndns ? "dns " : "dns -");
     for (int i = 0; i < config->ndns; i++) {
         if (i)
@@ -924,7 +926,15 @@ int main(int argc, char **argv, char **envp) {
             for (int i = 5; i < argc && config.ndns < MAX_DNS; i++)
                 if (!str_copy(config.dns[config.ndns++], argv[i], sizeof(config.dns[0])))
                     die("unit: a name server that is too long");
-            fits = firewall_egress_text(argv[3], argv[4], &config, text, sizeof(text));
+            fits = firewall_egress_text(argv[3], argv[4], "", &config, text, sizeof(text));
+        } else if (streq(argv[2], "egress-proxy") && argc == 7) {
+            int64_t port;
+            container_config_init(&config);
+            config.net = NET_PROXY;
+            if (!parse_number(argv[6], 0, 99999, &port))
+                die("unit: firewall egress-proxy <name> <ip> <gw> <port>");
+            config.proxy_port = (int)port;
+            fits = firewall_egress_text(argv[3], argv[4], argv[5], &config, text, sizeof(text));
         } else if (streq(argv[2], "both") && argc == 7) {
             static char links_text[FIREWALL_TEXT_MAX], egress_text[FIREWALL_TEXT_MAX];
             container_config_init(&config);
@@ -935,7 +945,7 @@ int main(int argc, char **argv, char **envp) {
                 !str_copy(config.links[0], argv[6], sizeof(config.links[0])))
                 die("unit: firewall both <name> <ip> <dns> <link>");
             fits = firewall_links_text(argv[3], &config, links_text, sizeof(links_text)) &&
-                   firewall_egress_text(argv[3], argv[4], &config, egress_text, sizeof(egress_text)) &&
+                   firewall_egress_text(argv[3], argv[4], "", &config, egress_text, sizeof(egress_text)) &&
                    firewall_rules_text(false, links_text, egress_text, text, sizeof(text));
         } else if (streq(argv[2], "nft-egress")) {
             container_config_init(&config);
@@ -943,7 +953,15 @@ int main(int argc, char **argv, char **envp) {
             for (int i = 4; i < argc && config.ndns < MAX_DNS; i++)
                 if (!str_copy(config.dns[config.ndns++], argv[i], sizeof(config.dns[0])))
                     die("unit: a name server that is too long");
-            fits = nft_egress_record(argv[3], &config, text, sizeof(text));
+            fits = nft_egress_record("unit", argv[3], "", &config, text, sizeof(text));
+        } else if (streq(argv[2], "nft-egress-proxy") && argc == 7) {
+            int64_t port;
+            container_config_init(&config);
+            config.net = NET_PROXY;
+            if (!parse_number(argv[6], 0, 99999, &port))
+                die("unit: firewall nft-egress-proxy <name> <ip> <gw> <port>");
+            config.proxy_port = (int)port;
+            fits = nft_egress_record(argv[3], argv[4], argv[5], &config, text, sizeof(text));
         } else if (streq(argv[2], "nft-record")) {
             container_config_init(&config);
             for (int i = 4; i < argc && config.nlinks < MAX_LINKS; i++)

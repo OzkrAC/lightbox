@@ -1893,7 +1893,10 @@ COMMIT'
 # nothing else; out of the bridge anything, and back what belongs to it; the
 # subnet masqueraded when ip_masq is true. What a container of --net outside
 # sends out of the bridge goes through egress, and what it sends the host
-# through egress_host, which refuses it every address of the host's.
+# through egress_host, which refuses it every address of the host's. What a
+# container of --net proxy sends either way goes through egress_proxy, which
+# lets on what goes to its proxy; the bridge drops what it would switch from
+# or to its port, before any link.
 t_nft_setup_text() {
     got=$("$UNIT" firewall nft-setup 10.9.5.0/16 10.9.0.1 br7 true)
     tab=$(printf '\t')
@@ -1904,6 +1907,12 @@ ${tab}}
 ${tab}set outside_dns {
 ${tab}${tab}type ipv4_addr . ipv4_addr
 ${tab}}
+${tab}set proxied {
+${tab}${tab}type ipv4_addr
+${tab}}
+${tab}set proxy_to {
+${tab}${tab}type ipv4_addr . ipv4_addr . inet_service
+${tab}}
 ${tab}set refused {
 ${tab}${tab}type ipv4_addr
 ${tab}${tab}flags interval
@@ -1911,6 +1920,8 @@ ${tab}}
 ${tab}chain egress {
 ${tab}}
 ${tab}chain egress_host {
+${tab}}
+${tab}chain egress_proxy {
 ${tab}}
 ${tab}chain forward {
 ${tab}${tab}type filter hook forward priority filter; policy accept;
@@ -1924,6 +1935,7 @@ ${tab}}
 }
 flush chain ip lightbox egress
 flush chain ip lightbox egress_host
+flush chain ip lightbox egress_proxy
 flush chain ip lightbox forward
 flush chain ip lightbox input
 flush chain ip lightbox postrouting
@@ -1932,7 +1944,9 @@ add element ip lightbox refused { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.
 add rule ip lightbox forward oifname \"br7\" ct state established,related accept
 add rule ip lightbox forward oifname \"br7\" iifname != \"br7\" drop
 add rule ip lightbox forward iifname \"br7\" oifname != \"br7\" ip saddr @outside jump egress
+add rule ip lightbox forward iifname \"br7\" oifname != \"br7\" ip saddr @proxied jump egress_proxy
 add rule ip lightbox input iifname \"br7\" ip saddr @outside jump egress_host
+add rule ip lightbox input iifname \"br7\" ip saddr @proxied jump egress_proxy
 add rule ip lightbox egress ct state established,related return
 add rule ip lightbox egress ip saddr . ip daddr @outside_dns udp dport 53 return
 add rule ip lightbox egress ip saddr . ip daddr @outside_dns tcp dport 53 return
@@ -1941,16 +1955,24 @@ add rule ip lightbox egress_host ct state established,related return
 add rule ip lightbox egress_host ip saddr . ip daddr @outside_dns udp dport 53 return
 add rule ip lightbox egress_host ip saddr . ip daddr @outside_dns tcp dport 53 return
 add rule ip lightbox egress_host reject with icmp type admin-prohibited
+add rule ip lightbox egress_proxy ct state established,related return
+add rule ip lightbox egress_proxy ip saddr . ip daddr . tcp dport @proxy_to return
+add rule ip lightbox egress_proxy reject with icmp type admin-prohibited
 add rule ip lightbox postrouting ip saddr 10.9.0.0/16 oifname != \"br7\" masquerade
 table bridge lightbox {
 ${tab}set links {
 ${tab}${tab}type ifname . ifname
+${tab}}
+${tab}set sealed {
+${tab}${tab}type ifname
 ${tab}}
 ${tab}chain forward {
 ${tab}${tab}type filter hook forward priority filter; policy accept;
 ${tab}}
 }
 flush chain bridge lightbox forward
+add rule bridge lightbox forward meta ibrname \"br7\" iifname @sealed drop
+add rule bridge lightbox forward meta ibrname \"br7\" oifname @sealed drop
 add rule bridge lightbox forward meta ibrname \"br7\" iifname . oifname @links accept
 add rule bridge lightbox forward meta ibrname \"br7\" drop"
     [ "$got" = "$want" ] || { printf '%s\n' "$got"; return 1; }
@@ -1958,9 +1980,9 @@ add rule bridge lightbox forward meta ibrname \"br7\" drop"
     [ "$got" = 0 ] || { echo "with ip_masq = false, masquerade rules: $got"; return 1; }
     # bridge_accept_fwmark: accepted before anything is dropped, in both tables
     got=$("$UNIT" firewall nft-setup 10.0.0.0/24 10.0.0.1 br0 true 0x10/0xf0 | grep -n 'mark')
-    [ "$got" = '33:add rule ip lightbox forward meta mark & 0xf0 == 0x10 accept
-34:add rule ip lightbox input meta mark & 0xf0 == 0x10 accept
-57:add rule bridge lightbox forward meta mark & 0xf0 == 0x10 accept' ] || { printf '%s\n' "$got"; return 1; }
+    [ "$got" = '42:add rule ip lightbox forward meta mark & 0xf0 == 0x10 accept
+43:add rule ip lightbox input meta mark & 0xf0 == 0x10 accept
+74:add rule bridge lightbox forward meta mark & 0xf0 == 0x10 accept' ] || { printf '%s\n' "$got"; return 1; }
     got=$("$UNIT" firewall nft-setup 10.0.0.0/24 10.0.0.1 br0 true 0x10 | grep 'mark' | head -n 1)
     [ "$got" = 'add rule ip lightbox forward meta mark 0x10 accept' ] || { echo "a mark without a mask: $got"; return 1; }
     # a bridge whose name would not stay between the quotes gets no rules
@@ -2209,6 +2231,68 @@ COMMIT'
     done
     got=$("$UNIT" firewall egress web 10.199.0.5 '1.1.1.1 -j X')
     [ "$got" = 'too long' ] || { echo "a name server with more in it: $got"; return 1; }
+}
+
+# --net proxy under iptables (ROADMAP 8.6): the container's chain lets on
+# what answers it and what goes to its proxy's port of the gateway, and
+# refuses the rest; at the top of LIGHTBOX-LINKS, before any link's chain,
+# what the bridge switches from it or to it is dropped. An address, a
+# gateway or a port that is not one lightbox writes gets no rules.
+t_firewall_proxy_text() {
+    got=$("$UNIT" firewall egress-proxy web 10.199.0.5 10.199.0.1 3128)
+    want='*filter
+:LO-5ea0e1194872 - [0:0]
+-A LO-5ea0e1194872 -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
+-A LO-5ea0e1194872 -d 10.199.0.1 -p tcp --dport 3128 -j RETURN
+-A LO-5ea0e1194872 -j REJECT --reject-with icmp-admin-prohibited
+-A LIGHTBOX-EGRESS -s 10.199.0.5 -j LO-5ea0e1194872
+-I LIGHTBOX-LINKS 1 -s 10.199.0.5 -j DROP
+-I LIGHTBOX-LINKS 1 -d 10.199.0.5 -j DROP
+COMMIT'
+    [ "$got" = "$want" ] || { printf '%s\n' "$got"; return 1; }
+    for args in '10.199.0.05 10.199.0.1 3128' '10.199.0.5 10.199.0.01 3128' '10.199.0.5 10.199.0.1 0' \
+                '10.199.0.5 10.199.0.1 65536' '10.199.0.5 - 3128'; do
+        # shellcheck disable=SC2086     # the words of a case
+        got=$("$UNIT" firewall egress-proxy web $args)
+        [ "$got" = 'too long' ] || { echo "$args: $got"; return 1; }
+    done
+}
+
+# --net proxy under nftables: the record is one line, of the address, its
+# proxy's address and port and its port on the bridge; from it the elements
+# of the sets proxied, proxy_to and, in the bridge table, sealed. A record
+# that is not one lightbox writes is refused.
+t_nft_proxy_text() {
+    got=$("$UNIT" firewall nft-egress-proxy web 10.199.0.5 10.199.0.1 3128)
+    [ "$got" = 'nftables
+proxy 10.199.0.5 10.199.0.1 3128 vb-5ea0e1194872' ] || { printf '%s\n' "$got"; return 1; }
+    record='nftables
+proxy 10.199.0.5 10.199.0.1 3128 vb-5ea0e1194872
+'
+    elements='element ip lightbox proxied { 10.199.0.5 }
+element ip lightbox proxy_to { 10.199.0.5 . 10.199.0.1 . 3128 }
+element bridge lightbox sealed { "vb-5ea0e1194872" }'
+    got=$("$UNIT" nftegress add "$record")
+    [ "$got" = "$(printf '%s\n' "$elements" | sed 's/^/add /')" ] || { printf '%s\n' "$got"; return 1; }
+    got=$("$UNIT" nftegress remove "$record")
+    [ "$got" = "$(printf '%s\n' "$elements" | sed 's/^/add /'; printf '%s\n' "$elements" | sed 's/^/delete /')" ] ||
+        { printf '%s\n' "$got"; return 1; }
+    for line in 'proxy 10.199.0.5 10.199.0.1 3128' 'proxy 10.199.0.5 10.199.0.1 3128 vb-5ea0e1194872 x' \
+                'proxy 10.199.0.5 10.199.0.1 03128 vb-5ea0e1194872' 'proxy 10.199.0.5 10.199.0.1 0 vb-5ea0e1194872' \
+                'proxy 10.199.0.5 10.199.0.1 65536 vb-5ea0e1194872' 'proxy 10.199.0.5 10.199.0.01 3128 vb-5ea0e1194872' \
+                'proxy 10.199.0.5  10.199.0.1 3128 vb-5ea0e1194872' 'proxy 10.199.0.5 10.199.0.1 3128 vb-5ea0e119487' \
+                'proxy 10.199.0.5 10.199.0.1 3128 vb-5ea0e1194872 }' 'proxy 10.199.0.5 10.199.0.1 3128 eth0' \
+                'proxy 10.199.0.5 10.199.0.1 3128 "vb-5ea0e119487"'; do
+        got=$("$UNIT" nftegress add "nftables
+$line
+")
+        [ "$got" = refused ] || { printf 'record %s: %s\n' "$line" "$got"; return 1; }
+    done
+    for wrong in "${record%?}" "${record}10.0.0.1
+"; do
+        got=$("$UNIT" nftegress add "$wrong")
+        [ "$got" = refused ] || { printf 'record %s: %s\n' "$wrong" "$got"; return 1; }
+    done
 }
 
 # What a start gives iptables-restore for a container with links and --net
@@ -2472,15 +2556,17 @@ config_net_keys() {
     head='version=1\nmem=64M\npids=32\ncpu=1\noom_score=0\n'
     # shellcheck disable=SC2059     # the head is a format of its own
     conf() { printf "$head$1" > "$D/web/.conf"; got=$(config); printf '%s\n' "$got"; }
-    for mode in nat outside none; do
+    for mode in nat outside none proxy:3128 proxy:1 proxy:65535; do
         conf "net=$mode\\n"
         printf '%s\n' "$got" | grep -qx "net $mode" || return 1
     done
     conf ''
     printf '%s\n' "$got" | grep -qx 'net nat' && printf '%s\n' "$got" | grep -qx 'dns -' || return 1
-    for wrong in Outside 'nat,' internet ''; do
+    for wrong in Outside 'nat,' internet '' proxy proxy: proxy:0 proxy:65536 proxy:03128 proxy:+80 proxy:-80 \
+                 'proxy:80 ' proxy:8o proxy:99999999999999999999 Proxy:80 proxy=80; do
         conf "net=$wrong\\n"
-        [ "$got" = "refused: $D/web/.conf: line 6: net is not nat, outside or none" ] || return 1
+        [ "$got" = "refused: $D/web/.conf: line 6: net is not nat, outside, none or proxy:<port>" ] ||
+            { echo "net=$wrong"; return 1; }
     done
     conf 'net=outside\nnet=nat\n'
     case $got in "refused: $D/web/.conf: line 7: "*) ;; *) return 1 ;; esac
@@ -3124,6 +3210,8 @@ check 'setup'"'"'s rules: links between ports, out by any interface, masquerade 
 check 'nftables: setup'"'"'s two tables, flushed chains, a set of links that is kept' t_nft_setup_text
 check '--net outside under iptables: a chain of the container'"'"'s own, its name servers and the rest refused' t_firewall_egress_text
 check '--net outside under nftables: a record of the address and name servers, and the sets'"'"' elements' t_nft_egress_text
+check '--net proxy under iptables: its proxy'"'"'s port of the gateway, the rest refused, and no link' t_firewall_proxy_text
+check '--net proxy under nftables: a record of the address, the proxy and the port, and the sets'"'"' elements' t_nft_proxy_text
 check 'a start puts in links and --net outside as one table, the chains before the rules' t_firewall_both_text
 check 'nftables: a container'"'"'s links are elements of the set, each once, taken out safely' t_nft_link_elements
 check 'nftables: a record that is not lightbox'"'"'s is not given to nft'  t_nft_records_refused
