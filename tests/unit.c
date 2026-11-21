@@ -1129,6 +1129,11 @@ int main(int argc, char **argv, char **envp) {
         struct exec_keeper k = { .kill_fd = -1, .procs_fd = (int32_t)fd, .caller_fd = -1, .deadline = 0 };
         keeper_end(&k);
     }
+    /* runner <text>: is the run that a .runner of this text names there? */
+    if (argc == 3 && streq(argv[1], "runner")) {
+        put(runner_alive(argv[2]) ? "alive\n" : "gone\n");
+        return 0;
+    }
     if (argc == 3 && streq(argv[1], "duration")) {
         int64_t ms;
         if (parse_duration_ms(argv[2], &ms))

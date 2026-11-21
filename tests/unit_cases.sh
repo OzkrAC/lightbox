@@ -1663,6 +1663,22 @@ t_duration() {
     return $bad
 }
 
+# A box of run is removed by the next run once the run its .runner names is
+# gone (ROADMAP 8.8): a PID with that start time, which a later process of
+# the same PID does not have. What is not a record of one names nobody.
+t_runner_record() {
+    local bad=0 start got text
+    start=$(awk '{ sub(/.*\) /, ""); print $20 }' /proc/$$/stat)
+    for pair in "$$ $start:alive" "$$ $start
+:alive" "$$ 1$start:gone" "$$ ${start}9:gone" "999999999 $start:gone" "0 $start:gone" \
+                "$$:gone" "$$  $start:gone" " $$ $start:gone" "x $start:gone" ":gone" "$$ x:gone"; do
+        text=${pair%:*}
+        got=$("$UNIT" runner "$text")
+        [ "$got" = "${pair##*:}" ] || { echo "'$text' -> $got, expected ${pair##*:}"; bad=1; }
+    done
+    return $bad
+}
+
 # Whatever of its three standard streams a caller leaves closed, the first
 # file lightbox opens is not given that number: a message meant for the
 # terminal would be written into the file.
@@ -3304,6 +3320,7 @@ check 'exec'"'"'s options are checked, and a missing value names its option' t_c
 
 check 'a number of seconds is digits within the limit'           t_seconds
 check "a duration is exec's --timeout, from 1 ms to 365 days, in s, m, h or d" t_duration
+check "a .runner names a run by its PID and start time, and nothing else does" t_runner_record
 check 'a file never gets the number of a closed standard stream' t_standard_streams_are_reserved
 check 'a start has one way out once it has changed the host'      t_start_has_one_way_out
 

@@ -7,7 +7,7 @@ A minimal, secure Linux container runtime: one static binary of about 150 KB, wi
 - **Kernel:** Linux 5.10 or later, the floor lightc sets, with namespaces and cgroup v2 offering the `cpu`, `memory` and `pids` controllers, and `io` for `--io-max`. For the network: bridge and veth; with iptables, `iptables` with the conntrack, physdev and MASQUERADE matches and targets, and `br_netfilter` with `net.bridge.bridge-nf-call-iptables=1` for containers created with `--link`; with nftables, nf_tables with NAT, masquerading, conntrack and the bridge family (`CONFIG_NF_TABLES_BRIDGE`, `nft_meta_bridge`), and no `br_netfilter`
 - **Building:** GCC 13 or later, which CI builds with, make and ninja, which builds lightc
 - **Host tools:** `iptables` and `iptables-restore`, or with `firewall_backend = nftables` `nft`, and `cp` and `rm`. Since 0.7 lightbox runs neither `ip` nor `nsenter`
-- **Root:** `setup`, `start`, `stop`, `restart`, `reset`, `update` and `exec` run as root, and so does `create --userns`. A container's root is the host's root, unless it was created with `--userns` (see [User namespaces](#user-namespaces) and [Threat model](#threat-model))
+- **Root:** `setup`, `start`, `stop`, `restart`, `reset`, `update`, `exec` and `run` run as root, and so does `create --userns`. A container's root is the host's root, unless it was created with `--userns` (see [User namespaces](#user-namespaces) and [Threat model](#threat-model))
 
 `lightbox doctor` checks all of this on the host it runs on: root, the kernel and the system calls lightbox makes, cgroup v2 and its controllers, that the kernel loads the cgroup device program a container starts with (`CONFIG_CGROUP_BPF`), the tools, the base root filesystem, and with nftables that forwarding is on. Each check that fails is followed by what fixes it, and `doctor` then exits 1; `doctor --json` gives the same to scripts.
 
@@ -394,6 +394,10 @@ Commands:
                                  5m or 1.5h; exec then exits with 124
          exec exits with the command's status, or 128 plus the signal that ended it; with
          125 when lightbox failed, 126 when the command could not be run, 127 when not found
+  run    [create options] [exec options] [--] [cmd [args...]]
+                                Create a box, start it, run a command in it as exec runs it,
+                                and remove it; run exits as exec does. A box whose run was
+                                killed is removed by the next run
   logs   <name> [-f]            Show what the container has printed; -f follows it
   inspect <name> [--json]       Show a container's configuration and state; --json as JSON
   doctor [--json]               Check what lightbox needs of this host, and say how to fix what
@@ -470,6 +474,16 @@ The command is found as a shell finds it: a name without a slash is looked for i
 
 Every `exec` runs in a cgroup of its own, `exec-<pid>-<start time>` of the `exec` that made it, below the container's, whose limits hold for it. Nothing in the container can reach cgroupfs to leave it, so what a command starts is in it until it ends. Without `--timeout`, what a command left running in the background goes on in that cgroup after `exec` returns, and the cgroup is removed once it is empty, by the next `exec` or by `stop`. `--timeout` ends what is in it with `cgroup.kill`, or, on a kernel before 5.14, by killing what it lists until nothing is left.
 
+### run
+
+`lightbox run [create options] [exec options] [--] [cmd [args...]]` is a box for one command: it creates a container under a name of its own, `run-` and 12 hex digits, starts it, runs the command in it as `exec` runs it, and removes it, whatever the command did. Every option of `create` and of `exec` goes before the command, `--timeout` among them, which ends the command with 124 as it does for `exec`; without a command, `run` runs `/bin/sh`.
+
+```sh
+sudo ./lightbox run --net none --timeout 10m -- /bin/sh -c 'make test'
+```
+
+What `run` prints is the command's: `create`, `start` and `rm` say nothing but their errors. It exits as `exec` does, with the command's status, 124, 126 or 127, and with 125 when the box could not be made or started. SIGINT, SIGTERM and SIGHUP sent to `run` go on to the command; one that comes while the box is made stops `run` there. The box is removed once the command has ended, or when it has not within `stop_timeout`, and the removal is in a session of its own, which a terminal's keys do not reach. A `run` killed outright cannot remove its box, which runs on: the box's `.runner` names that `run`, its PID and start time, and the next `run` removes every box whose `run` is gone, and says so. A box that must not outlive a killed `run` for long gets a `--ttl`, as `--timeout` keeps its command to its time in any case.
+
 ## Security
 
 All security features are on by default. Pass `--privileged` to disable.
@@ -527,7 +541,7 @@ What it does not keep out, and what to do about it:
 - **Output**: init leads a session of its own and keeps nothing that was open in the command that started it. Its standard output and error, and those of the hook and every service, are appended to `<container_dir>/<name>/console.log`, which only root can read. The log is kept from one start to the next and is not rotated or limited yet, so a container that prints without end fills the disk it is on
 - **Starting**: `start` and init talk over two pipes. Init builds the container when `start` has set up its cgroup and network, and reports back when it is built and again when the hook has ended. If either side goes away the other notices: an init whose `start` was killed exits before it runs anything
 - **External tools**: on the host, `iptables` and `iptables-restore`, or `nft`, make the firewall (a start with links runs one of them once, and every start looks at the firewall with one), and `cp` and `rm` take a snapshot or a copy of a base and remove a container. Everything else lightbox does with system calls of its own, rtnetlink for the network among them, and nothing from the image is run before `/init.sh`
-- **One command at a time**: `start`, `stop`, `restart`, `reset`, `update`, `rm`, `add-vol` and `rm-vol` take a lock on the container they change, and `create` and `setup` one on the whole store, so two commands on one container do their work one after the other. A command that has to wait says so. `ls` and `inspect` never wait. `setup`, `start`, `stop`, `restart`, `reset`, `update` and `exec` need root and say so before they touch anything
+- **One command at a time**: `start`, `stop`, `restart`, `reset`, `update`, `rm`, `add-vol` and `rm-vol` take a lock on the container they change, and `create` and `setup` one on the whole store, so two commands on one container do their work one after the other. A command that has to wait says so. `ls` and `inspect` never wait. `setup`, `start`, `stop`, `restart`, `reset`, `update`, `exec` and `run` need root and say so before they touch anything
 - **Configuration**: optional `/etc/lightbox/lightbox.conf`, or the file `--config` or `LIGHTBOX_CONFIG` names, for all paths and defaults
 
 ## Storage

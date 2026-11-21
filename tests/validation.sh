@@ -280,6 +280,52 @@ t_exec_failures_are_125() {
     return $bad
 }
 
+# run (ROADMAP 8.8) tells create's options and exec's from its command: each
+# option that create --help names, and exec's, gets past it to the question
+# of root, with a value where it takes one. Unknown options, missing values
+# and exec's options that are not right are refused first, with 125, and as
+# an ordinary user nothing is made.
+t_run_options() {
+    [ "$(id -u)" -ne 0 ] || return 77
+    local bad=0 opt kind msg rc count=0 before
+    before=$(kept_sum)
+    root='Error: lightbox run must be run as root'
+    while read -r opt kind; do
+        count=$((count + 1))
+        if [ "$kind" = value ]; then
+            msg=$(lb run "$opt" x -- /bin/true 2>&1)
+        else
+            msg=$(lb run "$opt" -- /bin/true 2>&1)
+        fi
+        rc=$?
+        [ "$msg" = "$root" ] && [ $rc -eq 125 ] || { echo "run $opt: $rc, $msg"; bad=1; }
+    done <<EOF
+$(lb create --help | awk '$1 ~ /^--/ { print $1, (($2 ~ /^</ || $2 ~ /\|/) ? "value" : "flag") }')
+EOF
+    echo "create's options that run takes: $count"
+    [ "$count" -ge 17 ] || { echo "create --help names fewer than 17"; bad=1; }
+    msg=$(lb run --user nobody -u 0 --env A=b -e B=c --workdir / -w /tmp --timeout 1s -- /bin/true 2>&1)
+    [ "$msg" = "$root" ] || { echo "exec's options: $msg"; bad=1; }
+    msg=$(lb run --mem 64M --ttl 2s --net none --userns /bin/echo hi 2>&1)
+    [ "$msg" = "$root" ] || { echo "a command without --: $msg"; bad=1; }
+    expect_125() { # message, words...
+        local want=$1
+        shift
+        msg=$(lb "$@" 2>&1)
+        rc=$?
+        [ "$msg" = "$want" ] && [ $rc -eq 125 ] || { echo "lightbox $*: $rc, $msg"; bad=1; }
+    }
+    expect_125 'Error: unknown option: --bogus
+A command that begins with a dash goes after --.' run --bogus /bin/true
+    expect_125 'Error: option --mem requires a value' run --mem
+    expect_125 'Error: option --timeout requires a value' run --timeout
+    expect_125 'Error: --timeout takes a duration above 0 and up to 365d, such as 30s, 5m or 1.5h: 0' run --timeout 0 -- /bin/true
+    expect_125 'Error: --workdir takes an absolute path: tmp' run --workdir tmp -- /bin/true
+    expect_125 'Error: --env takes KEY=VALUE: A' run --env A -- /bin/true
+    [ "$before" = "$(kept_sum)" ] || { echo "run as an ordinary user changed what lightbox keeps"; bad=1; }
+    return $bad
+}
+
 t_unknown_command_prints_usage() {
     usage=$(lb frobnicate 2>&1)
     [ $? -ne 0 ] && printf '%s\n' "$usage" | grep -q '^Usage: lightbox' &&
@@ -2018,6 +2064,7 @@ check 'add-vol appends a volume'                            t_addvol_appends
 check 'rm removes the container directory'                  t_rm_removes
 check 'stop and exec refuse a stopped container'            t_stopped_container_cannot_stop_or_exec
 check "exec's own failures are 125, and other commands' 1"  t_exec_failures_are_125
+check "run takes create's options and exec's, and refuses others first" t_run_options
 check 'an unknown command prints usage and fails'           t_unknown_command_prints_usage
 check 'ls writes nothing'                                   t_ls_writes_nothing
 check 'a PID record is a number and nothing else'           t_pid_record_is_a_number

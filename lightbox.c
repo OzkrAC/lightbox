@@ -1263,6 +1263,21 @@ static const char *make_resolv(container_config *cfg, char dns[MAX_DNS][16], int
     return NULL;
 }
 
+/*
+ * create's options that take a value and those that take none, for run,
+ * which has to tell them from its command (ROADMAP 8.8). Kept in step with
+ * cmd_create's loop: validation gives run every option create --help names.
+ */
+static const char *const create_value_options[] = {
+    "--mem", "--swap", "--pids", "--cpu", "--io-max", "--vol", "--rootfs", "--seccomp", "--net",
+    "--oom-score", "--ttl", "--link", "--dns",
+};
+static const char *const create_flag_options[] = { "--userns", "--read-only", "--copy", "--privileged" };
+
+/* Set by run: what create writes in the box's .runner, right after its mark,
+ * so that no box of run is ever without it once it can be started. */
+static char create_runner[48];
+
 static void cmd_create(int argc, char **argv) {
     bool full_copy = false;     /* --copy: the container is a copy of its base, not an overlay */
     require_tool("cp", tool_path_cp());
@@ -1479,6 +1494,14 @@ static void cmd_create(int argc, char **argv) {
     if (write_file_atomic(creating, "", MODE_PRIVATE_FILE) != 0) {
         create_err = "failed to mark the container as being created";
         goto fail_create;
+    }
+    if (create_runner[0]) {
+        char runner[MAX_PATH];
+        container_runner_path(runner, name);
+        if (write_file_atomic(runner, create_runner, MODE_PRIVATE_FILE) != 0) {
+            create_err = "failed to write which run the box is of";
+            goto fail_create;
+        }
     }
     static char resolv[RESOLV_TEXT_MAX];
     create_err = make_resolv(&cfg, dns, ndns, resolv);
@@ -5083,6 +5106,320 @@ static void cmd_exec(int argc, char **argv) {
     lc_kernel_exit(code);
 }
 
+/* ─── run ───────────────────────────────────────────────────────────────── */
+
+/*
+ * run [create options] [exec options] [--] [cmd [args...]] (ROADMAP 8.8): a
+ * box for one command. It is created under a name of its own, run- and 12
+ * hex digits, started, the command run in it as exec runs it, and removed,
+ * and run exits as exec does: with the command's status, or 124 to 127.
+ * Each step is a child of run's, so that one that ends its process when it
+ * fails does not keep the box from being removed, and what the steps print
+ * but their errors is put away: what run prints is the command's.
+ *
+ * SIGINT, SIGTERM and SIGHUP for run go on to the command as exec passes
+ * them on, and to a start, which undoes itself; a create is let finish. The
+ * box is then removed: once the command has ended, or when it has not within
+ * stop_timeout. The removal has a session of its own, so that a terminal's
+ * keys do not cut it short. A box whose run was killed outright stays: its
+ * .runner has that run's PID and start time, and the next run removes it.
+ */
+#define RUN_NAME_PREFIX "run-"
+#define RUN_ARGV_MAX    65536
+
+enum run_step { RUN_CREATE, RUN_START, RUN_EXEC, RUN_REMOVE };
+enum run_pass { PASS_NONE, PASS_ALL, PASS_SENT };
+
+struct run_box {
+    char   name[NAME_MAX_LEN + 1];
+    char **create_argv;
+    int    create_argc;
+    char **exec_argv;
+    int    exec_argc;
+    int32_t sfd;
+};
+
+static bool in_list(const char *arg, const char *const *list, size_t n) {
+    for (size_t i = 0; i < n; i++)
+        if (streq(arg, list[i]))
+            return true;
+    return false;
+}
+
+/*
+ * run's arguments as create's, which go into create_argv after the name, and
+ * exec's, which go into exec_argv after it with "--" and the command. Ends
+ * the process on an option that neither takes and on a value that is missing.
+ */
+static void run_split(int argc, char **argv, struct run_box *box) {
+    static char *create_argv[2 * (sizeof(create_value_options) / sizeof(create_value_options[0]) +
+                                  sizeof(create_flag_options) / sizeof(create_flag_options[0])) + RUN_ARGV_MAX];
+    static char *exec_argv[RUN_ARGV_MAX + 8];
+    static char dashdash[] = "--";
+    int c = 1, e = 1, i = 0;
+    for (; i < argc; i++) {
+        char *arg = argv[i];
+        if (streq(arg, "--")) {
+            i++;
+            break;
+        }
+        if (arg[0] != '-')
+            break;
+        bool for_exec = streq(arg, "--user") || streq(arg, "-u") || streq(arg, "--env") || streq(arg, "-e") ||
+                        streq(arg, "--workdir") || streq(arg, "-w") || streq(arg, "--timeout");
+        bool takes_value = for_exec || in_list(arg, create_value_options,
+                                               sizeof(create_value_options) / sizeof(create_value_options[0]));
+        if (!takes_value && !in_list(arg, create_flag_options, sizeof(create_flag_options) / sizeof(create_flag_options[0]))) {
+            print_str(STDERR, "Error: unknown option: ");
+            print_str(STDERR, arg);
+            print_str(STDERR, "\nA command that begins with a dash goes after --.\n");
+            lc_kernel_exit(failure_status);
+        }
+        if (c >= RUN_ARGV_MAX || e >= RUN_ARGV_MAX)
+            die("Error: run takes no more than " STRINGIFY(RUN_ARGV_MAX) " words");
+        char **into = for_exec ? exec_argv : create_argv;
+        int *at = for_exec ? &e : &c;
+        into[(*at)++] = arg;
+        if (takes_value)
+            into[(*at)++] = (char *)(uintptr_t)option_value(argc, argv, &i);
+    }
+    exec_argv[e++] = dashdash;
+    for (; i < argc; i++) {
+        if (e >= RUN_ARGV_MAX)
+            die("Error: run takes no more than " STRINGIFY(RUN_ARGV_MAX) " words");
+        exec_argv[e++] = argv[i];
+    }
+    create_argv[c] = NULL;
+    exec_argv[e] = NULL;
+    box->create_argv = create_argv;
+    box->create_argc = c;
+    box->exec_argv = exec_argv;
+    box->exec_argc = e;
+}
+
+/* A name no container has had: run- and 12 hex digits from the kernel. */
+static void run_name(char out[NAME_MAX_LEN + 1]) {
+    uint8_t bytes[6];
+    if (lb_sys_getrandom(bytes, sizeof(bytes), 0) != (lc_sysret)sizeof(bytes))
+        die("Error: cannot draw a name for the box");
+    static const char hex[] = "0123456789abcdef";
+    size_t at = lc_string_length(RUN_NAME_PREFIX);
+    lc_bytes_copy(out, RUN_NAME_PREFIX, at);
+    for (size_t i = 0; i < sizeof(bytes); i++) {
+        out[at++] = hex[bytes[i] >> 4];
+        out[at++] = hex[bytes[i] & 15];
+    }
+    out[at] = '\0';
+}
+
+/* One step of run, in a child: the child's PID. All but exec's have /dev/null
+ * for stdin and stdout; the removal has a session of its own. */
+static lc_sysret run_fork(enum run_step step, const struct run_box *box, const char *name) {
+    lc_sysret pid = lc_kernel_fork();
+    if (pid != 0)
+        return pid;
+    lc_kernel_close_file(box->sfd);
+    if (step != RUN_EXEC) {
+        lc_sysret null = lc_kernel_open_file("/dev/null", O_RDWR | O_CLOEXEC, 0);
+        if (null < 0 || lc_kernel_duplicate_fd((int32_t)null, STDIN, 0) < 0 ||
+            lc_kernel_duplicate_fd((int32_t)null, STDOUT, 0) < 0)
+            die("Error: cannot put away what a step of run prints");
+    }
+    if (step == RUN_REMOVE || step == RUN_CREATE)
+        (void)lc_kernel_create_session();
+    switch (step) {
+        case RUN_CREATE:
+            cmd_create(box->create_argc, box->create_argv);
+            break;
+        case RUN_START:
+            start_one(name, cfg_global.start_timeout);
+            break;
+        case RUN_EXEC:
+            cmd_exec(box->exec_argc, box->exec_argv);
+            break;
+        case RUN_REMOVE:
+            rm_one(name, 1);
+            break;
+    }
+    lc_kernel_exit(0);
+}
+
+/*
+ * Wait for a step's child: its exit status. A signal for run is noted in
+ * *asked, the first, and passed on as pass says: to all of them, or to those
+ * a process sent, as one from the terminal has reached the child by itself.
+ * With give_up, -1 once stop_timeout has passed since the first, the child
+ * still there.
+ */
+static int run_wait(lc_sysret child, int32_t sfd, enum run_pass pass, int *asked, bool give_up) {
+    int64_t deadline = 0;
+    for (;;) {
+        int32_t status = 0;
+        if (lc_kernel_wait_for_child((int32_t)child, &status, WNOHANG) == child)
+            return exit_code_from_status(status);
+        lc_timespec left, *wait = NULL;
+        if (deadline) {
+            int64_t ms = deadline - monotonic_ms();
+            if (ms <= 0)
+                return -1;
+            left.seconds = ms / 1000;
+            left.nanoseconds = (ms % 1000) * 1000000;
+            wait = &left;
+        }
+        struct lb_pollfd one = { .fd = sfd, .events = LB_POLLIN, .revents = 0 };
+        lc_sysret ready = lb_sys_ppoll(&one, 1, wait);
+        if (ready < 0 && ready != -LB_EINTR)
+            die("Error: failed to wait for a step of run");
+        if (ready <= 0)
+            continue;
+        lc_signal_info si;
+        if (lc_kernel_read_retry(sfd, &si, sizeof(si)) != (lc_sysret)sizeof(si) || si.signal == SIGCHLD)
+            continue;
+        if (!*asked)
+            *asked = (int)si.signal;
+        if (pass == PASS_ALL || (pass == PASS_SENT && si.code <= 0))
+            lc_kernel_send_signal((int32_t)child, (int32_t)si.signal);
+        if (give_up && !deadline)
+            deadline = monotonic_ms() + (int64_t)cfg_global.stop_timeout * 1000;
+    }
+}
+
+/* Remove a box, saying so when it could not be: true when it is gone. */
+static bool run_remove(const struct run_box *box, const char *name) {
+    int ignored = 0;
+    lc_sysret pid = run_fork(RUN_REMOVE, box, name);
+    int code = pid < 0 ? -1 : run_wait(pid, box->sfd, PASS_NONE, &ignored, false);
+    char cdir[MAX_PATH];
+    container_dir_path(cdir, name);
+    if (code == 0 && !path_exists(cdir))
+        return true;
+    print_str(STDERR, "Error: the box '");
+    print_str(STDERR, name);
+    print_str(STDERR, "' could not be removed; the next run removes it, or lightbox rm -f does\n");
+    return false;
+}
+
+/* Is the run that .runner names still there: its PID, with that start time? */
+static bool runner_alive(const char *text) {
+    int64_t pid = 0;
+    size_t i = 0;
+    for (; text[i] >= '0' && text[i] <= '9'; i++) {
+        pid = pid * 10 + (text[i] - '0');
+        if (pid > INT32_MAX)
+            return false;
+    }
+    if (i == 0 || pid == 0 || text[i] != ' ')
+        return false;
+    char started[32], now[32];
+    size_t n = 0;
+    for (i++; text[i] >= '0' && text[i] <= '9' && n + 1 < sizeof(started); i++)
+        started[n++] = text[i];
+    started[n] = '\0';
+    return n > 0 && proc_starttime((int)pid, now, sizeof(now)) == 0 && streq(now, started);
+}
+
+/* The boxes of runs that are gone, removed. */
+static void run_sweep(const struct run_box *box) {
+    static char names[MAX_LISTED][NAME_MAX_LEN + 1];
+    bool more = false;
+    int count = list_containers(names, MAX_LISTED, &more);
+    for (int i = 0; i < count; i++) {
+        char path[MAX_PATH], text[48];
+        container_runner_path(path, names[i]);
+        if (read_file(path, text, sizeof(text)) <= 0 || runner_alive(text))
+            continue;
+        print_str(STDERR, "Note: removing the box '");
+        print_str(STDERR, names[i]);
+        print_str(STDERR, "', whose run is gone\n");
+        (void)run_remove(box, names[i]);
+    }
+}
+
+static void cmd_run(int argc, char **argv) {
+    /* the whole of it from a sealed copy, which its exec then is */
+    run_sealed();
+
+    static struct run_box box;
+    run_split(argc, argv, &box);
+    /* exec's options looked at before anything is made: the name is put in
+     * its place later */
+    {
+        static char placeholder[] = "run-";
+        struct exec_request req = { .as = AS_ROOT, .gid = -1 };
+        box.exec_argv[0] = placeholder;
+        (void)parse_exec_options(box.exec_argc, box.exec_argv, 1, &req);
+    }
+    require_root("run");
+
+    uint64_t asked_set = sigmask_from_signal(SIGINT) | sigmask_from_signal(SIGTERM) | sigmask_from_signal(SIGHUP);
+    uint64_t held = asked_set | sigmask_from_signal(SIGCHLD);
+    if (lc_kernel_set_signal_mask(LC_SIG_BLOCK, &held, NULL) < 0)
+        die("Error: failed to take over run's signals");
+    lc_sysret sfd = lc_kernel_create_signal_fd(-1, &held, SFD_CLOEXEC);
+    if (sfd < 0)
+        die("Error: failed to take over run's signals");
+    box.sfd = (int32_t)sfd;
+
+    run_sweep(&box);
+
+    run_name(box.name);
+    box.create_argv[0] = box.name;
+    box.exec_argv[0] = box.name;
+    {
+        char self[16], started[32];
+        int pid = lc_kernel_get_process_id();
+        fmt_int(self, pid);
+        if (proc_starttime(pid, started, sizeof(started)) < 0)
+            die("Error: cannot read the start time of run, for its box");
+        bool cut = false;
+        size_t at = str_append(create_runner, 0, self, sizeof(create_runner), &cut);
+        at = str_append(create_runner, at, " ", sizeof(create_runner), &cut);
+        at = str_append(create_runner, at, started, sizeof(create_runner), &cut);
+        (void)str_append(create_runner, at, "\n", sizeof(create_runner), &cut);
+        if (cut)
+            die("Error: the record of run does not fit");
+    }
+
+    int asked = 0;
+    char cdir[MAX_PATH];
+    container_dir_path(cdir, box.name);
+    lc_sysret step = run_fork(RUN_CREATE, &box, box.name);
+    int code = step < 0 ? -1 : run_wait(step, box.sfd, PASS_NONE, &asked, false);
+    if (code != 0) {
+        if (path_exists(cdir))
+            (void)run_remove(&box, box.name);
+        lc_kernel_exit(asked ? 128 + asked : EXEC_FAILED);
+    }
+    if (!asked) {
+        step = run_fork(RUN_START, &box, box.name);
+        code = step < 0 ? -1 : run_wait(step, box.sfd, PASS_ALL, &asked, false);
+    }
+    if (code != 0 || asked) {
+        (void)run_remove(&box, box.name);
+        lc_kernel_exit(asked ? 128 + asked : EXEC_FAILED);
+    }
+
+    step = run_fork(RUN_EXEC, &box, box.name);
+    if (step < 0) {
+        (void)run_remove(&box, box.name);
+        die("Error: cannot make a process for the command of run");
+    }
+    code = run_wait(step, box.sfd, PASS_SENT, &asked, true);
+    if (code < 0) {
+        /* asked to end, and the command has not: the box goes with it */
+        (void)run_remove(&box, box.name);
+        int32_t status = 0;
+        lc_sysret got;
+        do {
+            got = lc_kernel_wait_for_child((int32_t)step, &status, 0);
+        } while (got == -LB_EINTR);
+        code = got == step ? exit_code_from_status(status) : 128 + asked;
+    } else {
+        (void)run_remove(&box, box.name);
+    }
+    lc_kernel_exit(code);
+}
+
 /* ─── cmd_ls ────────────────────────────────────────────────────────────── */
 
 /* ─── setup --teardown ──────────────────────────────────────────────────── */
@@ -5185,6 +5522,11 @@ static const struct { const char *name; const char *text; } command_help[] = {
         "                                 5m or 1.5h; exec then exits with 124\n"
         "         exec exits with the command's status, or 128 plus the signal that ended it; with\n"
         "         125 when lightbox failed, 126 when the command could not be run, 127 when not found\n" },
+    { "run",
+        "  run    [create options] [exec options] [--] [cmd [args...]]\n"
+        "                                Create a box, start it, run a command in it as exec runs it,\n"
+        "                                and remove it; run exits as exec does. A box whose run was\n"
+        "                                killed is removed by the next run\n" },
     { "logs",
         "  logs   <name> [-f]            Show what the container has printed; -f follows it\n" },
     { "inspect",
@@ -5302,7 +5644,7 @@ int main(int argc, char **argv, char **envp) {
     int nargs = argc - first;
     /* exec's status is its command's, and lightbox's own failures have
      * one of their own there, from here on */
-    if (streq(args[0], "exec"))
+    if (streq(args[0], "exec") || streq(args[0], "run"))
         failure_status = EXEC_FAILED;
 
     /* help and the version need no configuration, and get none of its warnings */
@@ -5347,6 +5689,7 @@ int main(int argc, char **argv, char **envp) {
     else if (streq(cmd, "rm-vol")) cmd_rm_vol(sub_argc, sub_argv);
     else if (streq(cmd, "rm"))     cmd_rm(sub_argc, sub_argv);
     else if (streq(cmd, "exec"))   cmd_exec(sub_argc, sub_argv);
+    else if (streq(cmd, "run"))    cmd_run(sub_argc, sub_argv);
     else if (streq(cmd, "logs"))   cmd_logs(sub_argc, sub_argv);
     else if (streq(cmd, "inspect")) cmd_inspect(sub_argc, sub_argv);
     else if (streq(cmd, "doctor")) cmd_doctor(sub_argc, sub_argv);

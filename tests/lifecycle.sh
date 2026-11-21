@@ -833,6 +833,104 @@ EOF
     start ttlbox && [ "$(state_of ttlbox)" = running ]
 }
 
+# What is left of a box of run that is gone: nothing, no directory, cgroup,
+# record, interface or firewall rule.
+run_left() { # name [address]
+    local bad=0
+    [ ! -e "$C/$1" ] || { echo "the directory of $1 is left"; bad=1; }
+    [ ! -e "$CG/$1" ] || { echo "the cgroup of $1 is left"; bad=1; }
+    [ ! -e "$RUN/$1" ] || { echo "the records of $1 are left"; bad=1; }
+    ! ip -o link show | grep -qF "lightbox:$1" || { echo "the interface of $1 is left"; bad=1; }
+    if [ -n "${2:-}" ]; then
+        ! iptables-save 2>/dev/null | grep -qF -- "$2/32" || { echo "an iptables rule names $2"; bad=1; }
+        ! nft list ruleset 2>/dev/null | grep -qwF -- "$2" || { echo "an nftables rule names $2"; bad=1; }
+    fi
+    return $bad
+}
+
+# run (ROADMAP 8.8): a box for one command. What it prints is the command's
+# alone, its status is the command's, and nothing of the box is left. Its
+# create options reach the box and its exec options the command; --timeout
+# ends the command with 124, a command that is not there is 127, and an
+# option create refuses is 125, with no box made.
+t_run() {
+    local out rc name ip began ms said
+    # shellcheck disable=SC2046  # options of one word each
+    out=$(lb run $(mode_options) -- /bin/sh -c "hostname; $KIT ip -o -4 addr show eth0 | $KIT awk '{ print \$4 }'; echo to-stderr >&2; exit 3" \
+          2>"$OUT/run.err" </dev/null)
+    rc=$?
+    printf '%s\n' "$out"
+    echo "status $rc; on stderr: $(cat "$OUT/run.err")"
+    name=$(printf '%s\n' "$out" | sed -n 1p)
+    ip=$(printf '%s\n' "$out" | sed -n 2p)
+    ip=${ip%/*}
+    [ "$rc" = 3 ] && [ "$(printf '%s\n' "$out" | grep -c .)" = 2 ] && [ "$(cat "$OUT/run.err")" = to-stderr ] ||
+        { echo "run printed more than the command, or did not return its status"; return 1; }
+    printf '%s\n' "$name" | grep -Eqx 'run-[0-9a-f]{12}' && [ -n "$ip" ] || { echo "the box was not run-<12 hex digits> with an address"; return 1; }
+    run_left "$name" "$ip" || return 1
+
+    # shellcheck disable=SC2046
+    out=$(lb run $(mode_options) --net none --env GREETING=hi --workdir /tmp -- \
+          /bin/sh -c 'echo "$GREETING $(pwd)"; cat /proc/net/dev' </dev/null)
+    said=$(printf '%s\n' "$out" | sed '1,3d' | awk -F: '{ gsub(/ /, "", $1); print $1 }' | paste -sd' ' -)
+    echo "with --net none, --env and --workdir: $(printf '%s\n' "$out" | sed -n 1p); its interfaces: $said"
+    [ "$(printf '%s\n' "$out" | sed -n 1p)" = 'hi /tmp' ] && [ "$said" = lo ] || return 1
+    began=$(date +%s%N)
+    # shellcheck disable=SC2046
+    lb run $(mode_options) --timeout 1s -- /bin/sleep 1113 </dev/null
+    rc=$?
+    ms=$(( ($(date +%s%N) - began) / 1000000 ))
+    echo "--timeout 1s: status $rc in $ms ms"
+    [ "$rc" = 124 ] && [ "$ms" -lt 6000 ] && ! running_cmd 'sleep 1113' || return 1
+    # shellcheck disable=SC2046
+    lb run $(mode_options) -- /no/such/program </dev/null 2>/dev/null
+    rc=$?
+    echo "a program that is not there: $rc"
+    [ "$rc" = 127 ] || return 1
+    out=$(lb run --mem 1x -- /bin/true 2>&1 </dev/null)
+    rc=$?
+    echo "--mem 1x: $rc, $out"
+    [ "$rc" = 125 ] && [ "$out" = 'Error: --mem takes <number>[K|M|G|T] or max, not: 1x' ] || return 1
+    [ -z "$(ls -d "$C"/run-* 2>/dev/null)" ] || { echo "boxes are left: $(ls -d "$C"/run-*)"; return 1; }
+}
+
+# A box of run whose command a SIGTERM to run ends is removed, and run
+# returns the command's status; one whose run was killed outright is
+# removed by the next run, which says so.
+t_run_ends() {
+    local front rc name said
+    mkdir -p "$T/vol/runsig" "$T/vol/runkill"
+    # shellcheck disable=SC2046
+    "$LB" run $(mode_options) --vol "$T/vol/runsig:/out" -- /bin/sh -c 'hostname > /out/name; exec sleep 1114' \
+        >/dev/null 2>"$OUT/runsig.err" </dev/null &
+    front=$!
+    wait_until 20 test -s "$T/vol/runsig/name" && wait_until 5 running_cmd 'sleep 1114' ||
+        { echo "the command did not start"; cat "$OUT/runsig.err"; kill -KILL "$front"; return 1; }
+    name=$(cat "$T/vol/runsig/name")
+    kill -TERM "$front"
+    wait "$front"
+    rc=$?
+    echo "SIGTERM to run of $name: status $rc; $(cat "$OUT/runsig.err")"
+    [ "$rc" = 143 ] && ! running_cmd 'sleep 1114' && run_left "$name" || return 1
+
+    # shellcheck disable=SC2046
+    "$LB" run $(mode_options) --vol "$T/vol/runkill:/out" -- /bin/sh -c 'hostname > /out/name; exec sleep 1115' \
+        >/dev/null 2>&1 </dev/null &
+    front=$!
+    wait_until 20 test -s "$T/vol/runkill/name" && wait_until 5 running_cmd 'sleep 1115' ||
+        { echo "the second did not start"; kill -KILL "$front"; return 1; }
+    name=$(cat "$T/vol/runkill/name")
+    kill -KILL "$front"
+    wait "$front" 2>/dev/null
+    echo "its run killed, $name: $(state_of "$name"); .runner: $(cat "$C/$name/.runner" 2>&1)"
+    [ "$(state_of "$name")" = running ] && [ -s "$C/$name/.runner" ] || { echo "the box of a killed run is not there"; return 1; }
+    # shellcheck disable=SC2046
+    said=$(lb run $(mode_options) -- /bin/true 2>&1 </dev/null) || { printf '%s\n' "$said"; return 1; }
+    printf '%s\n' "$said"
+    printf '%s\n' "$said" | grep -qxF "Note: removing the box '$name', whose run is gone" || return 1
+    ! running_cmd 'sleep 1115' && run_left "$name"
+}
+
 # A container whose init died with an exec's cgroup left below its own is
 # cleared away whole, the exec's cgroup first.
 t_exec_cgroup_of_a_dead_init() {
@@ -3823,6 +3921,8 @@ if [ "$MODE" = inside ]; then
     check 'exec --timeout holds when the exec is killed or stopped'      t_exec_timeout_without_its_exec
     check "the cgroup an exec left goes with a container whose init died" t_exec_cgroup_of_a_dead_init
     check 'a container with --ttl ends on time, with all it started, and is expired' t_ttl
+    check "run prints and returns the command's, and leaves nothing of its box" t_run
+    check 'a box of run goes when run is asked to end, or with the next run when run was killed' t_run_ends
     check 'exec without a command runs a shell on standard input'         t_exec_default_shell
     check 'a container has its own hostname, processes and root'          t_own_world
     check 'a running container cannot be started again or removed'        t_running_container_is_protected

@@ -40,6 +40,7 @@
 #include <linux/if_addr.h>
 #include <linux/if_link.h>
 #include <linux/memfd.h>
+#include <linux/time.h>
 #include <linux/mount.h>
 #include <linux/netlink.h>
 #include <linux/openat2.h>
@@ -69,6 +70,10 @@ SAME_NR(renameat);
 SAME_NR(ppoll);
 SAME_NR(close_range);
 SAME_NR(pidfd_open);
+SAME_NR(getrandom);
+
+/* --ttl's clock (ROADMAP 8.8) */
+_Static_assert(LB_CLOCK_BOOTTIME == CLOCK_BOOTTIME, "LB_CLOCK_BOOTTIME is not CLOCK_BOOTTIME");
 SAME_NR(open_tree);
 SAME_NR(openat2);
 SAME_NR(fcntl);

@@ -37,6 +37,7 @@
 #define LB_SYS_renameat   264
 #define LB_SYS_ppoll      271
 #define LB_SYS_memfd_create 319
+#define LB_SYS_getrandom  318
 #define LB_SYS_execveat   322
 #define LB_SYS_bpf        321
 #define LB_SYS_statx      332
@@ -61,6 +62,7 @@
 #define LB_SYS_capset     91
 #define LB_SYS_geteuid    175
 #define LB_SYS_memfd_create 279
+#define LB_SYS_getrandom  278
 #define LB_SYS_execveat   281
 #define LB_SYS_bpf        280
 #define LB_SYS_statx      291
@@ -77,6 +79,10 @@
 #endif
 
 /* ─── Kernel constants (the same on both architectures) ─────────────────── */
+
+/* CLOCK_BOOTTIME: CLOCK_MONOTONIC with the time the system was suspended,
+ * for a lifetime that counts as a clock on the wall does */
+#define LB_CLOCK_BOOTTIME 7
 
 #define LB_EPERM                  1
 #define LB_ENOENT                 2
@@ -553,16 +559,18 @@ static inline lc_sysret lb_sys_recvfrom(int32_t fd, void *buf, uint64_t len, int
 /* ppoll(2) with the caller's signal mask left as it is: wait until one of the
  * descriptors has something, or for as long as timeout says. The number of
  * descriptors that have something, 0 when the time ran out. */
-/* CLOCK_BOOTTIME: CLOCK_MONOTONIC with the time the system was suspended,
- * for a lifetime that counts as a clock on the wall does */
-#define LB_CLOCK_BOOTTIME 7
-
 static inline lc_sysret lb_sys_ppoll(struct lb_pollfd *fds, uint64_t count, lc_timespec *timeout) {
     return lc_syscall5(LB_SYS_ppoll, (int64_t)fds, (int64_t)count, (int64_t)timeout, 0, 0);
 }
 
 /* pidfd_open(2), Linux 5.3: a descriptor for a process, which stays that
  * process's whatever becomes of its number, and reads as ready when it ends */
+/* getrandom(2), Linux 3.17: from the kernel's pool, which is ready once the
+ * system is up */
+static inline lc_sysret lb_sys_getrandom(void *buf, uint64_t len, uint32_t flags) {
+    return lc_syscall3(LB_SYS_getrandom, (int64_t)(uintptr_t)buf, (int64_t)len, flags);
+}
+
 static inline lc_sysret lb_sys_pidfd_open(int32_t pid, uint32_t flags) {
     return lc_syscall2(LB_SYS_pidfd_open, pid, flags);
 }

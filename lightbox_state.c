@@ -41,6 +41,14 @@ void container_resolv_path(char *buf, const char *name) {
     path_join_or_die(buf, MAX_PATH, base, ".resolv");
 }
 
+/* Who runs a box of run (ROADMAP 8.8): "<pid> <start time>\n" of that run,
+ * for the next run to remove the box when it is gone. */
+void container_runner_path(char *buf, const char *name) {
+    char base[MAX_PATH];
+    container_dir_path(base, name);
+    path_join_or_die(buf, MAX_PATH, base, ".runner");
+}
+
 /* A mark that create has not finished with the container. It is in the
  * container's directory, written to stay: a container that is half made is
  * still half made after a reboot. */
