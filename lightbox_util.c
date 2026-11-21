@@ -7,17 +7,36 @@ void print_str(int32_t fd, const char *s) {
 
 int failure_status = 1;
 
+/* What a failure does before it ends the process, in the process that asked
+ * for it only, as a child it forks has not asked: exec's end in the audit
+ * log. Done once. */
+static void (*before_failing)(void);
+static int32_t before_failing_pid;
+
+void on_failure(void (*fn)(void)) {
+    before_failing = fn;
+    before_failing_pid = fn ? lc_kernel_get_process_id() : 0;
+}
+
+void fail_now(void) {
+    void (*fn)(void) = before_failing;
+    before_failing = NULL;
+    if (fn && before_failing_pid == lc_kernel_get_process_id())
+        fn();
+    lc_kernel_exit(failure_status);
+}
+
 void die(const char *msg) {
     print_str(STDERR, msg);
     lc_print_char(STDERR, '\n');
-    lc_kernel_exit(failure_status);
+    fail_now();
 }
 
 void die2(const char *prefix, const char *detail) {
     print_str(STDERR, prefix);
     print_str(STDERR, detail);
     lc_print_char(STDERR, '\n');
-    lc_kernel_exit(failure_status);
+    fail_now();
 }
 
 bool streq(const char *a, const char *b) {
@@ -218,6 +237,22 @@ bool parse_duration_ms(const char *text, int64_t *ms) {
     if (value < 1 || value > DURATION_MAX_MS)
         return false;
     *ms = value;
+    return true;
+}
+
+/* bytes random bytes, from getrandom, as twice as many lowercase hex digits
+ * and a NUL: false, with out empty, if the kernel gave fewer. */
+bool random_hex(char *out, size_t bytes) {
+    static const char hex[] = "0123456789abcdef";
+    uint8_t drawn[32];
+    out[0] = '\0';
+    if (bytes > sizeof(drawn) || lb_sys_getrandom(drawn, bytes, 0) != (lc_sysret)bytes)
+        return false;
+    for (size_t i = 0; i < bytes; i++) {
+        out[2 * i] = hex[drawn[i] >> 4];
+        out[2 * i + 1] = hex[drawn[i] & 15];
+    }
+    out[2 * bytes] = '\0';
     return true;
 }
 

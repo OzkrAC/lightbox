@@ -629,6 +629,29 @@ t_ttl_option() {
     [ ! -e "$C/e" ]
 }
 
+# create draws an id for each box (ROADMAP 8.9), which .conf keeps as id= and
+# inspect shows, and by which the audit log tells a box from a later one of
+# its name. inspect names the audit log too.
+t_box_id() {
+    local one two again
+    lb create a && lb create b || return 1
+    one=$(sed -n 's/^id=//p' "$C/a/.conf")
+    two=$(sed -n 's/^id=//p' "$C/b/.conf")
+    echo "the ids of a and b: $one $two"
+    printf '%s\n%s\n' "$one" "$two" | grep -Ecx '[0-9a-f]{16}' | grep -qx 2 && [ "$one" != "$two" ] ||
+        { echo "not two ids of 16 hex digits"; return 1; }
+    lb inspect a | grep -qx "id: $one" && lb inspect a | grep -qx "audit_path: $W/data/audit.log" ||
+        { echo "inspect does not show the id and the audit log"; return 1; }
+    command -v python3 >/dev/null 2>&1 && {
+        lb inspect a --json | python3 -I -c 'import json, sys; c = json.load(sys.stdin)[0]; assert c["id"] == sys.argv[1] and c["audit_path"].endswith("/data/audit.log")' "$one" ||
+            { echo "inspect --json does not say them"; return 1; }
+    }
+    lb rm a && lb create a || return 1
+    again=$(sed -n 's/^id=//p' "$C/a/.conf")
+    echo "a made again: $again"
+    [ -n "$again" ] && [ "$again" != "$one" ]
+}
+
 t_net_option() {
     lb create a && lb create b --net nat && lb create c --net none &&
         lb create d --net outside --dns 10.0.0.2 --dns 1.1.1.1 && lb create p --net proxy:3128 || return 1
@@ -1918,6 +1941,34 @@ two" ] || return 1
     refused lb logs web
 }
 
+# logs --audit prints the lines of the audit log about one box (ROADMAP 8.9),
+# and those of a box that is gone; nothing where no exec ran. The log is one
+# for the host, and never read through a link.
+t_logs_audit() {
+    local out msg
+    lb create web || return 1
+    [ -z "$(lb logs web --audit)" ] && [ -z "$(lb logs --audit gone)" ] || { echo "lines where no exec ran"; return 1; }
+    printf '%s\n' '{"box":"web","event":"start"}' '{"box":"web2","event":"start"}' '{"box":"gone","event":"end"}' \
+        '{"box":"web","event":"end"}' > "$W/data/audit.log"
+    out=$(lb logs --audit web) || return 1
+    printf '%s\n' "$out"
+    [ "$out" = '{"box":"web","event":"start"}
+{"box":"web","event":"end"}' ] || { echo "not the lines of web"; return 1; }
+    [ "$(lb logs gone --audit)" = '{"box":"gone","event":"end"}' ] || { echo "not the lines of a box that is gone"; return 1; }
+    # a box that does not run has nothing to follow
+    out=$(HOME="$W/home" LIGHTBOX_CONFIG="$CONF" timeout 5 "$LB" logs --audit -f web | wc -l) && [ "$out" = 2 ] ||
+        { echo "logs --audit -f of a stopped box did not end by itself"; return 1; }
+    msg=$(lb logs --audit 2>&1) && return 1
+    [ "$msg" = 'Usage: lightbox logs <name> [-f] [--audit]' ] || { echo "without a name: $msg"; return 1; }
+    msg=$(lb logs web --audit extra 2>&1) && return 1
+    [ "$msg" = 'Error: unexpected argument: extra' ] || { echo "a word too many: $msg"; return 1; }
+    refused lb logs --audit 'a@b' 2>/dev/null || return 1
+    ln -sf "$CONF" "$W/data/audit.log"
+    msg=$(lb logs --audit web 2>&1) && return 1
+    echo "through a link: $msg"
+    case $msg in "Error: cannot read the audit log $W/data/audit.log (errno "*) ;; *) return 1 ;; esac
+}
+
 # logs -f goes on while the container runs and ends when it has ended, with
 # what was written last. An ordinary user's own process stands in for init:
 # to such a user it reads as running, since PID 1 is not theirs to look at.
@@ -2083,6 +2134,7 @@ check 'start checks its options before it does anything'    t_start_options_are_
 check 'a timeout setting that cannot be read is a warning'  t_start_timeout_setting
 check 'stop checks its options before it does anything'     t_stop_options_are_checked
 check 'logs prints the log, and nothing where there is none' t_logs_prints_the_log
+check 'logs --audit prints the lines of one box, of one that is gone too, and never through a link' t_logs_audit
 check 'logs -f follows a running container and ends with it' t_logs_follows
 check 'a command with its standard streams closed is harmless' t_closed_streams_are_harmless
 check 'create writes name servers, hostname and hosts'      t_create_writes_names
@@ -2126,6 +2178,7 @@ check '--swap takes what --mem does and 0, and is none unless given' t_swap_opti
 check '--seccomp takes allow or deny, allow is the default, and it is stored and shown' t_seccomp_option
 check '--net takes nat, outside, none or proxy:<port>, outside is the default, and it is stored and shown' t_net_option
 check '--ttl takes a duration, which is stored as given and shown'  t_ttl_option
+check 'create draws an id for each box, which is stored and shown'  t_box_id
 check '--io-max is a line of io.max for a whole disk that is there' t_io_max_option
 check 'the firewall settings are Docker'"'"'s, and a wrong one keeps the built-in' t_firewall_settings
 check 'firewall_backend and bridge_accept_fwmark: Docker'"'"'s, and a wrong one is not taken' t_firewall_backend_settings

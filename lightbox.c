@@ -1587,7 +1587,11 @@ static void cmd_create(int argc, char **argv) {
         goto fail_create;
     }
 
-    /* write config */
+    /* write config, with the id the audit log knows the box by */
+    if (!random_hex(cfg.id, BOX_ID_LEN / 2)) {
+        create_err = "cannot draw an id for the container";
+        goto fail_create;
+    }
     create_err = container_config_save(name, &cfg);
     if (create_err)
         goto fail_create;
@@ -2116,6 +2120,7 @@ enum exec_as { AS_ROOT, AS_NAME, AS_ID };
 struct exec_request {
     enum exec_as as;
     const char  *user;                  /* AS_NAME */
+    const char  *user_text;             /* --user as given, or NULL */
     int          uid, gid;              /* AS_ID; gid is -1 when only a uid was given */
     const char  *env[MAX_EXEC_ENV];     /* --env, in the order given */
     int          nenv;
@@ -2605,6 +2610,7 @@ static int parse_exec_options(int argc, char **argv, int first, struct exec_requ
         } else if (user) {
             if (!parse_user_spec(value, req))
                 die2("Error: --user takes a name, a uid or uid:gid, and this is none of them: ", value);
+            req->user_text = value;
         } else if (env) {
             size_t eq = 0;
             while (value[eq] && value[eq] != '=')
@@ -5015,6 +5021,73 @@ static void request_term(struct exec_request *req) {
         req->term = term;
 }
 
+/*
+ * The audit log (ROADMAP 8.9, lightbox_audit.c): a line as the command is
+ * about to start, and one when it has ended, which a failure in between
+ * writes too. An exec whose start cannot be recorded does not run; one whose
+ * end cannot be says so and exits as it would have.
+ */
+static const char *exec_via = "exec";       /* "run" in the exec of a run */
+static struct audit_end exec_audit;
+static int64_t exec_audit_started;
+
+static void audit_failed(const char *what, int rc) {
+    char path[MAX_PATH], digits[16];
+    audit_log_path(path);
+    fmt_int(digits, -rc);
+    print_str(STDERR, what);
+    print_str(STDERR, path);
+    print_str(STDERR, " (errno ");
+    print_str(STDERR, digits);
+    print_str(STDERR, ")");
+}
+
+static void exec_audit_end(int status, bool timed_out) {
+    on_failure(NULL);
+    exec_audit.status = status;
+    exec_audit.duration_ms = monotonic_ms() - exec_audit_started;
+    exec_audit.timed_out = timed_out;
+    int rc = audit_record_end(&exec_audit);
+    if (rc < 0) {
+        audit_failed("Warning: the end of this exec is not in the audit log ", rc);
+        lc_print_char(STDERR, '\n');
+    }
+}
+
+static void exec_audit_failed(void) {
+    exec_audit_end(failure_status, false);
+}
+
+/* The start, and from then on a failure records an end: false if the start
+ * is not in the log. */
+static bool exec_audit_start(const char *name, const container_config *config, const char *cg,
+                             const struct exec_request *req, int64_t started) {
+    /* the exec's cgroup is EXEC_CGROUP_PREFIX<pid>-<start time> */
+    const char *exec_id = cg;
+    for (const char *c = cg; *c; c++) {
+        if (*c == '/')
+            exec_id = c + 1;
+    }
+    exec_id += lc_string_length(EXEC_CGROUP_PREFIX);
+
+    struct audit_start a = {
+        .box = name, .box_id = config->id, .exec_id = exec_id, .via = exec_via,
+        .uid = (int64_t)(uint32_t)lb_sys_getuid(), .loginuid = audit_loginuid(),
+        .user = req->user_text, .workdir = req->workdir, .timeout = req->timeout_text,
+        .env = req->env, .nenv = req->nenv, .argv = req->argv,
+    };
+    int rc = audit_record_start(&a);
+    if (rc < 0) {
+        audit_failed("Error: cannot write to the audit log ", rc);
+        print_str(STDERR, ", and an exec that it does not record is not run\n");
+        return false;
+    }
+    exec_audit = (struct audit_end){ .box = name, .box_id = config->id, .exec_id = exec_id };
+    exec_audit_started = started;
+    on_failure(exec_audit_failed);
+    return true;
+}
+
 static void cmd_exec(int argc, char **argv) {
     /* from the first moment the time limit can be counted from */
     int64_t started = monotonic_ms();
@@ -5080,6 +5153,11 @@ static void cmd_exec(int argc, char **argv) {
         die("Error: failed to take over the signals of an exec");
     }
 
+    if (!exec_audit_start(name, &config, cg, &req, started)) {
+        exec_cgroup_end(name, cg, false);
+        lc_kernel_exit(failure_status);
+    }
+
     lc_sysret worker = lc_kernel_fork();
     if (worker < 0) {
         exec_cgroup_end(name, cg, false);
@@ -5087,6 +5165,9 @@ static void cmd_exec(int argc, char **argv) {
     }
 
     if (worker == 0) {
+        /* the end of the exec is the caller's to record, never the worker's,
+         * whose PID in the container's namespace says nothing */
+        on_failure(NULL);
         lc_kernel_close_file(signal_fd);
         int status = exec_inside_container(cg, pid, privileged, config.userns, config.seccomp_allow,
                                            config.oom_score, &req);
@@ -5103,6 +5184,7 @@ static void cmd_exec(int argc, char **argv) {
         print_str(STDERR, ", and it and all it started were ended\n");
         code = EXEC_TIMED_OUT;
     }
+    exec_audit_end(code, timed_out);
     lc_kernel_exit(code);
 }
 
@@ -5199,17 +5281,10 @@ static void run_split(int argc, char **argv, struct run_box *box) {
 
 /* A name no container has had: run- and 12 hex digits from the kernel. */
 static void run_name(char out[NAME_MAX_LEN + 1]) {
-    uint8_t bytes[6];
-    if (lb_sys_getrandom(bytes, sizeof(bytes), 0) != (lc_sysret)sizeof(bytes))
-        die("Error: cannot draw a name for the box");
-    static const char hex[] = "0123456789abcdef";
     size_t at = lc_string_length(RUN_NAME_PREFIX);
     lc_bytes_copy(out, RUN_NAME_PREFIX, at);
-    for (size_t i = 0; i < sizeof(bytes); i++) {
-        out[at++] = hex[bytes[i] >> 4];
-        out[at++] = hex[bytes[i] & 15];
-    }
-    out[at] = '\0';
+    if (!random_hex(out + at, 6))
+        die("Error: cannot draw a name for the box");
 }
 
 /* One step of run, in a child: the child's PID. All but exec's have /dev/null
@@ -5235,6 +5310,7 @@ static lc_sysret run_fork(enum run_step step, const struct run_box *box, const c
             start_one(name, cfg_global.start_timeout);
             break;
         case RUN_EXEC:
+            exec_via = "run";
             cmd_exec(box->exec_argc, box->exec_argv);
             break;
         case RUN_REMOVE:
@@ -5528,7 +5604,8 @@ static const struct { const char *name; const char *text; } command_help[] = {
         "                                and remove it; run exits as exec does. A box whose run was\n"
         "                                killed is removed by the next run\n" },
     { "logs",
-        "  logs   <name> [-f]            Show what the container has printed; -f follows it\n" },
+        "  logs   <name> [-f] [--audit]  Show what the container has printed; -f follows it. --audit\n"
+        "                                shows what exec and run asked of it, kept after it is removed\n" },
     { "inspect",
         "  inspect <name> [--json]       Show a container's configuration and state; --json as JSON\n" },
     { "doctor",

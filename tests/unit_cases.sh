@@ -1663,6 +1663,108 @@ t_duration() {
     return $bad
 }
 
+# The strings of the audit log (ROADMAP 8.9) are ASCII alone, and give a
+# reader the bytes back exactly: valid UTF-8 as its characters, \uXXXX and a
+# pair above U+FFFF, and each byte of none as \udcXX, Python's
+# surrogateescape. A form longer than needed, a surrogate and what is above
+# U+10FFFF are no characters. The count is what is written.
+t_audit_json() {
+    local bad=0 pair got
+    for pair in '-:""' '616263:"abc"' '225c0a090d080c01:"\"\\\n\t\r\b\f\u0001"' '7f:"\u007f"' \
+                'c3a9:"\u00e9"' 'e282ac:"\u20ac"' 'f09f9880:"\ud83d\ude00"' 'e280ae:"\u202e"' \
+                'c285:"\u0085"' 'ff:"\udcff"' '80:"\udc80"' 'c080:"\udcc0\udc80"' \
+                'eda080:"\udced\udca0\udc80"' 'f4908080:"\udcf4\udc90\udc80\udc80"' \
+                'e28241:"\udce2\udc82A"' 'f0:"\udcf0"'; do
+        got=$("$UNIT" json "${pair%%:*}")
+        [ "$got" = "${pair#*:}" ] || { echo "${pair%%:*} -> $got, expected ${pair#*:}"; bad=1; }
+    done
+    command -v python3 >/dev/null || { echo "no python3 to read them back with"; return 77; }
+    python3 -I - "$UNIT" <<'PYEND' || bad=1
+import json, os, subprocess, sys
+unit, wrong = sys.argv[1], 0
+cases = [os.urandom(n) for n in range(64) for _ in range(8)]
+for b in cases:
+    out = subprocess.run([unit, 'json', b.hex() or '-'], capture_output=True, check=True).stdout[:-1]
+    if any(c < 0x20 or c >= 0x7f for c in out) or json.loads(out).encode('utf-8', 'surrogateescape') != b:
+        print('not read back as it was:', b.hex(), out)
+        wrong += 1
+print(len(cases) - wrong, 'of', len(cases), 'random strings read back as they were')
+sys.exit(1 if wrong else 0)
+PYEND
+    return $bad
+}
+
+# A time in the audit log: UTC as RFC 3339 has it, to the millisecond. A
+# clock before 1970 is shown as 1970 began and one after 9999 as it ends.
+t_audit_time() {
+    local bad=0 pair got
+    for pair in '0 0=1970-01-01T00:00:00.000Z' '951782400 5000000=2000-02-29T00:00:00.005Z' \
+                '951868799 999999999=2000-02-29T23:59:59.999Z' '1795278000 123999999=2026-11-21T16:20:00.123Z' \
+                '4107542400 0=2100-03-01T00:00:00.000Z' '253402300799 999999999=9999-12-31T23:59:59.999Z' \
+                '253402300800 0=9999-12-31T23:59:59.999Z' '-5 0=1970-01-01T00:00:00.000Z' \
+                '60 1000000000=1970-01-01T00:01:00.000Z'; do
+        # shellcheck disable=SC2086  # seconds and nanoseconds
+        got=$("$UNIT" utc ${pair%%=*})
+        [ "$got" = "${pair#*=}" ] || { echo "${pair%%=*} -> $got, expected ${pair#*=}"; bad=1; }
+    done
+    command -v python3 >/dev/null || return $bad
+    python3 -I - "$UNIT" <<'PYEND' || bad=1
+import datetime, os, subprocess, sys
+unit, wrong = sys.argv[1], 0
+for _ in range(200):
+    sec = int.from_bytes(os.urandom(5), 'big') % 253402300800
+    got = subprocess.run([unit, 'utc', str(sec), '7000000'], capture_output=True, text=True, check=True).stdout.strip()
+    want = datetime.datetime.fromtimestamp(sec, datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S') + '.007Z'
+    if got != want:
+        print(sec, got, 'and not', want)
+        wrong += 1
+print(200 - wrong, 'of 200 random times as Python has them')
+sys.exit(1 if wrong else 0)
+PYEND
+    return $bad
+}
+
+# The two lines of an exec: the box first, which logs --audit looks for, its
+# id, and what was asked; --env by its keys only, as values are often
+# credentials; null for what was not given.
+t_audit_lines() {
+    local got
+    got=$("$UNIT" auditline start web 0123456789abcdef 12-34 exec 0 1000 - /tmp 1s 2 A=1 TOKEN=secret /bin/sh -c 'exit 7')
+    echo "$got"
+    [ "$got" = '{"box":"web","box_id":"0123456789abcdef","time":"T","event":"start","exec_id":"12-34","via":"exec","uid":0,"loginuid":1000,"user":null,"workdir":"/tmp","timeout":"1s","env":["A","TOKEN"],"argv":["/bin/sh","-c","exit 7"]}' ] || return 1
+    got=$("$UNIT" auditline start run-0a1b2c3d4e5f - 5-6 run 0 -1 1000:1000 - - 0 "$(printf 'a"\\\001')")
+    echo "$got"
+    [ "$got" = '{"box":"run-0a1b2c3d4e5f","box_id":null,"time":"T","event":"start","exec_id":"5-6","via":"run","uid":0,"loginuid":null,"user":"1000:1000","workdir":null,"timeout":null,"env":[],"argv":["a\"\\\u0001"]}' ] || return 1
+    got=$("$UNIT" auditline end web 0123456789abcdef 12-34 124 1003 yes)
+    echo "$got"
+    [ "$got" = '{"box":"web","box_id":"0123456789abcdef","time":"T","event":"end","exec_id":"12-34","status":124,"duration_ms":1003,"timed_out":true}' ]
+}
+
+# logs --audit prints the lines of one box: those that begin with its name,
+# whole, however the log is cut as it is read, and the last one too when it
+# has no newline yet. A name that only begins with it, a line where it is not
+# first and an empty line are not its.
+audit_filter_lines() {
+    local want got piece bad=0
+    {
+        printf '%s\n' '{"box":"web","a":1}' '{"box":"web2","a":2}' '{"box":"we","a":3}' '' \
+            "{\"box\":\"web\",\"a\":4,\"long\":\"$(head -c 9000 /dev/zero | tr '\0' x)\"}" \
+            'x{"box":"web",' '{"box":"web",}'
+        printf '{"box":"db","a":5}\n{"box":"web","last":1}'
+    } > "$D/log"
+    want=$({ sed -n '1p;5p;7p' "$D/log"; printf '{"box":"web","last":1}'; } | cksum)
+    for piece in 1 2 3 7 13 14 15 64 4096; do
+        got=$("$UNIT" auditfilter web $piece "$D/log" | cksum)
+        [ "$got" = "$want" ] || { echo "read in pieces of $piece, not the lines of web"; bad=1; }
+    done
+    got=$("$UNIT" auditfilter db 5 "$D/log")
+    [ "$got" = '{"box":"db","a":5}' ] || { echo "the lines of db: $got"; bad=1; }
+    [ -z "$("$UNIT" auditfilter nosuch 5 "$D/log")" ] || { echo "lines of a box that has none"; bad=1; }
+    [ $bad = 0 ] && echo "the lines of web, read in pieces of 1 to 4096 bytes"
+    return $bad
+}
+t_audit_filter() { in_config_dir audit_filter_lines; }
+
 # A box of run is removed by the next run once the run its .runner names is
 # gone (ROADMAP 8.8): a PID with that start time, which a later process of
 # the same PID does not have. What is not a record of one names nobody.
@@ -2581,6 +2683,7 @@ io 8:0 rbps=1048576
 swap 1G
 base -
 ttl -
+id -
 userns -
 vol /srv/data -> /data rw
 vol /etc/app.conf -> /etc/app.conf ro
@@ -2697,6 +2800,25 @@ config_ttl_key() {
 }
 t_config_ttl_key() { in_config_dir config_ttl_key; }
 
+# id= (ROADMAP 8.9) is 16 lowercase hex digits, once at most; without it,
+# none, as for a box made before boxes had one.
+config_id_key() {
+    head='version=1\nmem=64M\npids=32\ncpu=1\noom_score=0\n'
+    # shellcheck disable=SC2059     # the head is a format of its own
+    conf() { printf "$head$1" > "$D/web/.conf"; got=$(config); printf '%s\n' "$got"; }
+    conf ''
+    printf '%s\n' "$got" | grep -qx 'id -' || return 1
+    conf 'id=0123456789abcdef\n'
+    printf '%s\n' "$got" | grep -qx 'id 0123456789abcdef' || return 1
+    for wrong in '' 0123456789ABCDEF 0123456789abcde 0123456789abcdef0 0123456789abcdeg ' 0123456789abcdef'; do
+        conf "id=$wrong\\n"
+        [ "$got" = "refused: $D/web/.conf: line 6: id is not 16 lowercase hex digits" ] || { echo "id=$wrong"; return 1; }
+    done
+    conf 'id=0123456789abcdef\nid=fedcba9876543210\n'
+    case $got in "refused: $D/web/.conf: line 7: "*) ;; *) return 1 ;; esac
+}
+t_config_id_key() { in_config_dir config_id_key; }
+
 # The ranges /etc/subuid and /etc/subgid give lightbox, and the one a new
 # container gets: the first pair of 65536 that no container's overlaps, the
 # k-th of each file. Other names' lines, and lines of a range that has host
@@ -2787,6 +2909,7 @@ io -
 swap -
 base -
 ttl -
+id -
 userns -' ] || return 1
     # a default that cannot be used is no default: the file must have the limit
     got=$(config nodefaults)
@@ -2920,6 +3043,7 @@ io -
 swap -
 base -
 ttl -
+id -
 userns -
 vol /srv/data -> /data rw
 vol /srv/other -> /data rw
@@ -2954,7 +3078,7 @@ vol=/srv/data:/data
 link=db' ] || { echo "the file is not what was put in"; bad=1; }
     [ "$(stat -c %a "$D/web/.conf")" = 600 ] || { echo "the file's mode is $(stat -c %a "$D/web/.conf")"; bad=1; }
     got=$(config | tr '\n' ' ')
-    case $got in 'version 1 mem 1G pids max cpu 0.25 oom_score 500 '*'seccomp deny net nat dns - io 8:0 wbps=1024 swap 64M base - ttl - userns - vol /srv/data -> /data rw link db ') ;;
+    case $got in 'version 1 mem 1G pids max cpu 0.25 oom_score 500 '*'seccomp deny net nat dns - io 8:0 wbps=1024 swap 64M base - ttl - id - userns - vol /srv/data -> /data rw link db ') ;;
         *) echo "read back: $got"; bad=1 ;; esac
     # --ttl as it was given, read back as the same duration
     got=$(written mem=1G pids=max cpu=1 ttl=1.5h)
@@ -2962,6 +3086,12 @@ link=db' ] || { echo "the file is not what was put in"; bad=1; }
         { echo "a ttl: $got"; cat "$D/web/.conf"; bad=1; }
     got=$(written mem=1G pids=max cpu=1 'ttl=1.5h ')
     case $got in 'refused: '*) ;; *) echo "written with a ttl that is not one: $got"; bad=1 ;; esac
+    # the id create drew, read back as written; one that is not an id is not written
+    got=$(written mem=1G pids=max cpu=1 id=0123456789abcdef)
+    [ "$got" = written ] && grep -qx 'id=0123456789abcdef' "$D/web/.conf" && config | grep -qx 'id 0123456789abcdef' ||
+        { echo "an id: $got"; cat "$D/web/.conf"; bad=1; }
+    got=$(written mem=1G pids=max cpu=1 id=0123456789ABCDEF)
+    case $got in 'refused: '*) ;; *) echo "written with an id that is not one: $got"; bad=1 ;; esac
     got=$(written mem=1G swap=64M pids=max cpu=0.25 'io=8:0 wbps=1024' src=/srv/data dst=/data link=db)
     [ "$got" = written ] || { echo "the good configuration, after the ttl: $got"; bad=1; }
 
@@ -3321,6 +3451,10 @@ check 'exec'"'"'s options are checked, and a missing value names its option' t_c
 check 'a number of seconds is digits within the limit'           t_seconds
 check "a duration is exec's --timeout, from 1 ms to 365 days, in s, m, h or d" t_duration
 check "a .runner names a run by its PID and start time, and nothing else does" t_runner_record
+check "the audit log's strings are ASCII, and give back the bytes they were, UTF-8 or not" t_audit_json
+check "the audit log's time is UTC, to the millisecond, from 1970 to 9999" t_audit_time
+check "an exec's two lines in the audit log name the box first, and --env by its keys only" t_audit_lines
+check "logs --audit keeps the lines of one box, whole, however the log is cut as it is read" t_audit_filter
 check 'a file never gets the number of a closed standard stream' t_standard_streams_are_reserved
 check 'a start has one way out once it has changed the host'      t_start_has_one_way_out
 
@@ -3355,6 +3489,7 @@ check 'userns=1 is read with a uid_start and a gid_start, and refused without' t
 check 'seccomp= is allow or deny, and the deny-list without it' t_config_seccomp_key
 check 'net= is nat, outside or none, nat without it, and dns= up to three addresses' t_config_net_keys
 check 'ttl= is a duration from 1 ms to 365 days, once at most, and none without it' t_config_ttl_key
+check 'id= is 16 lowercase hex digits, once at most, and none without it' t_config_id_key
 check 'a new container gets the first range of /etc/subuid and /etc/subgid that is free' t_userns_ranges
 check "a volume's maps make the container's root its source's owner, and never host root" t_volume_maps
 check 'base= is a snapshot'"'"'s id, read as it is, or refused'          t_config_base_key

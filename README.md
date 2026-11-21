@@ -145,6 +145,8 @@ It refuses while a container runs, and names it. Otherwise it removes lightbox's
 
 # See what the container's services have printed; -f keeps following
 ./lightbox logs mybox
+# and what exec and run asked of it
+./lightbox logs --audit mybox
 
 # List all containers, and look at one
 ./lightbox ls
@@ -398,7 +400,8 @@ Commands:
                                 Create a box, start it, run a command in it as exec runs it,
                                 and remove it; run exits as exec does. A box whose run was
                                 killed is removed by the next run
-  logs   <name> [-f]            Show what the container has printed; -f follows it
+  logs   <name> [-f] [--audit]  Show what the container has printed; -f follows it. --audit
+                                shows what exec and run asked of it, kept after it is removed
   inspect <name> [--json]       Show a container's configuration and state; --json as JSON
   doctor [--json]               Check what lightbox needs of this host, and say how to fix what
                                 is missing; --json as JSON
@@ -484,6 +487,26 @@ sudo ./lightbox run --net none --timeout 10m -- /bin/sh -c 'make test'
 
 What `run` prints is the command's: `create`, `start` and `rm` say nothing but their errors. It exits as `exec` does, with the command's status, 124, 126 or 127, and with 125 when the box could not be made or started. SIGINT, SIGTERM and SIGHUP sent to `run` go on to the command; one that comes while the box is made stops `run` there. The box is removed once the command has ended, or when it has not within `stop_timeout`, and the removal is in a session of its own, which a terminal's keys do not reach. A `run` killed outright cannot remove its box, which runs on: the box's `.runner` names that `run`, its PID and start time, and the next `run` removes every box whose `run` is gone, and says so. A box that must not outlive a killed `run` for long gets a `--ttl`, as `--timeout` keeps its command to its time in any case.
 
+### Audit log
+
+Every `exec`, and so the command of every `run`, appends two lines to `<lightbox_dir>/audit.log`: one as the command is about to start, and one when it has ended. Each is one JSON object, written with one `write` on a descriptor opened to append, so that the lines of commands that run at once do not mix. `lightbox logs --audit <name>` prints the lines of a box, and still does after the box is removed; with `-f` it follows them while the box runs.
+
+```json
+{"box":"web","box_id":"8c1f0e7a5d3b2a19","time":"2026-11-21T16:39:23.123Z","event":"start","exec_id":"4242-981234","via":"exec","uid":0,"loginuid":1000,"user":null,"workdir":"/srv","timeout":"10m","env":["CI"],"argv":["make","test"]}
+{"box":"web","box_id":"8c1f0e7a5d3b2a19","time":"2026-11-21T16:41:02.456Z","event":"end","exec_id":"4242-981234","status":0,"duration_ms":99333,"timed_out":false}
+```
+
+- `box_id` is the id that `create` draws for a box, kept in its `.conf` as `id=` and shown by `inspect`: it tells a box from a later one of the same name. A box created before 0.8 has none, and its lines have `null`.
+- `exec_id` is the PID and start time of the `exec`, as its cgroup is named, and pairs a start with its end. `via` is `exec` or `run`.
+- `uid` is the caller's, which is 0 under `sudo`, and `loginuid` that of the user who logged in, from `/proc/self/loginuid`, which `sudo` and `su` keep; `null` when no login set one.
+- `user`, `workdir` and `timeout` are as given, and `null` when not given. `env` has the keys of `--env` and not their values, which are often credentials. `argv` is the command as given, or `/bin/sh`.
+- `status` is what `exec` exits with, 124 to 127 among them, `duration_ms` how long it took from the moment `exec` began, and `timed_out` whether `--timeout` ended the command.
+- Every string is ASCII: a character outside it as `\uXXXX`, and a byte that is not part of UTF-8 as `\udcXX`, Python's `surrogateescape`, so `json.loads(line)["argv"][0].encode("utf-8", "surrogateescape")` gives back the bytes that were given. No control sequence or reordering mark in an argument reaches a terminal that shows the log.
+
+An `exec` whose start cannot be written in the log does not run, and exits with 125; one whose end cannot be written says so and exits as it would have. A start with no end is an `exec` whose process was killed.
+
+The log is mode 0600 in `lightbox_dir`, mode 0700, which no box has mounted: what runs in a box can neither read it nor change it. It records what was asked of a box, not what the command then did; what left a box through a proxy is in the proxy's log. The arguments are recorded as given, so the log is as sensitive as the commands are. Root on the host can change it, and it is not rotated yet.
+
 ## Security
 
 All security features are on by default. Pass `--privileged` to disable.
@@ -521,7 +544,7 @@ What it does not keep out, and what to do about it:
 - **Without `--userns`, a container's root is the host's root.** What keeps it in is the namespaces and the sandbox; a flaw in the kernel past them would be a flaw on the host. Create a container with `--userns` (see [User namespaces](#user-namespaces)), or run as root in it only what you would run as root on the host, and the rest with `exec --user`.
 - **`--privileged` turns the sandbox off.** Such a container has all capabilities, no seccomp filter and no device program; give it only to what needs that, such as a hook that mounts filesystems.
 - **With `--net nat` the host itself is in reach,** as it was for every container before 0.8: services of the host that listen on the bridge's address, or on all addresses, answer such a container, and so do the host's networks. Give it `--net outside`, the default, unless it needs them, or keep the services to the addresses they are for.
-- **Disk is not limited.** A container's copy of its image and its `console.log`, which is not rotated, take what the disk has.
+- **Disk is not limited.** A container's copy of its image and its `console.log`, which is not rotated, take what the disk has, and so does the audit log.
 - **Whoever runs lightbox is root.** lightbox does not decide who may use it: giving someone `sudo lightbox` is giving them root.
 - **Images are trusted as files.** `create` copies an image as it is; what it contains runs in the sandbox, with the container's root.
 
@@ -539,6 +562,7 @@ What it does not keep out, and what to do about it:
 - **Init**: lightbox remains PID 1 inside the container. It reaps children and handles shutdown from the moment the container is built, and runs `/init.sh`, if the rootfs has one, as one of its children: after `/tmp` and `/run` are mounted, with the sandbox on, and only once the container is on record, so `stop` and `ls` always find a container whose hook runs
 - **Stopping**: `stop` sends init a SIGTERM that carries the number of seconds the container may take. Init passes SIGTERM on to every process in the container, the ones `exec` put there included, reaps them, and exits when none is left or the time is over; the kernel kills whatever remains with it. `stop` waits for init through a pidfd, so it returns as soon as the container has ended. It then kills anything still in the cgroup and in the cgroups of its execs below it, waits until the kernel reports the cgroup empty, and removes those and then it. A SIGTERM sent to init by other means has the same effect, with the `stop_timeout` that was set when the container started
 - **Output**: init leads a session of its own and keeps nothing that was open in the command that started it. Its standard output and error, and those of the hook and every service, are appended to `<container_dir>/<name>/console.log`, which only root can read. The log is kept from one start to the next and is not rotated or limited yet, so a container that prints without end fills the disk it is on
+- **Audit**: `exec` and `run` append what they ask of a box to `<lightbox_dir>/audit.log`, one for the host, which only root can read and no box has mounted, so that a box's record outlives the box (see [Audit log](#audit-log))
 - **Starting**: `start` and init talk over two pipes. Init builds the container when `start` has set up its cgroup and network, and reports back when it is built and again when the hook has ended. If either side goes away the other notices: an init whose `start` was killed exits before it runs anything
 - **External tools**: on the host, `iptables` and `iptables-restore`, or `nft`, make the firewall (a start with links runs one of them once, and every start looks at the firewall with one), and `cp` and `rm` take a snapshot or a copy of a base and remove a container. Everything else lightbox does with system calls of its own, rtnetlink for the network among them, and nothing from the image is run before `/init.sh`
 - **One command at a time**: `start`, `stop`, `restart`, `reset`, `update`, `rm`, `add-vol` and `rm-vol` take a lock on the container they change, and `create` and `setup` one on the whole store, so two commands on one container do their work one after the other. A command that has to wait says so. `ls` and `inspect` never wait. `setup`, `start`, `stop`, `restart`, `reset`, `update`, `exec` and `run` need root and say so before they touch anything

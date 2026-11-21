@@ -364,6 +364,7 @@ static void put_config(const container_config *config) {
     } else {
         put("ttl -\n");
     }
+    put_line("id ", config->id[0] ? config->id : "-");
     if (config->userns) {
         char u[11], g[11];
         format_u32(u, config->uid_start);
@@ -388,7 +389,7 @@ static void put_config(const container_config *config) {
 /* A field of a configuration set to a value as it is, however long it is
  * allowed to be and whatever is in it. */
 static void set_unchecked(container_config *config, const char *assignment) {
-    static const char *const fields[] = { "mem=", "pids=", "cpu=", "io=", "link=", "src=", "dst=", "swap=", "ttl=" };
+    static const char *const fields[] = { "mem=", "pids=", "cpu=", "io=", "link=", "src=", "dst=", "swap=", "ttl=", "id=" };
     size_t which = 0, len = 0;
     for (; which < sizeof(fields) / sizeof(fields[0]); which++) {
         len = lc_string_length(fields[which]);
@@ -419,6 +420,7 @@ static void set_unchecked(container_config *config, const char *assignment) {
                 if (!parse_duration_ms(value, &config->ttl_ms))
                     config->ttl_ms = 0;
                 break;
+        case 9: fits = str_copy(config->id, value, sizeof(config->id)); break;
         default: break;
     }
     if (!fits)
@@ -1132,6 +1134,113 @@ int main(int argc, char **argv, char **envp) {
     /* runner <text>: is the run that a .runner of this text names there? */
     if (argc == 3 && streq(argv[1], "runner")) {
         put(runner_alive(argv[2]) ? "alive\n" : "gone\n");
+        return 0;
+    }
+    /* json <hex>: the bytes the hex digits are, as a JSON string of the
+     * audit log; "-" for none */
+    if (argc == 3 && streq(argv[1], "json")) {
+        static char bytes[4096], quoted[JSON_QUOTED_MAX(sizeof(bytes)) + 2];
+        size_t n = 0;
+        for (const char *h = streq(argv[2], "-") ? "" : argv[2]; h[0] && h[1] && n < sizeof(bytes); h += 2) {
+            int hi = h[0] <= '9' ? h[0] - '0' : h[0] - 'a' + 10;
+            int lo = h[1] <= '9' ? h[1] - '0' : h[1] - 'a' + 10;
+            bytes[n++] = (char)(hi * 16 + lo);
+        }
+        size_t counted = json_quote(NULL, bytes, n);
+        size_t len = json_quote(quoted, bytes, n);
+        if (counted != len || len > JSON_QUOTED_MAX(n))
+            die("unit: json_quote counted a length that it did not write, or above its bound");
+        quoted[len++] = '\n';
+        (void)lc_kernel_write_all(STDOUT, quoted, len);
+        return 0;
+    }
+    /* utc <seconds> <nanoseconds>: a time as the audit log writes it */
+    if (argc == 4 && streq(argv[1], "utc")) {
+        int64_t parts[2];
+        for (int i = 0; i < 2; i++) {
+            const char *t = argv[2 + i];
+            bool minus = t[0] == '-';
+            int64_t v = 0;
+            for (t += minus; *t; t++)
+                v = v * 10 + (*t - '0');
+            parts[i] = minus ? -v : v;
+        }
+        char out[UTC_TEXT_LEN + 1];
+        format_utc(out, parts[0], parts[1]);
+        put_line("", out);
+        return 0;
+    }
+    /* auditline start <box> <box_id|-> <exec_id> <via> <uid> <loginuid> <user|-> <workdir|->
+     *           <timeout|-> <number of env> <env>... [argv...]
+     * auditline end <box> <box_id|-> <exec_id> <status> <ms> <yes|no>:
+     * the line, with "T" for the time */
+    if (argc >= 3 && streq(argv[1], "auditline")) {
+        static char line[1 << 20];
+        size_t len = 0, counted = 0;
+#define DASH(i) (streq(argv[i], "-") ? NULL : argv[i])
+        if (streq(argv[2], "start") && argc >= 13) {
+            int nenv = 0;
+            for (const char *t = argv[12]; *t; t++)
+                nenv = nenv * 10 + (*t - '0');
+            if (13 + nenv > argc)
+                die("unit: fewer env than counted");
+            struct audit_start a = {
+                .box = argv[3], .box_id = DASH(4), .exec_id = argv[5], .via = argv[6],
+                .uid = 0, .loginuid = -1, .user = DASH(9), .workdir = DASH(10), .timeout = DASH(11),
+                .env = (const char *const *)(argv + 13), .nenv = nenv,
+                .argv = (const char *const *)(argv + 13 + nenv),
+            };
+            for (int k = 0; k < 2; k++) {
+                const char *t = argv[7 + k];
+                bool minus = t[0] == '-';
+                int64_t v = 0;
+                for (t += minus; *t; t++)
+                    v = v * 10 + (*t - '0');
+                if (k == 0) a.uid = minus ? -v : v; else a.loginuid = minus ? -v : v;
+            }
+            counted = audit_start_line(NULL, &a, "T");
+            len = audit_start_line(line, &a, "T");
+        } else if (streq(argv[2], "end") && argc == 9) {
+            int status = 0;
+            int64_t ms = 0;
+            for (const char *t = argv[6]; *t; t++)
+                status = status * 10 + (*t - '0');
+            for (const char *t = argv[7]; *t; t++)
+                ms = ms * 10 + (*t - '0');
+            struct audit_end e = { .box = argv[3], .box_id = DASH(4), .exec_id = argv[5],
+                                   .status = status, .duration_ms = ms, .timed_out = streq(argv[8], "yes") };
+            counted = audit_end_line(NULL, &e, "T");
+            len = audit_end_line(line, &e, "T");
+        } else {
+            die("unit: auditline start ... or auditline end ...");
+        }
+#undef DASH
+        if (counted != len)
+            die("unit: an audit line is not as long as counted");
+        (void)lc_kernel_write_all(STDOUT, line, len);
+        return 0;
+    }
+    /* auditfilter <box> <piece> <file>: the lines of the file about the box,
+     * read in pieces of that many bytes */
+    if (argc == 5 && streq(argv[1], "auditfilter")) {
+        int piece = 0;
+        for (const char *t = argv[3]; *t; t++)
+            piece = piece * 10 + (*t - '0');
+        static char buf[4096], kept[4096 + NAME_MAX_LEN + 16];
+        if (piece < 1 || piece > (int)sizeof(buf))
+            die("unit: a piece of 1 to 4096 bytes");
+        lc_sysret fd = lc_kernel_open_file(argv[4], O_RDONLY | O_CLOEXEC, 0);
+        if (fd < 0)
+            die2("unit: cannot open ", argv[4]);
+        struct audit_filter f;
+        audit_filter_start(&f, argv[2]);
+        for (;;) {
+            lc_sysret n = lc_kernel_read_retry((int32_t)fd, buf, (size_t)piece);
+            if (n <= 0)
+                break;
+            size_t len = audit_filter(&f, buf, (size_t)n, kept);
+            (void)lc_kernel_write_all(STDOUT, kept, len);
+        }
         return 0;
     }
     if (argc == 3 && streq(argv[1], "duration")) {

@@ -117,6 +117,11 @@ typedef struct {
 /* --ttl as it is kept: a duration as parse_duration_ms takes it */
 #define DURATION_TEXT_MAX 24
 
+/* A box's id (ROADMAP 8.9): 16 lowercase hex digits that create draws and
+ * .conf keeps, which the audit log tells a box from a later one of its name
+ * by. A box made before boxes had one has none. */
+#define BOX_ID_LEN 16
+
 /* What init reports when --ttl ended the container, besides 0 for a stop and
  * 1 for a failure (ROADMAP 8.8): its state is then "expired". */
 #define INIT_EXPIRED 2
@@ -138,6 +143,7 @@ typedef struct {
     char dns[MAX_DNS][16];
     char base[13];              /* the snapshot it overlays; empty: a copy of its base */
     char ttl[DURATION_TEXT_MAX];    /* --ttl as given; empty: none */
+    char id[BOX_ID_LEN + 1];    /* empty: made before boxes had one */
     int64_t ttl_ms;             /* its lifetime from each start, or 0 */
     bool userns;                /* uid and gid 0 are uid_start and gid_start on the host */
     uint32_t uid_start;
@@ -220,6 +226,9 @@ void print_str(int32_t fd, const char *s);
 #define EXEC_TIMED_OUT 124
 #define EXEC_FAILED    125
 extern int failure_status;
+/* fn is run before a failure ends this process, die's or fail_now's; NULL: nothing */
+void on_failure(void (*fn)(void));
+[[noreturn]] void fail_now(void);
 [[noreturn]] void die(const char *msg);
 [[noreturn]] void die2(const char *prefix, const char *detail);
 bool streq(const char *a, const char *b);
@@ -271,6 +280,7 @@ bool has_control_chars(const char *s);
 #define DURATION_MAX_MS ((int64_t)365 * 86400 * 1000)
 [[nodiscard]] bool parse_duration_ms(const char *text, int64_t *ms);
 int fmt_int(char *buf, int val);
+[[nodiscard]] bool random_hex(char *out, size_t bytes);
 int write_file(const char *path, const char *data);
 void require_write_file(const char *path, const char *data);
 
@@ -772,5 +782,58 @@ void cmd_doctor(int argc, char **argv);
 void cmd_ls(int argc, char **argv);
 void cmd_inspect(int argc, char **argv);
 void cmd_logs(int argc, char **argv);
+
+/* ─── The audit log (lightbox_audit.c, ROADMAP 8.9) ─────────────────────── */
+
+/* <lightbox_dir>/audit.log */
+void audit_log_path(char *buf);
+
+/* s[0..len) as a JSON string in ASCII; out NULL: counted only. At most
+ * JSON_QUOTED_MAX(len) bytes, the number written. */
+#define JSON_QUOTED_MAX(len) ((len) * 6 + 2)
+size_t json_quote(char *out, const char *s, size_t len);
+
+/* "YYYY-MM-DDTHH:MM:SS.mmmZ" */
+#define UTC_TEXT_LEN 24
+void format_utc(char out[UTC_TEXT_LEN + 1], int64_t seconds, int64_t nanoseconds);
+
+/* What the line of an exec's start records: what was asked of the box */
+struct audit_start {
+    const char *box, *box_id;           /* box_id empty or NULL: a box made before boxes had one */
+    const char *exec_id;                /* <pid>-<start time> of the exec, as its cgroup is named */
+    const char *via;                    /* "exec" or "run" */
+    int64_t     uid, loginuid;          /* loginuid -1: none */
+    const char *user, *workdir, *timeout;   /* as given, or NULL */
+    const char *const *env;             /* --env KEY=VALUE, of which the keys are recorded */
+    int         nenv;
+    const char *const *argv;            /* the command, NULL at its end */
+};
+
+/* and of its end */
+struct audit_end {
+    const char *box, *box_id, *exec_id;
+    int         status;                 /* what exec exits with */
+    int64_t     duration_ms;
+    bool        timed_out;
+};
+
+/* The line, with its newline; out NULL: counted only. Its length. */
+size_t audit_start_line(char *out, const struct audit_start *a, const char *time);
+size_t audit_end_line(char *out, const struct audit_end *e, const char *time);
+/* Append the line, stamped with the time now: 0 or a negative errno. */
+[[nodiscard]] int audit_record_start(const struct audit_start *a);
+[[nodiscard]] int audit_record_end(const struct audit_end *e);
+int64_t audit_loginuid(void);
+
+/* The lines of one box, from the log as it is read in pieces */
+enum audit_line_state { AUDIT_LINE_START, AUDIT_LINE_KEPT, AUDIT_LINE_SKIPPED };
+struct audit_filter {
+    char   prefix[NAME_MAX_LEN + 16];   /* {"box":"<name>", */
+    size_t len, matched;
+    enum audit_line_state state;
+};
+void audit_filter_start(struct audit_filter *f, const char *box);
+/* in[0..n) into out, which has room for n + sizeof(f->prefix): the length kept */
+size_t audit_filter(struct audit_filter *f, const char *in, size_t n, char *out);
 
 #endif

@@ -118,27 +118,41 @@ static void print_kv_int(const char *key, int val) {
 
 
 /*
- * logs <name> [-f]: what the container's init, its hook and its services
- * wrote to stdout and stderr, from every start since the container was made.
- * With -f it goes on for as long as the container runs.
+ * logs <name> [-f] [--audit]: what the container's init, its hook and its
+ * services wrote to stdout and stderr, from every start since the container
+ * was made. With --audit, the lines of the audit log about the box of that
+ * name (ROADMAP 8.9): what exec and run asked of it, kept after it is
+ * removed. With -f it goes on for as long as the container runs.
  */
 void cmd_logs(int argc, char **argv) {
-    if (argc < 1) die("Usage: lightbox logs <name> [-f]");
-    const char *name = argv[0];
-    validate_name(name);
-
-    bool follow = false;
-    for (int i = 1; i < argc; i++) {
+    const char *name = NULL;
+    bool follow = false, audit = false;
+    for (int i = 0; i < argc; i++) {
         if (streq(argv[i], "-f") || streq(argv[i], "--follow"))
             follow = true;
+        else if (streq(argv[i], "--audit"))
+            audit = true;
+        else if (argv[i][0] == '-' && argv[i][1])
+            die2("Error: unknown option: ", argv[i]);
+        else if (!name)
+            name = argv[i];
         else
-            die2(argv[i][0] == '-' ? "Error: unknown option: " : "Error: unexpected argument: ", argv[i]);
+            die2("Error: unexpected argument: ", argv[i]);
     }
+    if (!name) die("Usage: lightbox logs <name> [-f] [--audit]");
+    validate_name(name);
 
     char path[MAX_PATH];
-    container_dir_path(path, name);
-    if (!path_exists(path)) die2("Error: container does not exist: ", name);
-    container_log_path(path, name);
+    struct audit_filter filter;
+    if (audit) {
+        /* a box that was removed has its lines there still */
+        audit_log_path(path);
+        audit_filter_start(&filter, name);
+    } else {
+        container_dir_path(path, name);
+        if (!path_exists(path)) die2("Error: container does not exist: ", name);
+        container_log_path(path, name);
+    }
 
     lc_sysret fd = -LB_ENOENT;
     for (;;) {
@@ -151,24 +165,32 @@ void cmd_logs(int argc, char **argv) {
         if (fd < 0 && fd != -LB_ENOENT) {
             char digits[16];
             fmt_int(digits, (int)-fd);
-            print_str(STDERR, "Error: cannot read the log of container '");
-            print_str(STDERR, name);
-            print_str(STDERR, "' (errno ");
+            print_str(STDERR, audit ? "Error: cannot read the audit log " : "Error: cannot read the log of container '");
+            print_str(STDERR, audit ? path : name);
+            print_str(STDERR, audit ? " (errno " : "' (errno ");
             print_str(STDERR, digits);
             print_str(STDERR, ")\n");
             lc_kernel_exit(failure_status);
         }
 
-        /* a container that was never started has no log, which is an empty one */
+        /* a container that was never started has no log, which is an empty
+         * one, and a host where no exec ran no audit log */
         bool got_some = false;
         while (fd >= 0) {
             char buf[4096];
+            static char kept[sizeof(buf) + sizeof(filter.prefix)];
             lc_sysret n = lc_kernel_read_retry((int32_t)fd, buf, sizeof(buf));
             if (n < 0)
                 die("Error: reading the log failed");
             if (n == 0)
                 break;
-            if (lc_kernel_write_all(STDOUT, buf, (size_t)n) < 0)
+            const char *out = buf;
+            size_t len = (size_t)n;
+            if (audit) {
+                len = audit_filter(&filter, buf, len, kept);
+                out = kept;
+            }
+            if (lc_kernel_write_all(STDOUT, out, len) < 0)
                 lc_kernel_exit(failure_status);          /* nobody reads this any more */
             got_some = true;
         }
@@ -352,6 +374,11 @@ void cmd_inspect(int argc, char **argv) {
     report_text(&r, "config_path", conf_path);
     report_text(&r, "ip_path", ip_path);
     report_text(&r, "log_path", log_path);
+    {
+        char audit_path[MAX_PATH];
+        audit_log_path(audit_path);
+        report_text(&r, "audit_path", audit_path);
+    }
     report_text(&r, "pid_path", pid_path);
     report_text(&r, "pid_start_path", pid_start_path);
     report_text(&r, "state_path", state_path);
@@ -380,6 +407,7 @@ void cmd_inspect(int argc, char **argv) {
         net_mode_text(mode, config.net, config.proxy_port);
         report_text(&r, "net", mode);
         report_text(&r, "ttl", config.ttl[0] ? config.ttl : NULL);
+        report_text(&r, "id", config.id[0] ? config.id : NULL);
         report_volumes(&r, &config);
         report_links(&r, &config);
     }

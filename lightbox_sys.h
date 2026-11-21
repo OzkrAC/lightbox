@@ -29,6 +29,7 @@
 #define LB_SYS_flock      73
 #define LB_SYS_fsync      74
 #define LB_SYS_fchdir     81
+#define LB_SYS_getuid     102
 #define LB_SYS_geteuid    107
 #define LB_SYS_capget     125
 #define LB_SYS_capset     126
@@ -60,6 +61,7 @@
 #define LB_SYS_fsync      82
 #define LB_SYS_capget     90
 #define LB_SYS_capset     91
+#define LB_SYS_getuid     174
 #define LB_SYS_geteuid    175
 #define LB_SYS_memfd_create 279
 #define LB_SYS_getrandom  278
@@ -88,7 +90,9 @@
 #define LB_ENOENT                 2
 #define LB_ESRCH                  3
 #define LB_EINTR                  4
+#define LB_EIO                    5
 #define LB_EAGAIN                 11
+#define LB_ENOMEM                 12
 #define LB_EACCES                 13
 #define LB_EBUSY                  16
 #define LB_EEXIST                 17
@@ -587,6 +591,10 @@ static inline lc_sysret lb_sys_flock(int32_t fd, int32_t operation) {
 
 static inline lc_sysret lb_sys_geteuid(void) {
     return lc_syscall0(LB_SYS_geteuid);
+}
+
+static inline lc_sysret lb_sys_getuid(void) {
+    return lc_syscall0(LB_SYS_getuid);
 }
 
 static inline lc_sysret lb_sys_fcntl(int32_t fd, int32_t request, uint64_t argument) {

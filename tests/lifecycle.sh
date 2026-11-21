@@ -767,6 +767,63 @@ t_exec_timeout() {
 
 none_running() { local w; for w; do running_cmd "$w" && return 1; done; return 0; }  # command lines
 
+# Every exec writes two lines to the audit log of the host (ROADMAP 8.9): one
+# as its command starts and one when it has ended. They parse as JSON, name
+# the box by its name and id, and carry what was asked, --env by its keys
+# only, and how it ended. The lines of a run are kept when its box is gone.
+# No file in the box has what the log has.
+t_audit_log() {
+    local log=$T/lb/audit.log id rc found name
+    up audit || return 1
+    id=$(conf_value audit id)
+    lb exec audit --env TOKEN=not-for-the-log --workdir /tmp /bin/sh -c 'exit 7' auditmarker4711 </dev/null
+    rc=$?
+    lb exec audit --timeout 1s /bin/sleep 1116 </dev/null 2>/dev/null
+    echo "statuses $rc and $?; the log: $(stat -c '%a %U' "$log"), its directory $(stat -c '%a' "$T/lb")"
+    lb logs --audit audit
+    lb logs --audit audit | python3 -I -c '
+import json, re, sys
+box_id = sys.argv[1]
+lines = [json.loads(l) for l in sys.stdin]
+assert len(lines) == 4, "%d lines" % len(lines)
+a, b, c, d = lines
+for l in lines:
+    assert l["box"] == "audit" and l["box_id"] == box_id, "the box"
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z", l["time"]), l["time"]
+assert [l["event"] for l in lines] == ["start", "end", "start", "end"], "the events"
+assert a["exec_id"] == b["exec_id"] != c["exec_id"] == d["exec_id"], "the exec ids"
+assert a["via"] == "exec" and a["uid"] == 0 and a["user"] is None and a["workdir"] == "/tmp" and a["timeout"] is None
+assert a["env"] == ["TOKEN"] and a["argv"] == ["/bin/sh", "-c", "exit 7", "auditmarker4711"], "what was asked"
+assert b["status"] == 7 and b["timed_out"] is False and b["duration_ms"] >= 0, "its end"
+assert c["timeout"] == "1s" and c["argv"] == ["/bin/sleep", "1116"], "the second"
+assert d["status"] == 124 and d["timed_out"] is True and d["duration_ms"] >= 1000, "its end"
+' "$id" || return 1
+    [ "$rc" = 7 ] && [ "$(stat -c '%a %U' "$log")" = '600 root' ] || return 1
+    ! grep -q not-for-the-log "$log" || { echo "the value of an --env is in the log"; return 1; }
+    # what the box can read, but /proc, /sys and lightbox's own /dev, with one
+    # file the box writes that has it, which the search has to find: the
+    # pattern does not match itself, which is in the command lines of /proc
+    found=$(LB_TIMEOUT=120 lb exec audit /bin/sh -c \
+        "echo auditmarker4711 > /tmp/control; for d in /*; do case \$d in /proc|/sys|/dev) ;;
+         *) $KIT find \"\$d\" -type f -exec $KIT grep -l 'auditmarke[r]4711' {} + ;; esac; done" \
+        </dev/null 2>/dev/null)
+    echo "files in the box with what the log has: $found"
+    [ "$found" = /tmp/control ] || return 1
+
+    # shellcheck disable=SC2046
+    name=$(lb run $(mode_options) -- /bin/sh -c 'hostname; exit 5' </dev/null)
+    rc=$?
+    echo "run of $name: $rc; its lines:"
+    lb logs --audit "$name"
+    [ "$rc" = 5 ] && [ ! -e "$C/$name" ] || return 1
+    lb logs --audit "$name" | python3 -I -c '
+import json, re, sys
+lines = [json.loads(l) for l in sys.stdin]
+assert [l["event"] for l in lines] == ["start", "end"] and lines[0]["via"] == "run", "the lines of run"
+assert re.fullmatch("[0-9a-f]{16}", lines[0]["box_id"]) and lines[1]["status"] == 5, "its box and status"
+'
+}
+
 # exec --timeout holds without the process that ran exec: its worker, which
 # the container cannot reach, ends the command and all it started at once
 # when that process is killed, and a second past the deadline when it is
@@ -3925,6 +3982,7 @@ if [ "$MODE" = inside ]; then
     check 'a container with --ttl ends on time, with all it started, and is expired' t_ttl
     check "run prints and returns the command's, and leaves nothing of its box" t_run
     check 'a box of run goes when run is asked to end, or with the next run when run was killed' t_run_ends
+    check 'each exec writes its start and its end to the audit log, which the box cannot see' t_audit_log
     check 'exec without a command runs a shell on standard input'         t_exec_default_shell
     check 'a container has its own hostname, processes and root'          t_own_world
     check 'a running container cannot be started again or removed'        t_running_container_is_protected

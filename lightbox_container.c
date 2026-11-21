@@ -447,13 +447,25 @@ static const char *config_problem(const char *path, int line, const char *what, 
     return problem;
 }
 
+/* A box's id: BOX_ID_LEN lowercase hex digits */
+static bool box_id_ok(const char *id) {
+    size_t len = lc_string_length(id);
+    if (len != BOX_ID_LEN)
+        return false;
+    for (size_t i = 0; i < len; i++) {
+        if (!((id[i] >= '0' && id[i] <= '9') || (id[i] >= 'a' && id[i] <= 'f')))
+            return false;
+    }
+    return true;
+}
+
 /* The keys a file has once at most. */
 enum {
     KEY_MEM = 1 << 0, KEY_PIDS = 1 << 1, KEY_CPU = 1 << 2, KEY_OOM = 1 << 3,
     KEY_PRIVILEGED = 1 << 4, KEY_READONLY = 1 << 5, KEY_USERNS = 1 << 6,
     KEY_UID_START = 1 << 7, KEY_IO = 1 << 8, KEY_SWAP = 1 << 9, KEY_BASE = 1 << 10,
     KEY_GID_START = 1 << 11, KEY_SECCOMP = 1 << 12, KEY_NET = 1 << 13, KEY_DNS = 1 << 14,
-    KEY_TTL = 1 << 15,
+    KEY_TTL = 1 << 15, KEY_ID = 1 << 16,
 };
 
 static unsigned key_bit(const char *key) {
@@ -462,7 +474,7 @@ static unsigned key_bit(const char *key) {
         { "privileged", KEY_PRIVILEGED }, { "readonly", KEY_READONLY }, { "userns", KEY_USERNS },
         { "uid_start", KEY_UID_START }, { "io", KEY_IO }, { "swap", KEY_SWAP }, { "base", KEY_BASE },
         { "gid_start", KEY_GID_START }, { "seccomp", KEY_SECCOMP }, { "net", KEY_NET },
-        { "dns", KEY_DNS }, { "ttl", KEY_TTL },
+        { "dns", KEY_DNS }, { "ttl", KEY_TTL }, { "id", KEY_ID },
     };
     for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
         if (streq(key, keys[i].name))
@@ -578,6 +590,9 @@ static const char *config_line(container_config *config, char *line, unsigned *s
         case KEY_TTL:
             return parse_duration_ms(value, &config->ttl_ms) && str_copy(config->ttl, value, sizeof(config->ttl))
                    ? NULL : "ttl is not a duration from 1 ms to 365 days, such as 30m or 8h";
+        case KEY_ID:
+            return box_id_ok(value) && str_copy(config->id, value, sizeof(config->id))
+                   ? NULL : "id is not " STRINGIFY(BOX_ID_LEN) " lowercase hex digits";
         default:    /* KEY_IO */
             return io_limit_ok(value) && str_copy(config->io, value, sizeof(config->io))
                    ? NULL : "io is not <major>:<minor> with rbps, wbps, riops or wiops =<number> or =max";
@@ -687,7 +702,7 @@ static bool same_config(const container_config *a, const container_config *b) {
         a->privileged != b->privileged || a->read_only != b->read_only || a->userns != b->userns ||
         a->uid_start != b->uid_start || a->gid_start != b->gid_start ||
         a->seccomp_allow != b->seccomp_allow || a->net != b->net || a->proxy_port != b->proxy_port ||
-        a->ndns != b->ndns || !streq(a->ttl, b->ttl) || a->ttl_ms != b->ttl_ms ||
+        a->ndns != b->ndns || !streq(a->ttl, b->ttl) || a->ttl_ms != b->ttl_ms || !streq(a->id, b->id) ||
         a->nvols != b->nvols || a->nlinks != b->nlinks)
         return false;
     for (int i = 0; i < a->ndns; i++) {
@@ -752,6 +767,8 @@ const char *container_config_save(const char *name, const container_config *conf
         put_line(&out, "base", config->base);
     if (config->ttl[0])
         put_line(&out, "ttl", config->ttl);
+    if (config->id[0])
+        put_line(&out, "id", config->id);
 
     for (int i = 0; i < config->nvols; i++) {
         const volume_spec *vol = &config->vols[i];
