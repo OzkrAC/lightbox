@@ -553,6 +553,10 @@ static inline lc_sysret lb_sys_recvfrom(int32_t fd, void *buf, uint64_t len, int
 /* ppoll(2) with the caller's signal mask left as it is: wait until one of the
  * descriptors has something, or for as long as timeout says. The number of
  * descriptors that have something, 0 when the time ran out. */
+/* CLOCK_BOOTTIME: CLOCK_MONOTONIC with the time the system was suspended,
+ * for a lifetime that counts as a clock on the wall does */
+#define LB_CLOCK_BOOTTIME 7
+
 static inline lc_sysret lb_sys_ppoll(struct lb_pollfd *fds, uint64_t count, lc_timespec *timeout) {
     return lc_syscall5(LB_SYS_ppoll, (int64_t)fds, (int64_t)count, (int64_t)timeout, 0, 0);
 }

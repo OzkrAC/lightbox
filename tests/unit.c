@@ -356,6 +356,14 @@ static void put_config(const container_config *config) {
     put_line("io ", config->io[0] ? config->io : "-");
     put_line("swap ", config->swap[0] ? config->swap : "-");
     put_line("base ", config->base[0] ? config->base : "-");
+    if (config->ttl[0]) {
+        put("ttl ");
+        put(config->ttl);
+        put(" ");
+        put_int64(config->ttl_ms);
+    } else {
+        put("ttl -\n");
+    }
     if (config->userns) {
         char u[11], g[11];
         format_u32(u, config->uid_start);
@@ -380,7 +388,7 @@ static void put_config(const container_config *config) {
 /* A field of a configuration set to a value as it is, however long it is
  * allowed to be and whatever is in it. */
 static void set_unchecked(container_config *config, const char *assignment) {
-    static const char *const fields[] = { "mem=", "pids=", "cpu=", "io=", "link=", "src=", "dst=", "swap=" };
+    static const char *const fields[] = { "mem=", "pids=", "cpu=", "io=", "link=", "src=", "dst=", "swap=", "ttl=" };
     size_t which = 0, len = 0;
     for (; which < sizeof(fields) / sizeof(fields[0]); which++) {
         len = lc_string_length(fields[which]);
@@ -406,6 +414,11 @@ static void set_unchecked(container_config *config, const char *assignment) {
                 config->nvols++;
                 break;
         case 7: fits = str_copy(config->swap, value, sizeof(config->swap)); break;
+        /* the text as it is, and what it means when it is a duration */
+        case 8: fits = str_copy(config->ttl, value, sizeof(config->ttl));
+                if (!parse_duration_ms(value, &config->ttl_ms))
+                    config->ttl_ms = 0;
+                break;
         default: break;
     }
     if (!fits)

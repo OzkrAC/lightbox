@@ -800,6 +800,39 @@ t_exec_timeout_without_its_exec() {
     [ "$ms" -lt 3000 ] && [ "$rc" = 124 ]
 }
 
+# --ttl (ROADMAP 8.8): a container ends at the end of its lifetime from its
+# start, as stop ends it, with what its hook and an exec left running, and
+# ls and inspect show it as expired, as its log says; the next stop clears
+# away what it left and keeps it expired, and a start gives it a lifetime
+# again.
+t_ttl() {
+    local began ms
+    box ttlbox --ttl 2s || return 1
+    hook ttlbox <<EOF
+$KIT setsid sleep 1101 >/dev/null 2>&1 </dev/null &
+EOF
+    began=$(date +%s%N)
+    start ttlbox || return 1
+    sh_in ttlbox "$KIT setsid sleep 1102 >/dev/null 2>&1 </dev/null &" || return 1
+    wait_until 5 running_cmd 'sleep 1101' && wait_until 5 running_cmd 'sleep 1102' ||
+        { echo "what the hook and the exec started is not running"; return 1; }
+    shows_expired() { lb ls | grep -Eq '^ttlbox +[0-9.]+ +expired'; }
+    wait_until 6 shows_expired || { lb ls; echo "ls does not show it as expired"; return 1; }
+    ms=$(( ($(date +%s%N) - began) / 1000000 ))
+    lb ls
+    echo "expired $ms ms after its start began"
+    [ "$ms" -ge 2000 ] && [ "$ms" -lt 4000 ] || return 1
+    lb inspect ttlbox | grep -qx 'state: expired' || { echo "inspect does not show it as expired"; return 1; }
+    none_running 'sleep 1101' 'sleep 1102' || { echo "a process is left"; return 1; }
+    cgroup_empty "$CG/ttlbox" || { echo "its cgroup is not empty"; return 1; }
+    grep -q -- '--ttl is over; it stops' "$C/ttlbox/console.log" || { echo "the log does not say why"; return 1; }
+    lb stop ttlbox >"$OUT/ttlbox.stop" 2>&1
+    cat "$OUT/ttlbox.stop"
+    grep -q 'came to the end of its --ttl' "$OUT/ttlbox.stop" || return 1
+    nothing_left ttlbox && [ "$(state_of ttlbox)" = expired ] || return 1
+    start ttlbox && [ "$(state_of ttlbox)" = running ]
+}
+
 # A container whose init died with an exec's cgroup left below its own is
 # cleared away whole, the exec's cgroup first.
 t_exec_cgroup_of_a_dead_init() {
@@ -3789,6 +3822,7 @@ if [ "$MODE" = inside ]; then
     check 'exec --timeout ends the command and all it started, and returns 124' t_exec_timeout
     check 'exec --timeout holds when the exec is killed or stopped'      t_exec_timeout_without_its_exec
     check "the cgroup an exec left goes with a container whose init died" t_exec_cgroup_of_a_dead_init
+    check 'a container with --ttl ends on time, with all it started, and is expired' t_ttl
     check 'exec without a command runs a shell on standard input'         t_exec_default_shell
     check 'a container has its own hostname, processes and root'          t_own_world
     check 'a running container cannot be started again or removed'        t_running_container_is_protected

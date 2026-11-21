@@ -559,6 +559,30 @@ privileged=1'; do
 # takes neither an address nor --link. With firewall = false lightbox makes
 # no rules, and so no container of outside. Anything else is refused and
 # makes nothing, and a .conf of another net cannot be used.
+# --ttl (ROADMAP 8.8): a duration, stored as it was given and shown by
+# inspect; none without it. What is not a duration is refused, and leaves no
+# container.
+t_ttl_option() {
+    local msg value
+    lb create a --ttl 1.5h && lb create b || return 1
+    conf_has a 'ttl=1.5h' && ! grep -q '^ttl=' "$C/b/.conf" || { echo "the ttl is not stored as given"; return 1; }
+    lb inspect a | grep -qx 'ttl: 1.5h' && lb inspect b | grep -qx 'ttl: -' || { echo "inspect does not show it"; return 1; }
+    command -v python3 >/dev/null 2>&1 && {
+        lb inspect a --json | python3 -I -c 'import json, sys; assert json.load(sys.stdin)[0]["ttl"] == "1.5h"' &&
+        lb inspect b --json | python3 -I -c 'import json, sys; assert json.load(sys.stdin)[0]["ttl"] is None' ||
+            { echo "inspect --json does not say it"; return 1; }
+    }
+    for value in 0 0s 1ms 366d 2x -1 '' '2 s'; do
+        msg=$(lb create e --ttl "$value" 2>&1) && { echo "--ttl '$value' was taken"; return 1; }
+        [ "$msg" = "Error: --ttl takes a duration above 0 and up to 365d, such as 30m or 8h: $value" ] ||
+            { echo "--ttl '$value': $msg"; return 1; }
+        [ ! -e "$C/e" ] || { echo "--ttl '$value' left a container"; return 1; }
+    done
+    msg=$(lb create e --ttl 2>&1) && return 1
+    echo "--ttl without a value: $msg"
+    [ ! -e "$C/e" ]
+}
+
 t_net_option() {
     lb create a && lb create b --net nat && lb create c --net none &&
         lb create d --net outside --dns 10.0.0.2 --dns 1.1.1.1 && lb create p --net proxy:3128 || return 1
@@ -2054,6 +2078,7 @@ check 'two creates at once get two addresses'                 t_creates_at_once_
 check '--swap takes what --mem does and 0, and is none unless given' t_swap_option
 check '--seccomp takes allow or deny, allow is the default, and it is stored and shown' t_seccomp_option
 check '--net takes nat, outside, none or proxy:<port>, outside is the default, and it is stored and shown' t_net_option
+check '--ttl takes a duration, which is stored as given and shown'  t_ttl_option
 check '--io-max is a line of io.max for a whole disk that is there' t_io_max_option
 check 'the firewall settings are Docker'"'"'s, and a wrong one keeps the built-in' t_firewall_settings
 check 'firewall_backend and bridge_accept_fwmark: Docker'"'"'s, and a wrong one is not taken' t_firewall_backend_settings

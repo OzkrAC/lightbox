@@ -1341,6 +1341,10 @@ static void cmd_create(int argc, char **argv) {
             const char *value = option_value(argc, argv, &i);
             if (!parse_oom_score(value, &cfg.oom_score))
                 die2("Error: --oom-score takes a number from -1000 to 1000, not: ", value);
+        } else if (streq(opt, "--ttl")) {
+            const char *value = option_value(argc, argv, &i);
+            if (!parse_duration_ms(value, &cfg.ttl_ms) || !str_copy(cfg.ttl, value, sizeof(cfg.ttl)))
+                die2("Error: --ttl takes a duration above 0 and up to 365d, such as 30m or 8h: ", value);
         } else if (streq(opt, "--vol")) {
             const char *value = option_value(argc, argv, &i);
             volume_spec vol = {0};
@@ -1904,8 +1908,37 @@ static void shut_down(int32_t sfd, int grace_seconds) {
  *
  * hook_pid is 0 when there is no hook; report_fd is then not used.
  */
-static int supervisor_loop(int32_t sfd, int32_t report_fd, int32_t hook_pid, int stop_grace) {
+/* Milliseconds since boot, suspended time included: what --ttl counts. */
+static int64_t boottime_ms(void) {
+    lc_timespec now = { 0, 0 };
+    lc_kernel_get_clock(LB_CLOCK_BOOTTIME, &now);
+    return now.seconds * 1000 + now.nanoseconds / 1000000;
+}
+
+/*
+ * Init's loop: reap, see the hook end, and shut down when asked or, with
+ * --ttl, at the deadline (0: none), when it returns INIT_EXPIRED. Init is
+ * what keeps the lifetime: no process of the container can send it a signal
+ * it does not handle, trace it or set the clock it reads. It is in the
+ * container all the same, and only the host could keep a lifetime from it.
+ */
+static int supervisor_loop(int32_t sfd, int32_t report_fd, int32_t hook_pid, int stop_grace, int64_t deadline) {
     for (;;) {
+        if (deadline) {
+            int64_t left = deadline - boottime_ms();
+            if (left <= 0) {
+                print_str(STDERR, "lightbox: the container's --ttl is over; it stops\n");
+                shut_down(sfd, stop_grace);
+                return INIT_EXPIRED;
+            }
+            struct lb_pollfd one = { .fd = sfd, .events = LB_POLLIN, .revents = 0 };
+            lc_timespec wait = { .seconds = left / 1000, .nanoseconds = (left % 1000) * 1000000 };
+            lc_sysret ready = lb_sys_ppoll(&one, 1, &wait);
+            if (ready < 0 && ready != -LB_EINTR)
+                die("Error: failed to wait for init's signals");
+            if (ready <= 0)
+                continue;
+        }
         lc_signal_info si;
         lc_sysret n = lc_kernel_read_retry(sfd, &si, sizeof(si));
         if (n != (lc_sysret)sizeof(si))
@@ -1959,6 +1992,8 @@ static int init_main(const struct child_args *ca) {
      * configures the network needs a privileged container. */
     if (!ca->privileged)
         apply_sandbox(ca->seccomp_allow);
+    /* a lifetime counts from the moment the container is built */
+    int64_t deadline = ca->config && ca->config->ttl_ms ? boottime_ms() + ca->config->ttl_ms : 0;
 
     uint64_t mask = supervisor_signal_mask();
     lc_sysret sfd = lc_kernel_create_signal_fd(-1, &mask, SFD_CLOEXEC);
@@ -1997,7 +2032,7 @@ static int init_main(const struct child_args *ca) {
         lc_kernel_close_file(ca->report_wr);
     }
 
-    return supervisor_loop((int32_t)sfd, ca->report_wr, hook_pid, ca->stop_grace);
+    return supervisor_loop((int32_t)sfd, ca->report_wr, hook_pid, ca->stop_grace, deadline);
 }
 
 static int open_target_path(int target_pid, const char *suffix) {
@@ -3616,16 +3651,19 @@ static bool reconcile(const char *name) {
         return false;
 
     int status = 0;
-    bool ended_well = container_exit_report(name, &status) && status == 0;
+    bool reported = container_exit_report(name, &status);
+    bool ended_well = reported && status == 0;
+    bool expired = reported && status == INIT_EXPIRED;
 
     (void)release_container(name);      /* it has said what it could not remove */
     container_forget_pid(name);
-    (void)record_container_state(name, ended_well ? "exited\n" : "failed\n");
+    (void)record_container_state(name, expired ? "expired\n" : ended_well ? "exited\n" : "failed\n");
 
     print_str(STDERR, "Note: container '");
     print_str(STDERR, name);
-    print_str(STDERR, ended_well ? "' had stopped by itself; what it left has been cleared away\n"
-                                 : "' had ended without a stop; what it left has been cleared away\n");
+    print_str(STDERR, expired ? "' came to the end of its --ttl; what it left has been cleared away\n"
+                      : ended_well ? "' had stopped by itself; what it left has been cleared away\n"
+                                   : "' had ended without a stop; what it left has been cleared away\n");
     return true;
 }
 
@@ -5113,6 +5151,8 @@ static const struct { const char *name; const char *text; } command_help[] = {
         "                                nothing; proxy:<port>, that port of the gateway, where a\n"
         "                                proxy listens, and nothing else\n"
         "         --oom-score <n>        OOM score adjustment (default: 500)\n"
+        "         --ttl <duration>       How long it may run from each start, such as 30m or 8h; then\n"
+        "                                it stops as stop stops it, and is expired\n"
         "         --link <name>          Allow network to another container\n"
         "         --dns <address>        A name server for the container (up to 3; default: the host's)\n" },
     { "start",

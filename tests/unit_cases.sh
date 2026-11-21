@@ -2564,6 +2564,7 @@ dns -
 io 8:0 rbps=1048576
 swap 1G
 base -
+ttl -
 userns -
 vol /srv/data -> /data rw
 vol /etc/app.conf -> /etc/app.conf ro
@@ -2658,6 +2659,28 @@ config_net_keys() {
 }
 t_config_net_keys() { in_config_dir config_net_keys; }
 
+# ttl= (ROADMAP 8.8) is a duration as exec --timeout takes one, kept as it was
+# written, and once at most; without it, none.
+config_ttl_key() {
+    head='version=1\nmem=64M\npids=32\ncpu=1\noom_score=0\n'
+    # shellcheck disable=SC2059     # the head is a format of its own
+    conf() { printf "$head$1" > "$D/web/.conf"; got=$(config); printf '%s\n' "$got"; }
+    conf ''
+    printf '%s\n' "$got" | grep -qx 'ttl -' || return 1
+    for pair in '2s:2000' '30m:1800000' '1.5h:5400000' '90:90000' '365d:31536000000'; do
+        conf "ttl=${pair%%:*}\\n"
+        printf '%s\n' "$got" | grep -qx "ttl ${pair%%:*} ${pair##*:}" || { echo "ttl=${pair%%:*}"; return 1; }
+    done
+    for wrong in '' 0 0s 1ms 366d -1 2x '2 s' .5; do
+        conf "ttl=$wrong\\n"
+        [ "$got" = "refused: $D/web/.conf: line 6: ttl is not a duration from 1 ms to 365 days, such as 30m or 8h" ] ||
+            { echo "ttl=$wrong"; return 1; }
+    done
+    conf 'ttl=2s\nttl=3s\n'
+    case $got in "refused: $D/web/.conf: line 7: "*) ;; *) return 1 ;; esac
+}
+t_config_ttl_key() { in_config_dir config_ttl_key; }
+
 # The ranges /etc/subuid and /etc/subgid give lightbox, and the one a new
 # container gets: the first pair of 65536 that no container's overlaps, the
 # k-th of each file. Other names' lines, and lines of a range that has host
@@ -2747,6 +2770,7 @@ dns -
 io -
 swap -
 base -
+ttl -
 userns -' ] || return 1
     # a default that cannot be used is no default: the file must have the limit
     got=$(config nodefaults)
@@ -2879,6 +2903,7 @@ dns -
 io -
 swap -
 base -
+ttl -
 userns -
 vol /srv/data -> /data rw
 vol /srv/other -> /data rw
@@ -2913,8 +2938,16 @@ vol=/srv/data:/data
 link=db' ] || { echo "the file is not what was put in"; bad=1; }
     [ "$(stat -c %a "$D/web/.conf")" = 600 ] || { echo "the file's mode is $(stat -c %a "$D/web/.conf")"; bad=1; }
     got=$(config | tr '\n' ' ')
-    case $got in 'version 1 mem 1G pids max cpu 0.25 oom_score 500 '*'seccomp deny net nat dns - io 8:0 wbps=1024 swap 64M base - userns - vol /srv/data -> /data rw link db ') ;;
+    case $got in 'version 1 mem 1G pids max cpu 0.25 oom_score 500 '*'seccomp deny net nat dns - io 8:0 wbps=1024 swap 64M base - ttl - userns - vol /srv/data -> /data rw link db ') ;;
         *) echo "read back: $got"; bad=1 ;; esac
+    # --ttl as it was given, read back as the same duration
+    got=$(written mem=1G pids=max cpu=1 ttl=1.5h)
+    [ "$got" = written ] && grep -qx 'ttl=1.5h' "$D/web/.conf" && config | grep -qx 'ttl 1.5h 5400000' ||
+        { echo "a ttl: $got"; cat "$D/web/.conf"; bad=1; }
+    got=$(written mem=1G pids=max cpu=1 'ttl=1.5h ')
+    case $got in 'refused: '*) ;; *) echo "written with a ttl that is not one: $got"; bad=1 ;; esac
+    got=$(written mem=1G swap=64M pids=max cpu=0.25 'io=8:0 wbps=1024' src=/srv/data dst=/data link=db)
+    [ "$got" = written ] || { echo "the good configuration, after the ttl: $got"; bad=1; }
 
     before=$(cat "$D/web/.conf")
     nl='
@@ -2936,7 +2969,7 @@ link=db' ] || { echo "the file is not what was put in"; bad=1; }
     case $got in 'refused: '*) ;; *) echo "written with a carriage return: $got"; bad=1 ;; esac
     # values that are one line and still not what a reader takes, or takes as they are
     for value in mem=lots mem=0100M mem= pids=0 pids= cpu=1024 cpu= 'link=a b' link= swap=lots swap=00 \
-                 io=8:0 'io=8:0 rbps=01' 'io=8:0 xbps=1' \
+                 io=8:0 'io=8:0 rbps=01' 'io=8:0 xbps=1' ttl=0 ttl=2x ttl=1ms \
                  src=/srv/ src=/srv/../etc src=srv src=/proc/1; do
         case $value in src=*) got=$(written "$value" dst=/data) ;; *) got=$(written "$value") ;; esac
         case $got in 'refused: '*) ;; *) echo "written with $value: $got"; bad=1 ;; esac
@@ -3304,6 +3337,7 @@ check 'what a .conf leaves out is the default, if that is usable' t_config_defau
 check 'userns=1 is read with a uid_start and a gid_start, and refused without' t_config_userns_keys
 check 'seccomp= is allow or deny, and the deny-list without it' t_config_seccomp_key
 check 'net= is nat, outside or none, nat without it, and dns= up to three addresses' t_config_net_keys
+check 'ttl= is a duration from 1 ms to 365 days, once at most, and none without it' t_config_ttl_key
 check 'a new container gets the first range of /etc/subuid and /etc/subgid that is free' t_userns_ranges
 check "a volume's maps make the container's root its source's owner, and never host root" t_volume_maps
 check 'base= is a snapshot'"'"'s id, read as it is, or refused'          t_config_base_key

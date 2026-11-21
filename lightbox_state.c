@@ -344,8 +344,12 @@ void container_shown_state(const char *name, container_liveness live, char *buf,
         return;
     }
     get_container_state(name, buf, bufsz);
-    if (live == CONTAINER_DEAD || streq(buf, "running"))
-        str_copy_or_die(buf, "exited", bufsz, "a container's state");
+    if (live == CONTAINER_DEAD || streq(buf, "running")) {
+        /* init says so when --ttl ended it (ROADMAP 8.8) */
+        int status = 0;
+        bool expired = container_exit_report(name, &status) && status == INIT_EXPIRED;
+        str_copy_or_die(buf, expired ? "expired" : "exited", bufsz, "a container's state");
+    }
 }
 
 /* ─── Locks ─────────────────────────────────────────────────────────────── */

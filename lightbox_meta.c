@@ -379,6 +379,7 @@ void cmd_inspect(int argc, char **argv) {
         char mode[NET_MODE_TEXT_MAX];
         net_mode_text(mode, config.net, config.proxy_port);
         report_text(&r, "net", mode);
+        report_text(&r, "ttl", config.ttl[0] ? config.ttl : NULL);
         report_volumes(&r, &config);
         report_links(&r, &config);
     }

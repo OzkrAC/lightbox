@@ -114,6 +114,13 @@ typedef struct {
     bool ro;
 } volume_spec;
 
+/* --ttl as it is kept: a duration as parse_duration_ms takes it */
+#define DURATION_TEXT_MAX 24
+
+/* What init reports when --ttl ended the container, besides 0 for a stop and
+ * 1 for a failure (ROADMAP 8.8): its state is then "expired". */
+#define INIT_EXPIRED 2
+
 typedef struct {
     int  version;               /* 0: a file from before it had the line */
     char mem[MEM_TEXT_MAX];
@@ -130,6 +137,8 @@ typedef struct {
     int  ndns;                  /* the name servers create gave it, which outside lets it ask */
     char dns[MAX_DNS][16];
     char base[13];              /* the snapshot it overlays; empty: a copy of its base */
+    char ttl[DURATION_TEXT_MAX];    /* --ttl as given; empty: none */
+    int64_t ttl_ms;             /* its lifetime from each start, or 0 */
     bool userns;                /* uid and gid 0 are uid_start and gid_start on the host */
     uint32_t uid_start;
     uint32_t gid_start;
