@@ -767,6 +767,68 @@ t_exec_timeout() {
 
 none_running() { local w; for w; do running_cmd "$w" && return 1; done; return 0; }  # command lines
 
+# A box created with nothing but --profile agent and --workspace (ROADMAP
+# 8.10) has each setting of the profile in its .conf under its own key, and
+# Phase 8's first two exit conditions hold for it: its uid 0 is an
+# unprivileged uid on the host, the allow-list filter is installed, its only
+# interface is lo, and a file it writes in its workspace, where every exec
+# runs, belongs on the host to the workspace's owner.
+t_agent_profile() {
+    need_subids || return 77
+    local key inside ifaces u g said
+    mkdir -p "$T/vol/agentws" && chown 2345:2346 "$T/vol/agentws" || return 1
+    lb create agent --profile agent --workspace "$T/vol/agentws" >"$OUT/agent.create" 2>&1 </dev/null ||
+        { cat "$OUT/agent.create"; return 1; }
+    port_of agent >/dev/null
+    cat "$C/agent/.conf"
+    for key in profile=agent userns=1 seccomp=allow net=none mem=2G pids=512 cpu=2 ttl=8h workdir=/workspace \
+               "vol=$T/vol/agentws:/workspace"; do
+        grep -qxF -- "$key" "$C/agent/.conf" || { echo "the .conf has no $key"; return 1; }
+    done
+    [ -n "$(conf_value agent base)" ] && [ ! -e "$C/agent/.ip" ] || { echo "not an overlay, or it has an address"; return 1; }
+    lb inspect agent | grep -qx 'profile: agent' || { echo "inspect does not say the profile"; return 1; }
+    start agent || return 1
+    u=$(conf_value agent uid_start) g=$(conf_value agent gid_start)
+    echo "init on the host: $(host_ids_of "$(pid_of agent)"), its range from $u $g"
+    [ "$u" -gt 0 ] && [ "$(host_ids_of "$(pid_of agent)")" = "$u $g" ] || { echo "uid 0 in the box is not an unprivileged uid"; return 1; }
+    inside=$(lb exec agent /bin/sh -c "id -u; pwd; grep '^Seccomp:' /proc/self/status | tr -d '\t'; echo made > made" </dev/null | paste -sd' ')
+    echo "in it: $inside"
+    [ "$inside" = '0 /workspace Seccomp:2' ] || return 1
+    said=$(sh_in agent "$KIT hostname another" 2>&1) && { echo "the box took sethostname"; return 1; }
+    case $said in *'not implemented'*) ;; *) echo "not the allow-list, which answers ENOSYS: $said"; return 1 ;; esac
+    ifaces=$(sh_in agent 'cat /proc/net/dev' | sed '1,2d' | awk -F: '{ gsub(/ /, "", $1); print $1 }' | paste -sd' ')
+    echo "its interfaces: $ifaces; what it made in its workspace, on the host: $(stat -c %u:%g "$T/vol/agentws/made")"
+    [ "$ifaces" = lo ] && [ "$(stat -c %u:%g "$T/vol/agentws/made")" = 2345:2346 ] || return 1
+    [ "$(lb exec agent --workdir /tmp /bin/sh -c pwd </dev/null)" = /tmp ] || { echo "--workdir does not hold over the workspace"; return 1; }
+    lb stop agent >/dev/null && lb rm agent >/dev/null || return 1
+    nothing_left agent
+}
+
+# run --profile agent (ROADMAP 8.10, and 8.8's exit condition): the status
+# of the command, run in its workspace, and nothing of the box left; the
+# same after SIGTERM to run.
+t_agent_run() {
+    need_subids || return 77
+    local out rc name front
+    mkdir -p "$T/vol/agentrun" && chown 2345:2346 "$T/vol/agentrun" || return 1
+    out=$(lb run --profile agent --workspace "$T/vol/agentrun" -- /bin/sh -c 'hostname; pwd; echo made > made; exit 3' </dev/null)
+    rc=$?
+    name=$(printf '%s\n' "$out" | sed -n 1p)
+    echo "run --profile agent: status $rc, $(printf '%s\n' "$out" | paste -sd' '); made: $(stat -c %u:%g "$T/vol/agentrun/made" 2>&1)"
+    [ "$rc" = 3 ] && [ "$(printf '%s\n' "$out" | sed -n 2p)" = /workspace ] &&
+        [ "$(stat -c %u:%g "$T/vol/agentrun/made")" = 2345:2346 ] && run_left "$name" || return 1
+    lb run --profile agent -- /bin/sh -c 'hostname; exec sleep 1118' >"$OUT/agentrun.out" 2>"$OUT/agentrun.err" </dev/null &
+    front=$!
+    wait_until 30 test -s "$OUT/agentrun.out" && wait_until 5 running_cmd 'sleep 1118' ||
+        { echo "the command did not start"; cat "$OUT/agentrun.err"; kill -KILL "$front"; return 1; }
+    name=$(cat "$OUT/agentrun.out")
+    kill -TERM "$front"
+    wait "$front"
+    rc=$?
+    echo "SIGTERM to run --profile agent of $name: status $rc"
+    [ "$rc" = 143 ] && ! running_cmd 'sleep 1118' && run_left "$name"
+}
+
 # Every exec writes two lines to the audit log of the host (ROADMAP 8.9): one
 # as its command starts and one when it has ended. They parse as JSON, name
 # the box by its name and id, and carry what was asked, --env by its keys
@@ -3983,6 +4045,8 @@ if [ "$MODE" = inside ]; then
     check "run prints and returns the command's, and leaves nothing of its box" t_run
     check 'a box of run goes when run is asked to end, or with the next run when run was killed' t_run_ends
     check 'each exec writes its start and its end to the audit log, which the box cannot see' t_audit_log
+    check 'a box of --profile agent with a workspace has the profile, and Phase 8 holds for it' t_agent_profile
+    check 'run --profile agent returns the status, runs in the workspace and leaves nothing' t_agent_run
     check 'exec without a command runs a shell on standard input'         t_exec_default_shell
     check 'a container has its own hostname, processes and root'          t_own_world
     check 'a running container cannot be started again or removed'        t_running_container_is_protected

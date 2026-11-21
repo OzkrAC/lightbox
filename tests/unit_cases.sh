@@ -2684,6 +2684,8 @@ swap 1G
 base -
 ttl -
 id -
+profile -
+workdir -
 userns -
 vol /srv/data -> /data rw
 vol /etc/app.conf -> /etc/app.conf ro
@@ -2819,6 +2821,32 @@ config_id_key() {
 }
 t_config_id_key() { in_config_dir config_id_key; }
 
+# profile=agent and workdir= (ROADMAP 8.10): the profile a box was made with,
+# which is agent or none, and where its commands run, an absolute path; once
+# at most each, and none without them.
+config_profile_keys() {
+    head='version=1\nmem=64M\npids=32\ncpu=1\noom_score=0\n'
+    # shellcheck disable=SC2059     # the head is a format of its own
+    conf() { printf "$head$1" > "$D/web/.conf"; got=$(config); printf '%s\n' "$got"; }
+    conf ''
+    printf '%s\n' "$got" | grep -qx 'profile -' && printf '%s\n' "$got" | grep -qx 'workdir -' || return 1
+    conf 'profile=agent\nworkdir=/workspace\n'
+    printf '%s\n' "$got" | grep -qx 'profile agent' && printf '%s\n' "$got" | grep -qx 'workdir /workspace' || return 1
+    for wrong in '' Agent agent2 none; do
+        conf "profile=$wrong\\n"
+        [ "$got" = "refused: $D/web/.conf: line 6: profile is not agent" ] || { echo "profile=$wrong"; return 1; }
+    done
+    for wrong in '' workspace ./w; do
+        conf "workdir=$wrong\\n"
+        [ "$got" = "refused: $D/web/.conf: line 6: workdir is not an absolute path" ] || { echo "workdir=$wrong"; return 1; }
+    done
+    conf 'profile=agent\nprofile=agent\n'
+    case $got in "refused: $D/web/.conf: line 7: "*) ;; *) return 1 ;; esac
+    conf 'workdir=/a\nworkdir=/b\n'
+    case $got in "refused: $D/web/.conf: line 7: "*) ;; *) return 1 ;; esac
+}
+t_config_profile_keys() { in_config_dir config_profile_keys; }
+
 # The ranges /etc/subuid and /etc/subgid give lightbox, and the one a new
 # container gets: the first pair of 65536 that no container's overlaps, the
 # k-th of each file. Other names' lines, and lines of a range that has host
@@ -2910,6 +2938,8 @@ swap -
 base -
 ttl -
 id -
+profile -
+workdir -
 userns -' ] || return 1
     # a default that cannot be used is no default: the file must have the limit
     got=$(config nodefaults)
@@ -3044,6 +3074,8 @@ swap -
 base -
 ttl -
 id -
+profile -
+workdir -
 userns -
 vol /srv/data -> /data rw
 vol /srv/other -> /data rw
@@ -3078,7 +3110,7 @@ vol=/srv/data:/data
 link=db' ] || { echo "the file is not what was put in"; bad=1; }
     [ "$(stat -c %a "$D/web/.conf")" = 600 ] || { echo "the file's mode is $(stat -c %a "$D/web/.conf")"; bad=1; }
     got=$(config | tr '\n' ' ')
-    case $got in 'version 1 mem 1G pids max cpu 0.25 oom_score 500 '*'seccomp deny net nat dns - io 8:0 wbps=1024 swap 64M base - ttl - id - userns - vol /srv/data -> /data rw link db ') ;;
+    case $got in 'version 1 mem 1G pids max cpu 0.25 oom_score 500 '*'seccomp deny net nat dns - io 8:0 wbps=1024 swap 64M base - ttl - id - profile - workdir - userns - vol /srv/data -> /data rw link db ') ;;
         *) echo "read back: $got"; bad=1 ;; esac
     # --ttl as it was given, read back as the same duration
     got=$(written mem=1G pids=max cpu=1 ttl=1.5h)
@@ -3092,6 +3124,13 @@ link=db' ] || { echo "the file is not what was put in"; bad=1; }
         { echo "an id: $got"; cat "$D/web/.conf"; bad=1; }
     got=$(written mem=1G pids=max cpu=1 id=0123456789ABCDEF)
     case $got in 'refused: '*) ;; *) echo "written with an id that is not one: $got"; bad=1 ;; esac
+    # the profile and the workdir, read back as written; a workdir that is not a path is not written
+    got=$(written mem=1G pids=max cpu=1 profile=agent workdir=/workspace)
+    [ "$got" = written ] && grep -qx 'profile=agent' "$D/web/.conf" && grep -qx 'workdir=/workspace' "$D/web/.conf" &&
+        config | grep -qx 'profile agent' && config | grep -qx 'workdir /workspace' ||
+        { echo "a profile and a workdir: $got"; cat "$D/web/.conf"; bad=1; }
+    got=$(written mem=1G pids=max cpu=1 workdir=workspace)
+    case $got in 'refused: '*) ;; *) echo "written with a workdir that is not a path: $got"; bad=1 ;; esac
     got=$(written mem=1G swap=64M pids=max cpu=0.25 'io=8:0 wbps=1024' src=/srv/data dst=/data link=db)
     [ "$got" = written ] || { echo "the good configuration, after the ttl: $got"; bad=1; }
 
@@ -3490,6 +3529,7 @@ check 'seccomp= is allow or deny, and the deny-list without it' t_config_seccomp
 check 'net= is nat, outside or none, nat without it, and dns= up to three addresses' t_config_net_keys
 check 'ttl= is a duration from 1 ms to 365 days, once at most, and none without it' t_config_ttl_key
 check 'id= is 16 lowercase hex digits, once at most, and none without it' t_config_id_key
+check 'profile= is agent and workdir= an absolute path, each once at most, and none without them' t_config_profile_keys
 check 'a new container gets the first range of /etc/subuid and /etc/subgid that is free' t_userns_ranges
 check "a volume's maps make the container's root its source's owner, and never host root" t_volume_maps
 check 'base= is a snapshot'"'"'s id, read as it is, or refused'          t_config_base_key

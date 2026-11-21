@@ -408,6 +408,8 @@ void cmd_inspect(int argc, char **argv) {
         report_text(&r, "net", mode);
         report_text(&r, "ttl", config.ttl[0] ? config.ttl : NULL);
         report_text(&r, "id", config.id[0] ? config.id : NULL);
+        report_text(&r, "profile", config.profile == PROFILE_AGENT ? "agent" : NULL);
+        report_text(&r, "workdir", config.workdir[0] ? config.workdir : NULL);
         report_volumes(&r, &config);
         report_links(&r, &config);
     }

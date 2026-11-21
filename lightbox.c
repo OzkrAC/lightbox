@@ -1270,9 +1270,83 @@ static const char *make_resolv(container_config *cfg, char dns[MAX_DNS][16], int
  */
 static const char *const create_value_options[] = {
     "--mem", "--swap", "--pids", "--cpu", "--io-max", "--vol", "--rootfs", "--seccomp", "--net",
-    "--oom-score", "--ttl", "--link", "--dns",
+    "--oom-score", "--ttl", "--link", "--dns", "--profile", "--workspace",
 };
 static const char *const create_flag_options[] = { "--userns", "--read-only", "--copy", "--privileged" };
+
+/*
+ * --profile agent (ROADMAP 8.10): what this phase built, with one switch. A
+ * user namespace, the allow-list filter, an overlay root, and --net none
+ * unless --net outside or proxy:<port> is given; the limits and the lifetime
+ * that no option gives, from the agent_* settings. What would undo it is
+ * refused, by its name; what tightens it further, such as --read-only, is
+ * taken. Each setting goes in .conf under its own key, beside profile=agent.
+ */
+static void agent_profile(container_config *cfg, bool net_given, bool full_copy) {
+    if (cfg->privileged)
+        die("Error: --profile agent refuses --privileged");
+    if (cfg->nlinks > 0)
+        die("Error: --profile agent refuses --link");
+    if (net_given && cfg->net == NET_NAT)
+        die("Error: --profile agent refuses --net nat");
+    if (!cfg->seccomp_allow)
+        die("Error: --profile agent refuses --seccomp deny");
+    if (full_copy)
+        die("Error: --profile agent refuses --copy: its root is an overlay of its base");
+    cfg->profile = PROFILE_AGENT;
+    cfg->userns = true;
+    if (!net_given)
+        cfg->net = NET_NONE;
+
+    static const char *const why = "this setting of lightbox.conf cannot be used, and no option gave the box of --profile agent that limit";
+    struct { char *field; size_t size; const char *value; const char *key; } limits[] = {
+        { cfg->mem,  sizeof(cfg->mem),  cfg_global.agent_mem,  "agent_mem" },
+        { cfg->pids, sizeof(cfg->pids), cfg_global.agent_pids, "agent_pids" },
+        { cfg->cpu,  sizeof(cfg->cpu),  cfg_global.agent_cpu,  "agent_cpu" },
+    };
+    for (size_t i = 0; i < sizeof(limits) / sizeof(limits[0]); i++) {
+        if (limits[i].field[0])
+            continue;
+        if (!limits[i].value[0] || !str_copy(limits[i].field, limits[i].value, limits[i].size))
+            die_about("Error: ", why, limits[i].key);
+    }
+    if (!cfg->ttl[0]) {
+        if (!cfg_global.agent_ttl_ok)
+            die_about("Error: ", "this setting of lightbox.conf cannot be used, and no --ttl gave the box of --profile agent a lifetime",
+                      "agent_ttl");
+        if (!streq(cfg_global.agent_ttl, "none") &&
+            (!parse_duration_ms(cfg_global.agent_ttl, &cfg->ttl_ms) ||
+             !str_copy(cfg->ttl, cfg_global.agent_ttl, sizeof(cfg->ttl))))
+            die_about("Error: ", "this setting of lightbox.conf cannot be used", "agent_ttl");
+    }
+}
+
+/* --workspace <dir>: the directory at /workspace, as a volume, which with
+ * --userns is its owner's (ROADMAP 8.2), and where every exec runs. */
+static void add_workspace(container_config *cfg, const char *dir) {
+    if (dir[0] != '/')
+        die2("Error: --workspace takes an absolute path: ", dir);
+    for (const char *c = dir; *c; c++) {
+        if (*c == ':')
+            die2("Error: --workspace takes a directory whose path has no ':', as a volume's has none: ", dir);
+    }
+    if (!path_is_directory(dir))
+        die2("Error: --workspace takes a directory that is there: ", dir);
+    char spec[MAX_PATH + sizeof(WORKSPACE_DIR) + 1];
+    size_t at = 0;
+    bool cut = false;
+    at = str_append(spec, at, dir, sizeof(spec), &cut);
+    at = str_append(spec, at, ":", sizeof(spec), &cut);
+    (void)str_append(spec, at, WORKSPACE_DIR, sizeof(spec), &cut);
+    if (cut)
+        die2("Error: --workspace takes a directory whose path is shorter: ", dir);
+    volume_spec vol = {0};
+    parse_volume_spec_or_die(spec, &vol);
+    const char *wrong = config_add_volume(cfg, &vol);
+    if (wrong)
+        die_about("Error: --workspace: ", wrong, dir);
+    str_copy_or_die(cfg->workdir, WORKSPACE_DIR, sizeof(cfg->workdir), "--workspace");
+}
 
 /* Set by run: what create writes in the box's .runner, right after its mark,
  * so that no box of run is ever without it once it can be started. */
@@ -1315,6 +1389,8 @@ static void cmd_create(int argc, char **argv) {
     cfg.net = NET_OUTSIDE;
     char dns[MAX_DNS][16];
     int ndns = 0;
+    bool net_given = false, agent = false;
+    const char *workspace = NULL;
 
     for (int i = address_given ? 2 : 1; i < argc; i++) {
         const char *opt = argv[i];
@@ -1346,6 +1422,17 @@ static void cmd_create(int argc, char **argv) {
             const char *value = option_value(argc, argv, &i);
             if (!parse_net_mode(value, &cfg.net, &cfg.proxy_port))
                 die2("Error: --net takes nat, outside, none or proxy:<port>, not: ", value);
+            net_given = true;
+        } else if (streq(opt, "--profile")) {
+            const char *value = option_value(argc, argv, &i);
+            if (!streq(value, "agent"))
+                die2("Error: --profile takes agent, not: ", value);
+            agent = true;
+        } else if (streq(opt, "--workspace")) {
+            const char *value = option_value(argc, argv, &i);
+            if (workspace)
+                die("Error: --workspace is given once: a box has one workspace");
+            workspace = value;
         } else if (streq(opt, "--rootfs")) {
             str_copy_or_die(cfg_global.rootfs, option_value(argc, argv, &i), MAX_PATH, "--rootfs");
         } else if (streq(opt, "--copy")) {
@@ -1383,6 +1470,11 @@ static void cmd_create(int argc, char **argv) {
         }
     }
 
+    if (agent)
+        agent_profile(&cfg, net_given, full_copy);
+    if (workspace)
+        add_workspace(&cfg, workspace);
+
     /* what no option gave comes from lightbox.conf */
     {
         const char *unusable = container_config_fill_defaults(&cfg);
@@ -1393,7 +1485,7 @@ static void cmd_create(int argc, char **argv) {
 
     /* its own ids, and the right to give them out, which only root has */
     if (cfg.userns)
-        require_root("create --userns");
+        require_root(agent ? "create --profile agent" : "create --userns");
 
     /* --net none: loopback, and no address, link or rule to have */
     if (cfg.net == NET_NONE) {
@@ -2124,7 +2216,8 @@ struct exec_request {
     int          uid, gid;              /* AS_ID; gid is -1 when only a uid was given */
     const char  *env[MAX_EXEC_ENV];     /* --env, in the order given */
     int          nenv;
-    const char  *workdir;               /* --workdir, or NULL */
+    const char  *workdir;               /* --workdir, the box's workdir=, or NULL */
+    const char  *workdir_text;          /* --workdir as given, or NULL */
     int64_t      timeout_ms;            /* --timeout, or 0 */
     const char  *timeout_text;          /* as it was given */
     int64_t      keeper_deadline;       /* with --timeout: when the worker ends it, the caller failing */
@@ -2624,6 +2717,7 @@ static int parse_exec_options(int argc, char **argv, int first, struct exec_requ
             if (value[0] != '/')
                 die2("Error: --workdir takes an absolute path: ", value);
             req->workdir = value;
+            req->workdir_text = value;
         }
     }
     return i;
@@ -5073,7 +5167,7 @@ static bool exec_audit_start(const char *name, const container_config *config, c
     struct audit_start a = {
         .box = name, .box_id = config->id, .exec_id = exec_id, .via = exec_via,
         .uid = (int64_t)(uint32_t)lb_sys_getuid(), .loginuid = audit_loginuid(),
-        .user = req->user_text, .workdir = req->workdir, .timeout = req->timeout_text,
+        .user = req->user_text, .workdir = req->workdir_text, .timeout = req->timeout_text,
         .env = req->env, .nenv = req->nenv, .argv = req->argv,
     };
     int rc = audit_record_start(&a);
@@ -5114,6 +5208,10 @@ static void cmd_exec(int argc, char **argv) {
      * without its configuration, nothing is run in it */
     static container_config config;
     container_config_load_or_die(name, &config);
+    /* a box with a workspace runs every command there that names no other
+     * (ROADMAP 8.10) */
+    if (!req.workdir && config.workdir[0])
+        req.workdir = config.workdir;
     int pid = get_container_pid(name);
     bool privileged = config.privileged;
     /* where its proxy is: the gateway that it started with, as lightbox.conf
@@ -5567,7 +5665,13 @@ static const struct { const char *name; const char *text; } command_help[] = {
         "         --ttl <duration>       How long it may run from each start, such as 30m or 8h; then\n"
         "                                it stops as stop stops it, and is expired\n"
         "         --link <name>          Allow network to another container\n"
-        "         --dns <address>        A name server for the container (up to 3; default: the host's)\n" },
+        "         --dns <address>        A name server for the container (up to 3; default: the host's)\n"
+        "         --profile <name>       agent: a user namespace, the allow-list, an overlay, and the\n"
+        "                                network of --net none unless --net outside or proxy:<port> is\n"
+        "                                given, with the limits and lifetime of the agent_* settings. As\n"
+        "                                root; it refuses --privileged, --link, --net nat, --seccomp deny\n"
+        "                                and --copy\n"
+        "         --workspace <dir>      The directory at /workspace, where every exec runs\n" },
     { "start",
         "  start  <name>... [-t <seconds>]  Start stopped containers, one after the other\n"
         "         -t <seconds>            How long to wait for /init.sh (default: 30, 0: do not wait)\n" },

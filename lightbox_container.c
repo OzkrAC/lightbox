@@ -465,7 +465,7 @@ enum {
     KEY_PRIVILEGED = 1 << 4, KEY_READONLY = 1 << 5, KEY_USERNS = 1 << 6,
     KEY_UID_START = 1 << 7, KEY_IO = 1 << 8, KEY_SWAP = 1 << 9, KEY_BASE = 1 << 10,
     KEY_GID_START = 1 << 11, KEY_SECCOMP = 1 << 12, KEY_NET = 1 << 13, KEY_DNS = 1 << 14,
-    KEY_TTL = 1 << 15, KEY_ID = 1 << 16,
+    KEY_TTL = 1 << 15, KEY_ID = 1 << 16, KEY_PROFILE = 1 << 17, KEY_WORKDIR = 1 << 18,
 };
 
 static unsigned key_bit(const char *key) {
@@ -475,6 +475,7 @@ static unsigned key_bit(const char *key) {
         { "uid_start", KEY_UID_START }, { "io", KEY_IO }, { "swap", KEY_SWAP }, { "base", KEY_BASE },
         { "gid_start", KEY_GID_START }, { "seccomp", KEY_SECCOMP }, { "net", KEY_NET },
         { "dns", KEY_DNS }, { "ttl", KEY_TTL }, { "id", KEY_ID },
+        { "profile", KEY_PROFILE }, { "workdir", KEY_WORKDIR },
     };
     for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
         if (streq(key, keys[i].name))
@@ -593,6 +594,12 @@ static const char *config_line(container_config *config, char *line, unsigned *s
         case KEY_ID:
             return box_id_ok(value) && str_copy(config->id, value, sizeof(config->id))
                    ? NULL : "id is not " STRINGIFY(BOX_ID_LEN) " lowercase hex digits";
+        case KEY_PROFILE:
+            config->profile = PROFILE_AGENT;
+            return streq(value, "agent") ? NULL : "profile is not agent";
+        case KEY_WORKDIR:
+            return value[0] == '/' && str_copy(config->workdir, value, sizeof(config->workdir))
+                   ? NULL : "workdir is not an absolute path";
         default:    /* KEY_IO */
             return io_limit_ok(value) && str_copy(config->io, value, sizeof(config->io))
                    ? NULL : "io is not <major>:<minor> with rbps, wbps, riops or wiops =<number> or =max";
@@ -703,6 +710,7 @@ static bool same_config(const container_config *a, const container_config *b) {
         a->uid_start != b->uid_start || a->gid_start != b->gid_start ||
         a->seccomp_allow != b->seccomp_allow || a->net != b->net || a->proxy_port != b->proxy_port ||
         a->ndns != b->ndns || !streq(a->ttl, b->ttl) || a->ttl_ms != b->ttl_ms || !streq(a->id, b->id) ||
+        a->profile != b->profile || !streq(a->workdir, b->workdir) ||
         a->nvols != b->nvols || a->nlinks != b->nlinks)
         return false;
     for (int i = 0; i < a->ndns; i++) {
@@ -769,6 +777,10 @@ const char *container_config_save(const char *name, const container_config *conf
         put_line(&out, "ttl", config->ttl);
     if (config->id[0])
         put_line(&out, "id", config->id);
+    if (config->profile == PROFILE_AGENT)
+        put_line(&out, "profile", "agent");
+    if (config->workdir[0])
+        put_line(&out, "workdir", config->workdir);
 
     for (int i = 0; i < config->nvols; i++) {
         const volume_spec *vol = &config->vols[i];

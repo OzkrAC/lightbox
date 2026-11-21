@@ -45,6 +45,8 @@ _Static_assert(CONF_MAX > MAX_VOLS * (2 * MAX_PATH + 8) + MAX_LINKS * (NAME_MAX_
 #define MEM_TEXT_MAX    24      /* "<number>[K|M|G|T]" or "max" */
 #define PIDS_TEXT_MAX   12      /* a count or "max" */
 #define CPU_TEXT_MAX    12      /* CPUs, "2" or "0.5" */
+/* --ttl as it is kept: a duration as parse_duration_ms takes it */
+#define DURATION_TEXT_MAX 24
 #define IO_TEXT_MAX     128     /* a line for io.max */
 
 #define PIDS_LIMIT_MAX  4194304         /* the most processes Linux numbers */
@@ -74,6 +76,15 @@ typedef struct {
     char default_cpu[CPU_TEXT_MAX];
     int  default_oom;
     bool default_oom_ok;
+    /* What --profile agent gives a box that no option gives a limit or a
+     * lifetime (ROADMAP 8.10), empty when it cannot be used, as above.
+     * agent_ttl is "none" for no lifetime, and agent_ttl_ok false when it
+     * cannot be used. */
+    char agent_mem[MEM_TEXT_MAX];
+    char agent_pids[PIDS_TEXT_MAX];
+    char agent_cpu[CPU_TEXT_MAX];
+    char agent_ttl[DURATION_TEXT_MAX];
+    bool agent_ttl_ok;
     int  start_timeout;     /* seconds start waits for the init hook; 0: not at all */
     int  stop_timeout;      /* seconds a container gets to end when it is asked to */
     char dns[64];           /* name servers for new containers, as written; empty: the host's */
@@ -114,13 +125,19 @@ typedef struct {
     bool ro;
 } volume_spec;
 
-/* --ttl as it is kept: a duration as parse_duration_ms takes it */
-#define DURATION_TEXT_MAX 24
-
 /* A box's id (ROADMAP 8.9): 16 lowercase hex digits that create draws and
  * .conf keeps, which the audit log tells a box from a later one of its name
  * by. A box made before boxes had one has none. */
 #define BOX_ID_LEN 16
+
+/* --profile (ROADMAP 8.10): what a box was made with, kept in .conf as
+ * profile=agent. Each setting the profile gave is kept under its own key
+ * beside it, so that what the profile means later does not change a box
+ * that is there. --workspace binds its directory here, and makes it where
+ * every exec runs. */
+#define PROFILE_NONE  0
+#define PROFILE_AGENT 1
+#define WORKSPACE_DIR "/workspace"
 
 /* What init reports when --ttl ended the container, besides 0 for a stop and
  * 1 for a failure (ROADMAP 8.8): its state is then "expired". */
@@ -144,6 +161,8 @@ typedef struct {
     char base[13];              /* the snapshot it overlays; empty: a copy of its base */
     char ttl[DURATION_TEXT_MAX];    /* --ttl as given; empty: none */
     char id[BOX_ID_LEN + 1];    /* empty: made before boxes had one */
+    int  profile;               /* PROFILE_NONE, or PROFILE_AGENT: made with --profile agent */
+    char workdir[MAX_PATH];     /* where exec runs a command without --workdir; empty: / */
     int64_t ttl_ms;             /* its lifetime from each start, or 0 */
     bool userns;                /* uid and gid 0 are uid_start and gid_start on the host */
     uint32_t uid_start;

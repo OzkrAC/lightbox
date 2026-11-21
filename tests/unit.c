@@ -365,6 +365,8 @@ static void put_config(const container_config *config) {
         put("ttl -\n");
     }
     put_line("id ", config->id[0] ? config->id : "-");
+    put_line("profile ", config->profile == PROFILE_AGENT ? "agent" : "-");
+    put_line("workdir ", config->workdir[0] ? config->workdir : "-");
     if (config->userns) {
         char u[11], g[11];
         format_u32(u, config->uid_start);
@@ -389,7 +391,7 @@ static void put_config(const container_config *config) {
 /* A field of a configuration set to a value as it is, however long it is
  * allowed to be and whatever is in it. */
 static void set_unchecked(container_config *config, const char *assignment) {
-    static const char *const fields[] = { "mem=", "pids=", "cpu=", "io=", "link=", "src=", "dst=", "swap=", "ttl=", "id=" };
+    static const char *const fields[] = { "mem=", "pids=", "cpu=", "io=", "link=", "src=", "dst=", "swap=", "ttl=", "id=", "profile=", "workdir=" };
     size_t which = 0, len = 0;
     for (; which < sizeof(fields) / sizeof(fields[0]); which++) {
         len = lc_string_length(fields[which]);
@@ -421,6 +423,9 @@ static void set_unchecked(container_config *config, const char *assignment) {
                     config->ttl_ms = 0;
                 break;
         case 9: fits = str_copy(config->id, value, sizeof(config->id)); break;
+        /* agent, the one profile there is */
+        case 10: config->profile = PROFILE_AGENT; fits = streq(value, "agent"); break;
+        case 11: fits = str_copy(config->workdir, value, sizeof(config->workdir)); break;
         default: break;
     }
     if (!fits)

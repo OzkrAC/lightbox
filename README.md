@@ -263,6 +263,14 @@ default_pids = 128
 default_cpu = 1
 default_oom = 500
 
+# What create --profile agent and run --profile agent give a box that no
+# option gives a limit or a lifetime: what --mem, --pids, --cpu and --ttl
+# take, and agent_ttl none for no lifetime
+agent_mem = 2G
+agent_pids = 512
+agent_cpu = 2
+agent_ttl = 8h
+
 # Seconds that start waits for a container's /init.sh; 0 does not wait
 start_timeout = 30
 
@@ -375,6 +383,12 @@ Commands:
                                 it stops as stop stops it, and is expired
          --link <name>          Allow network to another container
          --dns <address>        A name server for the container (up to 3; default: the host's)
+         --profile <name>       agent: a user namespace, the allow-list, an overlay, and the
+                                network of --net none unless --net outside or proxy:<port> is
+                                given, with the limits and lifetime of the agent_* settings. As
+                                root; it refuses --privileged, --link, --net nat, --seccomp deny
+                                and --copy
+         --workspace <dir>      The directory at /workspace, where every exec runs
   start  <name>... [-t <seconds>]  Start stopped containers, one after the other
          -t <seconds>            How long to wait for /init.sh (default: 30, 0: do not wait)
   stop   <name>... [-t <seconds>]  Stop running containers, one after the other
@@ -445,6 +459,8 @@ A container's name is 1 to 30 characters of `a-z`, `A-Z`, `0-9`, `_` and `-`.
 | `--net nat\|outside\|none\|proxy:<port>` | `outside` | What it may reach: `outside` the internet and its name servers only, `nat` the network every container had before 0.8, with the host and its networks, `none` loopback alone, with no address, or `proxy:<port>` that TCP port of the gateway and nothing else, where a proxy of the host's listens, with no name server and no `--link` (see [Security](#security) and [contrib/proxy](contrib/proxy/README.md)) |
 | `--link <name>` | — | Allow network to another container (repeatable) |
 | `--dns <address>` | the host's | A name server for the container (IPv4, up to 3) |
+| `--profile agent` | none | Everything Phase 8 built for a box that holds an AI agent's session, with one switch: `--userns`, the allow-list seccomp filter, an overlay root, and `--net none` unless `--net outside` or `--net proxy:<port>` is given; the limits and the lifetime that no option gives come from the `agent_mem`, `agent_pids`, `agent_cpu` and `agent_ttl` settings, 2G, 512, 2 CPUs and 8h unless `lightbox.conf` says otherwise. It refuses `--privileged`, `--link`, `--net nat`, `--seccomp deny` and `--copy`, and names the one it refused; what tightens a box further, such as `--read-only` or a smaller `--mem`, is taken. The box's `.conf` has each setting under its own key and `profile=agent` beside them, so a later change to what the profile means, or to the settings, does not change a box that is there. As root, for the user namespace |
+| `--workspace <dir>` | none | A directory of the host's at `/workspace`, as a volume that with `--userns` is its owner's, so that what the box writes there is the owner's on the host; and the directory every `exec` runs in that is given no `--workdir`. The `.conf` keeps it as the volume and `workdir=/workspace`. The directory has to be there, and its path has to be absolute and have no `:` |
 
 A value that is not what its option takes ends `create` with the option named, and nothing is made: no value is shortened or stored to be found wrong at the next start. An option that is given without its value says so.
 
@@ -460,7 +476,7 @@ Options come before the command. A command that begins with a dash goes after `-
 |------|---------|-------------|
 | `--user <name\|uid[:gid]>`, `-u` | root | Who the command runs as. A name is looked up in the container's `/etc/passwd`. A value that begins with a digit must be a uid, or a uid and a gid, and nothing else |
 | `--env <KEY=VALUE>`, `-e` | — | Set a variable in the command's environment (repeatable; the later of two for one variable wins) |
-| `--workdir <dir>`, `-w` | `/` | The directory the command runs in, as an absolute path in the container |
+| `--workdir <dir>`, `-w` | `/`, or `/workspace` in a box with a workspace | The directory the command runs in, as an absolute path in the container |
 | `--timeout <duration>` | none | How long the command may run: digits, up to three more after a point, and `s`, `m`, `h` or `d`, or no unit for seconds, from 1 ms to 365 days, such as `30s`, `5m` or `1.5h`. At the deadline the command and everything it started are ended, in the background and in sessions of their own too, and `exec` exits with 124. A command that ends before it takes along what it left running. Two processes keep the time, the `exec` process and its worker, which the container cannot reach: when the `exec` process ends while the command runs, killed for one, the worker ends everything at once, and when it is held up, stopped for one, the worker does so a second past the deadline. Only root on the host, killing both, can let a command outlive its limit |
 
 What the command gets as its standard streams depends on what `exec` itself was given, and is never a terminal of yours:
@@ -483,6 +499,8 @@ Every `exec` runs in a cgroup of its own, `exec-<pid>-<start time>` of the `exec
 
 ```sh
 sudo ./lightbox run --net none --timeout 10m -- /bin/sh -c 'make test'
+# the same in a box of the agent profile, in this directory
+sudo ./lightbox run --profile agent --workspace "$PWD" --timeout 10m -- make test
 ```
 
 What `run` prints is the command's: `create`, `start` and `rm` say nothing but their errors. It exits as `exec` does, with the command's status, 124, 126 or 127, and with 125 when the box could not be made or started. SIGINT, SIGTERM and SIGHUP sent to `run` go on to the command; one that comes while the box is made stops `run` there. The box is removed once the command has ended, or when it has not within `stop_timeout`, and the removal is in a session of its own, which a terminal's keys do not reach. A `run` killed outright cannot remove its box, which runs on: the box's `.runner` names that `run`, its PID and start time, and the next `run` removes every box whose `run` is gone, and says so. A box that must not outlive a killed `run` for long gets a `--ttl`, as `--timeout` keeps its command to its time in any case.
@@ -499,7 +517,7 @@ Every `exec`, and so the command of every `run`, appends two lines to `<lightbox
 - `box_id` is the id that `create` draws for a box, kept in its `.conf` as `id=` and shown by `inspect`: it tells a box from a later one of the same name. A box created before 0.8 has none, and its lines have `null`.
 - `exec_id` is the PID and start time of the `exec`, as its cgroup is named, and pairs a start with its end. `via` is `exec` or `run`.
 - `uid` is the caller's, which is 0 under `sudo`, and `loginuid` that of the user who logged in, from `/proc/self/loginuid`, which `sudo` and `su` keep; `null` when no login set one.
-- `user`, `workdir` and `timeout` are as given, and `null` when not given. `env` has the keys of `--env` and not their values, which are often credentials. `argv` is the command as given, or `/bin/sh`.
+- `user`, `workdir` and `timeout` are as given, and `null` when not given: a command that runs in a box's workspace because it was given no `--workdir` has `null`. `env` has the keys of `--env` and not their values, which are often credentials. `argv` is the command as given, or `/bin/sh`.
 - `status` is what `exec` exits with, 124 to 127 among them, `duration_ms` how long it took from the moment `exec` began, and `timed_out` whether `--timeout` ended the command.
 - Every string is ASCII: a character outside it as `\uXXXX`, and a byte that is not part of UTF-8 as `\udcXX`, Python's `surrogateescape`, so `json.loads(line)["argv"][0].encode("utf-8", "surrogateescape")` gives back the bytes that were given. No control sequence or reordering mark in an argument reaches a terminal that shows the log.
 

@@ -652,6 +652,88 @@ t_box_id() {
     [ -n "$again" ] && [ "$again" != "$one" ]
 }
 
+# create --profile agent (ROADMAP 8.10) refuses what would undo it, each by
+# its name and whichever comes first, and takes what tightens it, as far as
+# asking for root, which it needs for its user namespace; nothing is made
+# before that. Its agent_* settings are checked as the default_* ones are,
+# and refused where a box would have needed one. What it stores is the
+# lifecycle suite's to see, as root.
+t_profile_option() {
+    [ "$(id -u)" -ne 0 ] || return 77
+    local before msg opt setting key root='Error: lightbox create --profile agent must be run as root'
+    before=$(kept_sum)
+    for opt in '--privileged:--privileged' '--link db:--link' '--net nat:--net nat' \
+               '--seccomp deny:--seccomp deny' '--copy:--copy: its root is an overlay of its base'; do
+        # shellcheck disable=SC2086     # the option and its value
+        msg=$(lb create a --profile agent ${opt%%:*} 2>&1) && { echo "--profile agent took ${opt%%:*}"; return 1; }
+        [ "$msg" = "Error: --profile agent refuses ${opt#*:}" ] || { echo "${opt%%:*}: $msg"; return 1; }
+        # shellcheck disable=SC2086
+        msg=$(lb create a ${opt%%:*} --profile agent 2>&1) && return 1
+        [ "$msg" = "Error: --profile agent refuses ${opt#*:}" ] || { echo "${opt%%:*} first: $msg"; return 1; }
+    done
+    echo "refused, each by its name: --privileged, --link, --net nat, --seccomp deny, --copy"
+    for opt in '' --read-only '--net none' '--net outside' '--net proxy:3128' '--seccomp allow' --userns \
+               '--mem 512M --pids 64 --cpu 1 --ttl 1h' "--workspace $W/vol"; do
+        # shellcheck disable=SC2086
+        msg=$(lb create a --profile agent $opt 2>&1) && { echo "--profile agent $opt made a box"; return 1; }
+        [ "$msg" = "$root" ] || { echo "--profile agent $opt: $msg"; return 1; }
+    done
+    msg=$(lb create a --profile other 2>&1) && return 1
+    [ "$msg" = 'Error: --profile takes agent, not: other' ] || { echo "--profile other: $msg"; return 1; }
+    msg=$(lb create a --profile 2>&1) && return 1
+    [ "$msg" = 'Error: option --profile requires a value' ] || { echo "--profile without a value: $msg"; return 1; }
+    for setting in 'agent_mem = 1Gb' 'agent_pids = lots' 'agent_cpu = 1024' 'agent_ttl = 0'; do
+        printf '%s\n' "$setting" >> "$CONF"
+        key=${setting%% *}
+        lb ls 2>&1 >/dev/null | grep -q "^Warning: $key in lightbox.conf is not " || { echo "no warning for $setting"; return 1; }
+        msg=$(lb create a --profile agent 2>&1) && return 1
+        case $msg in *"Error: $key: "*) ;; *) echo "the refusal does not name $key: $msg"; return 1 ;; esac
+        # given every limit and the lifetime, the box needs none of them
+        msg=$(lb create a --profile agent --mem 64M --pids 5 --cpu 1 --ttl 1h 2>&1 | tail -n 1)
+        [ "$msg" = "$root" ] || { echo "with all four given and $setting: $msg"; return 1; }
+        sed -i '$d' "$CONF"
+    done
+    printf 'agent_ttl = none\n' >> "$CONF"
+    msg=$(lb ls 2>&1 >/dev/null)
+    sed -i '$d' "$CONF"
+    [ -z "$msg" ] || { echo "agent_ttl = none: $msg"; return 1; }
+    echo "agent_mem, agent_pids, agent_cpu and agent_ttl: said when wrong, and refused where needed"
+    [ "$before" = "$(kept_sum)" ] || { echo "what lightbox keeps changed"; return 1; }
+}
+
+# --workspace <dir> (ROADMAP 8.10) is a volume at /workspace, where every
+# exec runs: .conf has the volume and workdir=, and inspect shows it. A
+# directory that is not there, a relative path, one with a colon, a second
+# --workspace and a --vol at /workspace are refused, and nothing is made.
+t_workspace_option() {
+    local msg want
+    mkdir -p "$W/vol/ws" "$W/vol/a:b"
+    lb create w --workspace "$W/vol/ws" && lb create plain || return 1
+    conf_has w "vol=$W/vol/ws:/workspace" && conf_has w 'workdir=/workspace' || { cat "$C/w/.conf"; return 1; }
+    ! grep -q '^workdir=\|^profile=' "$C/w/.conf" "$C/plain/.conf" | grep -v 'w/.conf:workdir=' ||
+        { echo "a profile, or a workdir where there is no workspace"; return 1; }
+    lb inspect w | grep -qx 'workdir: /workspace' && lb inspect w | grep -qx 'profile: -' &&
+        lb inspect plain | grep -qx 'workdir: -' || { echo "inspect does not show them"; return 1; }
+    command -v python3 >/dev/null 2>&1 && {
+        lb inspect w --json | python3 -I -c 'import json, sys; c = json.load(sys.stdin)[0]; assert c["workdir"] == "/workspace" and c["profile"] is None' ||
+            { echo "inspect --json does not say them"; return 1; }
+    }
+    for want in "$W/vol/none:Error: --workspace takes a directory that is there: $W/vol/none" \
+                "ws:Error: --workspace takes an absolute path: ws"; do
+        msg=$(lb create x --workspace "${want%%:*}" 2>&1) && return 1
+        [ "$msg" = "${want#*:}" ] || { echo "--workspace ${want%%:*}: $msg"; return 1; }
+    done
+    msg=$(lb create x --workspace "$W/vol/a:b" 2>&1) && return 1
+    [ "$msg" = "Error: --workspace takes a directory whose path has no ':', as a volume's has none: $W/vol/a:b" ] ||
+        { echo "a path with a colon: $msg"; return 1; }
+    msg=$(lb create x --workspace "$W/vol/ws" --workspace "$W/vol/ws" 2>&1) && return 1
+    [ "$msg" = 'Error: --workspace is given once: a box has one workspace' ] || { echo "two: $msg"; return 1; }
+    msg=$(lb create x --vol "$W/vol/ws:/workspace" --workspace "$W/vol/ws" 2>&1) && return 1
+    [ "$msg" = "Error: --workspace: $W/vol/ws: there is already a volume at that destination" ] ||
+        { echo "with a --vol at /workspace: $msg"; return 1; }
+    [ ! -e "$C/x" ] || { echo "a refused box is there"; return 1; }
+}
+
 t_net_option() {
     lb create a && lb create b --net nat && lb create c --net none &&
         lb create d --net outside --dns 10.0.0.2 --dns 1.1.1.1 && lb create p --net proxy:3128 || return 1
@@ -2179,6 +2261,8 @@ check '--seccomp takes allow or deny, allow is the default, and it is stored and
 check '--net takes nat, outside, none or proxy:<port>, outside is the default, and it is stored and shown' t_net_option
 check '--ttl takes a duration, which is stored as given and shown'  t_ttl_option
 check 'create draws an id for each box, which is stored and shown'  t_box_id
+check '--profile agent refuses what would undo it by its name, and its agent_* settings are checked' t_profile_option
+check '--workspace is a volume at /workspace and the workdir, and what is not a directory is refused' t_workspace_option
 check '--io-max is a line of io.max for a whole disk that is there' t_io_max_option
 check 'the firewall settings are Docker'"'"'s, and a wrong one keeps the built-in' t_firewall_settings
 check 'firewall_backend and bridge_accept_fwmark: Docker'"'"'s, and a wrong one is not taken' t_firewall_backend_settings
