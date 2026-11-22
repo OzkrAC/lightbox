@@ -15,7 +15,7 @@ Not tagged yet: what is written of the next release so far.
 
 - **Packages.** `packaging/build-deb.sh` builds lightbox as a `.deb`, for Debian and Ubuntu, and `packaging/build-xbps.sh` as an `.xbps`, for Void Linux with glibc and with musl, each for x86_64 and aarch64. A package holds what `make install` installs: the binary, the manual page, the example configuration as a configuration file, and lightbox's directories. CI builds both on every run and keeps them as the run's artifacts; it installs each, and runs the lifecycle suite with the binary of the installed `.deb`. `packaging/README.md` says how to build and install them.
 - **A manual page.** `lightbox(8)` lists the commands and their options, and `make install` puts it in `$(PREFIX)/share/man/man8`.
-- **`make dist`** makes `lightbox-<version>.tar.gz`: every file that is committed, with lightc's at the commit lightbox pins in their place, so that it builds with `make` and no network, which the archive a hosting site makes of a tag does not. The same commit gives the same archive.
+- **`make dist`** makes `lightbox-<version>.tar.gz`: every file that is committed, with lightc's at the commit lightbox pins in their place, so that it builds with `make` and no network, which the archive a hosting site makes of a tag does not. The same commit gives the same archive. CI makes it at every run, twice, and builds lightbox from where it was unpacked.
 - **A licence.** lightbox is under the MIT licence, as lightc is: `LICENSE`.
 - **Documentation**, in `docs/`: ten pages on getting started, every command, the configuration, storage, the network, the sandbox, agent boxes, how lightbox works and what to do when something is wrong. They are Luccet notes, which a browser renders, and describe 0.8.0.
 

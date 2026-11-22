@@ -10,6 +10,8 @@ lightbox as a `.deb`, for Debian and Ubuntu, and as an `.xbps`, for Void Linux, 
 | `build-xbps.sh` | Builds the two `.xbps`, with `xbps-create`, on Void |
 | `xbps/INSTALL` | What xbps runs when it has unpacked the package: it makes lightbox's directories |
 
+`.github/workflows/packages.yml` is the CI: it builds each package on both architectures, installs it with its package manager, checks what was installed, and for the `.deb` runs the lifecycle suite with the installed binary. It also makes the source archive of `make dist`, twice, and builds lightbox from it.
+
 ## What a package holds
 
 What `make install PREFIX=/usr` installs, and nothing else of lightbox's own:
@@ -34,7 +36,14 @@ packaging/build-deb.sh          # on Debian or Ubuntu: dist/lightbox_<version>-1
 packaging/build-xbps.sh         # on Void: dist/lightbox-<version>_1.<arch>.xbps, and the same for <arch>-musl
 ```
 
-Both take the output directory as their one argument. The `.deb` is built from the files that git tracks, so a new file has to be added to git before it is in the package. The `.xbps` for glibc and the one for musl hold the same binary, as lightbox links no C library, and differ in the architecture they name.
+Both take the output directory as their one argument, and build for the architecture of the machine they run on. What they need beside git:
+
+```sh
+sudo apt install build-essential debhelper ninja-build      # Debian, Ubuntu
+sudo xbps-install gcc make ninja                            # Void
+```
+
+`build-essential` is what every Debian package build takes for granted: where it is missing, `dpkg-buildpackage` says so and stops with status 3, whatever else is installed. The `.deb` is built from the files that git tracks, so a new file has to be added to git before it is in the package. The `.xbps` for glibc and the one for musl hold the same binary, as lightbox links no C library, and differ in the architecture they name.
 
 To install what was built:
 
@@ -52,4 +61,5 @@ sudo xbps-install --repository="$PWD/dist" lightbox
 ## What the packages are not
 
 - **Not in a distribution's repository.** They are files to install by hand, from a CI run or a release. Debian and Void take a package from an upstream with a release history, which lightbox does not have yet.
+- **Without a package of debugging symbols.** Debian files a binary's symbols under its build ID, and lightc's linker script leaves the binary without one. The binary in a package is stripped.
 - **Not hardened as a distribution's own packages are.** The binary is static, not position-independent and has no stack protector, as lightc does not support either yet. The Makefile holds to that whatever flags a package build gives it.

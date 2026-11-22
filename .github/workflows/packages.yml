@@ -1,9 +1,15 @@
 name: Packages
 
-# lightbox as a .deb and as an .xbps, for x86_64 and aarch64: built, looked
-# at, and installed to see that what was installed works. ci.yml calls this on
-# every push to main and every pull request, and it can be run by hand. The
-# packages are the run's artifacts. packaging/README.md says what they hold.
+# lightbox as a .deb and as an .xbps, for x86_64 and aarch64, and as the
+# source archive of "make dist": built, looked at, and installed to see that
+# what was installed works. ci.yml calls this on every push to main and every
+# pull request, and it can be run by hand. What is built is the run's
+# artifacts. packaging/README.md says what a package holds.
+#
+# A log takes a login to read, and an annotation does not. So what a job
+# found is an annotation of the run too, written by .github/annotate.sh: what
+# a package holds, what lintian says of it, and the end of the output of a
+# build that failed.
 
 on:
   workflow_call:
@@ -11,6 +17,12 @@ on:
 
 permissions:
   contents: read
+
+# bash -eo pipefail, which "shell: bash" stands for: a step that sends its
+# output through tee fails when the command before the pipe does.
+defaults:
+  run:
+    shell: bash
 
 jobs:
   # dpkg-buildpackage on the runner's own Ubuntu, with the GCC it installs as
@@ -33,27 +45,48 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
-      # Squid for contrib/proxy's example, which the suite runs in its own
-      # namespaces: the service that the package starts is not needed.
+      # build-essential is what every Debian package build may take for
+      # granted, and dpkg-buildpackage stops, with status 3, where it is not
+      # installed. A runner has its parts, gcc, make and dpkg-dev, and not the
+      # package. Squid is for contrib/proxy's example, which the suite runs in
+      # its own namespaces: the service that the package starts is not needed.
       - name: Install what the build and the suite need
         run: |
           sudo apt-get update
-          sudo apt-get install -y debhelper ninja-build lintian busybox-static iproute2 iptables nftables util-linux strace squid
+          sudo apt-get install -y build-essential debhelper ninja-build lintian busybox-static iproute2 iptables nftables util-linux strace squid
           sudo systemctl disable --now squid || true
       - name: Build the package
-        run: packaging/build-deb.sh dist
+        id: build
+        run: packaging/build-deb.sh dist 2>&1 | tee "$RUNNER_TEMP/build.log"
+      - name: Why the build failed
+        if: ${{ failure() && steps.build.outcome == 'failure' }}
+        run: .github/annotate.sh error "build-deb.sh (${{ matrix.arch }}), the end of its output" "$RUNNER_TEMP/build.log"
       - name: What the package holds
         run: |
-          dpkg-deb --info dist/lightbox_*.deb
-          dpkg-deb --contents dist/lightbox_*.deb
+          {
+            ls -l dist/*.deb
+            dpkg-deb --info dist/lightbox_*.deb
+            dpkg-deb --contents dist/lightbox_*.deb
+          } 2>&1 | tee "$RUNNER_TEMP/package.log"
+          .github/annotate.sh notice ".deb (${{ matrix.arch }})" "$RUNNER_TEMP/package.log" 80
       # What Debian's own checker says of the package. It reports and fails
       # nothing yet: a static binary that is no PIE is what it is there to
       # find, and which of its tags are to be answered is decided from what
-      # it prints here.
+      # it prints here. The annotation has the tags without their
+      # explanations, which the log has.
       - name: lintian
-        run: lintian --info --display-info --pedantic dist/lightbox_*.deb || true
+        run: |
+          lintian --info --display-info --pedantic dist/lightbox_*.deb > "$RUNNER_TEMP/lintian.log" 2>&1 || true
+          cat "$RUNNER_TEMP/lintian.log"
+          grep -E '^[EWIPXOC]: ' "$RUNNER_TEMP/lintian.log" > "$RUNNER_TEMP/lintian-tags.log" || true
+          [ -s "$RUNNER_TEMP/lintian-tags.log" ] ||
+            { echo "no tag; lintian's first lines:"; head -n 5 "$RUNNER_TEMP/lintian.log"; } > "$RUNNER_TEMP/lintian-tags.log"
+          .github/annotate.sh notice "lintian (${{ matrix.arch }})" "$RUNNER_TEMP/lintian-tags.log" 80
+      # Each line is something a user of the package relies on. The one that
+      # fails is named in an annotation.
       - name: Install the package
         run: |
+          trap 'echo "::error title=The installed .deb (${{ matrix.arch }})::this failed: $BASH_COMMAND"' ERR
           sudo apt-get install -y ./dist/lightbox_*.deb
           test "$(command -v lightbox)" = /usr/bin/lightbox
           lightbox --version
@@ -65,6 +98,7 @@ jobs:
           dpkg-query -W -f='${Conffiles}\n' lightbox | grep -q ' /etc/lightbox/lightbox.conf '
           test "$(sudo stat -c %a /var/lib/lightbox)" = 700
           test "$(sudo stat -c %a /var/lib/lightbox/containers)" = 700
+          test "$(sudo stat -c %a /var/lib/lightbox/rootfs)" = 755
           test ! -e /run/lightbox
       # What doctor says of a runner with the package on it. A runner has no
       # base in /var/lib/lightbox/rootfs, so a check fails, and that is no
@@ -86,12 +120,14 @@ jobs:
           else
             echo "all available"
           fi
+      # The suite writes its totals and each case that fails as annotations.
       - name: Lifecycle suite, with the binary of the package
         run: sudo GITHUB_ACTIONS=true LIGHTBOX_TEST_MODPROBE=1 bash tests/lifecycle.sh /usr/bin/lightbox
       # A removal takes the binary and leaves the configuration; a purge takes
       # that too.
       - name: Remove the package
         run: |
+          trap 'echo "::error title=Removing the .deb (${{ matrix.arch }})::this failed: $BASH_COMMAND"' ERR
           sudo apt-get remove -y lightbox
           test ! -e /usr/bin/lightbox
           test -f /etc/lightbox/lightbox.conf
@@ -103,9 +139,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: lightbox-deb-${{ matrix.arch }}
-          path: |
-            dist/*.deb
-            dist/*.ddeb
+          path: dist/*.deb
           if-no-files-found: error
 
   # Void Linux in a container, on the runner of each architecture: lightbox is
@@ -129,10 +163,13 @@ jobs:
         with:
           submodules: recursive
       # The container is root, and the tree is the runner's: what the build
-      # leaves in it is root's, which the steps after it only read.
+      # leaves in it is root's, which the steps after it only read. The shell
+      # prints each command before it runs it, so that the end of the output
+      # names the one that failed.
       - name: Build, package and install in a Void Linux container
+        id: void
         run: |
-          docker run --rm -v "$PWD:/src" -w /src ghcr.io/void-linux/void-glibc-full:latest sh -euc '
+          docker run --rm -v "$PWD:/src" -w /src ghcr.io/void-linux/void-glibc-full:latest sh -euxc '
             xbps-install -Syu xbps
             xbps-install -yu
             xbps-install -y gcc make ninja file
@@ -145,22 +182,84 @@ jobs:
             test "$(lightbox --version | cut -d" " -f2)" = "$(sh packaging/version.sh)"
             file /usr/bin/lightbox
             file /usr/bin/lightbox | grep -q "statically linked"
-            xbps-query -f lightbox
-            xbps-query -S lightbox
             test -f /usr/share/man/man8/lightbox.8
             test -f /usr/share/licenses/lightbox/LICENSE
             test -f /etc/lightbox/lightbox.conf
             test "$(stat -c %a /var/lib/lightbox)" = 700
             test "$(stat -c %a /var/lib/lightbox/containers)" = 700
-            test -d /var/lib/lightbox/rootfs
+            test "$(stat -c %a /var/lib/lightbox/rootfs)" = 755
+            {
+              gcc --version | head -n 1
+              lightbox --version
+              file /usr/bin/lightbox
+              xbps-query -S lightbox
+              xbps-query -f lightbox
+              ls -ld /var/lib/lightbox /var/lib/lightbox/containers /var/lib/lightbox/rootfs
+            } > dist/installed.txt
             lightbox doctor || true
             xbps-remove -y lightbox
             test ! -e /usr/bin/lightbox
-          '
+          ' 2>&1 | tee "$RUNNER_TEMP/void.log"
+      - name: Why the step in the container failed
+        if: ${{ failure() && steps.void.outcome == 'failure' }}
+        run: .github/annotate.sh error "Void Linux container (${{ matrix.arch }}), the end of its output" "$RUNNER_TEMP/void.log"
       - name: What was built
-        run: ls -l dist/*.xbps
+        run: |
+          { ls -l dist/*.xbps; cat dist/installed.txt; } 2>&1 | tee "$RUNNER_TEMP/package.log"
+          .github/annotate.sh notice ".xbps (${{ matrix.arch }})" "$RUNNER_TEMP/package.log" 80
       - uses: actions/upload-artifact@v7
         with:
           name: lightbox-xbps-${{ matrix.arch }}
           path: dist/*.xbps
+          if-no-files-found: error
+
+  # "make dist": the archive a release hands out as its source. It is made
+  # twice, as one commit has to give one archive, and lightbox is built and
+  # installed from where the archive was unpacked, which is no git checkout.
+  source:
+    name: Source archive
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Install the toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+      - name: Make the archive, twice
+        run: |
+          trap 'echo "::error title=make dist::this failed: $BASH_COMMAND"' ERR
+          mkdir "$RUNNER_TEMP/first" "$RUNNER_TEMP/unpacked"
+          make dist
+          mv lightbox-*.tar.gz "$RUNNER_TEMP/first/"
+          make dist
+          cmp lightbox-*.tar.gz "$RUNNER_TEMP"/first/lightbox-*.tar.gz
+          test "$(tar -tzf lightbox-*.tar.gz | wc -l)" = "$(git ls-files --recurse-submodules | wc -l)"
+      - name: Build and install from the archive
+        run: |
+          trap 'echo "::error title=Building from the source archive::this failed: $BASH_COMMAND"' ERR
+          tar -xzf lightbox-*.tar.gz -C "$RUNNER_TEMP/unpacked"
+          cd "$RUNNER_TEMP"/unpacked/lightbox-*
+          test ! -e .git
+          make
+          ./lightbox --version
+          test "$(./lightbox --version | cut -d' ' -f2)" = "$(sh packaging/version.sh)"
+          make install PREFIX=/usr DESTDIR="$RUNNER_TEMP/stage"
+          test -x "$RUNNER_TEMP/stage/usr/bin/lightbox"
+          test -f "$RUNNER_TEMP/stage/usr/share/man/man8/lightbox.8"
+          test -f "$RUNNER_TEMP/stage/etc/lightbox/lightbox.conf"
+      - name: What the archive is
+        run: |
+          {
+            ls -l lightbox-*.tar.gz
+            sha256sum lightbox-*.tar.gz
+            echo "$(tar -tzf lightbox-*.tar.gz | wc -l) files, as many as git has; made twice, the same both times"
+          } 2>&1 | tee "$RUNNER_TEMP/source.log"
+          .github/annotate.sh notice "Source archive" "$RUNNER_TEMP/source.log"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: lightbox-source
+          path: lightbox-*.tar.gz
           if-no-files-found: error

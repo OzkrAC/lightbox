@@ -5,8 +5,13 @@
 #
 #   packaging/build-deb.sh [output directory]         default: dist
 #
-# It needs dpkg-dev, debhelper, gcc 13 or later, make and ninja-build, and
-# builds for the architecture of the machine it runs on, amd64 or arm64.
+# It needs build-essential, debhelper and ninja-build, with gcc 13 or later,
+# and builds for the architecture of the machine it runs on, amd64 or arm64:
+#
+#   sudo apt install build-essential debhelper ninja-build
+#
+# Without build-essential dpkg-buildpackage stops with status 3, whatever
+# else is installed: every Debian package build takes it for granted.
 # To install the result:
 #
 #   sudo apt install ./dist/lightbox_*.deb
@@ -56,7 +61,7 @@ EOF
 
 (cd "$src" && dpkg-buildpackage --build=binary --no-sign)
 
-for f in "$build"/lightbox_*.deb "$build"/lightbox-dbgsym_*.ddeb "$build"/lightbox-dbgsym_*.deb; do
+for f in "$build"/lightbox_*.deb; do
     [ -f "$f" ] || continue
     mv "$f" "$out/"
     echo "build-deb: $out/$(basename "$f")"

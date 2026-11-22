@@ -10,8 +10,10 @@ export DEB_BUILD_MAINT_OPTIONS = hardening=+all,-pie,-stackprotector optimize=-l
 %:
 	dh $@
 
-# STRIP=true: the Makefile does not strip the binary, so that dh_strip can
-# keep its symbols in lightbox-dbgsym.
+# STRIP=true: the Makefile leaves the stripping to dh_strip, which
+# DEB_BUILD_OPTIONS=nostrip turns off. There is no lightbox-dbgsym: debhelper
+# files a binary's debugging symbols under its build ID, and lightc's linker
+# script leaves the binary without one.
 override_dh_auto_build:
 	dh_auto_build -- STRIP=true
 
