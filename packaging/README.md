@@ -24,7 +24,7 @@ What `make install PREFIX=/usr` installs, and nothing else of lightbox's own:
 | `/etc/lightbox/lightbox.conf` | The example configuration, in which every setting is a comment. A configuration file to the package manager: one that was changed is kept when the package is updated |
 | `/var/lib/lightbox`, mode 0700 | `lightbox_dir`, with `containers`, mode 0700, and `rootfs`, the place of the default base, which is yours to fill |
 
-and what each distribution asks for beside it: the licence, and in the `.deb` also `README.md` and `CHANGELOG.md`, in `/usr/share/doc/lightbox`, and the answers to what lintian says of the package, `debian/lightbox.lintian-overrides`, each with its reason.
+and what each distribution asks for beside it: the licence, and in the `.deb` also `README.md` and `CHANGELOG.md`, the latter as `changelog.gz`, in `/usr/share/doc/lightbox`, and the answers to what lintian says of the package, `debian/lightbox.lintian-overrides`, each with its reason.
 
 A package starts nothing and changes nothing on the host: lightbox has no daemon. `lightbox setup` makes the host's network, and `lightbox doctor` says what the host lacks. `run_dir`, `/run/lightbox`, is in no package: it is on a tmpfs, and `setup` and `start` make it.
 

@@ -5649,7 +5649,7 @@ static const struct { const char *name; const char *text; } command_help[] = {
         "         --io-max <limit>       I/O limit for one disk: \"8:0 wbps=10485760\", with rbps, wbps,\n"
         "                                riops or wiops (default: none)\n"
         "         --vol  <src:dst[:ro]>  Bind mount (repeatable)\n"
-        "         --rootfs <path>         Base rootfs to copy (default: $LIGHTBOX_ROOTFS or lightbox.conf)\n"
+        "         --rootfs <path>        The base it is made from (default: $LIGHTBOX_ROOTFS or lightbox.conf)\n"
         "         --userns               A user namespace of its own: its root is an unprivileged uid\n"
         "                                on the host, from the range of /etc/subuid; as root\n"
         "         --read-only            Read-only root filesystem\n"

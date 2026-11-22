@@ -656,7 +656,7 @@ add element bridge lightbox sealed { "vb-d02d8a15c0f8" }
 What changes with the backend, as it does for Docker:
 
 - **No `br_netfilter`.** The bridge-family chain sees what the bridge switches by itself, so a container with links starts without it.
-- **`setup` does not turn IPv4 forwarding on.** When it is off and `ip_forward` is true, `setup` stops before it changes anything, and so does a `start` that has to make the host's network again:
+- **`setup` does not turn IPv4 forwarding on.** When it is off, with `ip_forward` and `firewall` both true, `setup` stops before it changes anything, and so does a `start` that has to make the host's network again:
 
 ```text
 Error: IPv4 forwarding is off. With firewall_backend = nftables lightbox does not turn it
@@ -690,8 +690,8 @@ Six settings of `lightbox.conf` are about the firewall. The first five are Docke
 {.ref}
 | Setting | Built-in | What it does |
 |---|---|---|
-| [`firewall`](configuration.html#conf-firewall) | `true` | `false`: lightbox makes no firewall rule at all, and `setup` says so. Nothing is masqueraded, so containers reach beyond the host only where the host routes their subnet. `create` refuses `--net outside`, the default, and `--net proxy`, and `start` does not start a container that has either, or one with links. Rules that an earlier `setup` made stay as they are |
-| [`ip_forward`](configuration.html#conf-ip_forward) | `true` | `false`: `setup` leaves IPv4 forwarding as it is. When it is off, `setup` says so, and containers reach the host and nothing beyond it |
+| [`firewall`](configuration.html#conf-firewall) | `true` | `false`: lightbox makes no firewall rule at all, and `setup` says so. It does not turn IPv4 forwarding on either ([below](#firewall-false)). Nothing is masqueraded, so containers reach beyond the host only where the host forwards and routes their subnet. `create` refuses `--net outside`, the default, and `--net proxy`, and `start` does not start a container that has either, or one with links. Rules that an earlier `setup` made stay as they are |
+| [`ip_forward`](configuration.html#conf-ip_forward) | `true` | `false`: `setup` leaves IPv4 forwarding as it is. When it is off, `setup` says so, and containers reach the host and nothing beyond it. With `firewall = false` it is left as it is in any case |
 | [`ip_forward_no_drop`](configuration.html#conf-ip_forward_no_drop) | `false` | `true`: when `setup` turns forwarding on, it leaves the `FORWARD` policy as it is. Without it the policy becomes DROP first, so that the host forwards what a rule accepts and nothing else. A host that had forwarding on already keeps its policy in any case |
 | [`ip_masq`](configuration.html#conf-ip_masq) | `true` | `false`: nothing is masqueraded. What a container sends leaves with the container's own address, and gets an answer only from where there is a route back to `subnet` |
 | [`firewall_backend`](configuration.html#conf-firewall_backend) | `iptables` | `nftables`: the rules are in [two tables](#nftables) and not in [chains of iptables](#iptables) |
@@ -707,8 +707,22 @@ Warning: bridge_accept_fwmark in lightbox.conf is not a mark, or a mark and a ma
 that a packet can carry: 0; using none
 ```
 
-:::warning[firewall = false still turns forwarding on]
-With `firewall = false`, `setup` with iptables still turns IPv4 forwarding on when it is off, unless `ip_forward = false` says otherwise, and it leaves the `FORWARD` policy as it is. The host then forwards between all its interfaces whatever its own rules let through. Set `ip_forward = false` as well, or have rules of the host's own decide what is forwarded.
+#### With firewall = false, forwarding is the host's {#firewall-false}
+
+lightbox turns IPv4 forwarding on only where it also makes the rules that say what is forwarded. With `firewall = false` it makes none, so `setup`, and a `start` that makes the host's network again, leave forwarding as it is, whatever `ip_forward` says and with either backend. When it is off, `setup` says so and goes on:
+
+```text
+firewall = false in lightbox.conf: no firewall rules were made
+Warning: IPv4 forwarding is off, and firewall = false in lightbox.conf: lightbox makes
+no rule that says what this host forwards, so it leaves forwarding as it is.
+Containers reach this host and nothing beyond it until forwarding is on, with rules
+of this host's (sysctl -w net.ipv4.ip_forward=1)
+```
+
+Until the host turns forwarding on, with rules of its own for what may pass, containers reach the host and nothing beyond it. `lightbox doctor` says the same in its line `host_network`, which is `ready` all the same: forwarding is no part of lightbox's network on such a host, and no `start` waits for it.
+
+:::important[Changed in 0.9]
+Up to 0.8, `setup` with iptables turned forwarding on with `firewall = false` as well, and left the `FORWARD` policy as it was: on a host with no firewall of its own, the host then forwarded between all its interfaces. A host that relied on lightbox to turn forwarding on has to do so itself now, where it keeps its own settings, such as a file in `/etc/sysctl.d`.
 :::
 
 ### Beside the host's own firewall {#host-firewall}
@@ -722,12 +736,12 @@ With `firewall = false`, `setup` with iptables still turns IPv4 forwarding on wh
 
 `lightbox setup` makes the host's side of the network, and is run once, as root. It takes no argument but `--teardown`. In this order:
 
-1. **Looks before it changes anything.** With `firewall = true` the backend's tool has to be there. `subnet` and `gw` have to be one network. With nftables and `ip_forward = true`, forwarding has to be on. `cgroup_root` has to be a cgroup v2 hierarchy, or an empty directory, on which `setup` mounts one. Any of these ends `setup` with nothing made: no bridge, and no rule.
+1. **Looks before it changes anything.** With `firewall = true` the backend's tool has to be there. `subnet` and `gw` have to be one network. With nftables, `firewall = true` and `ip_forward = true`, forwarding has to be on. `cgroup_root` has to be a cgroup v2 hierarchy, or an empty directory, on which `setup` mounts one. Any of these ends `setup` with nothing made: no bridge, and no rule.
 2. **Makes `lightbox_dir`, `container_dir` and `run_dir`**, for root alone, and restricts ones that are there to mode 0700.
 3. **Takes the lock of the store**, so that one `setup` works at a time and no `create` decides on an address meanwhile.
 4. **Makes the bridge**, or leaves the one that is there ([The bridge](#bridge)).
 5. **Makes the standing rules** of the backend ([The firewall](#firewall)), and takes out what lightbox made with the other one.
-6. **Turns IPv4 forwarding on**, with iptables, if it was off and `ip_forward` is true. The `FORWARD` policy becomes DROP first, unless `ip_forward_no_drop` is true or `firewall` is false. What it changed goes on record in `run_dir`, for `setup --teardown` to say.
+6. **Turns IPv4 forwarding on**, with iptables and `firewall = true`, if it was off and `ip_forward` is true. The `FORWARD` policy becomes DROP first, unless `ip_forward_no_drop` is true. What it changed goes on record in `run_dir`, for `setup --teardown` to say. With `firewall = false` it leaves forwarding as it is, and [warns when it is off](#firewall-false).
 
 On a host where forwarding was off and `br_netfilter` is not loaded, the first `setup` with the built-in settings prints:
 
@@ -774,7 +788,7 @@ The bridge, the rules and forwarding live in the kernel only. Two things take th
 
 ### A reboot {#reboot}
 
-A reboot takes the bridge, every rule and chain, forwarding, unless the host turns it on by itself, and `run_dir`, which is on a tmpfs. Nothing has to be run for lightbox at boot. Every `start` of a container with a network looks whether the host's side is all there: the bridge, forwarding where `ip_forward` is true, and lightbox's jumps or tables. When something is missing, it says so, makes all of it again as `setup` does, and goes on:
+A reboot takes the bridge, every rule and chain, forwarding, unless the host turns it on by itself, and `run_dir`, which is on a tmpfs. Nothing has to be run for lightbox at boot. Every `start` of a container with a network looks whether the host's side is all there: the bridge, forwarding where `ip_forward` and `firewall` are true, and lightbox's jumps or tables. When something is missing, it says so, makes all of it again as `setup` does, and goes on:
 
 ```text
 lightbox's host network is not all there, as after a reboot: making it again

@@ -934,7 +934,11 @@ void cmd_doctor(int argc, char **argv) {
             str_append(text, str_append(text, str_append(text, 0, "not all there (missing: ", sizeof(text), &cut),
                                         missing, sizeof(text), &cut),
                        "; start makes it, as lightbox setup does)", sizeof(text), &cut);
-        doc_setting(d, "host_network", missing ? text : "ready", NULL);
+        else if (host_forwarding_left_off())
+            /* lightbox's part is there; what it leaves to the host is told */
+            str_append(text, 0, "ready (IPv4 forwarding is off, and with firewall = false it is this host's to turn on: "
+                                "containers reach this host and nothing beyond it)", sizeof(text), &cut);
+        doc_setting(d, "host_network", missing || host_forwarding_left_off() ? text : "ready", NULL);
     }
 
     doc_begin_checks(d);
@@ -961,7 +965,7 @@ void cmd_doctor(int argc, char **argv) {
     }
     check_cgroups(d);
     check_device_filter(d);
-    if (nftables && cfg_global.ip_forward) {
+    if (nftables && cfg_global.firewall && cfg_global.ip_forward) {
         char forwarding[8];
         bool on = read_file("/proc/sys/net/ipv4/ip_forward", forwarding, sizeof(forwarding)) > 0 && forwarding[0] == '1';
         doc_yes_no(d, "ip_forwarding", on,

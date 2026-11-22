@@ -588,6 +588,38 @@ t_firewall_false() {
     nothing_left fwoutside
 }
 
+# firewall = false: lightbox makes no rule, so it does not turn forwarding on
+# either, at setup or at a start: the host would forward between all its
+# interfaces with nothing of lightbox's to say what. setup says that it left
+# it, and a start does not take it for a part of the network that is missing.
+t_firewall_false_leaves_forwarding() {
+    alt_conf nofwfwd 'firewall = false' || return 1
+    echo 0 > /proc/sys/net/ipv4/ip_forward || return 1
+    rules=$(firewall_rules)
+    started=
+    said=$(alt_lb setup 2>&1)
+    rc=$?
+    printf '%s\n' "$said"
+    forwarding=$(cat /proc/sys/net/ipv4/ip_forward)
+    if [ $rc = 0 ] && [ "$forwarding" = 0 ]; then
+        box fwnat --net nat && started=$(alt_lb start fwnat 2>&1 </dev/null)
+        rc=$?
+        printf '%s\n' "$started"
+        forwarding=$(cat /proc/sys/net/ipv4/ip_forward)
+    fi
+    after=$(firewall_rules)
+    alt_lb rm -f fwnat >/dev/null 2>&1
+    echo 1 > /proc/sys/net/ipv4/ip_forward      # as the cases after this one found it
+    [ $rc = 0 ] || { echo "setup, or the start of a container of --net nat, failed with firewall = false"; return 1; }
+    [ "$forwarding" = 0 ] || { echo "forwarding was turned on with firewall = false"; return 1; }
+    [ "$rules" = "$after" ] || { echo "the firewall changed with firewall = false:"; printf '%s\n' "$after"; return 1; }
+    case $said in *'IPv4 forwarding is off, and firewall = false'*'leaves forwarding as it is'*) ;; *)
+        echo "setup did not say that it left forwarding off"; return 1 ;; esac
+    case $started in *'making it again'*)
+        echo "a start took forwarding for a part of lightbox's network that is missing"; return 1 ;; esac
+    return 0
+}
+
 # setup reads subnet and gw as one network before it changes anything: a
 # gateway outside the subnet ends it, with no bridge made and no rule added.
 t_setup_refuses_a_gateway_outside() {
@@ -4267,6 +4299,7 @@ if [ "$MODE" = inside ]; then
     check 'setup takes out the rules lightbox 0.4 put in FORWARD and POSTROUTING' t_setup_takes_out_old_rules
     check 'ip_forward_no_drop = true leaves the FORWARD policy'           t_ip_forward_no_drop
     check 'firewall = false: no rule is made, and a container with links is refused' t_firewall_false
+    check 'firewall = false: forwarding is left as it is, by setup and by a start' t_firewall_false_leaves_forwarding
     check 'doctor finds nothing missing'                                  t_doctor
     check 'doctor names each precondition of start that is broken, and its fix' t_doctor_names_what_is_missing
 

@@ -90,7 +90,7 @@ typedef struct {
     char dns[64];           /* name servers for new containers, as written; empty: the host's */
     /* The firewall, as Docker's daemon.json has these: */
     bool firewall;              /* lightbox makes its rules (Docker: "iptables") */
-    bool ip_forward;            /* setup turns IPv4 forwarding on ("ip-forward") */
+    bool ip_forward;            /* setup turns IPv4 forwarding on, where firewall has it make the rules ("ip-forward") */
     bool ip_forward_no_drop;    /* and then leaves the FORWARD policy as it is ("ip-forward-no-drop") */
     bool ip_masq;               /* what leaves by anything but the bridge is masqueraded ("ip-masq") */
     firewall_backend_kind firewall_backend;     /* "firewall-backend" */
@@ -104,8 +104,10 @@ typedef struct {
 extern global_config cfg_global;
 
 /* Where the settings come from: --config, then $LIGHTBOX_CONFIG, then
- * /etc/lightbox/lightbox.conf, then, for one release more and with a
- * warning, $HOME/.config/lightbox/lightbox.conf; or the built-in values. */
+ * /etc/lightbox/lightbox.conf; or the built-in values. Where lightbox looked
+ * before 0.6, $HOME/.config/lightbox/lightbox.conf, is not read: CONFIG_HOME
+ * is a file there with nothing named and none in /etc, which ends the
+ * command. */
 #define CONFIG_ETC_FILE  "/etc/lightbox/lightbox.conf"
 #define CONFIG_HOME_FILE ".config/lightbox/lightbox.conf"
 typedef enum { CONFIG_GIVEN, CONFIG_ENV, CONFIG_ETC, CONFIG_HOME, CONFIG_NONE } config_source;
@@ -741,6 +743,10 @@ void ensure_host_network(const char *starting);
 /* What of it is not there, as "the bridge, the firewall rules", or NULL
  * when all of it is. The firewall is looked at only by root. */
 const char *host_network_missing(void);
+/* Forwarding is off, and with firewall = false lightbox leaves it so: it is
+ * no part of lightbox's host network then, and containers reach this host
+ * and nothing beyond it. */
+bool host_forwarding_left_off(void);
 /* setup --teardown, once no container runs: lightbox's firewall rules, in
  * either backend, the bridge, cgroup_base and the record of forwarding. */
 void teardown_host(void);

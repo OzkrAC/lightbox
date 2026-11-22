@@ -27,7 +27,7 @@ From a clone to a running container: what the host needs, building and installin
 | cgroups | cgroup v2, offering the `cpu`, `memory` and `pids` controllers, and `io` for `--io-max`; and `CONFIG_CGROUP_BPF`, for the program that filters a container's devices |
 | Network | Bridge and veth devices |
 | Firewall, with iptables | `iptables` and `iptables-restore`, with connection tracking, the `addrtype` match and the `REJECT` and `MASQUERADE` targets; and for containers created with `--link`, the `physdev` match and `br_netfilter` with `net.bridge.bridge-nf-call-iptables=1` |
-| Firewall, with nftables | `nft`, and nf_tables with NAT, masquerading, conntrack and the bridge family (`CONFIG_NF_TABLES_BRIDGE`, `nft_meta_bridge`); no `br_netfilter` |
+| Firewall, with nftables | `nft`, and nf_tables with NAT, masquerading, conntrack, rejection (`nft_reject_ipv4`) and the bridge family (`CONFIG_NF_TABLES_BRIDGE`, `nft_meta_bridge`); no `br_netfilter` |
 | Other tools | `cp` and `rm`. lightbox runs neither `ip` nor `nsenter` |
 | Rights | Root. `setup`, `reload`, `start`, `stop`, `restart`, `reset`, `update`, `exec` and `run` refuse to run as anyone else, and so does `create` with `--userns` or `--profile`; lightbox's directories are root's alone, so in practice every command runs as root |
 
@@ -105,10 +105,10 @@ sudo tests/fetch_image.sh alpine /var/lib/lightbox/rootfs
 Or fetch one yourself, and check it before you unpack it. Alpine publishes a `.sha256` beside each file; on aarch64 take the `aarch64` files:
 
 ```sh
-wget https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.3-x86_64.tar.gz
-wget https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.3-x86_64.tar.gz.sha256
-sha256sum -c alpine-minirootfs-3.21.3-x86_64.tar.gz.sha256
-sudo tar -xzf alpine-minirootfs-3.21.3-x86_64.tar.gz -C /var/lib/lightbox/rootfs --numeric-owner
+wget https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/alpine-minirootfs-3.24.4-x86_64.tar.gz
+wget https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/alpine-minirootfs-3.24.4-x86_64.tar.gz.sha256
+sha256sum -c alpine-minirootfs-3.24.4-x86_64.tar.gz.sha256
+sudo tar -xzf alpine-minirootfs-3.24.4-x86_64.tar.gz -C /var/lib/lightbox/rootfs --numeric-owner
 ```
 
 `/var/lib/lightbox/rootfs` is where lightbox looks when nothing says otherwise. A base elsewhere is named by `--rootfs <path>` on `create`, by the environment variable `LIGHTBOX_ROOTFS`, or by `rootfs` in `lightbox.conf`, in that order ([Configuration](configuration.html#rootfs-order)).

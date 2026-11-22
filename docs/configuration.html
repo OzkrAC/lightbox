@@ -23,8 +23,9 @@ Every command but `help` and `--version` begins by putting its settings together
 
 1. The file that `--config <path>` names. The option stands before the command, as in `lightbox --config /etc/lightbox/staging.conf ls`; after the command it is an option the command does not know.
 2. The file that the environment variable `LIGHTBOX_CONFIG` names, when it is set and not empty.
-3. `/etc/lightbox/lightbox.conf`, when it is there. `make install` puts the example file there, in which every setting is a comment.
-4. `~/.config/lightbox/lightbox.conf`, where lightbox looked before 0.6, when it is there and the file in `/etc` is not. `~` is what `HOME` names, and `/root` without one.
+3. `/etc/lightbox/lightbox.conf`, when it is there. `make install` and the packages put the example file there, in which every setting is a comment.
+
+With none of the three, the built-in values are the settings.
 
 A file that `--config` or `LIGHTBOX_CONFIG` names has to be there. When it cannot be read the command ends:
 
@@ -32,16 +33,20 @@ A file that `--config` or `LIGHTBOX_CONFIG` names has to be there. When it canno
 Error: cannot read the configuration: /etc/lightbox/staging.conf
 ```
 
-The file in `/etc`, or the one in `~`, that is there and cannot be read is a warning, and the built-in values are used.
+The file in `/etc` that is there and cannot be read is a warning, and the built-in values are used.
 
-The file in `~` is read with a warning:
+**No file in a home directory is read.** Before 0.6 the settings were in `~/.config/lightbox/lightbox.conf`, where `~` is what `HOME` names, and `/root` without one; 0.6 to 0.8 still read that file, with a warning, when there was none in `/etc`. A command that runs as root takes no settings from a home directory, so from 0.9 on lightbox does not read it. A file that is there, with nothing named and none in `/etc`, ends every command but `help` and `--version`, since going on with the built-in values in its place would be another network and other directories than the file says:
 
 ```text
-Warning: the configuration is read from /root/.config/lightbox/lightbox.conf, where lightbox 0.7 will
-not look. Move it to /etc/lightbox/lightbox.conf, or name it with --config or LIGHTBOX_CONFIG
+Error: /root/.config/lightbox/lightbox.conf is where lightbox looked for its settings before 0.6, and it is
+not read. Move it to /etc/lightbox/lightbox.conf, or name it with --config or LIGHTBOX_CONFIG
 ```
 
-The message was written for 0.6 and still names 0.7. This release reads the file all the same; move it as the message asks, and do not count on the next release reading it. With a file in both places the one in `/etc` is read, and a note says that the other is not.
+Beside a file in `/etc` it is only said to be left:
+
+```text
+Note: /root/.config/lightbox/lightbox.conf is not read; /etc/lightbox/lightbox.conf is
+```
 
 `lightbox doctor` begins with every setting as lightbox has read it, which is the quickest way to see what a host is configured with ([Troubleshooting](troubleshooting.html#doctor)).
 
@@ -146,7 +151,7 @@ Where cgroup v2 is mounted. `setup` looks at it before it changes anything on th
 ```ini
 cgroup_base = /sys/fs/cgroup/lightbox
 ```
-The cgroup that holds the containers': a container's is `<cgroup_base>/<name>`, and the cgroup of each `exec` is below that. It is `<cgroup_root>/lightbox` unless it is set, and the example file does not name it, as there is rarely a reason to set it.
+The cgroup that holds the containers': a container's is `<cgroup_base>/<name>`, and the cgroup of each `exec` is below that. It is `<cgroup_root>/lightbox` unless it is set, and there is rarely a reason to set it.
 
 The first `start` makes it. `setup --teardown` removes it, unless it is `cgroup_root` itself.
 :::
@@ -294,14 +299,14 @@ The settings of Docker's `daemon.json`, with its names in the descriptions. Each
 ```ini
 firewall = true
 ```
-Whether lightbox makes firewall rules at all (Docker's `iptables`). With `false` a container with links is not started, as nothing would keep it to its links, and neither is one of `--net outside`, which is the default of `create`, or of `--net proxy`: `create` refuses both, and for the default it names `--net nat` and `--net none` as what can be had.
+Whether lightbox makes firewall rules at all (Docker's `iptables`). With `false` a container with links is not started, as nothing would keep it to its links, and neither is one of `--net outside`, which is the default of `create`, or of `--net proxy`: `create` refuses both, and for the default it names `--net nat` and `--net none` as what can be had. With `false`, `setup` does not turn IPv4 forwarding on either: see [`ip_forward`](#conf-ip_forward).
 :::
 
 :::member{#conf-ip_forward}
 ```ini
 ip_forward = true
 ```
-Whether `setup` turns IPv4 forwarding on when it is off (Docker's `ip-forward`). With `false` it leaves forwarding as it is, and says so when it is off. With `firewall_backend = nftables`, `setup` never turns it on, and stops when it is off and this setting is `true`.
+Whether `setup` turns IPv4 forwarding on when it is off (Docker's `ip-forward`). With `false` it leaves forwarding as it is, and says so when it is off. With `firewall_backend = nftables`, `setup` never turns it on, and stops when it is off and this setting is `true`. With `firewall = false` lightbox makes no rule that says what is forwarded, so `setup` leaves forwarding as it is whatever this setting says, and warns when it is off: turning it on is then for the host's own rules.
 :::
 
 :::member{#conf-ip_forward_no_drop}
@@ -343,7 +348,7 @@ lightbox reads four variables of the environment it is run in, and uses none of 
 |---|---|
 | `LIGHTBOX_CONFIG` | The `lightbox.conf` to read, when `--config` names none. A file it names has to be there. Set and empty, it counts as not set |
 | `LIGHTBOX_ROOTFS` | The base that `create` and `run` use when they are given no `--rootfs`. It comes before `rootfs` in `lightbox.conf`, and counts whether there is a `lightbox.conf` or not. Up to 448 characters; set and empty, it counts as not set |
-| `HOME` | Only to find `~/.config/lightbox/lightbox.conf`, the file of [before 0.6](#file) |
+| `HOME` | Only to see whether `~/.config/lightbox/lightbox.conf` is there, the file of [before 0.6](#file), which is not read: so that a file left there is said, and not passed over |
 | `TERM` | `exec` and `run` give it to the command they run, when it is a name of up to 64 letters, digits, `-`, `_`, `.` and `+`. Otherwise the command has `TERM=xterm` |
 
 `sudo` does not pass a user's environment on unless it is set up to: under it, `--config` and `--rootfs` are the surer way to say the same.

@@ -2294,7 +2294,8 @@ ip filter FORWARD, inet firewall fwd, bridge other forward' ] || { printf '%s\n'
 }
 
 # Where lightbox's settings come from: --config, then LIGHTBOX_CONFIG unless
-# it is empty, then /etc/lightbox/lightbox.conf, then $HOME's, then none.
+# it is empty, then /etc/lightbox/lightbox.conf, then none. "home" is a file
+# in $HOME with none of the others, which lightbox does not read and ends at.
 t_config_sources() {
     bad=0
     expect() { # given env etc home -> source
@@ -3517,7 +3518,7 @@ check 'nftables: a container'"'"'s links are elements of the set, each once, tak
 check 'nftables: a record that is not lightbox'"'"'s is not given to nft'  t_nft_records_refused
 check 'bridge_accept_fwmark: a mark nft reads as written, and none that matches all' t_fwmarks
 check 'the forward chains that drop what nothing accepts are named'      t_forward_drop_chains
-check 'the settings come from --config, LIGHTBOX_CONFIG, /etc, HOME or nowhere' t_config_sources
+check 'the settings come from --config, LIGHTBOX_CONFIG, /etc or nowhere, and a file in HOME alone is told apart' t_config_sources
 check 'doctor asks for Linux 5.10 or later, read from the release'     t_kernel_floor
 check 'an address is four numbers and three dots, and no zero in front' t_addresses_are_strict
 check 'subnet and gw are one network, and an address on it is one a container can have' t_network_settings

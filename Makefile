@@ -261,8 +261,9 @@ install: lightbox
 	@echo "lightbox installed to $(DESTDIR)$(BINDIR)/lightbox"
 	@echo ""
 	@echo "Next steps:"
-	@echo "  1. Place a rootfs in $(DATADIR)/rootfs/"
-	@echo "     e.g.: wget -qO- https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.3-x86_64.tar.gz | tar -xz -C $(DATADIR)/rootfs/"
+	@echo "  1. Put a root filesystem in $(DATADIR)/rootfs/, the base new containers are made from."
+	@echo "     This fetches Alpine's and checks its SHA-256 before it unpacks it:"
+	@echo "       sudo tests/fetch_image.sh alpine $(DATADIR)/rootfs"
 	@echo "  2. Edit $(CONFDIR)/lightbox.conf if needed"
 	@echo "  3. Run: lightbox setup"
 

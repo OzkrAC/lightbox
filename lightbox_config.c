@@ -368,20 +368,25 @@ void cfg_global_load(char **envp, const char *given) {
     const char *home = env_get(envp, "HOME");
     if (!home) home = "/root";
 
-    /* --config, then $LIGHTBOX_CONFIG, then /etc, then where lightbox looked
-     * before 0.6, which it says; a home so long that the path does not fit
-     * has no file there */
+    /* --config, then $LIGHTBOX_CONFIG, then /etc. Where lightbox looked before
+     * 0.6, in $HOME, it does not read: a command that runs as root takes no
+     * settings from a home directory. A file that is there, and that nothing
+     * stands in for, ends the command: going on with the built-in values in
+     * its place would be another host network and other directories than the
+     * file says. Beside a file in /etc it is only said to be left. A home so
+     * long that the path does not fit has no file there. */
     char home_conf[MAX_PATH];
     bool home_there = path_join(home_conf, MAX_PATH, home, CONFIG_HOME_FILE) && path_exists(home_conf);
     const char *from_env = env_get(envp, "LIGHTBOX_CONFIG");
     config_source source = config_source_of(given, from_env, path_exists(CONFIG_ETC_FILE), home_there);
     const char *path = source == CONFIG_GIVEN ? given : source == CONFIG_ENV ? from_env
-                     : source == CONFIG_ETC ? CONFIG_ETC_FILE : source == CONFIG_HOME ? home_conf : NULL;
+                     : source == CONFIG_ETC ? CONFIG_ETC_FILE : NULL;
     if (source == CONFIG_HOME) {
-        print_str(STDERR, "Warning: the configuration is read from ");
+        print_str(STDERR, "Error: ");
         print_str(STDERR, home_conf);
-        print_str(STDERR, ", where lightbox 0.7 will\nnot look. Move it to " CONFIG_ETC_FILE
-                          ", or name it with --config or LIGHTBOX_CONFIG\n");
+        print_str(STDERR, " is where lightbox looked for its settings before 0.6, and it is\n"
+                          "not read. Move it to " CONFIG_ETC_FILE ", or name it with --config or LIGHTBOX_CONFIG\n");
+        lc_kernel_exit(failure_status);
     } else if (source == CONFIG_ETC && home_there) {
         print_str(STDERR, "Note: ");
         print_str(STDERR, home_conf);

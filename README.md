@@ -1,13 +1,13 @@
 # lightbox
 
-A minimal, secure Linux container runtime: one static binary of about 150 KB, with no libc, built on [lightc](https://github.com/OscarAC/lightc). It makes the Linux system calls it needs itself, a container's network among them, and runs a few host tools for the rest: `iptables` or `nft` for the firewall, and `cp` and `rm` for a container's files (see [How it works](#how-it-works)).
+A minimal, secure Linux container runtime: one static binary of about 240 KB, with no libc, built on [lightc](https://github.com/OscarAC/lightc). It makes the Linux system calls it needs itself, a container's network among them, and runs a few host tools for the rest: `iptables` or `nft` for the firewall, and `cp` and `rm` for a container's files (see [How it works](#how-it-works)).
 
 ## Prerequisites
 
-- **Kernel:** Linux 5.10 or later, the floor lightc sets, with namespaces and cgroup v2 offering the `cpu`, `memory` and `pids` controllers, and `io` for `--io-max`. For the network: bridge and veth; with iptables, `iptables` with the conntrack, physdev and MASQUERADE matches and targets, and `br_netfilter` with `net.bridge.bridge-nf-call-iptables=1` for containers created with `--link`; with nftables, nf_tables with NAT, masquerading, conntrack and the bridge family (`CONFIG_NF_TABLES_BRIDGE`, `nft_meta_bridge`), and no `br_netfilter`
+- **Kernel:** Linux 5.10 or later, the floor lightc sets, with namespaces and cgroup v2 offering the `cpu`, `memory` and `pids` controllers, and `io` for `--io-max`. For the network: bridge and veth; with iptables, `iptables` with connection tracking, the `addrtype` match and the `REJECT` and `MASQUERADE` targets, and for containers created with `--link` the `physdev` match and `br_netfilter` with `net.bridge.bridge-nf-call-iptables=1`; with nftables, nf_tables with NAT, masquerading, conntrack, rejection (`nft_reject_ipv4`) and the bridge family (`CONFIG_NF_TABLES_BRIDGE`, `nft_meta_bridge`), and no `br_netfilter`
 - **Building:** GCC 13 or later, which CI builds with, make and ninja, which builds lightc
 - **Host tools:** `iptables` and `iptables-restore`, or with `firewall_backend = nftables` `nft`, and `cp` and `rm`. Since 0.7 lightbox runs neither `ip` nor `nsenter`
-- **Root:** `setup`, `start`, `stop`, `restart`, `reset`, `update`, `exec` and `run` run as root, and so does `create --userns`. A container's root is the host's root, unless it was created with `--userns` (see [User namespaces](#user-namespaces) and [Threat model](#threat-model))
+- **Root:** `setup`, `reload`, `start`, `stop`, `restart`, `reset`, `update`, `exec` and `run` run as root, and so does `create` with `--userns` or `--profile agent`. A container's root is the host's root, unless it was created with `--userns` (see [User namespaces](#user-namespaces) and [Threat model](#threat-model))
 
 `lightbox doctor` checks all of this on the host it runs on: root, the kernel and the system calls lightbox makes, cgroup v2 and its controllers, that the kernel loads the cgroup device program a container starts with (`CONFIG_CGROUP_BPF`), the tools, the base root filesystem, and with nftables that forwarding is on. Each check that fails is followed by what fixes it, and `doctor` then exits 1; `doctor --json` gives the same to scripts. `doctor --profile agent` checks what a box of the agent profile needs as well (see [Running an agent in a box](#running-an-agent-in-a-box)).
 
@@ -71,9 +71,9 @@ The suite works in private network, mount and PID namespaces with a configuratio
 
 sudo drops the environment, so options go on make's command line: `sudo make test-lifecycle V=1 KEEP=1`. Build first, as yourself; the target builds nothing.
 
-`sudo make bench` works in the same namespaces and measures the wall time of `create`, `start`, `exec`, `stop` and `rm`, the number of processes one start makes, and `create` from a base of 1 GB. CI runs it on every push and puts its numbers on the run's page: on GitHub's runners a start takes 9 to 13 ms at 0.7.0, where it took 535 to 542 before Phase 1 of the roadmap.
+`sudo make bench` works in the same namespaces and measures the wall time of `create`, `start`, `exec`, `stop` and `rm`, the number of processes one start makes, and `create` from a base of 1 GB. CI runs it on every push and puts its numbers on the run's page: on GitHub's runners a start takes a median of 11.7 ms on x86_64 and 16.2 ms on aarch64 at 0.8.0, where it took 535 to 542 before Phase 1 of the roadmap. The changelog has the numbers of each release.
 
-`.github/workflows/ci.yml` runs `make check`, the lifecycle suite in its three ways and the timing on every push to `main` and every pull request, on x86_64 and on aarch64. A run's page lists each suite's totals, the cases it skipped and why each expected failure fails, without opening a log.
+`.github/workflows/ci.yml` runs `make check`, the lifecycle suite in six ways (as it is, with `--userns` on an overlay and on a copy, with `--seccomp deny`, and with Alpine's and Debian's images) and the timing on every push to `main` and every pull request, on x86_64 and on aarch64. A run's page lists each suite's totals, the cases it skipped and why each expected failure fails, without opening a log.
 
 ## Quick start
 
@@ -81,12 +81,20 @@ The commands below run as root, from the directory `make` built `./lightbox` in.
 
 ### 1. Get a rootfs
 
-lightbox needs a Linux root filesystem to use as a base image. Any distro works — Alpine's minirootfs is a good starting point (about 3 MB); on aarch64 take its `aarch64` tarball.
+lightbox needs a Linux root filesystem to make containers from: their base. Any distro works — Alpine's minirootfs is a good starting point (about 3 MB). `tests/fetch_image.sh` fetches it, or Debian's slim image, for this machine's architecture, checks it against a SHA-256 pinned in the script, and unpacks it into a directory that is empty or not there yet:
+
+```sh
+tests/fetch_image.sh alpine /opt/rootfs/alpine
+```
+
+Or fetch one yourself, and check it before you unpack it. Alpine publishes a `.sha256` beside each file; on aarch64 take the `aarch64` files:
 
 ```sh
 mkdir -p /opt/rootfs/alpine
-wget https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/x86_64/alpine-minirootfs-3.21.3-x86_64.tar.gz
-tar -xzf alpine-minirootfs-3.21.3-x86_64.tar.gz -C /opt/rootfs/alpine
+wget https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/alpine-minirootfs-3.24.4-x86_64.tar.gz
+wget https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/x86_64/alpine-minirootfs-3.24.4-x86_64.tar.gz.sha256
+sha256sum -c alpine-minirootfs-3.24.4-x86_64.tar.gz.sha256
+tar -xzf alpine-minirootfs-3.24.4-x86_64.tar.gz -C /opt/rootfs/alpine --numeric-owner
 ```
 
 Tell lightbox where to find it — either export the environment variable or pass `--rootfs` on each create:
@@ -114,16 +122,16 @@ Run once to create the bridge and the firewall rules and to turn on forwarding. 
 
 This creates:
 - A `br0` bridge with the address `gw` and the prefix of `subnet`, `10.0.0.1/24` unless `lightbox.conf` sets them
-- lightbox's firewall chains, reached from the top of `FORWARD` and `POSTROUTING` (see [Firewall](#firewall))
+- lightbox's firewall chains, reached from the top of `FORWARD`, `INPUT` and `POSTROUTING` (see [Firewall](#firewall))
 - IPv4 forwarding, if it was off, with the `FORWARD` policy set to DROP as Docker does
 - cgroup v2 mounted at `cgroup_root`, if it is an empty directory
 
-The bridge, the firewall rules and forwarding live in the kernel only, and a reboot takes them. `start` looks for them, with one process, and makes them again as `setup` does when they are not all there, saying so: after a reboot, or after a firewall service loaded its own rules over lightbox's.
+The bridge, the firewall rules and forwarding live in the kernel only, and a reboot takes them. The `start` of a container with a network looks for them, for the rules with two runs of `iptables` or one of `nft`, and makes them again as `setup` does when they are not all there, saying so: after a reboot, or after a firewall service loaded its own rules over lightbox's.
 
-A firewall's reload or flush (`firewall-cmd --reload`, `iptables -F`, a service that loads its own rules, `nft flush ruleset`) takes lightbox's rules while containers run, and with them the rules of their links. Until they are back, a container reaches nothing beyond this host, and what keeps containers apart is the bridge and the FORWARD policy only. Two containers without links still do not reach each other: their ports on the bridge are isolated, and an isolated port does not reach another. It does reach a port that is not isolated, which a linked container's is: with the policy at DROP, as `setup` leaves it when it turned forwarding on, nothing passes between them, links included; with ACCEPT, as a host that forwarded before keeps it, a linked container reaches and is reached by every container on the bridge. As with Podman, two things put them back:
+A firewall's reload or flush (`firewall-cmd --reload`, `iptables -F`, a service that loads its own rules, `nft flush ruleset`) takes lightbox's rules while containers run, and with them the rules of their links and of their `--net`. Until they are back, a container reaches nothing beyond this host, the host answers a container of `--net outside` or `proxy` as it answers one of `nat`, with its own services in reach, and what keeps containers apart is the bridge and the FORWARD policy only. Two containers without links still do not reach each other: their ports on the bridge are isolated, and an isolated port does not reach another. It does reach a port that is not isolated, which a linked container's is: with the policy at DROP, as `setup` leaves it when it turned forwarding on, nothing passes between them, links included; with ACCEPT, as a host that forwarded before keeps it, a linked container reaches and is reached by every container on the bridge. As with Podman, two things put them back:
 
-- `lightbox reload` puts in again what `setup` makes and the link rules of every running container, at once. Run it after the firewall's reload; it changes nothing that is there already. It leaves a container that another lightbox command is working on to that command, and says so.
-- The next `start` finds setup's rules gone, makes them again and puts back the links of the containers that run.
+- `lightbox reload` puts in again what `setup` makes and the links and `--net` rules of every running container, at once. Run it after the firewall's reload; it changes nothing that is there already. It leaves a container that another lightbox command is working on to that command, and says so.
+- The next `start` finds setup's rules gone, makes them again and puts back the links and `--net` rules of the containers that run.
 
 lightbox has no daemon to hear of a reload by itself, as Docker's does of firewalld's; a hook of the firewall's own that runs `lightbox reload` after it does the same.
 
@@ -233,17 +241,20 @@ What the hook gets:
 
 ## Configuration
 
-lightbox reads `/etc/lightbox/lightbox.conf` at startup, or the file that `--config <path>` or the variable `LIGHTBOX_CONFIG` names, in that order; `make install` puts the example there. All values have built-in defaults — the config file is optional. A file that `--config` or `LIGHTBOX_CONFIG` names has to be there. Without any of the three, lightbox 0.6 still reads `~/.config/lightbox/lightbox.conf`, where earlier versions looked, and warns that 0.7 will not; with `/etc/lightbox/lightbox.conf` there as well, it says that the file in `~` is not read.
+lightbox reads its settings at startup from the file that `--config <path>` names, else from the one that the variable `LIGHTBOX_CONFIG` names, else from `/etc/lightbox/lightbox.conf`, in that order; `make install` puts the example there. All values have built-in defaults — the config file is optional. A file that `--config` or `LIGHTBOX_CONFIG` names has to be there. `~/.config/lightbox/lightbox.conf`, where lightbox looked before 0.6, is not read. A file that is there, with nothing named and none in `/etc`, ends the command with an error that says to move it to `/etc/lightbox/lightbox.conf` or to name it, so that lightbox does not go on with the built-in values in its place; beside a file in `/etc`, lightbox says that the file in `~` is not read.
 
 A line is `<key> = <value>`, blank, or a comment that begins with `#`. A `#` after a space or a tab begins a comment too, and a carriage return at the end of a line is no part of it, as files written on Windows have one. A key lightbox does not know and a line that is no setting are reported as warnings, with the file and the line, and change nothing.
 
 ```ini
 # /etc/lightbox/lightbox.conf
 
-# Base directory for lightbox data (base rootfs and container directories)
+# Base directory for lightbox data: the default base, the snapshots of bases
+# that containers are made from, the containers, and the audit log
 lightbox_dir = /var/lib/lightbox
 
-# Default rootfs to copy when creating containers
+# The base new containers are made from: a directory that holds a root
+# filesystem. A container is an overlay of a snapshot of it, or with
+# create --copy a copy of its own
 # Also overridable with LIGHTBOX_ROOTFS env var or --rootfs flag
 rootfs = /var/lib/lightbox/rootfs
 
@@ -257,6 +268,9 @@ run_dir = /run/lightbox
 
 # cgroup v2 mount point
 cgroup_root = /sys/fs/cgroup
+
+# The cgroup that holds the containers': each container's is <cgroup_base>/<name>
+cgroup_base = /sys/fs/cgroup/lightbox
 
 # Bridge interface and network: subnet is <address>/<bits>, with 8 to 30
 # bits, and gw is the bridge's address in it
@@ -291,9 +305,9 @@ dns = 9.9.9.9, 149.112.112.112
 
 # The firewall, as Docker's daemon.json has it (see Firewall below): whether
 # lightbox makes its rules ("iptables"), whether setup turns IPv4 forwarding on
-# ("ip-forward"), whether it then leaves the FORWARD policy instead of setting
-# it to DROP ("ip-forward-no-drop"), and whether containers are masqueraded
-# ("ip-masq")
+# where it makes them ("ip-forward"), whether it then leaves the FORWARD policy
+# instead of setting it to DROP ("ip-forward-no-drop"), and whether containers
+# are masqueraded ("ip-masq")
 firewall = true
 ip_forward = true
 ip_forward_no_drop = false
@@ -306,7 +320,7 @@ firewall_backend = iptables
 # bridge_accept_fwmark = 0x10/0xf0
 ```
 
-If `lightbox_dir` is set, `rootfs` and `container_dir` are automatically derived from it (e.g., `rootfs = <lightbox_dir>/rootfs`) unless explicitly overridden.
+If `lightbox_dir` is set, `rootfs` and `container_dir` are automatically derived from it (e.g., `rootfs = <lightbox_dir>/rootfs`) unless explicitly overridden. `cgroup_base` is derived from `cgroup_root` in the same way, as `<cgroup_root>/lightbox`.
 
 No setting is cut to fit. A directory may be up to 448 characters long, and one that is longer, like a bridge name or an address that is too long, ends every command with the setting named: the first part of such a value would be the name of something else. The file itself may be up to 16 KB.
 
@@ -321,18 +335,21 @@ lightbox keeps its iptables rules in chains of its own, as Docker does with its 
 | Chain | Reached from | What is in it |
 |-------|--------------|---------------|
 | `LIGHTBOX-USER` | the top of `FORWARD` | This host's rules that are to decide before lightbox's, like Docker's `DOCKER-USER`. lightbox makes it and never changes it |
-| `LIGHTBOX-FORWARD` | `FORWARD`, after `LIGHTBOX-USER` | Between two ports of the bridge, what a link allows and nothing else; out of the bridge by any interface, and back what belongs to such a connection |
-| `LIGHTBOX-LINKS` | `LIGHTBOX-FORWARD` | A jump to `LB-<name>` for each running container with links, whose rules name the two ports of each link |
+| `LIGHTBOX-FORWARD` | `FORWARD`, after `LIGHTBOX-USER` | Between two ports of the bridge, what a link allows and nothing else; out of the bridge by any interface, once `LIGHTBOX-EGRESS` has let it go on, and back what belongs to such a connection |
+| `LIGHTBOX-LINKS` | `LIGHTBOX-FORWARD` | A jump for each running container with links to a chain of its own, `LB-` and twelve hex digits of a hash of its name, whose rules name the two ports of each link; and at the top two drops for each running container of `--net proxy`, of what the bridge would switch from it and to it |
+| `LIGHTBOX-INPUT` | the top of `INPUT` | What comes in from the bridge goes on to `LIGHTBOX-EGRESS` |
+| `LIGHTBOX-EGRESS` | `LIGHTBOX-FORWARD` and `LIGHTBOX-INPUT` | A jump by its address for each running container of `--net outside` or `proxy` to a chain of its own, `LO-` and the same twelve digits. That chain lets go on the answers to what the container asked, and for `outside` a question to one of its name servers on port 53, with the rest going to `LIGHTBOX-OUTSIDE`; for `proxy`, what goes to its port of the gateway, with the rest refused |
+| `LIGHTBOX-OUTSIDE` | the `LO-` chains of `--net outside` | What `outside` refuses: what is the host's own, broadcast and multicast, and the private and reserved ranges (see [Security](#security)) |
 | `LIGHTBOX-POSTROUTING` | the top of `POSTROUTING` (nat) | Masquerading of `subnet` for what leaves by any interface but the bridge |
 
 The settings are Docker's:
 
-- `firewall = false` (Docker's `iptables`): lightbox makes no firewall rules at all, and a container with links is not started, since nothing would keep it to its links. Without masquerading, containers do not reach beyond the host unless the host routes their subnet.
+- `firewall = false` (Docker's `iptables`): lightbox makes no firewall rules at all. A container with links is not started, since nothing would keep it to its links, and neither is one of `--net outside`, the default, or `proxy`, which are rules of lightbox's: `create` refuses both, and takes `--net nat` or `--net none`. With no rule of its own that says what the host forwards, lightbox leaves IPv4 forwarding as it is too, at `setup` and at a start, whatever `ip_forward` says, and `setup` says so when it is off. Until the host's own rules turn it on, and masquerade or route the subnet, containers reach this host and nothing beyond it.
 - `ip_forward = false` (`ip-forward`): `setup` leaves IPv4 forwarding as it is, and says so when it is off.
 - `ip_forward_no_drop = true` (`ip-forward-no-drop`): when `setup` turns forwarding on, it leaves the `FORWARD` policy as it is. Without it the policy becomes DROP, so that the host forwards what a rule accepts and nothing else. A host that had forwarding on already keeps its policy in any case.
 - `ip_masq = false` (`ip-masq`): nothing is masqueraded.
 
-A setting that is not `true` or `false` is said, and its built-in value is kept. `setup` flushes and fills `LIGHTBOX-FORWARD` and `LIGHTBOX-POSTROUTING` for the bridge of its `lightbox.conf`, so one host has one lightbox network. On a host where lightbox 0.4 or earlier ran `setup`, the next `setup` takes out the rules that it put straight into `FORWARD` and `POSTROUTING`; a running container with links gets its link rules back when it is started again.
+A setting that is not `true` or `false` is said, and its built-in value is kept. `setup` flushes and fills `LIGHTBOX-FORWARD`, `LIGHTBOX-INPUT`, `LIGHTBOX-OUTSIDE` and `LIGHTBOX-POSTROUTING` for the bridge of its `lightbox.conf`, so one host has one lightbox network; `LIGHTBOX-LINKS` and `LIGHTBOX-EGRESS` hold what running containers put there. On a host where lightbox 0.4 or earlier ran `setup`, the next `setup` takes out the rules that it put straight into `FORWARD` and `POSTROUTING`; a running container with links gets its link rules back when it is started again.
 
 #### With nftables
 
@@ -340,26 +357,30 @@ A setting that is not `true` or `false` is said, and its built-in value is kept.
 
 | Table | Chain or set | What is in it |
 |-------|--------------|---------------|
-| `ip lightbox` | `forward` | What comes back to the bridge for a connection from it; anything else new that would go into the bridge is dropped |
+| `ip lightbox` | `forward` | What comes back to the bridge for a connection from it; anything else new that would go into the bridge is dropped. Out of the bridge: a jump to `egress` for the addresses in `outside`, and to `egress_proxy` for those in `proxied` |
+| `ip lightbox` | `input` | From the bridge to the host: a jump to `egress_host` for the addresses in `outside`, and to `egress_proxy` for those in `proxied` |
+| `ip lightbox` | `egress`, `egress_host` | `--net outside`, beyond the host and to the host: answers and questions to the container's name servers go on; what goes to a range in `refused`, and everything else that goes to the host, is refused |
+| `ip lightbox` | `egress_proxy` | `--net proxy`: answers, and what goes to the container's port of the gateway, go on, and everything else is refused |
 | `ip lightbox` | `postrouting` | Masquerading of `subnet` for what leaves by any interface but the bridge, when `ip_masq` is true |
-| `bridge lightbox` | `forward` | Between two ports of the bridge, the pairs in `links` and nothing else |
-| `bridge lightbox` | `links` | A pair of ports for each way of each link of a running container |
+| `ip lightbox` | sets `outside`, `outside_dns`, `proxied`, `proxy_to`, `refused` | The address of each running container of `--net outside`, and each with each of its name servers; the address of each of `--net proxy`, and each with its gateway and port; the ranges that `outside` refuses |
+| `bridge lightbox` | `forward` | Between two ports of the bridge, nothing from or to a port in `sealed`, then the pairs in `links` and nothing else |
+| `bridge lightbox` | sets `links`, `sealed` | A pair of ports for each way of each link of a running container; the port of each running container of `--net proxy` |
 
-The bridge-family chain sees what the bridge switches without `br_netfilter`, so a container with links starts without it. `setup` makes both tables in one transaction, and a start of a container with links runs one `nft`. `setup` with nftables takes out the chains lightbox made in iptables, but for `LIGHTBOX-USER` and the jump to it, which are this host's; with iptables it takes the two tables away.
+The bridge-family chain sees what the bridge switches without `br_netfilter`, so a container with links starts without it. `setup` makes both tables in one transaction, and a start of a container with links, or of `--net outside` or `proxy`, runs one `nft`. `setup` with nftables takes out the chains lightbox made in iptables, but for `LIGHTBOX-USER` and the jump to it, which are this host's; with iptables it takes the two tables away.
 
 What changes with the backend, as it does for Docker:
 
-- `setup` does not turn IPv4 forwarding on. When it is off and `ip_forward` is true, `setup` stops before it changes anything and says so: turn it on yourself, with rules of this host's against forwarding between its other interfaces, or set `ip_forward = false`. `ip_forward_no_drop` has no use, as no policy is set.
+- `setup` does not turn IPv4 forwarding on. When it is off and `ip_forward` is true, `setup` stops before it changes anything and says so: turn it on yourself, with rules of this host's against forwarding between its other interfaces, or set `ip_forward = false`. With `firewall = false` it does not stop, as forwarding is then the host's own with either backend. `ip_forward_no_drop` has no use, as no policy is set.
 - There is no `LIGHTBOX-USER`. An nftables `accept` does not get a packet past another table, so the host's rules go in tables of its own: one that drops decides whatever lightbox's accept. To accept what lightbox's rules drop, mark it in a chain of the host's on the same hook with a lower priority (`filter - 1` or below), and set `bridge_accept_fwmark` to that mark, or mark and mask: `0x10`, or `0x10/0xf0`. Mark 0 is every unmarked packet's and is refused.
 - A chain of another table whose policy drops forwarded packets drops the containers' traffic too: iptables' `FORWARD` with policy DROP, which Docker, ufw, firewalld and lightbox's own `setup` with iptables leave, among them. `setup` names every such chain it finds, and so does `doctor`, as `forward_drops`. Change their policy, with `iptables -P FORWARD ACCEPT` for iptables', or accept the bridge's traffic in them.
-- A host firewall that flushes the whole ruleset when it loads, as `/etc/nftables.conf` files that begin with `flush ruleset` do, takes lightbox's tables with it. The next `start` makes them again; to have them back at once, run `lightbox setup`.
+- A host firewall that flushes the whole ruleset when it loads, as `/etc/nftables.conf` files that begin with `flush ruleset` do, takes lightbox's tables with it. The next `start` makes them again; to have them back at once, with the rules of the containers that run, which `setup` does not put back, run `lightbox reload`.
 
 ### Rootfs resolution order
 
 1. `--rootfs <path>` flag on create (highest priority)
 2. `LIGHTBOX_ROOTFS` environment variable
 3. `rootfs` in `lightbox.conf`
-4. `/var/lib/lightbox/rootfs` (built-in default)
+4. `<lightbox_dir>/rootfs`, which is `/var/lib/lightbox/rootfs` unless `lightbox_dir` is set (built-in default)
 
 ## Command reference
 
@@ -378,7 +399,7 @@ Commands:
          --io-max <limit>       I/O limit for one disk: "8:0 wbps=10485760", with rbps, wbps,
                                 riops or wiops (default: none)
          --vol  <src:dst[:ro]>  Bind mount (repeatable)
-         --rootfs <path>         Base rootfs to copy (default: $LIGHTBOX_ROOTFS or lightbox.conf)
+         --rootfs <path>        The base it is made from (default: $LIGHTBOX_ROOTFS or lightbox.conf)
          --userns               A user namespace of its own: its root is an unprivileged uid
                                 on the host, from the range of /etc/subuid; as root
          --read-only            Read-only root filesystem
@@ -386,6 +407,10 @@ Commands:
          --privileged           Disable security sandbox
          --seccomp allow|deny   The seccomp profile: the allow-list, or the deny-list
                                 (default: allow)
+         --net <mode>           What it may reach: outside, the internet and its name servers
+                                only (the default); nat, the network as before 0.8; none,
+                                nothing; proxy:<port>, that port of the gateway, where a
+                                proxy listens, and nothing else
          --oom-score <n>        OOM score adjustment (default: 500)
          --ttl <duration>       How long it may run from each start, such as 30m or 8h; then
                                 it stops as stop stops it, and is expired
@@ -444,7 +469,7 @@ Commands:
   --version                                    The version of lightbox, and of lightc
 ```
 
-Help that is asked for goes to standard output, and the command exits 0. A word that a command will not use is an error that names it, and the command does nothing. `start`, `stop`, `restart` and `rm` take several names, as Docker's do, and do one container after the other: one that cannot be done ends nothing for the others, the command names those it did not do at the end, and its exit status is the first that was not 0.
+Help that is asked for goes to standard output, and the command exits 0. A word that a command will not use is an error that names it, and the command does nothing. `start`, `stop`, `restart`, `reset` and `rm` take several names, as Docker's do, and do one container after the other: one that cannot be done ends nothing for the others, the command names those it did not do at the end, and its exit status is the first that was not 0.
 
 ### Create options
 
@@ -452,8 +477,8 @@ A container's name is 1 to 30 characters of `a-z`, `A-Z`, `0-9`, `_` and `-`.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--rootfs <path>` | `$LIGHTBOX_ROOTFS` | Base rootfs to copy |
-| `--mem <limit>` | `256M` | Memory limit: a number of bytes, optionally with `K`, `M`, `G` or `T`, or `max` for none |
+| `--rootfs <path>` | `$LIGHTBOX_ROOTFS` | The base the container is made from: a directory that holds a root filesystem (see [Rootfs resolution order](#rootfs-resolution-order) and [Storage](#storage)) |
+| `--mem <limit>` | `256M` | Memory limit: a number of bytes, optionally with `K`, `M`, `G` or `T`, in either case, or `max` for none |
 | `--swap <limit>` | `0` | Swap the container may use beyond its memory: `0`, a size as for `--mem`, or `max` |
 | `--pids <limit>` | `128` | Max processes, 1 to 4194304, or `max` for no limit |
 | `--cpu <num>` | `1` | CPUs, 0.01 to 512, with up to two decimals: `2`, `0.5`, `1.25` |
@@ -469,7 +494,7 @@ A container's name is 1 to 30 characters of `a-z`, `A-Z`, `0-9`, `_` and `-`.
 | `--net nat\|outside\|none\|proxy:<port>` | `outside` | What it may reach: `outside` the internet and its name servers only, `nat` the network every container had before 0.8, with the host and its networks, `none` loopback alone, with no address, or `proxy:<port>` that TCP port of the gateway and nothing else, where a proxy of the host's listens, with no name server and no `--link` (see [Security](#security) and [contrib/proxy](contrib/proxy/README.md)) |
 | `--link <name>` | — | Allow network to another container (repeatable) |
 | `--dns <address>` | the host's | A name server for the container (IPv4, up to 3) |
-| `--profile agent` | none | Everything Phase 8 built for a box that holds an AI agent's session, with one switch: `--userns`, the allow-list seccomp filter, an overlay root, and `--net none` unless `--net outside` or `--net proxy:<port>` is given; the limits and the lifetime that no option gives come from the `agent_mem`, `agent_pids`, `agent_cpu` and `agent_ttl` settings, 2G, 512, 2 CPUs and 8h unless `lightbox.conf` says otherwise. It refuses `--privileged`, `--link`, `--net nat`, `--seccomp deny` and `--copy`, and names the one it refused; what tightens a box further, such as `--read-only` or a smaller `--mem`, is taken. The box's `.conf` has each setting under its own key and `profile=agent` beside them, so a later change to what the profile means, or to the settings, does not change a box that is there. As root, for the user namespace |
+| `--profile agent` | none | Everything Phase 8 built for a box that holds an AI agent's session, with one switch: `--userns`, the allow-list seccomp filter, an overlay root, and `--net none` unless `--net outside` or `--net proxy:<port>` is given; the limits and the lifetime that no option gives come from the `agent_mem`, `agent_pids`, `agent_cpu` and `agent_ttl` settings, 2G, 512, 2 CPUs and 8h unless `lightbox.conf` says otherwise. It refuses `--privileged`, `--link`, `--net nat`, `--seccomp deny` and `--copy`, and names the one it refused. A `--mem`, `--pids`, `--cpu` or `--ttl` that is given is the box's, a larger one than the setting's too, and what tightens a box further, such as `--read-only`, is taken. The box's `.conf` has each setting under its own key and `profile=agent` beside them, so a later change to what the profile means, or to the settings, does not change a box that is there. As root, for the user namespace |
 | `--workspace <dir>` | none | A directory of the host's at `/workspace`, as a volume that with `--userns` is its owner's, so that what the box writes there is the owner's on the host; and the directory every `exec` runs in that is given no `--workdir`. The `.conf` keeps it as the volume and `workdir=/workspace`. The directory has to be there, and its path has to be absolute and have no `:` |
 
 A value that is not what its option takes ends `create` with the option named, and nothing is made: no value is shortened or stored to be found wrong at the next start. An option that is given without its value says so.
@@ -601,7 +626,7 @@ The sandbox covers everything in a container: init, the `/init.sh` hook and all 
 | /proc and /sys masking | The paths Docker masks by default are covered, files with `/dev/null` and directories with an empty read-only tmpfs. A mask that cannot be made fails the start |
 | /proc read-only | Remounts /proc/sys, /proc/bus, /proc/fs, /proc/irq read-only |
 | Root filesystem | Mounted `nodev`, and `nosuid` unless privileged. Devices come from the `/dev` that lightbox builds |
-| Devices | A cgroup device program, attached to a container's cgroup before init is in it, lets its processes open the devices of its `/dev` and no other: `null`, `zero`, `full`, `tty`, its devpts' `ptmx` and terminals, and `random` and `urandom` for reading only. A node of any other device is refused with EPERM wherever it is, and no device can be made; a privileged container has no program. `start` fails when the kernel does not load it, and `doctor` says whether it does |
+| Devices | A cgroup device program, attached to a container's cgroup before init is in it, lets its processes open the devices of its `/dev` and no other: `null`, `zero`, `full`, `tty`, its devpts' `ptmx` and terminals, and `random` and `urandom` for reading only. A node of any other device does not open, wherever it is: in `/dev` the program refuses it with EPERM, and on the root and in a volume the mount's `nodev` refuses it first, with EACCES. No device can be made; a privileged container has no program. `start` fails when the kernel does not load it, and `doctor` says whether it does |
 | Network | `create --net` chooses what a container may reach, as rules in lightbox's chains or tables, and `inspect` shows it. `outside`, the default, reaches the internet and the name servers it was created with, on port 53, and is refused at once, TCP with a reset, which a client says as a refused connection, and the rest with an ICMP "administratively prohibited", which it says as no route to the host: the host on every address of its, which `nat` leaves to the host's own firewall; and beyond the host `0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10`, `127.0.0.0/8`, `169.254.0.0/16`, the metadata address of the clouds among it, `172.16.0.0/12`, `192.0.0.0/24`, `192.168.0.0/16`, `198.18.0.0/15` and multicast and above. `nat` reaches the host and the outside, as before 0.8, and so does a container created before. `none` has loopback and no interface, address or rule. `proxy:<port>` reaches that TCP port of the gateway and is refused everything else at once, name servers included; its `resolv.conf` names none, so names are its proxy's to look up, and `exec` and the init hook have `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY` in both spellings. lightbox ships no proxy: what a container may reach through one is the proxy's configuration, and [contrib/proxy](contrib/proxy/README.md) has one for Squid that allows a list of names and looks up no other. The bridge drops what it would switch to or from a container of `proxy`, so a `--link` to it reaches nothing. The rules hold a container by its address, which one that is not privileged cannot change; a privileged container can |
 | Container isolation | A container without `--link` has an isolated port on the bridge: it reaches the host and the outside, and no other container, as far as its `--net` lets it reach either. IPv6 is off inside containers. A container with `--link` shares the bridge, and is kept to its links by firewall rules that name the two ports of each link: with iptables it does not start unless `br_netfilter` lets iptables see bridged traffic, and with nftables a table of the bridge family sees it without. A link holds whichever of the two starts first, and a container's link rules go with it when it stops, is removed or is found dead |
 | The terminal of whoever runs `exec` | A command never holds it. Typed at a terminal, `exec` gives the command a pseudo-terminal of the container and carries the bytes; where only one of its streams is a terminal, a pipe stands in for it |
@@ -624,18 +649,20 @@ What it does not keep out, and what to do about it:
 - **Without `--userns`, a container's root is the host's root.** What keeps it in is the namespaces and the sandbox; a flaw in the kernel past them would be a flaw on the host. Create a container with `--userns` (see [User namespaces](#user-namespaces)), or run as root in it only what you would run as root on the host, and the rest with `exec --user`.
 - **`--privileged` turns the sandbox off.** Such a container has all capabilities, no seccomp filter and no device program; give it only to what needs that, such as a hook that mounts filesystems.
 - **With `--net nat` the host itself is in reach,** as it was for every container before 0.8: services of the host that listen on the bridge's address, or on all addresses, answer such a container, and so do the host's networks. Give it `--net outside`, the default, unless it needs them, or keep the services to the addresses they are for.
-- **Disk is not limited.** A container's copy of its image and its `console.log`, which is not rotated, take what the disk has, and so does the audit log.
+- **Disk is not limited.** A container's own files, or its copy of its base, and its `console.log`, which is not rotated, take what the disk has, and so does the audit log.
 - **Whoever runs lightbox is root.** lightbox does not decide who may use it: giving someone `sudo lightbox` is giving them root.
-- **Images are trusted as files.** `create` copies an image as it is; what it contains runs in the sandbox, with the container's root.
+- **Images are trusted as files.** `create` takes a base as it is; what it contains runs in the sandbox, with the container's root.
+
+A security problem is reported in private, and not in the public issues: [SECURITY.md](SECURITY.md) says where, and what lightbox counts as one.
 
 ## How it works
 
 - **Namespaces**: `clone()` with PID, mount, UTS, IPC and network namespace flags, and with `--userns` a user namespace, whose maps `start` writes before init does anything. `start` makes the idmapped root in a mount namespace of its own, which init's is copied from, and init binds it onto itself, mounts `/proc` and `/sys` while the host's are still there, and becomes the container's root before it builds the rest
 - **Filesystem**: each container lives under `<container_dir>/<name>/` with `rootfs/` for its own files, `.conf` and `.ip` for what it is configured with and `console.log` for its output. Init mounts an overlay of the base's snapshot and `rootfs/` in the container's mount namespace, or takes `rootfs/` as it is for a copy, and `pivot_root`s into it (see [Storage](#storage))
 - **Runtime records**: what is known about a container while it runs is in `<run_dir>/<name>/`: `pid` and `pid_start` for its init, `state`, and `exit`, where init writes its exit status as the last thing it does. These are written without waiting for a disk, and a reboot takes them away with everything else in `/run`; a container without them is stopped. `start` makes the directory again when it is missing, for root alone
-- **States**: `ls` and `inspect` show `stopped`, `running`, `starting` and `stopping` while a command is at work, `exited` for a container that ended by itself, `expired` for one whose `--ttl` ran out, `failed` for one that was killed or whose start or hook failed, and `creating` for one that `create` did not finish. A half-made container is not started: remove it and create it again
+- **States**: `ls` and `inspect` show `stopped`, `running`, `starting` while a `start` sets a container up and its init is not on record yet, `stopping` for a moment at most at the end of a `stop`, as a container whose init is there shows as `running` whatever a command is doing with it, `exited` for a container that ended by itself, `expired` for one whose `--ttl` ran out, `failed` for one that was killed or whose start or hook failed, and `creating` for one that `create` did not finish. A half-made container is not started: remove it and create it again
 - **A container that ended without a stop**: when init is killed, or is told to stop by a signal from somewhere other than `lightbox stop`, from inside the container too, nobody is there to clear up. `ls` shows such a container as `exited` and changes nothing. The next `start`, `stop` or `rm` clears away what it left, its cgroup, its interface and the firewall rules of its links, says that it did, and records `exited` if init had ended with status 0, `expired` if its `--ttl` ended it, and `failed` otherwise
-- **A container's configuration**: `.conf` is lines of `key=value` that begin with `version=1`. One piece of code reads it and one writes it; a command reads it once, and `start` hands it to init. A file with the version line is read strictly: an unknown key, a key given twice or a value that is not one is an error that names the file and the line, and a file written by a newer lightbox is refused, not guessed at. A file from before the version line is still read as it was, and is written in the new form at the next `add-vol` or `rm-vol`. `rm` does not need the file, so a container whose configuration is damaged can always be removed
+- **A container's configuration**: `.conf` is lines of `key=value` that begin with `version=1`. One piece of code reads it and one writes it; a command reads it once, and `start` hands it to init. A file with the version line is read strictly: an unknown key, a key given twice or a value that is not one is an error that names the file and the line, and a file written by a newer lightbox is refused, not guessed at. A file from before the version line is still read as it was, and is written in the new form at the next `update`, `add-vol` or `rm-vol`. `rm` does not need the file, so a container whose configuration is damaged can always be removed
 - **Devices**: bind-mounted from host (`/dev/null`, `/dev/zero`, `/dev/random`, etc.)
 - **Networking**: veth pair per container connected to a host bridge with NAT. The container's end is `eth0`, made in the container's namespace. lightbox makes the bridge, the pair and the port, and takes them away, with rtnetlink requests of its own, and init gives `eth0` its address and the default route from inside the container: nothing enters the container's namespace from the host, and no tool is run for any of it. The host's end is `vb-` and twelve hex digits of a hash of the container's name, the same for a name every time, with the alias `lightbox:<name>`; `inspect` shows it as `host_interface`. lightbox removes only interfaces that carry its alias, and `start` refuses a container whose name on the host is taken by an interface it did not make, which it leaves alone. The alias is given as the interface joins the bridge, a moment after it is made: one that a `start` killed in that moment left has none, is left alone the same way, and goes with `ip link delete <interface>`. `create` writes the container's `/etc/resolv.conf`, `/etc/hostname` and a line for its own name in `/etc/hosts` among the container's own files, through its overlay or into its copy, where a link in the image cannot send them anywhere else
 - **Resource limits**: cgroups v2 (memory, PIDs, CPU, I/O)
@@ -644,8 +671,8 @@ What it does not keep out, and what to do about it:
 - **Output**: init leads a session of its own and keeps nothing that was open in the command that started it. Its standard output and error, and those of the hook and every service, are appended to `<container_dir>/<name>/console.log`, which only root can read. The log is kept from one start to the next and is not rotated or limited yet, so a container that prints without end fills the disk it is on
 - **Audit**: `exec` and `run` append what they ask of a box to `<lightbox_dir>/audit.log`, one for the host, which only root can read and no box has mounted, so that a box's record outlives the box (see [Audit log](#audit-log))
 - **Starting**: `start` and init talk over two pipes. Init builds the container when `start` has set up its cgroup and network, and reports back when it is built and again when the hook has ended. If either side goes away the other notices: an init whose `start` was killed exits before it runs anything
-- **External tools**: on the host, `iptables` and `iptables-restore`, or `nft`, make the firewall (a start with links runs one of them once, and every start looks at the firewall with one), and `cp` and `rm` take a snapshot or a copy of a base and remove a container. Everything else lightbox does with system calls of its own, rtnetlink for the network among them, and nothing from the image is run before `/init.sh`
-- **One command at a time**: `start`, `stop`, `restart`, `reset`, `update`, `rm`, `add-vol` and `rm-vol` take a lock on the container they change, and `create` and `setup` one on the whole store, so two commands on one container do their work one after the other. A command that has to wait says so. `ls` and `inspect` never wait. `setup`, `start`, `stop`, `restart`, `reset`, `update`, `exec` and `run` need root and say so before they touch anything
+- **External tools**: on the host, `iptables` and `iptables-restore`, or `nft`, make the firewall (the start of a container with links, or of `--net outside`, the default, or `proxy`, runs one of them once for its rules, and every start of a container with a network looks at the firewall with two runs of `iptables` or one of `nft`), and `cp` and `rm` take a snapshot or a copy of a base and remove a container. Everything else lightbox does with system calls of its own, rtnetlink for the network among them, and nothing from the image is run before `/init.sh`
+- **One command at a time**: `start`, `stop`, `restart`, `reset`, `update`, `rm`, `add-vol` and `rm-vol` take a lock on the container they change, and `create`, `setup`, `setup --teardown`, `reload`, `base add` and `base rm` one on the whole store, as does a `start` for as long as it makes the host's network again, so two commands on one container do their work one after the other. A command that has to wait says so. `ls` and `inspect` never wait. `setup`, `reload`, `start`, `stop`, `restart`, `reset`, `update`, `exec` and `run` need root, as does `create` with `--userns` or `--profile agent`, and say so before they touch anything
 - **Configuration**: optional `/etc/lightbox/lightbox.conf`, or the file `--config` or `LIGHTBOX_CONFIG` names, for all paths and defaults
 
 ## Storage

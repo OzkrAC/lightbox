@@ -1,7 +1,8 @@
 # lightbox configuration
 #
-# lightbox reads /etc/lightbox/lightbox.conf, which make install puts here, or
-# the file that --config <path> or LIGHTBOX_CONFIG names.
+# lightbox reads /etc/lightbox/lightbox.conf, which make install or a package
+# puts here, or the file that --config <path> or LIGHTBOX_CONFIG names. It
+# reads no file in a home directory.
 # All values are optional — built-in defaults are shown below. A # after a
 # space begins a comment, and a key lightbox does not know is warned about.
 #
@@ -9,12 +10,15 @@
 # bridge name or address that is too long, ends every command with the
 # setting named. The file may be up to 16 KB.
 
-# Base directory for lightbox data (base rootfs and container directories).
+# Base directory for lightbox data: the default base, the snapshots of bases
+# that containers are made from, the containers, and the audit log.
 # `lightbox setup` makes this directory and container_dir mode 0700, so both
 # must be directories that only lightbox uses.
 # lightbox_dir = /var/lib/lightbox
 
-# Default rootfs to copy when creating containers
+# The base new containers are made from: a directory that holds a root
+# filesystem. A container is an overlay of a snapshot of it, or with
+# create --copy a copy of its own.
 # Can also be set via LIGHTBOX_ROOTFS env var or --rootfs flag
 # Derived from lightbox_dir if not set explicitly
 # rootfs = /var/lib/lightbox/rootfs
@@ -33,11 +37,18 @@
 # cgroup v2 mount point
 # cgroup_root = /sys/fs/cgroup
 
+# The cgroup that holds the containers': each container's is <cgroup_base>/<name>
+# Derived from cgroup_root if not set explicitly
+# cgroup_base = /sys/fs/cgroup/lightbox
+
 # The firewall, with the settings of Docker's daemon.json; each true or false.
 # firewall: lightbox makes its rules, in its own chains reached from the top
-#   of FORWARD and POSTROUTING ("iptables"). Without them a container with
-#   links is not started.
-# ip_forward: setup turns IPv4 forwarding on ("ip-forward").
+#   of FORWARD, INPUT and POSTROUTING ("iptables"). Without them a container
+#   with links, with --net outside or with --net proxy is not started.
+# ip_forward: setup turns IPv4 forwarding on ("ip-forward"), where firewall
+#   has it make the rules that say what is forwarded. With firewall = false
+#   it leaves forwarding as it is: this host's own rules are then to turn it
+#   on with, and until they do containers reach this host and nothing beyond.
 # ip_forward_no_drop: when setup turns forwarding on, it leaves the FORWARD
 #   policy; otherwise the policy becomes DROP ("ip-forward-no-drop").
 # ip_masq: what containers send out by any interface but the bridge is

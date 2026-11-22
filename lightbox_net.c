@@ -1784,10 +1784,22 @@ static bool forwarding_on(void) {
     return read_file("/proc/sys/net/ipv4/ip_forward", forwarding, sizeof(forwarding)) > 0 && forwarding[0] == '1';
 }
 
+/* Forwarding is a part of lightbox's host network only where lightbox makes
+ * the rules that say what is forwarded. With firewall = false it makes none:
+ * forwarding is then this host's own, to turn on with the host's rules or to
+ * leave off, and lightbox neither turns it on nor waits for it. */
+static bool forwarding_wanted(void) {
+    return cfg_global.ip_forward && cfg_global.firewall;
+}
+
+bool host_forwarding_left_off(void) {
+    return cfg_global.ip_forward && !cfg_global.firewall && !forwarding_on();
+}
+
 /* With nftables, forwarding that is needed is on already, as Docker has it:
  * lightbox would have no DROP policy to turn it on with. */
 static void require_forwarding_for_nftables(void) {
-    if (cfg_global.firewall_backend == FIREWALL_NFTABLES && cfg_global.ip_forward && !forwarding_on())
+    if (cfg_global.firewall_backend == FIREWALL_NFTABLES && forwarding_wanted() && !forwarding_on())
         die("Error: IPv4 forwarding is off. With firewall_backend = nftables lightbox does not turn it\n"
             "on, as Docker does not: turn it on with rules of this host's against forwarding between\n"
             "its other interfaces (sysctl -w net.ipv4.ip_forward=1), or set ip_forward = false in\n"
@@ -1851,10 +1863,19 @@ static void host_network_setup(const container_network *net) {
      * rule accepts and nothing else. A host that had forwarding on already
      * keeps its policy, and ip_forward_no_drop keeps it in any case. What
      * was changed goes on record, for teardown to say.
+     *
+     * With firewall = false lightbox has made no rule, and turning forwarding
+     * on would have this host forward between all its interfaces with nothing
+     * of lightbox's to say what: it is left as it is, and that is said.
      */
     bool was_on = forwarding_on();
-    if (!was_on && cfg_global.ip_forward && !nftables) {
-        bool drop = cfg_global.firewall && !cfg_global.ip_forward_no_drop;
+    if (!was_on && cfg_global.ip_forward && !cfg_global.firewall) {
+        print_str(STDOUT, "Warning: IPv4 forwarding is off, and firewall = false in lightbox.conf: lightbox makes\n"
+                          "no rule that says what this host forwards, so it leaves forwarding as it is.\n"
+                          "Containers reach this host and nothing beyond it until forwarding is on, with rules\n"
+                          "of this host's (sysctl -w net.ipv4.ip_forward=1)\n");
+    } else if (!was_on && cfg_global.ip_forward && !nftables) {
+        bool drop = !cfg_global.ip_forward_no_drop;
         if (drop) {
             const char *policy[] = { "iptables", "-P", "FORWARD", "DROP", NULL };
             require_cmd(tool_path_iptables(), policy);
@@ -2065,7 +2086,7 @@ static bool firewall_present(void) {
 }
 
 static bool host_network_ready(void) {
-    return bridge_present() && (!cfg_global.ip_forward || forwarding_on()) && firewall_present();
+    return bridge_present() && (!forwarding_wanted() || forwarding_on()) && firewall_present();
 }
 
 const char *host_network_missing(void) {
@@ -2077,7 +2098,9 @@ const char *host_network_missing(void) {
         pos = str_append(missing, pos, "the bridge", sizeof(missing), &cut);
     if (lb_sys_geteuid() == 0 && !firewall_present())
         pos = str_append(missing, pos, pos ? ", the firewall rules" : "the firewall rules", sizeof(missing), &cut);
-    if (cfg_global.ip_forward && !forwarding_on())
+    /* what a start makes again: with nftables forwarding is this host's to
+     * turn on, and doctor has a check of its own for it */
+    if (forwarding_wanted() && cfg_global.firewall_backend != FIREWALL_NFTABLES && !forwarding_on())
         str_append(missing, pos, pos ? ", forwarding" : "forwarding", sizeof(missing), &cut);
     return missing[0] ? missing : NULL;
 }

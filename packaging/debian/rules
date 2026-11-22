@@ -34,12 +34,12 @@ override_dh_auto_install:
 execute_after_dh_fixperms:
 	chmod 0700 debian/lightbox/var/lib/lightbox debian/lightbox/var/lib/lightbox/containers
 
-# CHANGELOG.md is in the package once, with the documents and under its own
-# name, which debian/lightbox.docs sees to. The package built on Ubuntu 24.04
-# had no changelog.gz made of it; where debhelper does make one, this keeps it
-# from being there twice.
+# CHANGELOG.md is the package's changelog.gz, the name Debian gives an
+# upstream changelog and lintian asks for. It is named here because Ubuntu's
+# debhelper installs an upstream changelog only when it is told which file
+# that is; Debian's finds it by itself.
 override_dh_installchangelogs:
-	dh_installchangelogs -XCHANGELOG.md
+	dh_installchangelogs CHANGELOG.md
 
 # xz, which every dpkg reads. Ubuntu's dpkg-deb writes zstd unless told, and
 # Debian's dpkg reads that from Debian 12 on only.

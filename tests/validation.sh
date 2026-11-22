@@ -1633,9 +1633,11 @@ Warning: $CONF: line $((lines + 2)): not a setting, which is <key> = <value>: th
 }
 
 # Where the settings come from: --config, then LIGHTBOX_CONFIG, then
-# /etc/lightbox/lightbox.conf, then the place in $HOME that lightbox read
-# before, which it says it will stop reading. A file that is named and not
-# there is an error. (No case here writes /etc: the lifecycle suite has that.)
+# /etc/lightbox/lightbox.conf, and the built-in values where there is none.
+# The place in $HOME that lightbox read before 0.6 is not read: a file that
+# is there, with nothing named and none in /etc, ends the command, which
+# says where the settings are looked for. A file that is named and not there
+# is an error. (No case here writes /etc: the lifecycle suite has that.)
 t_config_lookup_order() {
     first=$W/first.conf second=$W/second.conf
     { cat "$CONF"; echo 'bridge = brfirst'; } > "$first"
@@ -1648,10 +1650,17 @@ t_config_lookup_order() {
     got=$(LIGHTBOX_CONFIG="$second" HOME="$W/home" "$LB" doctor 2>/dev/null | bridge)
     [ "$got" = brsecond ] || { echo "LIGHTBOX_CONFIG and HOME: $got"; bad=1; }
     if [ ! -e /etc/lightbox/lightbox.conf ]; then
-        said=$(LIGHTBOX_CONFIG='' HOME="$W/home" "$LB" doctor 2>&1)
-        [ "$(printf '%s\n' "$said" | bridge)" = brhome ] || { echo "an empty LIGHTBOX_CONFIG, and HOME: $(printf '%s\n' "$said" | bridge)"; bad=1; }
-        printf '%s\n' "$said" | grep -F "Warning: the configuration is read from $CONF, where lightbox 0.7 will" ||
-            { echo "the place in HOME was not said to be going"; bad=1; }
+        for words in doctor ls 'create fromhome 10.0.0.9'; do
+            # shellcheck disable=SC2086
+            said=$(LIGHTBOX_CONFIG='' HOME="$W/home" "$LB" $words 2>&1) && { echo "lightbox $words went on with a file in HOME alone"; bad=1; }
+            [ "$said" = "Error: $CONF is where lightbox looked for its settings before 0.6, and it is
+not read. Move it to /etc/lightbox/lightbox.conf, or name it with --config or LIGHTBOX_CONFIG" ] ||
+                { echo "lightbox $words, with a file in HOME alone: $said"; bad=1; }
+        done
+        # with no file there either, the built-in values, and nothing said
+        said=$(env -u LIGHTBOX_CONFIG HOME="$W/nohome" "$LB" doctor 2>&1)
+        [ "$(printf '%s\n' "$said" | bridge)" = br0 ] || { echo "no file anywhere: bridge $(printf '%s\n' "$said" | bridge)"; bad=1; }
+        printf '%s\n' "$said" | grep -E '^(Error|Warning|Note): .*lightbox\.conf' && { echo "no file anywhere, and that was said"; bad=1; }
     else
         echo "this host has /etc/lightbox/lightbox.conf: HOME is not looked at, and that is not tried"
     fi
@@ -2327,7 +2336,7 @@ check 'inspect --json is one JSON object, typed, or nothing'             t_inspe
 check 'configuration: carriage returns are stripped'                   t_config_strips_carriage_returns
 check 'configuration: inline comments are stripped'                    t_config_strips_inline_comments
 check 'configuration: unknown keys and lines that are no setting are said, with the line' t_config_reports_unknown_keys
-check 'configuration: --config, LIGHTBOX_CONFIG, /etc, then HOME with a warning' t_config_lookup_order
+check 'configuration: --config, LIGHTBOX_CONFIG, then /etc; a file in HOME alone ends the command' t_config_lookup_order
 check 'make install writes under DESTDIR only, and keeps a configuration' t_make_install_stays_in_destdir
 check 'help goes to standard output with status 0, and --version names the release' t_help_exits_zero
 check 'rm takes several names, and names those it did not remove'      t_rm_handles_every_argument

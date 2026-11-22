@@ -88,7 +88,7 @@ These are not counted: none of them changes `overall` or the exit status.
 firewall: true
 bridge_accept_fwmark: none
 ```
-Two of the settings say more than their value. `firewall: false (lightbox makes no firewall rules)` is a host on which a container with links, with `--net outside` or with `--net proxy` is not started, since nothing would keep it to what it may reach. `bridge_accept_fwmark` is `none`, or the mark, such as `0x10/0xf0`; with iptables it reads `0x10 (not used: with iptables, rules in LIGHTBOX-USER decide first)`. [The firewall's settings](networking.html#firewall-settings) explains both.
+Two of the settings say more than their value. `firewall: false (lightbox makes no firewall rules)` is a host on which a container with links, with `--net outside` or with `--net proxy` is not started, since nothing would keep it to what it may reach, and on which lightbox leaves IPv4 forwarding to the host. `bridge_accept_fwmark` is `none`, or the mark, such as `0x10/0xf0`; with iptables it reads `0x10 (not used: with iptables, rules in LIGHTBOX-USER decide first)`. [The firewall's settings](networking.html#firewall-settings) explains both.
 :::
 
 :::member{#check-bridge_filtering}
@@ -141,7 +141,10 @@ How many ranges of 65536 uids and gids `/etc/subuid` and `/etc/subgid` give the 
 ```text
 host_network: ready
 ```
-Whether the bridge is there, lightbox's firewall rules are in, and IPv4 forwarding is on where `ip_forward` is true. The firewall rules are looked at only when `doctor` runs as root.
+Whether the bridge is there, lightbox's firewall rules are in, and IPv4 forwarding is on where a `start` would turn it on: with iptables, when `firewall` and `ip_forward` are true. With nftables forwarding has a check of its own, [`ip_forwarding`](#check-ip_forwarding). The firewall rules are looked at only when `doctor` runs as root.
+
+- `ready (IPv4 forwarding is off, and with firewall = false it is this host's to turn on: containers reach this host and nothing beyond it)`\
+  lightbox's part is there. With `firewall = false` it makes no rule and leaves forwarding to the host: turn it on with rules of the host's own, or leave it off where containers are to reach the host alone. [Networking](networking.html#firewall-false) has the reason.
 
 - `not all there (missing: the bridge, the firewall rules, forwarding; start makes it, as lightbox setup does)`, with whichever of the three are missing\
   Nothing has to be done: the next `start` makes what is missing, and so does `lightbox setup`. After a [reboot](#reboot) this is the usual state. While containers run and `the firewall rules` are missing, a [firewall's reload](#firewall-reload) took them: run `lightbox reload`.
@@ -239,7 +242,7 @@ Whether the kernel loads the program that keeps a container to the devices of it
 ```text
 ip_forwarding: yes (on)
 ```
-With `firewall_backend = nftables` and `ip_forward = true` only: whether IPv4 forwarding is on. With nftables lightbox does not turn it on, as Docker does not with its nftables backend, and `setup` and `start` stop when it is off.
+With `firewall_backend = nftables`, `firewall = true` and `ip_forward = true` only: whether IPv4 forwarding is on. With nftables lightbox does not turn it on, as Docker does not with its nftables backend, and `setup` and `start` stop when it is off.
 
 - `no (off, and with firewall_backend = nftables lightbox does not turn it on)`\
   `sysctl -w net.ipv4.ip_forward=1`, and at every boot, with rules of this host's against forwarding between its other interfaces; or `ip_forward = false` in `lightbox.conf`, with which containers reach this host and nothing beyond it.
@@ -450,7 +453,7 @@ The first is an init that ended with status 0, and leaves the container `exited`
 | A package fails to install with `Operation not permitted` | Nothing in a container gives a file the setuid or the setgid bit or a file capability. A package that installs such a program, such as `passwd`, `mount` or `sudo`, or that runs `setcap`, such as `iputils-ping`, fails there | Update or install it in the base, on the host, and create the container from the new base; or give the container `--privileged` |
 | A connection to this host or to an address of your network is refused at once | `--net outside`, the default, reaches the internet and its name servers, and refuses the host and every private range | That is what it is for. A container that has to reach the host or its networks is created with `--net nat`: [What a container may reach](networking.html#net) |
 | Names do not resolve | A container asks the name servers it was created with, written in its `/etc/resolv.conf` then. A container of `--net proxy` has none: its proxy looks names up | `lightbox inspect <name>` shows its `net`, and `lightbox exec <name> cat /etc/resolv.conf` the name servers it asks. A container gets others with `create --dns`, or from `dns` in `lightbox.conf`: [Name servers](networking.html#dns) |
-| Nothing beyond this host is reached, by any container | The host's network is not all there, or a firewall drops what lightbox accepts | `sudo lightbox doctor`: look at `host_network` and, with nftables, at `forward_drops`. After a firewall's reload, [`lightbox reload`](#firewall-reload) |
+| Nothing beyond this host is reached, by any container | The host's network is not all there, a firewall drops what lightbox accepts, or, with `firewall = false`, forwarding is off, which lightbox then leaves to the host | `sudo lightbox doctor`: look at `host_network` and, with nftables, at `forward_drops`. After a firewall's reload, [`lightbox reload`](#firewall-reload) |
 | The container is gone from `ls`' `running` after it used much memory | A container's memory limit is a limit: past it the kernel ends the whole container, and `ls` shows it as `exited` | `lightbox update <name> --mem <limit>` gives it more, and `--swap` at `create` lets it swap. Then start it again |
 | `Permission denied` in a volume of a container with `--userns` | The container's root stands for the volume's owner on the host and for no one else. Files of other ids are nobody's, and a volume that is host root's cannot be written | Give the volume's source to the user whose files it holds: [Volumes and user namespaces](storage.html#volume-ownership) |
 | `exec` says `command not found` for a program that is in the image | A command without a slash is looked for in `/usr/bin`, `/bin`, `/usr/sbin` and `/sbin`, and nothing of your own `PATH` goes into the container | Name it by its path, or give the `exec` `--env PATH=…` |
@@ -743,7 +746,13 @@ lightbox clears up after itself, also after a container that ended without a sto
 
 ## Reporting a problem {#reporting}
 
-Problems are reported at [github.com/OzkrAC/lightbox/issues](https://github.com/OzkrAC/lightbox/issues). A report that can be acted on has:
+Problems are reported at [github.com/OzkrAC/lightbox/issues](https://github.com/OzkrAC/lightbox/issues).
+
+:::important[A security problem is reported in private]
+A way out of a container, around its network or past any other boundary that lightbox promises is not for the public issues. Report it through [GitHub's vulnerability reporting](https://github.com/OzkrAC/lightbox/security/advisories/new) for the repository, which only the maintainer reads. [`SECURITY.md`](https://github.com/OzkrAC/lightbox/blob/main/SECURITY.md) says what counts as one and what happens with a report.
+:::
+
+A report that can be acted on has:
 
 ```sh
 lightbox --version

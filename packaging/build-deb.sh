@@ -54,7 +54,7 @@ cat > "$src/debian/changelog" <<EOF
 lightbox ($version-$revision) unstable; urgency=medium
 
   * lightbox $(sh packaging/version.sh). What changed for someone who uses
-    it is in /usr/share/doc/lightbox/CHANGELOG.md.gz.
+    it is in /usr/share/doc/lightbox/changelog.gz.
 
  -- OzkrAC <OzkrAC@users.noreply.github.com>  $date
 EOF
