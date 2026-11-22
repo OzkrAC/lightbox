@@ -4240,4 +4240,351 @@ check 'what tar programs write in ways of their own is read' t_untar_taken
 check "a layer's marks become an overlay's own, or take out what they name" t_untar_marks
 check 'what is no archive of a tree is refused, and nothing is made outside the root' t_untar_refusals
 
+# I.4: the JSON an image's index, its manifest and its configuration are
+# written in. tests/json has the three of Alpine 3.22 for amd64 as Docker
+# Hub served them on 2026-11-22, byte for byte: each is named by its SHA-256
+# in the one before it, which the first case holds them to.
+json_helpers() {
+    bad=0
+    # the value at a path of a file: file, path, what is said of it
+    says() {
+        said=$("$UNIT" json-read "$1" "$2" 2>&1)
+        [ "$said" = "ok
+$3" ] || { echo "${1##*/} at '$2': '$said', not '$3'"; bad=1; }
+    }
+    # a text, given as printf writes it, and what is said of it
+    text_says() { # what the text is, the text, what is said
+        printf -- "$2" > "$D/text"
+        said=$("$UNIT" json-read "$D/text" 2>&1)
+        [ "$said" = "$3" ] || { echo "$1: '$said', not '$3'"; bad=1; }
+    }
+    taken() { text_says "$1" "$2" ok; }
+    refused() { text_says "$1" "$2" "refused: $3"; }
+}
+
+t_json_image() {
+    local dir=$HERE/json digest size
+    json_helpers
+    index=$dir/alpine-index.json manifest=$dir/alpine-manifest.json config=$dir/alpine-config.json
+
+    says "$index" /schemaVersion 'number 2 whole'
+    says "$index" /mediaType 'string application/vnd.oci.image.index.v1+json'
+    [ "$("$UNIT" json-read "$index" /manifests | sed -n 2p)" = 'array 16' ] || { echo "the index has not 16 manifests"; bad=1; }
+    says "$index" /manifests/0/mediaType 'string application/vnd.oci.image.manifest.v1+json'
+    says "$index" /manifests/0/platform 'object 2
+  architecture: string
+  os: string'
+    says "$index" /manifests/0/platform/architecture 'string amd64'
+    says "$index" /manifests/0/platform/os 'string linux'
+    says "$index" /manifests/2/platform/variant 'string v6'
+    says "$index" /manifests/16 none
+    # a name with dots in it, and a text whose every / is written \/
+    says "$index" /manifests/0/annotations/org.opencontainers.image.url 'string https://hub.docker.com/_/alpine'
+    # the manifest is the blob the index names, by its digest and its size
+    digest=$("$UNIT" sha256 "$manifest")
+    size=$(($(wc -c < "$manifest")))
+    says "$index" /manifests/0/digest "string sha256:$digest"
+    says "$index" /manifests/0/digest 'string sha256:9db2934886712d877c932e07249c75a59e6ca27adfbccc05261987a17bef2d63'
+    says "$index" /manifests/0/size "number $size whole"
+
+    says "$manifest" '' 'object 5
+  schemaVersion: number
+  mediaType: string
+  config: object
+  layers: array
+  annotations: object'
+    says "$manifest" /mediaType 'string application/vnd.oci.image.manifest.v1+json'
+    says "$manifest" /config/mediaType 'string application/vnd.oci.image.config.v1+json'
+    says "$manifest" /layers 'array 1
+  object'
+    says "$manifest" /layers/0/mediaType 'string application/vnd.oci.image.layer.v1.tar+gzip'
+    says "$manifest" /layers/0/digest 'string sha256:710f3da1112f360bed5d2908205aeee86b9d04ecd471354cf7049a2f0bdb5c72'
+    says "$manifest" /layers/0/size 'number 3794375 whole'
+    says "$manifest" /layers/1 none
+    says "$manifest" /annotations 'object 7
+  com.docker.official-images.bashbrew.arch: string
+  org.opencontainers.image.base.name: string
+  org.opencontainers.image.created: string
+  org.opencontainers.image.revision: string
+  org.opencontainers.image.source: string
+  org.opencontainers.image.url: string
+  org.opencontainers.image.version: string'
+    says "$manifest" /annotations/org.opencontainers.image.version 'string 3.22.8'
+    # and the configuration the blob the manifest names
+    digest=$("$UNIT" sha256 "$config")
+    size=$(($(wc -c < "$config")))
+    says "$manifest" /config/digest "string sha256:$digest"
+    says "$manifest" /config/size "number $size whole"
+
+    says "$config" /architecture 'string amd64'
+    says "$config" /os 'string linux'
+    says "$config" /rootfs/type 'string layers'
+    says "$config" /rootfs/diff_ids 'array 1
+  string'
+    says "$config" /rootfs/diff_ids/0 'string sha256:fdc5834cb53a4bde074c41b5baf85f9d5cece29df379fecafea8c396ba8c29d9'
+    says "$config" /config/Env/0 'string PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+    says "$config" /history/1/created_by 'string CMD ["/bin/sh"]'
+    says "$config" /history/1/empty_layer true
+    says "$config" /history/0/empty_layer none
+    # a name in other letters' case is not taken for the name, and not passed over
+    says "$manifest" /Layers 'other case'
+    says "$config" /config/env 'other case'
+    says "$config" /Config/Env 'other case'
+
+    [ "$("$UNIT" json-is "$manifest" /layers/0/mediaType application/vnd.oci.image.layer.v1.tar+gzip)" = same ] ||
+        { echo "the layer's media type is not what it is"; bad=1; }
+    [ "$("$UNIT" json-is "$manifest" /layers/0/mediaType application/vnd.oci.image.layer.v1.tar)" = other ] ||
+        { echo "the layer's media type is one it only begins with"; bad=1; }
+    return $bad
+}
+check "the values of a registry's index, manifest and configuration are read" t_json_image
+
+t_json_values() {
+    D=$(mktemp -d "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    json_helpers
+    hex_at() { "$UNIT" json-read "$D/text" "$1" | sed 1d | od -An -tx1 | tr -d ' \n'; }
+    hex_of() { printf "$1" | od -An -tx1 | tr -d ' \n'; }
+    same_hex() { # what, path, the bytes as printf writes them
+        [ "$(hex_at "$2")" = "$(hex_of "string $3\n")" ] || { echo "$1: $(hex_at "$2"), not $(hex_of "string $3\n")"; bad=1; }
+    }
+
+    # a string's escapes, each resolved: the eight of two characters, and
+    # \uXXXX to UTF-8 of one byte to four, the last from a surrogate pair
+    printf '%s' '{"two":"\"\\\/\b\f\n\r\t","u":"\u0041\u007f\u00e9\u20AC\uffff\ud83d\uDE00","raw":"' > "$D/text"
+    printf 'A\177\303\251\342\202\254\360\237\230\200","mixed":"a\\u0062c"}' >> "$D/text"
+    same_hex "the escapes of two characters" /two '"\\/\b\f\n\r\t'
+    same_hex "the escapes of four digits" /u 'A\177\303\251\342\202\254\357\277\277\360\237\230\200'
+    same_hex "UTF-8 as it is written" /raw 'A\177\303\251\342\202\254\360\237\230\200'
+    # into no fewer bytes than it has and one for its NUL, and never a part of it
+    says "$D/text" /mixed 'string abc'
+    for pair in '4:3 abc' '65536:3 abc' '3:none' '1:none' '0:none'; do
+        said=$("$UNIT" json-text "$D/text" /mixed "${pair%%:*}")
+        [ "$said" = "${pair#*:}" ] || { echo "abc into ${pair%%:*} bytes: '$said', not '${pair#*:}'"; bad=1; }
+    done
+    printf '["","\\u00e9x"]' > "$D/text"
+    for pair in '0 1:0 ' '1 4:3 éx' '1 3:none' '1 2:none'; do
+        want=${pair#*:} args=${pair%%:*}
+        said=$("$UNIT" json-text "$D/text" "/${args% *}" "${args#* }")
+        [ "$said" = "$want" ] || { echo "element ${args% *} into ${args#* } bytes: '$said', not '$want'"; bad=1; }
+    done
+    # a text is another text or the same, by what it says and not by how it is written
+    printf '{"s":"a\\u0062c","n":12,"e":""}' > "$D/text"
+    for pair in '/s abc:same' '/s ABC:other' '/s ab:other' '/s abcd:other' '/s :other' '/n 12:other' '/e :same' '/x abc:none'; do
+        args=${pair%%:*}
+        said=$("$UNIT" json-is "$D/text" "${args% *}" "${args#* }")
+        [ "$said" = "${pair#*:}" ] || { echo "'${args#* }' against ${args% *}: $said, not ${pair#*:}"; bad=1; }
+    done
+
+    # a number is given as it is written, and is a whole one when digits are all of it
+    printf '[0,7,18446744073709551615,18446744073709551616,-1,-0,1.0,1e3,10,123456789012345678901234567890,0.5E-3]' > "$D/text"
+    n=0
+    for want in '0 whole' '7 whole' '18446744073709551615 whole' 18446744073709551616 -1 -0 1.0 1e3 '10 whole' \
+                123456789012345678901234567890 0.5E-3; do
+        says "$D/text" "/$n" "number $want"
+        n=$((n + 1))
+    done
+
+    # a path is RFC 6901's: ~1 for /, ~0 for ~, a name that is empty, digits
+    # that are a name in an object and an index in an array
+    printf '{"a/b":1,"m~n":2,"":{"":3},"0":4,"~1":5,"list":[10,[20,21],{"x":30}],"deep":{"a":{"b":[null,true,false]}}}' > "$D/text"
+    says "$D/text" /a~1b 'number 1 whole'
+    says "$D/text" /m~0n 'number 2 whole'
+    says "$D/text" / 'object 1
+  : number'
+    says "$D/text" // 'number 3 whole'
+    says "$D/text" /0 'number 4 whole'
+    says "$D/text" /~01 'number 5 whole'
+    says "$D/text" /list 'array 3
+  number
+  array
+  object'
+    says "$D/text" /list/0 'number 10 whole'
+    says "$D/text" /list/1/1 'number 21 whole'
+    says "$D/text" /list/2/x 'number 30 whole'
+    says "$D/text" /deep/a/b/0 null
+    says "$D/text" /deep/a/b/1 true
+    says "$D/text" /deep/a/b/2 false
+    for path in /list/3 /list/01 /list/00 /list/- /list/+1 /list/1.0 /list/x /list/ /list/18446744073709551616 \
+                /list/0/0 /list/2/y /a/b /m~n/x /nothing a list /deep/a/b/3 /deep/a/b/0/x; do
+        says "$D/text" "$path" none
+    done
+
+    # A member whose name is the path's but for the case of its letters, with
+    # the long s and the Kelvin sign that fold to s and k: the lookup says so,
+    # whether or not the path's own name is there too.
+    printf '{"layers":[1],"Layers":[2],"digest":"d","size":{"Size":1},"layer\\u017f2":0,"\\u212aey":0,"\303\211":0,"x":0}' > "$D/text"
+    for path in /layers /Layers /LAYERS /Digest /DIGEST /size/size /layers2 /Layers2 /key /Key; do
+        says "$D/text" "$path" 'other case'
+    done
+    says "$D/text" /digest 'string d'
+    says "$D/text" /size/Size 'number 1 whole'
+    says "$D/text" /x 'number 0 whole'
+    says "$D/text" "$(printf '/\303\211')" 'number 0 whole'
+    # letters beyond ASCII are another name in another case, as they are to Go
+    says "$D/text" "$(printf '/\303\251')" none
+    says "$D/text" /X 'other case'
+
+    rm -rf -- "$D"
+    return $bad
+}
+check "a string's escapes are resolved, a number is whole or is not, and a path is RFC 6901's" t_json_values
+
+t_json_strict() {
+    D=$(mktemp -d "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    json_helpers
+    local no_value='what is here is no value' ends='the text ends before its value does'
+    local no_number='a number that is not written the way JSON has them' more='there is more after the value'
+    local no_name="a member's name has to be a string" no_colon="there is no colon after a member's name"
+    local in_object='there is no comma and no closing brace after a member'
+    local in_array='there is no comma and no closing bracket after an element'
+    local open='a string that does not end' control='a control character in a string, where only an escape may say one'
+    local escape='an escape that JSON does not have' utf8='bytes that are no UTF-8' half='half of a surrogate pair'
+    local nul='the character U+0000, which is not read' twice='a name that is there twice in one object'
+    local deep='arrays and objects are deeper inside one another than is read'
+
+    # what is JSON, and stays so
+    taken "an object with nothing in it" '{}'
+    taken "an array with nothing in it" ' [ ] '
+    taken "a string alone" '"a"'
+    taken "a number alone" '\n-0.5e+10\n'
+    taken "a word alone" 'null'
+    taken "blanks of every kind" ' \t\r\n{ "a" :\t[ 1 ,\r\n2 ] , "b" : { } } \n'
+    taken "numbers in every form" '[0,-0,1,10,1.5,-1.5,1e5,1E5,1e+5,1e-5,0.0,0e0,123456789012345678901234567890]'
+    taken "one name in two objects" '{"a":{"a":1},"b":{"a":2},"c":[{"a":3},{"a":4}]}'
+    taken "two names that differ in their case" '{"a":1,"A":2}'
+    taken "DEL, which is no control character to JSON" '"\177"'
+
+    # no value, or more than one
+    refused "no text" '' "1:1: there is no value"
+    refused "blanks alone" ' \n\t ' "2:3: there is no value"
+    refused "a byte order mark" '\357\273\277{}' "1:1: $no_value"
+    refused "a comment" '// c\n{}' "1:1: $no_value"
+    refused "two values" '1 2' "1:3: $more"
+    refused "two objects" '{}{}' "1:3: $more"
+    refused "a letter after the value" '{}\n x' "2:2: $more"
+    refused "a NUL after the value" '{}\000' "1:3: $more"
+    refused "a word that is none" 'nul' "1:1: $no_value"
+    refused "a word in capitals" 'True' "1:1: $no_value"
+    refused "NaN" 'NaN' "1:1: $no_value"
+    refused "Infinity" '[Infinity]' "1:2: $no_value"
+    refused "a string in single quotes" "'a'" "1:1: $no_value"
+    refused "a form feed for a blank" '[\f1]' "1:2: $no_value"
+
+    # numbers
+    refused "a number that begins with 0" '01' "1:1: $no_number"
+    refused "a sign alone" '[-]' "1:2: $no_number"
+    refused "minus Infinity" '-Infinity' "1:1: $no_number"
+    refused "a point with nothing after it" '[1.]' "1:2: $no_number"
+    refused "an exponent with nothing after it" '1e' "1:1: $no_number"
+    refused "an exponent with a sign alone" '[1e+]' "1:2: $no_number"
+    refused "a point with nothing before it" '.5' "1:1: $no_value"
+    refused "a plus sign" '+1' "1:1: $no_value"
+    refused "a number in hex" '0x10' "1:2: $more"
+
+    # arrays and objects
+    refused "an object that does not end" '{' "1:2: $ends"
+    refused "an array that does not end" '[1,' "1:4: $ends"
+    refused "a member without its value" '{"a":' "1:6: $ends"
+    refused "a comma before an array's end" '[1,]' "1:4: $no_value"
+    refused "a comma before an object's end" '{"a":1,}' "1:8: $no_name"
+    refused "a name without quotes" '{a:1}' "1:2: $no_name"
+    refused "a number for a name" '{1:1}' "1:2: $no_name"
+    refused "no colon" '{"a" 1}' "1:6: $no_colon"
+    refused "no comma in an object" '{"a":1 "b":2}' "1:8: $in_object"
+    refused "no comma in an array" '[1 2]' "1:4: $in_array"
+    refused "an array closed as an object" '[1}' "1:3: $in_array"
+    refused "an object closed as an array" '{"a":1]' "1:7: $in_object"
+    refused "a closing bracket alone" ']' "1:1: $no_value"
+
+    # strings
+    refused "a string that does not end" '"abc' "1:1: $open"
+    refused "a string that ends in a backslash" '"abc\\' "1:5: $open"
+    refused "an escape there is none of" '"a\\qb"' "1:3: $escape"
+    refused "an escape of three digits" '"\\u12g4"' "1:2: $escape"
+    refused "the first half of a pair alone" '"\\ud800"' "1:2: $half"
+    refused "the first half and a letter" '"\\ud800\\u0041"' "1:2: $half"
+    refused "the second half alone" '"a\\udc00"' "1:3: $half"
+    refused "the two halves the wrong way round" '"\\udc00\\ud800"' "1:2: $half"
+    refused "U+0000 as an escape" '{"a":"x\\u0000y"}' "1:8: $nul"
+    refused "U+0000 in a name" '{"\\u0000":1}' "1:3: $nul"
+    refused "a tab in a string" '"a\tb"' "1:3: $control"
+    refused "a line's end in a string" '["a\nb"]' "1:4: $control"
+    refused "a NUL in a string" '"a\000b"' "1:3: $control"
+    refused "a byte that is no UTF-8" '"\377"' "1:2: $utf8"
+    refused "a byte of a longer character alone" '"a\200"' "1:3: $utf8"
+    refused "a form longer than the shortest" '"\300\200"' "1:2: $utf8"
+    refused "another, of three bytes" '"\340\200\200"' "1:2: $utf8"
+    refused "a surrogate written as UTF-8" '"\355\240\200"' "1:2: $utf8"
+    refused "a character above U+10FFFF" '"\364\220\200\200"' "1:2: $utf8"
+    refused "a character cut short" '"\342\202"' "1:2: $utf8"
+    refused "a character cut short in a name" '{"\303":1}' "1:3: $utf8"
+
+    # a name twice in one object, however it is written, and where the second is
+    refused "a name twice" '{"a":1,"a":2}' "1:8: $twice"
+    refused "a name twice, once as an escape" '{"a":1,"b":2,"\\u0061":3}' "1:14: $twice"
+    refused "a name twice in an object inside" '{"b":{"x":1,"y":2,"x":3},"c":0}' "1:19: $twice"
+    refused "a name twice, lines apart" '{"a":1,\n "b":2,\n "a":3}' "3:2: $twice"
+    refused "a name three times" '{"k":1,"a":0,"k":2,"k":3}' "1:14: $twice"
+    refused "two names twice" '{"p":1,"q":2,"q":3,"p":4}' "1:14: $twice"
+    refused "a name twice, once as a surrogate pair" '{"\\ud83d\\ude00":1,"\360\237\230\200":2}' "1:19: $twice"
+    refused "the empty name twice" '[{"":1,"":2}]' "1:8: $twice"
+
+    # 32 arrays and objects inside one another are read, and no more
+    nested() { # how many, what opens one, what the innermost has in it, what closes one
+        local i text=$3
+        for i in $(seq 1 "$1"); do text="$2$text$4"; done
+        printf '%s' "$text" > "$D/text"
+        "$UNIT" json-read "$D/text"
+    }
+    for depth in 1 31 32; do
+        [ "$(nested $depth '[' '' ']')" = ok ] || { echo "$depth arrays inside one another are not read"; bad=1; }
+        [ "$(nested $depth '{"a":' 0 '}')" = ok ] || { echo "$depth objects inside one another are not read"; bad=1; }
+    done
+    [ "$(nested 32 '[' '"a"' ']')" = ok ] || { echo "a string in 32 arrays is not read"; bad=1; }
+    said=$(nested 33 '[' '' ']')
+    [ "$said" = "refused: 1:33: $deep" ] || { echo "33 arrays inside one another: '$said'"; bad=1; }
+    said=$(nested 33 '{"a":' 0 '}')
+    [ "$said" = "refused: 1:161: $deep" ] || { echo "33 objects inside one another: '$said'"; bad=1; }
+    said=$(nested 32 '[' '{}' ']')
+    [ "$said" = "refused: 1:33: $deep" ] || { echo "an object in 32 arrays: '$said'"; bad=1; }
+
+    # 1048576 bytes are read, and not one more
+    { printf '"'; head -c 1048574 /dev/zero | tr '\0' a; printf '"'; } > "$D/text"
+    said=$("$UNIT" json-read "$D/text" | head -c 40)
+    [ "$said" = ok ] || { echo "a text of 1048576 bytes: '$said'"; bad=1; }
+    printf ' ' >> "$D/text"
+    said=$("$UNIT" json-read "$D/text")
+    [ "$said" = "refused: 1:1048577: the text is longer than is read" ] || { echo "a text of 1048577 bytes: '$said'"; bad=1; }
+
+    # An object of 100000 members is checked for a name twice in no more
+    # time than its names take to sort; the last of them, there before, is
+    # found where it is.
+    seq 1 100000 | awk 'BEGIN { printf "{" } { printf "%s\"%d\":0", (NR > 1 ? "," : ""), ($1 * 7919) % 100000 } END { printf "}" }' > "$D/text"
+    said=$("$UNIT" json-read "$D/text" /7919 /99999)
+    [ "$said" = "ok
+number 0 whole
+number 0 whole" ] || { echo "an object of 100000 members: '$said'"; bad=1; }
+    size=$(($(wc -c < "$D/text")))
+    { head -c $((size - 1)) "$D/text"; printf ',"75\\u0030":1}'; } > "$D/again"
+    said=$("$UNIT" json-read "$D/again")
+    [ "$said" = "refused: 1:$((size + 1)): $twice" ] || { echo "and with one of them twice: '$said', not at 1:$((size + 1))"; bad=1; }
+
+    rm -rf -- "$D"
+    return $bad
+}
+check 'a text that is no JSON, or says one thing twice, is refused with where' t_json_strict
+
+# What Python's reader takes, held as strictly as this one, this one takes,
+# and every value at every path is the same: texts that are JSON, texts of
+# one with bytes changed, and texts of pieces put together.
+t_json_python() {
+    command -v python3 >/dev/null || { echo "no python3 to compare with"; return 77; }
+    D=$(mktemp -d "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    local bad=0
+    python3 -I "$HERE/json_texts.py" "$UNIT" "$D" 3000 1 > "$D/said" 2>&1 || { cat "$D/said"; bad=1; }
+    rm -rf -- "$D"
+    return $bad
+}
+check "what Python's reader takes of 3000 texts, and gives, is what this one does" t_json_python
+
 summary unit

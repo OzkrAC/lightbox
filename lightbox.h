@@ -591,6 +591,71 @@ typedef struct {
  * with failure and failed_at set. What was made before a failure stays. */
 [[nodiscard]] int tar_read_tree(tar_reader *r, int32_t dirfd);
 
+/* ─── JSON, read (lightbox_json.c, ROADMAP I.4) ─────────────────────────── */
+
+/*
+ * What an image's index, manifest and configuration are written in. A text
+ * is checked whole and strictly, json_check, and then its values are looked
+ * up in it; nothing is built from it, and a value is its bytes in the text,
+ * which has to stay where it is for as long as one is used.
+ */
+#define JSON_TEXT_MAX  ((size_t)1 << 20)    /* the longest text that is read */
+#define JSON_DEPTH_MAX 32                   /* arrays and objects inside one another */
+
+typedef enum { JSON_NULL, JSON_FALSE, JSON_TRUE, JSON_NUMBER, JSON_STRING, JSON_ARRAY, JSON_OBJECT } json_kind;
+
+typedef struct {
+    const char *text;
+    size_t      len;
+} json_value;
+
+/* Why a text is not read, and where: the bytes before the place, its line
+ * from 1, and its column in the line, in bytes and from 1. */
+typedef struct {
+    const char *why;
+    size_t      offset;
+    size_t      line;
+    size_t      column;
+} json_refusal;
+
+/* A text as RFC 8259 has one, and nothing that readers take differently: a
+ * name twice in one object, bytes that are no UTF-8, half a surrogate pair,
+ * \u0000, anything but blanks around the value. 0 and the value the text is,
+ * or -1 and why not. */
+[[nodiscard]] int json_check(const char *text, size_t len, json_value *root, json_refusal *why);
+
+json_kind json_kind_of(json_value v);
+
+/* An array's elements or an object's members, in the order they are written:
+ *   for (bool more = json_first(v, &item); more; more = json_next(&item)) */
+typedef struct {
+    json_value name;    /* of a member, a string; of an element, nothing */
+    json_value value;
+    json_value rest;    /* what follows it in its array or object */
+    bool       named;
+} json_item;
+[[nodiscard]] bool json_first(json_value in, json_item *item);
+[[nodiscard]] bool json_next(json_item *item);
+size_t json_count(json_value v);
+
+/*
+ * The value at a path from v, written as RFC 6901 has a path: "" is v,
+ * "/layers/0/digest" the member digest of the first element of the member
+ * layers; in a name, ~1 stands for / and ~0 for ~. 1 with the value, 0 when
+ * nothing is there, and -1 when an object on the way has a member whose name
+ * is the path's but for the case of its letters: Go's reader of JSON takes
+ * that member for the field, so that the text says two things.
+ */
+[[nodiscard]] int json_at(json_value v, const char *path, json_value *out);
+
+/* What a string says, its escapes resolved, with a NUL: its length, or -1
+ * and an empty text for what is no string or does not fit. */
+[[nodiscard]] int64_t json_text(json_value v, char *out, size_t size);
+[[nodiscard]] bool json_text_is(json_value v, const char *text);
+/* A number written with digits alone, 0 to 2^64 - 1: no sign, no fraction
+ * and no exponent, which is how a size and a version are written. */
+[[nodiscard]] bool json_whole(json_value v, uint64_t *number);
+
 /* ─── Base snapshots (lightbox_base.c) ──────────────────────────────────── */
 
 #define BASE_ID_LEN  12

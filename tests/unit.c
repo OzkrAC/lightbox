@@ -122,6 +122,19 @@
  *                                             "attributes-left <n>", "bytes <n>" and
  *                                             "sha256 <digest>" of what was read; or
  *                                             "failed: <entry>: <why>" and status 1
+ *   unit json-read <file> [<path>...]         json_check of the file's text, of which a byte more
+ *                                             than is read is taken: "ok", or "refused:
+ *                                             <line>:<column>: <why>" and status 1. Then json_at
+ *                                             for each path, written as RFC 6901 has one: "none",
+ *                                             "other case", or the value's kind and what it says:
+ *                                             "string <text>", "number <as written>" with " whole"
+ *                                             after one json_whole takes, "true", "false", "null",
+ *                                             and "array <count>" or "object <count>" with a line
+ *                                             "  <kind>" or "  <name>: <kind>" for each of what
+ *                                             is in it, which json_first and json_next give
+ *   unit json-text <file> <path> <size>       json_text of the value at a path into <size> bytes:
+ *                                             "<length> <text>", or "none"
+ *   unit json-is <file> <path> <text>         json_text_is of it: same or other
  *   unit volspec <spec>                       parse_volume_spec: "<src> -> <dst> ro|rw",
  *                                             or "invalid: <what is wrong>"
  *   unit volumes <root> <spec>... [-- <probe>...]
@@ -806,6 +819,86 @@ struct unit_tar_source {
 static int64_t unit_tar_read(void *from, void *data, size_t len) {
     const struct unit_tar_source *source = from;
     return lc_kernel_read_retry(source->fd, data, source->piece && source->piece < len ? source->piece : len);
+}
+
+/* "unit json-read" and the two beside it: a file's text, checked, or the refusal said and status 1 */
+static char unit_json_bytes[JSON_TEXT_MAX + 1];
+static char unit_json_string[65536];
+
+static json_value unit_json_root(const char *path) {
+    lc_sysret fd = lc_kernel_open_file(path, O_RDONLY, 0);
+    if (fd < 0)
+        die2("unit: cannot open ", path);
+    lc_sysret len = lc_kernel_read_all((int32_t)fd, unit_json_bytes, sizeof(unit_json_bytes));
+    if (len < 0)
+        die2("unit: cannot read ", path);
+    json_value root;
+    json_refusal why;
+    if (json_check(unit_json_bytes, (size_t)len, &root, &why) != 0) {
+        char line[16], column[16];
+        fmt_int(line, (int)why.line);
+        fmt_int(column, (int)why.column);
+        put("refused: ");
+        put(line);
+        put(":");
+        put(column);
+        put(": ");
+        put(why.why ? why.why : "(no reason given)");
+        put("\n");
+        lc_kernel_exit(1);
+    }
+    return root;
+}
+
+static const char *unit_json_kind(json_value v) {
+    switch (json_kind_of(v)) {
+    case JSON_NULL:   return "null";
+    case JSON_FALSE:  return "false";
+    case JSON_TRUE:   return "true";
+    case JSON_NUMBER: return "number";
+    case JSON_STRING: return "string";
+    case JSON_ARRAY:  return "array";
+    case JSON_OBJECT: return "object";
+    }
+    return "(no kind)";
+}
+
+static void unit_json_put(json_value v) {
+    json_kind kind = json_kind_of(v);
+    put(unit_json_kind(v));
+    if (kind == JSON_STRING) {
+        put(" ");
+        put(json_text(v, unit_json_string, sizeof(unit_json_string)) < 0 ? "(cannot be given)" : unit_json_string);
+    } else if (kind == JSON_NUMBER) {
+        uint64_t whole;
+        put(" ");
+        (void)lc_kernel_write_all(STDOUT, v.text, v.len);
+        if (json_whole(v, &whole)) {
+            /* and the number it took is the one that is written */
+            char digits[24];
+            int at = (int)sizeof(digits);
+            digits[--at] = '\0';
+            do { digits[--at] = (char)('0' + whole % 10); whole /= 10; } while (whole);
+            size_t len = sizeof(digits) - 1 - (size_t)at;
+            put(len != v.len || lc_bytes_compare(digits + at, v.text, len) != 0 ? " whole, but another number"
+                                                                                : " whole");
+        }
+    } else if (kind == JSON_ARRAY || kind == JSON_OBJECT) {
+        put(" ");
+        put_int64((int64_t)json_count(v));
+        json_item item;
+        for (bool more = json_first(v, &item); more; more = json_next(&item)) {
+            put("  ");
+            if (item.named) {
+                put(json_text(item.name, unit_json_string, sizeof(unit_json_string)) < 0 ? "(cannot be given)"
+                                                                                         : unit_json_string);
+                put(": ");
+            }
+            put_line("", unit_json_kind(item.value));
+        }
+        return;
+    }
+    put("\n");
 }
 
 int main(int argc, char **argv, char **envp) {
@@ -1725,6 +1818,56 @@ int main(int argc, char **argv, char **envp) {
         put("bytes ");
         put_int64((int64_t)r.bytes);
         put_line("sha256 ", hex);
+        return 0;
+    }
+    if (argc >= 3 && streq(argv[1], "json-read")) {
+        json_value root = unit_json_root(argv[2]);
+        put("ok\n");
+        for (int i = 3; i < argc; i++) {
+            json_value v;
+            int there = json_at(root, argv[i], &v);
+            if (there == 1)
+                unit_json_put(v);
+            else
+                put(there == 0 ? "none\n" : "other case\n");
+        }
+        return 0;
+    }
+    if (argc == 5 && streq(argv[1], "json-text")) {
+        json_value root = unit_json_root(argv[2]), v;
+        int size = number_arg(argv[4]);
+        if (size < 0 || size > (int)sizeof(unit_json_string))
+            die("unit: json-text takes 0 to 65536 bytes");
+        if (json_at(root, argv[3], &v) != 1) {
+            put("none\n");
+            return 0;
+        }
+        /* a byte after what it may write into, which has to stay */
+        if (size < (int)sizeof(unit_json_string))
+            unit_json_string[size] = '#';
+        int64_t len = json_text(v, unit_json_string, (size_t)size);
+        if (size < (int)sizeof(unit_json_string) && unit_json_string[size] != '#')
+            die("unit: json_text wrote past its size");
+        if (len < 0) {
+            if (size > 0 && unit_json_string[0] != '\0')
+                die("unit: json_text left a text it refused");
+            put("none\n");
+            return 0;
+        }
+        char digits[16];
+        fmt_int(digits, (int)len);
+        put(digits);
+        put(" ");
+        put_line("", unit_json_string);
+        return 0;
+    }
+    if (argc == 5 && streq(argv[1], "json-is")) {
+        json_value root = unit_json_root(argv[2]), v;
+        if (json_at(root, argv[3], &v) != 1) {
+            put("none\n");
+            return 0;
+        }
+        put(json_text_is(v, argv[4]) ? "same\n" : "other\n");
         return 0;
     }
     if (argc == 3 && streq(argv[1], "sha256-name")) {
