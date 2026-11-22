@@ -4,7 +4,7 @@ What changed for someone who uses lightbox, newest first. `ROADMAP.md` has the r
 
 ## 0.9.0
 
-Phase 9 of the roadmap: packages. lightbox is something that is installed, and not only built: a release holds a `.deb` for Debian and Ubuntu and an `.xbps` for Void Linux, each for x86_64 and aarch64, with a source archive that builds without a network, the SHA-256 sums of all of them, and a signed record of the run that built each. With them come a manual page, a licence, which is MIT, the documentation in `docs/`, and `SECURITY.md`. Two fixes that writing the documentation found change what lightbox does on a host, and are the first two entries below: it no longer turns IPv4 forwarding on where it makes no firewall rules, and it no longer reads its settings from a home directory.
+Phase 9 of the roadmap: packages. lightbox is something that is installed, and not only built: a release holds a `.deb` for Debian and Ubuntu and an `.xbps` for Void Linux, each for x86_64 and aarch64, with a source archive that builds without a network, the SHA-256 sums of all of them, and a signed record of the run that built each. With them come a manual page, a licence, which is MIT, the documentation in `docs/`, and `SECURITY.md`. Two fixes that writing the documentation found change what lightbox does on a host, and are the first two entries below: it no longer turns IPv4 forwarding on where it makes no firewall rules, and it no longer reads its settings from a home directory. Nothing in this release changes how a container starts or stops: on GitHub's runners a start took a median of 13.5 ms on x86_64 and 17.3 ms on aarch64 in the run of the release commit, and 11.7 and 16.6 in the run before it, which is how far two runs of one binary differ there.
 
 ### Changes you may have to act on
 
@@ -20,7 +20,7 @@ Phase 9 of the roadmap: packages. lightbox is something that is installed, and n
 - **A manual page.** `lightbox(8)` lists the commands and their options, and `make install` puts it in `$(PREFIX)/share/man/man8`.
 - **`make dist`** makes `lightbox-<version>.tar.gz`: every file that is committed, with lightc's at the commit lightbox pins in their place, so that it builds with `make` and no network, which the archive a hosting site makes of a tag does not. The same commit gives the same archive. CI makes it at every run, twice, and builds lightbox from where it was unpacked.
 - **A licence.** lightbox is under the MIT licence, as lightc is: `LICENSE`.
-- **Documentation**, in `docs/`: ten pages on getting started, every command, the configuration, storage, the network, the sandbox, agent boxes, how lightbox works and what to do when something is wrong. They are Luccet notes, which a browser renders, and describe this release.
+- **Documentation**, in `docs/`: ten pages on getting started, every command, the configuration, storage, the network, the sandbox, agent boxes, how lightbox works and what to do when something is wrong. They are Luccet notes, which a browser renders, and describe this release. They are published at [ozkr.ac/lightbox](https://ozkr.ac/lightbox/), and README names that address.
 - **`SECURITY.md`**: what lightbox counts as a security problem, and where one is reported, which is in private, through GitHub's vulnerability reporting for the repository, and not in the public issues.
 
 ### Changed
