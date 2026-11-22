@@ -1,4 +1,4 @@
-<!doctype html><html lang="en"><meta charset="utf-8"><title>Getting started · lightbox</title><meta name="description" content="From a clone of lightbox to a running container: what the host needs, building and installing, a base root filesystem, the host's network, a first container and an init hook that starts its services."><script src="https://cdn.luccet.dev/v2.0.0/luccet.js"></script>
+<!doctype html><html lang="en"><meta charset="utf-8"><title>Getting started · lightbox</title><meta name="description" content="From a package of lightbox, or a clone, to a running container: what the host needs, installing a package or building, a base root filesystem, the host's network, a first container and an init hook that starts its services."><script src="https://cdn.luccet.dev/v2.0.0/luccet.js"></script>
 
 :::use
 https://cdn.luccet.dev/themes/v1.0.0/classic.css
@@ -13,7 +13,7 @@ docs.css
 # Getting started {#top}
 
 {.brief}
-From a clone to a running container: what the host needs, building and installing, a base root filesystem, the host's network, a first container, and an init hook that starts its services.
+From a package, or a clone, to a running container: what the host needs, installing a package or building, a base root filesystem, the host's network, a first container, and an init hook that starts its services.
 
 ::toc
 
@@ -37,7 +37,59 @@ Three things are needed only by what uses them:
 - **Linux 5.12 and a filesystem with idmapped mounts**, such as ext4, xfs or btrfs, for `--userns`; **Linux 5.19** for a container that has both `--userns` and an overlay, which a box of the agent profile has ([Security](security.html#userns)).
 - **A range of ids for the name `lightbox`** in `/etc/subuid` and `/etc/subgid`, for `--userns` too.
 
-Once lightbox is built, `lightbox doctor` checks all of this on the host it runs on, and follows each check that fails with what fixes it. `lightbox doctor --profile agent` checks what a box of the agent profile needs as well. [Troubleshooting](troubleshooting.html#doctor) explains every line it prints.
+Once lightbox is installed or built, `lightbox doctor` checks all of this on the host it runs on, and follows each check that fails with what fixes it. `lightbox doctor --profile agent` checks what a box of the agent profile needs as well. [Troubleshooting](troubleshooting.html#doctor) explains every line it prints.
+
+## Installing a package {#packages}
+
+A [release](https://github.com/OzkrAC/lightbox/releases) of lightbox holds it as a package for Debian and Ubuntu and for Void Linux, each for x86_64 and aarch64. With one of these the next two sections, on building, are not needed.
+
+{.ref}
+| For | The file of release 0.9.0 |
+|---|---|
+| Debian and Ubuntu, x86_64 | `lightbox_0.9.0-1_amd64.deb` |
+| Debian and Ubuntu, aarch64 | `lightbox_0.9.0-1_arm64.deb` |
+| Void Linux with glibc | `lightbox-0.9.0_1.x86_64.xbps`, `lightbox-0.9.0_1.aarch64.xbps` |
+| Void Linux with musl | `lightbox-0.9.0_1.x86_64-musl.xbps`, `lightbox-0.9.0_1.aarch64-musl.xbps` |
+| Building it yourself | `lightbox-0.9.0.tar.gz`, the source with lightc's inside, which builds with `make` and no network |
+
+The release has `SHA256SUMS` too, with the SHA-256 of each of its files. Check what you downloaded, in the directory it is in:
+
+```sh
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+GitHub also keeps a signed record of the run that built each file, and its command line checks a download against it: `gh attestation verify <file> --repo OzkrAC/lightbox`.
+
+On Debian and Ubuntu, `apt` installs the file, and `iptables` with it where neither that nor `nftables` is installed:
+
+```sh
+sudo apt install ./lightbox_0.9.0-1_amd64.deb
+```
+
+On Void Linux, xbps installs from a repository, and a directory with an index is one:
+
+```sh
+xbps-rindex -a lightbox-0.9.0_1.*.xbps
+sudo xbps-install --repository="$PWD" lightbox
+```
+
+{.ref}
+| Path | Mode | What it is |
+|---|---|---|
+| `/usr/bin/lightbox` | 0755 | The binary |
+| `/usr/share/man/man8/lightbox.8` | 0644 | The manual page, `man lightbox`; in the `.deb` it is compressed, as `lightbox.8.gz` |
+| `/etc/lightbox/lightbox.conf` | 0644 | A copy of `lightbox.conf.example`, in which every setting is a comment that shows its default. It is a configuration file to the package manager: one that you changed is kept when the package is updated |
+| `/var/lib/lightbox/` | 0700 | `lightbox_dir`, where lightbox keeps its data |
+| `/var/lib/lightbox/rootfs/` | 0755 | The default base, empty until you put a root filesystem there |
+| `/var/lib/lightbox/containers/` | 0700 | `container_dir`, with a directory for each container |
+
+A package starts nothing and changes nothing else on the host: lightbox has no daemon, and the host's network is made by [`lightbox setup`](#setup), further down. Removing the package, with `apt remove` or `xbps-remove`, takes the binary and leaves the containers and the bases in `/var/lib/lightbox`.
+
+:::note[The packages are lightbox's own]
+They are built by lightbox's continuous integration, which installs each one and runs the container suite with the binary of the `.deb`. lightbox is in no distribution's repository, so no package manager finds a newer release by itself: a newer package is downloaded and installed as the first was, over it.
+:::
+
+Go on with [a base root filesystem](#rootfs).
 
 ## Building {#build}
 
@@ -67,7 +119,7 @@ The submodule is the only copy that `make` configures and builds itself. A tree 
 
 `make check` runs everything that can be checked without root: the system call numbers and structures against the kernel's headers, the compiler's analyzer, and the unit, validation and seccomp suites. One more suite starts real containers and needs root. [How it works](internals.html#tests) describes each.
 
-## Installing {#install}
+## Installing what was built {#install}
 
 lightbox runs from the directory it was built in, as `./lightbox`. To install it:
 
@@ -79,16 +131,18 @@ sudo make install
 | Path | Mode | What it is |
 |---|---|---|
 | `/usr/local/bin/lightbox` | 0755 | The binary |
+| `/usr/local/share/man/man8/lightbox.8` | 0644 | The manual page: `man lightbox` |
 | `/etc/lightbox/` | 0755 | The directory of the configuration |
 | `/etc/lightbox/lightbox.conf` | 0644 | A copy of `lightbox.conf.example`, in which every setting is a comment that shows its default. A file that is there already is left as it is |
 | `/var/lib/lightbox/` | 0700 | `lightbox_dir`, where lightbox keeps its data |
 | `/var/lib/lightbox/rootfs/` | 0755 | The default base, empty until you put a root filesystem there |
 | `/var/lib/lightbox/containers/` | 0700 | `container_dir`, with a directory for each container |
-| `/run/lightbox/` | 0755 | `run_dir`, the records of the containers that run. A reboot takes it, and the next `start` makes it again |
 
-`PREFIX` (`/usr/local`) or `BINDIR` moves the binary, and `DESTDIR` is put in front of every path, for packaging. `CONFDIR`, `DATADIR` and `RUNDIR` say where `make install` makes the other directories, and nothing more: the paths that lightbox uses are its own defaults and the settings of `lightbox.conf`, so data elsewhere needs the settings of [Configuration](configuration.html#settings), and a configuration elsewhere needs `--config` or `LIGHTBOX_CONFIG` to name it.
+That is what a package holds, under `/usr/local` in place of `/usr`. `run_dir`, `/run/lightbox`, with the records of the containers that run, is not in the list: it is on a tmpfs, which a reboot empties, and `setup` and `start` make it.
 
-`sudo make uninstall` removes the binary and leaves the configuration, the containers and the bases.
+`PREFIX` (`/usr/local`) moves the binary and the manual page, or `BINDIR` and `MANDIR` each by itself, and `DESTDIR` is put in front of every path, for packaging. `CONFDIR` and `DATADIR` say where `make install` makes the other directories, and nothing more: the paths that lightbox uses are its own defaults and the settings of `lightbox.conf`, so data elsewhere needs the settings of [Configuration](configuration.html#settings), and a configuration elsewhere needs `--config` or `LIGHTBOX_CONFIG` to name it.
+
+`sudo make uninstall` removes the binary and the manual page, and leaves the configuration, the containers and the bases.
 
 The rest of this page writes `lightbox` for the installed binary and runs it as root: in a root shell, or with `sudo` in front.
 
@@ -137,8 +191,8 @@ lightbox setup
 It makes:
 
 - A bridge, `br0`, with the address `gw` and the prefix of `subnet`: `10.0.0.1/24` unless `lightbox.conf` says otherwise.
-- lightbox's firewall rules, in chains of its own that are reached from the top of `FORWARD` and `POSTROUTING`, or with `firewall_backend = nftables` in two tables of its own.
-- IPv4 forwarding, if it was off, with the `FORWARD` policy set to DROP, as Docker does. With nftables `setup` does not turn forwarding on: when it is off, `setup` stops before it changes anything and says what to do.
+- lightbox's firewall rules, in chains of its own that are reached from the top of `FORWARD`, `INPUT` and `POSTROUTING`, or with `firewall_backend = nftables` in two tables of its own.
+- IPv4 forwarding, if it was off, with the `FORWARD` policy set to DROP, as Docker does. With nftables `setup` does not turn forwarding on: when it is off, `setup` stops before it changes anything and says what to do. With `firewall = false` in `lightbox.conf` lightbox makes no rules, and leaves forwarding as it is too ([Networking](networking.html#firewall-false)).
 - cgroup v2, mounted at `cgroup_root` if that is an empty directory.
 
 It also restricts `lightbox_dir` and `container_dir` to their owner, mode 0700, and says so when it had to.

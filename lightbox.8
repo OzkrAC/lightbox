@@ -330,8 +330,14 @@ Take a new snapshot of a base, for the containers made after it.
 Remove snapshots that no container uses.
 .TP
 .B setup
-Make the host's side of the network: the bridge, lightbox's firewall rules,
-and IPv4 forwarding.
+Make the host's side of the network: the bridge and lightbox's firewall
+rules.
+With iptables it also turns IPv4 forwarding on, unless
+.B firewall
+or
+.B ip_forward
+is false in
+.IR lightbox.conf .
 Every
 .B start
 does the same when something of it is missing.

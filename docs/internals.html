@@ -398,8 +398,11 @@ A wrong number does not fail to build; it calls another system call. So `make ch
 | `lightbox_devices.h` | The devices of a container's `/dev` as one table, and the cgroup device program made from it |
 | `lightbox_sys.h` | The private system call numbers, constants and wrappers |
 | `lightbox.conf.example` | Every setting with its built-in value, which `make install` puts in `/etc/lightbox` |
+| `lightbox.8` | The manual page, which `make install` puts in `man8` |
 | `contrib/proxy/` | A Squid configuration for containers of `--net proxy` |
 | `tests/`, `bench/` | The suites below, and the timing script |
+| `packaging/` | What builds the `.deb` and the `.xbps`, and writes the notes of a release |
+| `docs/` | These pages |
 | `lightc/` | lightc, pinned as a git submodule |
 
 Two rules run through the code. No text is ever cut to fit: a path, a name or a value that is too long is refused where it is read, with the option or the setting named, as the first part of it would be the name of something else. And what a container could have written is handled as that: its `.conf` is in a directory of root's alone, outside its root; its account files are read only by a process whose root is the container's; and `create` and `reset` write into its root only by names looked up inside it.
@@ -418,6 +421,10 @@ lightbox is C23, compiled freestanding and linked statically against lightc and 
 | `-fstack-clash-protection`, `-ftrivial-auto-var-init=zero`, and on x86_64 `-fcf-protection=full` | Hardening that needs no runtime support, each where the compiler has it |
 | `-fno-stack-protector` | The stack protector needs a canary that lightc does not set up yet |
 | `-mno-outline-atomics`, on aarch64 | No calls into a runtime library for atomic operations |
+
+`CFLAGS` and `LDFLAGS`, on make's command line or in the environment, are added to these, which is how a distribution's package build hands over its flags. What lightbox needs comes after them and holds whatever they say: a freestanding, static program, without a stack protector and without link-time optimisation. The `lightc/` submodule is built as lightc builds itself, whatever flags `make` was given. `make STRIP=true` leaves the symbols in, for a package build that strips by its own means.
+
+`make dist` makes `lightbox-<version>.tar.gz`: every file that is committed, with lightc's at the pinned commit in their place, so that the archive builds with `make` and no network. The same commit gives the same archive, byte for byte.
 
 [Getting started](guide.html#build) has the commands, and where `make` looks for lightc.
 
@@ -471,8 +478,13 @@ The suite does not use the host, and leaves nothing on it. It runs itself again 
 | Checks (aarch64) | `ubuntu-24.04-arm`, GCC 14 | `make`, then `make check`, natively: an emulator would refuse to install a seccomp filter |
 | Lifecycle suite, six times on each of x86_64 and aarch64 | `ubuntu-24.04` and `ubuntu-24.04-arm` | `sudo make test-lifecycle` on the suite's own image as it is; with `LIGHTBOX_TEST_USERNS=overlay`; with `=copy`; with `LIGHTBOX_TEST_SECCOMP=deny`; and on the Alpine and the Debian image that `tests/fetch_image.sh` fetches. The job on the suite's own image runs `sudo make bench` afterwards |
 | Cross-build for aarch64 | `ubuntu-24.04` | `make CC=aarch64-linux-gnu-gcc`, and a look that the result is a static aarch64 executable |
+| `.deb`, on each of x86_64 and aarch64 | `ubuntu-24.04` and `ubuntu-24.04-arm` | `packaging/build-deb.sh`; lintian, of which an error or a warning without an answer fails the job; an install with `apt` on the runner and in containers of Debian 12 and 13; the lifecycle suite with `/usr/bin/lightbox` of the package; a removal and a purge |
+| `.xbps`, on each of x86_64 and aarch64 | Void Linux's container image, on the same two runners | `packaging/build-xbps.sh`, an install with `xbps-install` from the directory the packages are in, a look at what was installed, and a removal |
+| Source archive | `ubuntu-24.04` | `make dist` twice, with the two archives compared, and a build and a `make install` from where one was unpacked, which is no git checkout |
+
+The three kinds of package job are `.github/workflows/packages.yml`, which `ci.yml` calls. `.github/workflows/release.yml` calls it too, for a tag that is the version of `lightbox.h` with a `v` before it: it then writes `SHA256SUMS`, has GitHub record where each file was built, and makes a draft release with the files, which the maintainer publishes.
 
 Under GitHub Actions the runner writes annotations, which a run's summary page lists without opening a log: each suite's totals as a notice that names every case it skipped, each failed case as an error with the first and the last lines of its output, and for expected failures the last line each printed, so that a reader can see that it fails for the reason its name gives. The timing is a notice of its own. A job that fails prints the end of the kernel log.
 
 {.source}
-Source: `lightbox.c` for the commands and init; `lightbox_state.c` for records, states and locks; `lightbox_base.c`, `lightbox_container.c`, `lightbox_util.c`, `lightbox_net.c` and `lightbox_userns.c` for what they call; `lightbox_sys.h`; the `Makefile`; `tests/lib.sh` and the heads of the suites; `.github/workflows/ci.yml`.
+Source: `lightbox.c` for the commands and init; `lightbox_state.c` for records, states and locks; `lightbox_base.c`, `lightbox_container.c`, `lightbox_util.c`, `lightbox_net.c` and `lightbox_userns.c` for what they call; `lightbox_sys.h`; the `Makefile`; `tests/lib.sh` and the heads of the suites; `.github/workflows/ci.yml`, `packages.yml` and `release.yml`; `packaging/README.md`.

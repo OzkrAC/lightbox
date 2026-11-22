@@ -58,11 +58,11 @@ The three directories and each container's directory are mode 0700, and lightbox
 {.ref}
 | Path | What it is, and what makes it |
 |---|---|
-| `<lightbox_dir>` | Mode 0700. `setup` makes it, and restricts one that is there to 0700 and says so; `make install` makes it too |
+| `<lightbox_dir>` | Mode 0700. `setup` makes it, and restricts one that is there to 0700 and says so; `make install` and the packages make it too |
 | `<lightbox_dir>/audit.log` | Mode 0600, made by the first `exec` or `run`. Two lines for every `exec`, appended; never rotated ([the audit log](commands.html#audit-log)) |
 | `<lightbox_dir>/bases/<id>/` | Mode 0700, made by `create` and by `base add`. A snapshot: `rootfs/` with the copy of the base, `source` with the base's path, and `taken` with the time as seconds and nanoseconds since 1970. It is made as `.<id>.new` and renamed when it is whole |
-| `<lightbox_dir>/rootfs/` | The default of the `rootfs` setting, which `make install` makes, empty. Nothing of lightbox's writes to a base |
-| `<container_dir>` | Mode 0700, made by `setup` and by `make install`. `create` does not make it |
+| `<lightbox_dir>/rootfs/` | The default of the `rootfs` setting, which `make install` and the packages make, empty. Nothing of lightbox's writes to a base |
+| `<container_dir>` | Mode 0700, made by `setup`, by `make install` and by the packages. `create` does not make it |
 | `<container_dir>/<name>/` | Mode 0700, made by `create`. `rm` removes it whole |
 | `…/rootfs/` | The container's own files, made by `create` and made anew by `reset`. With `--userns` the directory of an overlay belongs to the container's root, the first uid and gid of its range on the host |
 | `…/.work/`, `…/.merged/` | Mode 0700, for an overlay only, made by `create` and made anew by `reset`. `.merged/` is empty on the host |
@@ -75,7 +75,7 @@ The three directories and each container's directory are mode 0700, and lightbox
 | `<run_dir>/.forwarding` | Written by `setup` when it turns IPv4 forwarding on: `on`, or `on drop` when it set the `FORWARD` policy too, for `setup --teardown` to say what stays changed |
 | `<run_dir>/<name>/` | Mode 0700 and its files 0600, made by `start`. They are written without waiting for a disk, and taken away when the container is stopped: a container without them is stopped ([How it works](internals.html#records)) |
 
-`make install` makes `/var/lib/lightbox` and its `containers/` mode 0700, `rootfs/` in it and `/run/lightbox` mode 0755, and `/etc/lightbox` with the example `lightbox.conf` if none is there. `setup` then makes the three directories that are missing, each by itself and not the ones above it, and restricts `/run/lightbox` to 0700.
+`make install`, and a package, make `/var/lib/lightbox` and its `containers/` mode 0700, `rootfs/` in it mode 0755, and `/etc/lightbox` with the example `lightbox.conf` if none is there. Neither makes `run_dir`: `/run` is a tmpfs, which a reboot empties, so it is made by what runs after one. `setup` makes each of the three directories that is missing, `lightbox_dir`, `container_dir` and `run_dir`, by itself and not the ones above it, mode 0700, and restricts one that is there with another mode, as the `/run/lightbox` that `make install` made before 0.9.
 
 A few things are not in the list because they are not files of lightbox's:
 

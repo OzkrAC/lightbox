@@ -41,7 +41,7 @@ Three things hold throughout:
 - **Nothing happens in the background.** lightbox has no daemon. A container's PID 1 is lightbox itself, which reaps what the container leaves, keeps its lifetime and shuts it down. What is known about a container is in files: its configuration under `container_dir`, and its state under `run_dir` while it runs. [How it works](internals.html) follows a container from `create` to `rm`.
 - **The kernel is the only library.** lightbox is linked against lightc and nothing else, and it sets up namespaces, mounts, cgroups and the network with system calls of its own. On the host it runs a few tools and no others: `iptables` with `iptables-restore`, or `nft`, for the firewall, and `cp` and `rm` for a container's files. Nothing from an image runs before its `/init.sh`.
 
-lightbox runs on Linux. On macOS it runs in a Linux virtual machine, and on Windows in WSL2.
+lightbox runs on Linux. On macOS it runs in a Linux virtual machine, and on Windows in WSL2. A [release](https://github.com/OzkrAC/lightbox/releases) holds it as a package for Debian and Ubuntu and for Void Linux, and as source that builds with `make`; it is under the MIT licence.
 
 ## What a container is {#container}
 
@@ -61,7 +61,7 @@ A container with `--profile agent` is a *box*: a container set up to hold an AI 
 
 :::div{.cards cols="1 1"}
 ### [Getting started](guide.html)
-Building and installing lightbox, a base root filesystem, the host's network, a first container, and the init hook that starts its services.
+Installing lightbox from a package, or building it, a base root filesystem, the host's network, a first container, and the init hook that starts its services.
 +++
 ### [Commands](commands.html)
 Every command, with its options, the values they take, what it prints, its exit statuses, and the JSON that `ls`, `inspect` and `doctor` give to programs.

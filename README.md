@@ -37,7 +37,22 @@ The Makefile looks for lightc in `LIGHTC=`, then in the `lightc/` submodule, the
 
 ### Packages
 
-`packaging/build-deb.sh` builds lightbox as a `.deb` on Debian or Ubuntu, and `packaging/build-xbps.sh` as an `.xbps` on Void Linux, for the machine's architecture. A package holds what `make install` installs. CI builds both on every run, for x86_64 and aarch64, installs each, and keeps them as the run's artifacts. From 0.9.0 on a release holds them, with the source archive and the SHA-256 sums of all of them. [packaging/README.md](packaging/README.md) has the details.
+From 0.9.0 on a [release](https://github.com/OzkrAC/lightbox/releases) holds lightbox as a `.deb`, for Debian and Ubuntu, and as an `.xbps`, for Void Linux with glibc and with musl, each for x86_64 and aarch64, with the source archive and `SHA256SUMS`, the SHA-256 of every file. In the directory the download is in:
+
+```sh
+sha256sum --check --ignore-missing SHA256SUMS
+
+# Debian, Ubuntu
+sudo apt install ./lightbox_0.9.0-1_amd64.deb
+
+# Void Linux
+xbps-rindex -a lightbox-0.9.0_1.*.xbps
+sudo xbps-install --repository="$PWD" lightbox
+```
+
+A package holds what `make install` installs, under `/usr`, and starts nothing: `lightbox doctor` says what the host lacks, and `sudo lightbox setup` makes the network. The packages are lightbox's own and in no distribution's repository, so a newer release is downloaded and installed the same way. GitHub keeps a signed record of the run that built each file, which `gh attestation verify <file> --repo OzkrAC/lightbox` checks a download against.
+
+`packaging/build-deb.sh` builds the `.deb` on Debian or Ubuntu, and `packaging/build-xbps.sh` the `.xbps` on Void Linux, for the machine's architecture. CI builds both on every run, for x86_64 and aarch64, installs each, and keeps them as the run's artifacts. [packaging/README.md](packaging/README.md) has the details.
 
 `make dist` makes `lightbox-<version>.tar.gz`: the sources with lightc's inside, which build with `make` and no network.
 
