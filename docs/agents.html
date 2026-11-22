@@ -1,0 +1,432 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><title>Agent boxes · lightbox</title><meta name="description" content="The agent profile of lightbox: a box that holds an AI agent's working session and takes every command for possibly hostile. What the profile turns on and refuses, a workspace, time limits, run, reset and a lifetime, the audit log, and the two places a harness can run."><script src="https://cdn.luccet.dev/v2.0.0/luccet.js"></script>
+
+:::use
+https://cdn.luccet.dev/themes/v1.0.0/classic.css
+https://cdn.luccet.dev/themes/v1.0.0/github.css
+https://cdn.luccet.dev/code/v1.0.0/code.js
+lightbox-docs.js
+docs.css
+:::
+
+::site-nav
+
+# Agent boxes {#top}
+
+{.brief}
+A box is a container that holds an AI agent's working session and takes every command for possibly hostile. `--profile agent` turns on with one switch what lightbox has for that. This page says what the profile is, what it keeps a command from and where that ends, and how a harness drives a box.
+
+::toc
+
+## The profile {#profile}
+
+An AI agent runs commands, and text it reads, a web page or a file in a repository, can steer which ones. A box for an agent's session therefore treats every command as one that may have been written by someone else: one that sends files out, damages what it can write, runs without end, or tries the kernel.
+
+`--profile agent` is an option of [`create`](commands.html#create) and of [`run`](commands.html#run), and `agent` is the only profile there is. It gives a box what each of the following options would, and writes each under its own key in the box's `.conf`:
+
+{.ref}
+| The box gets | As if it were given | Its `.conf` has |
+|---|---|---|
+| A user namespace: its uid 0 is an unprivileged uid of the host's | `--userns` | `userns=1`, `uid_start=`, `gid_start=` |
+| The allow-list seccomp filter | `--seccomp allow`, which every new container has | `seccomp=allow` |
+| A root that is an overlay of its base | no `--copy` | `base=<id>` |
+| No network: loopback alone | `--net none`, unless `--net outside` or `--net proxy:<port>` is given | `net=none` |
+| 2 GB of memory | `--mem`, with the value of [`agent_mem`](configuration.html#conf-agent_mem) | `mem=2G` |
+| 512 processes | `--pids`, with the value of [`agent_pids`](configuration.html#conf-agent_pids) | `pids=512` |
+| 2 CPUs | `--cpu`, with the value of [`agent_cpu`](configuration.html#conf-agent_cpu) | `cpu=2` |
+| A lifetime of 8 hours from each start | `--ttl`, with the value of [`agent_ttl`](configuration.html#conf-agent_ttl) | `ttl=8h` |
+
+The four limits come from the `agent_*` settings of `lightbox.conf`, whose built-in values are the ones above, and only where no option gives the box that limit: `--mem 4G` on the command line is the box's memory limit, whatever `agent_mem` says. `agent_ttl = none` gives a box of the profile no lifetime unless `--ttl` gives it one. A setting that cannot be used, such as `agent_mem = lots`, is warned about by every command, and stops the `create` of a box that would have needed it:
+
+```text
+Error: agent_mem: this setting of lightbox.conf cannot be used, and no option gave the box of --profile agent that limit
+```
+
+### What it refuses {#profile-refuses}
+
+An option that would undo the profile ends `create` with the option named, and nothing is made:
+
+{.ref}
+| Option | What `create` says |
+|---|---|
+| `--privileged` | `Error: --profile agent refuses --privileged` |
+| `--link <name>` | `Error: --profile agent refuses --link` |
+| `--net nat` | `Error: --profile agent refuses --net nat` |
+| `--seccomp deny` | `Error: --profile agent refuses --seccomp deny` |
+| `--copy` | `Error: --profile agent refuses --copy: its root is an overlay of its base` |
+
+Every other option of `create` is taken as it is given. `--read-only` and a `--vol` are the box's as they are any container's, and `--mem`, `--pids`, `--cpu` and `--ttl` replace the profile's own values, whether they are smaller or larger. A box with `--net none` has no address, so an address on the command line is refused, as it is for any container without a network.
+
+### What the box records {#profile-conf}
+
+A box that was made with `--profile agent --workspace /home/you/agent-work` and nothing else has a `.conf` such as this one, in which the three ids are examples:
+
+```ini
+version=1
+mem=2G
+pids=512
+cpu=2
+oom_score=500
+seccomp=allow
+net=none
+userns=1
+uid_start=2147483647
+gid_start=2147483647
+base=1f0c9a7d52e3
+ttl=8h
+id=8c1f0e7a5d3b2a19
+profile=agent
+workdir=/workspace
+vol=/home/you/agent-work:/workspace
+```
+
+`profile=agent` says how the box was made, and [`inspect`](commands.html#inspect) shows it as `profile: agent`. Nothing reads it to decide what the box may do: each setting is in the file under its own key, and a start goes by those. A later release that changes what the profile means, or a change of the `agent_*` settings, therefore changes the boxes made after it and none that is there. [A container's `.conf`](configuration.html#container-conf) has every key.
+
+### What it needs {#profile-needs}
+
+- **Root.** `create --profile agent` gives out a range of host ids, which only root may: `Error: lightbox create --profile agent must be run as root`. `run` needs root in any case.
+- **A range of ids** for the name `lightbox` in `/etc/subuid` and in `/etc/subgid`. Each box takes 65536 uids and 65536 gids of it for as long as it exists. [User namespaces](security.html#userns) says how to add one.
+- **Linux 5.19 or later**, for an overlay on an idmapped layer, and a filesystem with idmapped mounts, such as ext4, xfs or btrfs, under `lightbox_dir` and `container_dir`. An ordinary `--userns` container can fall back on `--copy` with Linux 5.12; a box of the profile cannot, as the profile refuses `--copy`.
+
+[`doctor --profile agent`](#doctor) checks all three, and says what to do about each that is missing.
+
+## What it defends against {#defends}
+
+The likeliest first.
+
+- **Sending files or credentials out.** A box of the profile has [`--net none`](networking.html#net-none) unless it is given another network: loopback, and no interface, address or rule besides. With [`--net proxy:<port>`](networking.html#net-proxy) it reaches one TCP port of the gateway and no name server, so what leaves it is what a proxy on the host lets through, to the names on the proxy's list, and a lookup cannot carry data out. Credentials stay outside the box, with a harness outside it or with a proxy that adds them to requests. They are never mounted in the box or given to it in its environment: a key the box can read is a key it can send wherever it can reach, or leave in its workspace.
+- **Damaging what it can write.** Its root is an overlay of its base, and [`reset`](storage.html#reset) makes it the base's again without copying anything. On the host it writes in [its workspace](#workspace) alone, as the workspace's owner and not as root.
+- **Running away with resources.** [Limits](security.html#limits) on memory, processes and CPU, a [lifetime](#ttl) after which the box stops by itself, and [`exec --timeout`](#timeouts), which ends a command and everything it started.
+- **Reaching the host.** Its uid 0 is an unprivileged uid of the host's ([user namespaces](security.html#userns)), the [allow-list seccomp filter](security.html#seccomp) answers every system call it does not name with `ENOSYS`, it has the 11 [capabilities](security.html#capabilities) of any container, within its own user namespace only, and the [device filter](security.html#devices) keeps it to its own `/dev`. The options that would open any of this are the ones the profile refuses.
+- **Doing it unseen.** Every `exec` and every `run` is in the [audit log](commands.html#audit-log) of the host, with its arguments, its status and how long it took. No box has the log mounted, so what runs in a box can neither read it nor change it.
+
+## Where it stops {#stops}
+
+:::warning[The kernel is the host's]
+A box is a container. A flaw in the kernel that a system call on the allow-list reaches is a way out of it, and no profile rules that out.
+:::
+
+- **The kernel is shared.** Code from third parties you do not trust, such as a repository you have not read, a package nobody has reviewed or an agent that browses the web, belongs in a virtual machine with lightbox inside it, so that a way out of a box ends in the machine and not on your host. That is also how lightbox runs on macOS, in a Linux virtual machine, and on Windows, in WSL2. Keep the host's kernel up to date in either case: the box is as good as the kernel under it.
+- **The workspace comes back untrusted.** What the box wrote in it runs when its owner runs it: git runs the hooks in `.git/hooks` and the commands that `.git/config` names, `make` runs its Makefile, `npm` and `pip` run the scripts of a package, and an editor runs the tasks of a folder. Read what changed before anything on the host builds, opens or runs it, and give a box whose task does not need the history a workspace without its `.git`.
+- **What a proxy lets through.** A name on the proxy's list is a way out for anything that is sent to it, and an API that the box may use with a key is one it may use for its own ends. Keep the list short, and the keys that reach the box's requests ones that you can revoke.
+- **A lifetime is a guard, not a boundary.** The box's own init keeps `--ttl`, inside the box. No process there can stop it from doing so, but a kernel flaw past the sandbox could. `exec --timeout` is kept from outside the box.
+- **Whoever drives the box is root on the host.** `exec` and `run` need root, so a harness that may run `lightbox` may do anything. Run nothing else with that right, and see [what the threat model leaves to you](security.html#not-covered).
+
+## Checking the host {#doctor}
+
+Run `doctor --profile agent` as root before the first box, and again after a kernel update or after `lightbox_dir` moved to another filesystem:
+
+```sh
+sudo lightbox doctor --profile agent
+```
+
+It makes every check of [`doctor`](troubleshooting.html#doctor), and five more for the profile. On a host that has everything they read as follows, with the host's own kernel release, number of ranges and paths, and `doctor` exits with 0:
+
+```text
+agent.kernel: yes (7.0.0-1017-azure; the profile needs Linux 5.19 or later, for an overlay on an idmapped layer)
+agent.userns_ranges: yes (32768 ranges of 65536 ids, one for each box)
+agent.idmap: yes (/var/lib/lightbox/bases and /var/lib/lightbox/containers)
+agent.nft: ok (/usr/sbin/nft)
+agent.cgroup_kill: yes (/sys/fs/cgroup/lightbox/cgroup.kill)
+```
+
+{.ref}
+| Check | What it looks for |
+|---|---|
+| `agent.kernel` | Linux 5.19 or later |
+| `agent.userns_ranges` | At least one range of 65536 ids for `lightbox` in `/etc/subuid` and in `/etc/subgid` |
+| `agent.idmap` | That the filesystems under the snapshots and under the containers take an idmapped mount, tried with a mount that is never attached |
+| `agent.nft` | The `nft` program, which filters a box's traffic at the bridge with `firewall_backend = nftables` |
+| `agent.cgroup_kill` | `cgroup.kill`, with which `exec --timeout` and `stop` end everything a box started at once |
+
+A check that fails is followed by a line that begins with `to fix:`, and `doctor` then exits with 1. [The checks of the agent profile](troubleshooting.html#agent-checks) has each of them with everything it can say.
+
+## A workspace {#workspace}
+
+`--workspace <dir>` gives a box one directory of the host's, at `/workspace`, and makes it the directory every command runs in:
+
+```sh
+mkdir -p ~/agent-work
+sudo lightbox create agent --profile agent --workspace ~/agent-work
+```
+
+It is an option of `create` and of `run`, with the profile or without it, and it does two things, both of which the `.conf` keeps:
+
+- **A volume.** The directory is bound at `/workspace`, read-write, as [`--vol <dir>:/workspace`](storage.html#volumes) would bind it: `vol=<dir>:/workspace`. It is one of the box's 16 volumes, and a `--vol` at `/workspace` beside it is refused, as two volumes at one destination are.
+- **A working directory.** `workdir=/workspace`: every [`exec`](commands.html#exec) that is given no `--workdir` runs there, and so does the command of a `run`. `--workdir` on an `exec` holds over it.
+
+### Whose the files are {#workspace-owner}
+
+In a box with a user namespace, which every box of the profile is, the workspace is mounted for its owner: the box's root stands for the owner and the group of the directory on the host, and no other id is mapped. So:
+
+- A file the box's root makes there belongs on the host to the directory's owner and group, not to root and not to an id of the box's range. In the box the same files are root's.
+- Files of the directory that belong to anyone else show as nobody's in the box, and the box's other users make nothing there.
+- The box's root cannot give a file there to another id, and cannot give one the setuid or the setgid bit, so nothing it leaves in the workspace runs on the host with more rights than its owner has.
+
+```console
+$ sudo lightbox exec agent --timeout 10m -- /bin/sh -c 'id -u; pwd; echo done > result.txt'
+0
+/workspace
+```
+
+The command ran as root in the box, in the workspace, and `~/agent-work/result.txt` is yours on the host, with your group. [Volumes and user namespaces](storage.html#volume-ownership) has the whole of it.
+
+### The rules for the directory {#workspace-rules}
+
+- Its path is absolute and has no `:` in it, as a volume's has none, and `--workspace` is given once.
+- It is a directory that is there when the box is created, and when it is started: a volume's source is taken at every start, and a start whose volume is gone fails with `volume source does not exist`.
+- Its owner and its group are not root. A directory that is root's, by its uid or by its gid, is bound as it is, since no container stands for root: its files show as nobody's, and the box writes in it only where anyone on the host may. Under `sudo`, `~` is still your own home directory, as your shell has put the path in its place before `sudo` runs.
+- It is on a filesystem with idmapped mounts. Where it is not, the start says so and the box does not start.
+
+What `create` says when the directory will not do:
+
+```text
+Error: --workspace takes an absolute path: agent-work
+Error: --workspace takes a directory that is there: /home/you/agent-wrok
+Error: --workspace takes a directory whose path has no ':', as a volume's has none: /tmp/a:b
+Error: --workspace is given once: a box has one workspace
+```
+
+A workspace outlives the box. [`reset`](#reset) does not touch it, `rm` leaves it where it is, and what a `run` wrote in it is there when the `run` has ended. That is what it is for, and it is also why it [comes back untrusted](#stops).
+
+## Time limits and exit statuses {#timeouts}
+
+A harness has to know two things about every command: that it ends, and how it ended.
+
+### exec --timeout {#exec-timeout}
+
+`exec --timeout <duration>` gives a command that long: digits, up to three more after a point, and `s`, `m`, `h` or `d`, or no unit for seconds, from 1 ms to 365 days, as in `30s`, `5m`, `1.5h` or `90`. The time counts from the moment `exec` begins.
+
+- **At the deadline** the command and everything it started are ended, what it put in the background and in sessions of their own too. `exec` says so on standard error and exits with 124:
+
+  ```text
+  Error: the command ran past its time limit, --timeout 2s, and it and all it started were ended
+  ```
+
+- **A command that ends before its deadline** returns its own status, and what it left running is ended with it. Without `--timeout`, what a command left in the background goes on after `exec` returns, within the box's limits and until the box stops.
+- **Everything is found, because every `exec` runs in [a cgroup of its own](commands.html#exec-cgroup)** below the box's, which nothing in the box can leave. `--timeout` ends what is in it with `cgroup.kill`, or, on a kernel before 5.14, by killing what it lists until nothing is left.
+- **Two processes keep the time.** The `exec` process, on the host, ends the cgroup at the deadline. Its worker, which the box cannot reach, keeps watch too: when the `exec` process ends while the command runs, killed for one, the worker ends everything at once, and when the `exec` process is held up, stopped for one, the worker does so a second past the deadline. Only root on the host, by killing both, can let a command outlive its limit.
+
+Give every command of an agent a `--timeout`. A command that waits for input that never comes, or that the model wrote to wait, would otherwise hold the harness until the box's lifetime is over.
+
+### What exec exits with {#statuses}
+
+`exec` exits with its command's status, and `run` exits as `exec` does. lightbox's own statuses are those of `env` and `timeout`, so that a harness can tell what the command did from what lightbox did:
+
+{.ref}
+| Status | What happened | What a harness does |
+|---|---|---|
+| 0 to 123 | The command ran and returned this | Hands it to the model with the output |
+| 124 | `--timeout` ended the command, and all it started | Says that the command ran out of time. Nothing of it is left running |
+| 125 | lightbox failed before the command ran: an option it does not take, a box that is not running, stopped or [expired](#ttl), no root, or an audit log that cannot be written. For `run`, also a box that could not be made or started | Reads what lightbox said on standard error. A box that expired or stopped is started again, or replaced; nothing is retried blindly |
+| 126 | The command could not be run: a file that is not executable, or a `--workdir` that is not there | Hands it to the model: the command was wrong, not the box |
+| 127 | The command is not there | The same |
+| 128 + *n* | Signal *n* ended the command: 137 for `SIGKILL`, 143 for `SIGTERM` | The memory limit ends a process with `SIGKILL`, and the kernel then ends the whole box: look at `ls` |
+
+A command can return 124 to 127 itself. For 124 the audit log settles it: the end line of an `exec` that lightbox ended for its time has `"timed_out":true`. Every other command of lightbox's fails with 1. [exec's exit status](commands.html#exec-status) has the same from the side of the command line.
+
+Give the command no terminal and nothing to read unless it is meant to read it: in a script, `</dev/null` on the `exec` keeps a command from reading the harness's own input.
+
+## A box for one command: run {#run}
+
+`run` is a box for one command. It creates a box under a name of its own, `run-` and 12 hex digits, starts it, runs the command in it as `exec` runs it, and removes the box, whatever the command did:
+
+```sh
+sudo lightbox run --profile agent --workspace ~/agent-work --timeout 10m -- /bin/sh -c 'cat result.txt'
+```
+
+- **Every option of `create` and of `exec` goes before the command**, `--timeout` among them, and a command that begins with a dash goes after `--`. Without a command, `run` runs `/bin/sh`.
+- **What `run` prints is the command's.** `create`, `start` and `rm` say nothing but their errors.
+- **It exits as `exec` does**: with the command's status, 124, 126 or 127, and with 125 when the box could not be made or started.
+- **Signals.** `SIGINT`, `SIGTERM` and `SIGHUP` sent to `run` go on to the command, and `run` exits as the command then ends: with 143 for one that `SIGTERM` ended. A signal that comes while the box is being made or started stops `run` there, with 128 plus the signal's number. The box is removed once the command has ended, or when it has not within [`stop_timeout`](configuration.html#conf-stop_timeout) seconds, and the removal is in a session of its own, which a terminal's keys do not reach.
+
+What is left when `run` has returned: what the command wrote in its workspace, and its two lines in the audit log, where `"via":"run"` tells them from those of an `exec`. Nothing else: no directory, no cgroup, no interface and no firewall rule.
+
+:::note[A run that was killed outright]
+A `run` that is killed with `SIGKILL` cannot remove its box, which runs on. The box's `.runner` file names that `run`, by its PID and start time, and the next `run` removes every box whose `run` is gone, saying `Note: removing the box 'run-…', whose run is gone`. `lightbox rm -f` removes one by hand. A box of the profile has a lifetime in any case, so it does not run on for longer than that: give a `run` a `--ttl` near the time its command may take.
+:::
+
+Use `run` for a command that stands alone, such as a test suite or a build. A task of many commands that build on each other is a box and an `exec` for each, which keeps what the earlier ones left: `run` makes a new box every time.
+
+## Between tasks: reset {#reset}
+
+`reset` throws away everything a box did outside its workspace:
+
+```console
+$ sudo lightbox reset agent
+Resetting container 'agent'...
+Container 'agent' reset: its root filesystem is its base's again
+```
+
+- **What goes.** Everything the box wrote, changed or removed in its root filesystem: packages it installed, files it left in `/root` or `/usr/local`, shell histories, and whatever a command planted for the next one to find. Its own layer is replaced by an empty one, and the files that `create` wrote in `/etc` are written again. Nothing of the base is copied, so the size of the base does not matter to it.
+- **What stays.** The workspace and every other volume, the box's configuration with its limits, its ids and its `id`, its address, its log and its lines in the audit log.
+- **It leaves the box stopped.** A box that runs is stopped first, as `stop` stops it, and `-t <seconds>` is `stop`'s. Start it again for the next task:
+
+  ```sh
+  sudo lightbox reset agent && sudo lightbox start agent
+  ```
+
+- **A reset that was cut short** leaves the box marked as half made, and `start` refuses it. `reset` again makes it whole.
+
+`reset` between tasks is what keeps one task's leftovers out of the next: a tool that the model installed, a changed `PATH` in a profile script, a background process. [reset](storage.html#reset) says how it works. What it cannot undo is what the box wrote in its workspace.
+
+## A lifetime: --ttl {#ttl}
+
+A box of the profile stops by itself, 8 hours after each start unless [`agent_ttl`](configuration.html#conf-agent_ttl) or `--ttl <duration>` says otherwise. The duration is written as `exec --timeout` takes one.
+
+- **The clock** is the time since boot, which goes on while the host is suspended, and it counts from the moment the box is built at each start. A box that is stopped and started again has its whole lifetime again.
+- **At the end** the box's init shuts it down as `stop` does: every process gets `SIGTERM`, the commands of `exec` among them, and what is left after [`stop_timeout`](configuration.html#conf-stop_timeout) seconds is killed. Init writes why in the box's log: `lightbox: the container's --ttl is over; it stops`.
+- **Afterwards** `ls` and `inspect` show the box as `expired`. An `exec` into it fails with 125, `Error: container is not running`. The next `start`, `stop` or `rm` clears away what the box left on the host, and says so:
+
+  ```text
+  Note: container 'agent' came to the end of its --ttl; what it left has been cleared away
+  ```
+
+  `start` then starts it for another lifetime, and `rm` removes it. Its root filesystem is as the box left it, so an expired box can be looked at, or `reset`.
+- **The lifetime is the box's.** It is in the `.conf` as `ttl=`, and [`update`](commands.html#update) does not change it: make the box again for another.
+
+The lifetime is a guard against boxes that are forgotten or run away. Init keeps it from inside the box, where no process can send it a signal it does not handle, trace it or set its clock; a kernel flaw past the sandbox could, so do not count on it as a security boundary. A command's own limit is [`exec --timeout`](#exec-timeout), which is kept from outside.
+
+## Reading the audit log {#audit}
+
+Every `exec`, and so the command of every `run`, writes one line to the host's audit log as the command is about to start and one when it has ended. [The audit log](commands.html#audit-log) has the format and every field. `logs --audit` prints the lines of one box, also after the box is removed, and with `-f` follows them while the box runs:
+
+```sh
+sudo lightbox logs --audit agent
+```
+
+Each line is one JSON object, and `exec_id` pairs a start with its end. This prints what every command of a box was, how it ended and how long it took:
+
+```sh
+sudo lightbox logs --audit agent | python3 -c '
+import json, sys
+started = {}
+for line in sys.stdin:
+    e = json.loads(line)
+    if e["event"] == "start":
+        started[e["exec_id"]] = e
+        continue
+    s = started.pop(e["exec_id"], None)
+    what = " ".join(s["argv"]) if s else "(its start is not among these lines)"
+    how = "timed out" if e["timed_out"] else "status %d" % e["status"]
+    print("%-10s %7d ms  %s" % (how, e["duration_ms"], what))
+for s in started.values():
+    print("%-10s %10s  %s" % ("no end", "", " ".join(s["argv"])))
+'
+```
+
+For a box that ran three commands, of which one ran into its `--timeout` and one lost its `exec` to a `kill`:
+
+```text
+status 0     99333 ms  /bin/sh -c make test
+timed out     2004 ms  /bin/sh -c sleep 60
+no end                 /bin/sh -c cat notes.txt
+```
+
+With `jq`, the ends alone: `sudo lightbox logs --audit agent | jq -r 'select(.event == "end") | [.exec_id, .status, .duration_ms, .timed_out] | @tsv'`.
+
+What to know when a harness relies on it:
+
+- **It records what was asked of a box, not what the command then did.** What left a box through a proxy is in the proxy's log.
+- **An `exec` whose start cannot be written does not run**, and exits with 125. A start with no end is an `exec` whose process was killed.
+- **The arguments are recorded as they were given**, so the log is as sensitive as the commands are, and `--env` is recorded by its keys only. Do not put a secret in an argument: it would be in the log, and in the box.
+- **A box's name can be used again.** `box_id` tells a box from a later one of the same name, and stays the same over a `reset`.
+- **The file** is `audit.log` in [`lightbox_dir`](configuration.html#conf-lightbox_dir), for root alone, and it is not rotated yet.
+
+## The harness outside the box {#outside}
+
+The harness, the program that talks to the model, can run in one of two places. Outside the box is the simpler and the tighter one: the harness runs on the host with the model's credentials, and drives the box through `exec`. The box needs no network at all, which is the profile's default.
+
+```sh
+sudo lightbox doctor --profile agent
+mkdir -p ~/agent-work
+sudo lightbox create agent --profile agent --workspace ~/agent-work
+sudo lightbox start agent
+sudo lightbox exec agent --timeout 10m -- /bin/sh -c 'id -u; pwd; echo done > result.txt'
+cat ~/agent-work/result.txt
+sudo lightbox logs --audit agent
+sudo lightbox reset agent
+sudo lightbox rm agent
+```
+
+1. `doctor --profile agent` says whether [the host has what the profile needs](#doctor).
+2. The workspace is a directory of yours, not root's, which the box writes in as you.
+3. `create` makes the box and `start` starts it. It has no address: `create` says `created (no network)`.
+4. Each command of the model's is one `exec` with a `--timeout`. This one prints `0` and `/workspace`: the command is root in the box, in the workspace.
+5. `result.txt` is in `~/agent-work`, and it is yours.
+6. `logs --audit` has the two lines of the `exec`.
+7. `reset` throws away what the box did outside its workspace, and leaves it stopped. `rm` removes it.
+
+A harness does the middle of this in a loop. In outline, for one task, with the commands coming from wherever the harness gets them:
+
+```sh
+sudo lightbox start agent || exit 1
+while read -r command; do
+    sudo lightbox exec agent --timeout 10m -- /bin/sh -c "$command" </dev/null
+    status=$?
+    case $status in
+        124) echo "the command ran out of time" ;;
+        125) echo "lightbox could not run it" >&2; break ;;
+    esac
+done
+sudo lightbox reset agent
+```
+
+- **Credentials** are the harness's, on the host. Nothing of them is mounted in the box, and none goes in with `--env`: a variable is in the box for as long as its command runs, and a box that can read a key can write it into its workspace.
+- **The box has no network**, so a tool that the task needs is in the base, or in the workspace. [A base root filesystem](guide.html#rootfs) says what an image has to contain. A task that has to fetch something is a box behind a proxy, as below.
+- **What comes out** is what the commands print and what they write in the workspace. Take both for text that someone else may have written: the output goes back to the model, and the workspace to whoever opens it.
+
+## The harness inside the box {#inside}
+
+A harness can also run in the box, as one long `exec`, and reach the model through a proxy on the host. The box is created with `--net proxy:<port>`: it reaches that TCP port of the gateway, the bridge's address, and nothing else, and its `resolv.conf` names no name server, so names are the proxy's to look up.
+
+lightbox ships no proxy. `contrib/proxy` in the source tree has a configuration for Squid 6 that listens on port 3128 of the gateway and lets through the names on its list and no other; add the model's API and the package registries the agent needs to the list. From a clone, on Debian or Ubuntu, with the default `subnet` and `gw`:
+
+```sh
+sudo apt-get install squid
+sudo cp contrib/proxy/squid.conf /etc/squid/squid.conf
+sudo cp contrib/proxy/lightbox-allowed-domains /etc/squid/lightbox-allowed-domains
+sudo systemctl restart squid
+```
+
+Squid listens on the bridge's address, which is there once `lightbox setup`, or the first start after a boot, has made the bridge. [A proxy for --net proxy](networking.html#proxy) has what the configuration does and does not do, and what a host firewall has to let in. Then the box:
+
+```sh
+sudo lightbox create agent --profile agent --net proxy:3128 --workspace ~/agent-work
+sudo lightbox start agent
+sudo lightbox exec agent -- /bin/sh -c 'echo "$HTTPS_PROXY"'
+sudo lightbox stop agent
+sudo lightbox rm agent
+```
+
+The third command prints `http://10.0.0.1:3128`, the gateway and the port. `exec` and the init hook give every command the proxy in six variables, as programs read one spelling or the other: `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy` and `https_proxy` with that address, and `NO_PROXY` and `no_proxy` with `localhost,127.0.0.1,::1`. curl, wget, pip, npm and git read them. The variables only say where the proxy is: a program that ignores them reaches nothing, as the firewall rules refuse everything but the proxy's port.
+
+The harness then runs as
+
+```sh
+sudo lightbox exec agent --timeout 8h -- <harness>
+```
+
+and ends with the box at the latest, when its lifetime is over.
+
+- **Credentials.** A key that the harness needs is in the box once the harness has it, and the box can send it to any name on the proxy's list. It stays out of the box only where something outside adds it to the requests, such as a proxy that ends their TLS connection itself, with a certificate authority the box trusts. The configuration in `contrib/proxy` does not do that. Use a key that is this box's alone, that can do no more than the task needs, and that you can revoke.
+- **The list is the boundary.** Whatever the box may send to a name on it, it may send there for its own ends. A code host or a package registry that takes uploads is a place to put files.
+- **The audit log has one line pair** for the whole session, the long `exec`. What the harness ran inside the box is the harness's to record, and what it fetched is in the proxy's log.
+- **A firewall's reload takes the rules** that keep the box to its proxy until `lightbox reload` puts them back: see [After a firewall's reload](troubleshooting.html#firewall-reload).
+
+`--net outside` is the third network a box of the profile may have: the internet and its name servers, and nothing of the host, of a private network or of the clouds' metadata services ([--net outside](networking.html#net-outside)). It keeps a box from the host and not from sending out what it can read, so it suits a box that holds nothing worth sending.
+
+## Before you run an agent {#checklist}
+
+- [ ] `sudo lightbox doctor --profile agent` exits with 0 on this host.
+- [ ] The host's kernel is up to date, and code you do not trust at all runs in a virtual machine with lightbox inside it.
+- [ ] The box is made with `--profile agent`, and with `--net none` unless the task needs a network. If it does, `--net proxy:<port>` with a short list of names.
+- [ ] The workspace is a directory of an ordinary user's that holds what the task needs and nothing else: no credentials, no `.git` it does not need, nothing that is not backed up.
+- [ ] No credential is mounted in the box, passed with `--env` or written in an argument.
+- [ ] Every `exec` has a `--timeout`, and the harness tells 124 and 125 from a command's own status.
+- [ ] The box is `reset` between tasks, or each command is a `run`.
+- [ ] The base has the tools the task needs, and no more.
+- [ ] Someone reads what changed in the workspace before anything on the host builds, opens or runs it.
+- [ ] The audit log is kept, and looked at.
+
+{.source}
+Source: the profile, the workspace, `exec`, `run` and `reset` in `lightbox.c`, the audit log in `lightbox_audit.c`, `doctor --profile agent` in `lightbox_meta.c`, and the proxy's configuration in `contrib/proxy`. The agent group of `tests/lifecycle.sh` runs a copy of the commands of both walk-throughs.

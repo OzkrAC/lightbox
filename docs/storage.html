@@ -1,0 +1,313 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><title>Storage · lightbox</title><meta name="description" content="Every file and directory lightbox keeps, bases and their snapshots, containers as overlays and as copies, reset, volumes and whose their files are, the logs as files, and what takes disk."><script src="https://cdn.luccet.dev/v2.0.0/luccet.js"></script>
+
+:::use
+https://cdn.luccet.dev/themes/v1.0.0/classic.css
+https://cdn.luccet.dev/themes/v1.0.0/github.css
+https://cdn.luccet.dev/code/v1.0.0/code.js
+lightbox-docs.js
+docs.css
+:::
+
+::site-nav
+
+# Storage {#top}
+
+{.brief}
+Everything lightbox keeps is a file in one of three directories. This page shows them all, and what a container's root filesystem is made of: a snapshot of its base, which containers share, the container's own files on top of it, and the volumes that bring in directories of the host.
+
+::toc
+
+## What is kept where {#layout}
+
+Three settings name the directories: [`lightbox_dir`](configuration.html#conf-lightbox_dir) for what belongs to the host as a whole, [`container_dir`](configuration.html#conf-container_dir) for the containers, and [`run_dir`](configuration.html#conf-run_dir) for the records of the ones that run. This is what they hold with the built-in settings, on a host with one container, `web`:
+
+```text
+/var/lib/lightbox/                lightbox_dir
+├── audit.log                     what every exec and run asked of a box
+├── bases/
+│   └── 3f3f51180fc8/             a snapshot of a base, by its id
+│       ├── rootfs/               the copy of the base that containers overlay
+│       ├── source                the path of the base it was taken of
+│       └── taken                 when it was taken
+├── rootfs/                       the base of the rootfs setting, yours to fill
+└── containers/                   container_dir
+    └── web/                      a container
+        ├── rootfs/               its own files: the top of its overlay, or a full copy
+        ├── .work/                the overlay's work directory
+        ├── .merged/              where the overlay is mounted, for the container alone
+        ├── .conf                 its configuration
+        ├── .ip                   its address
+        ├── .resolv               what create wrote in its resolv.conf
+        ├── console.log           what its init, its hook and its services print
+        ├── .runner               in a box of run: the run it belongs to
+        └── .creating             while create or reset has not finished with it
+
+/run/lightbox/                    run_dir, on a tmpfs
+├── .forwarding                   what setup changed of IPv4 forwarding
+└── web/                          the records of a container that runs, or ran
+    ├── pid                       the PID of its init
+    ├── pid_start                 when that process started
+    ├── state                     its state
+    ├── exit                      the status its init ended with
+    ├── firewall                  a record of the firewall rules of its links
+    └── egress                    a record of the firewall rules of its --net
+```
+
+The three directories and each container's directory are mode 0700, and lightbox's own files in them 0600, all root's: root filesystems hold setuid programs and secrets that other users of the host must not reach, and the records beside them say what each container may do. Inside a root filesystem, the modes and the owners are the image's.
+
+{.ref}
+| Path | What it is, and what makes it |
+|---|---|
+| `<lightbox_dir>` | Mode 0700. `setup` makes it, and restricts one that is there to 0700 and says so; `make install` makes it too |
+| `<lightbox_dir>/audit.log` | Mode 0600, made by the first `exec` or `run`. Two lines for every `exec`, appended; never rotated ([the audit log](commands.html#audit-log)) |
+| `<lightbox_dir>/bases/<id>/` | Mode 0700, made by `create` and by `base add`. A snapshot: `rootfs/` with the copy of the base, `source` with the base's path, and `taken` with the time as seconds and nanoseconds since 1970. It is made as `.<id>.new` and renamed when it is whole |
+| `<lightbox_dir>/rootfs/` | The default of the `rootfs` setting, which `make install` makes, empty. Nothing of lightbox's writes to a base |
+| `<container_dir>` | Mode 0700, made by `setup` and by `make install`. `create` does not make it |
+| `<container_dir>/<name>/` | Mode 0700, made by `create`. `rm` removes it whole |
+| `…/rootfs/` | The container's own files, made by `create` and made anew by `reset`. With `--userns` the directory of an overlay belongs to the container's root, the first uid and gid of its range on the host |
+| `…/.work/`, `…/.merged/` | Mode 0700, for an overlay only, made by `create` and made anew by `reset`. `.merged/` is empty on the host |
+| `…/.conf` | Mode 0600, written by `create`, `update`, `add-vol` and `rm-vol`. The container's configuration ([Configuration](configuration.html#container-conf)) |
+| `…/.ip`, `…/.resolv` | Mode 0600, written by `create`. The container's address, which one of `--net none` has none of, and the text of its `resolv.conf` |
+| `…/console.log` | Mode 0600, made by the first `start`. Appended to at every start; never rotated ([logs](#logs)) |
+| `…/.runner` | Mode 0600, in a box that `run` made. The PID and the start time of that `run`, by which the next `run` finds a box whose `run` is gone |
+| `…/.creating` | An empty mark that `create` and `reset` make, and take away when the container is whole. A container that has it is shown as `creating`, and `start` refuses it |
+| `<run_dir>` | Mode 0700, made by `setup`, and by `start` after a reboot. `setup --teardown` removes it when it is empty |
+| `<run_dir>/.forwarding` | Written by `setup` when it turns IPv4 forwarding on: `on`, or `on drop` when it set the `FORWARD` policy too, for `setup --teardown` to say what stays changed |
+| `<run_dir>/<name>/` | Mode 0700 and its files 0600, made by `start`. They are written without waiting for a disk, and taken away when the container is stopped: a container without them is stopped ([How it works](internals.html#records)) |
+
+`make install` makes `/var/lib/lightbox` and its `containers/` mode 0700, `rootfs/` in it and `/run/lightbox` mode 0755, and `/etc/lightbox` with the example `lightbox.conf` if none is there. `setup` then makes the three directories that are missing, each by itself and not the ones above it, and restricts `/run/lightbox` to 0700.
+
+A few things are not in the list because they are not files of lightbox's:
+
+- **Locks.** A command that changes a container locks the container's directory itself, and `create`, `setup` and `base` lock `container_dir`. There are no lock files ([How it works](internals.html#locks)).
+- **Cgroups.** A container's cgroup is `<cgroup_base>/<name>` in the kernel's cgroup filesystem, there while the container runs ([How it works](internals.html#cgroups)).
+- **The network.** The bridge, a container's interfaces and the firewall rules are in the kernel only ([Networking](networking.html#overview)).
+
+Two kinds of name are left by a command that was killed at the wrong moment. A file whose name ends in `.tmp.<pid>` is the new content of the file beside it, which was about to be renamed into place; nothing reads it. Directories called `.try-lower`, `.try-upper`, `.try-work` and `.try-root` in a container's directory are where `create` and `reset` try whether an overlay can be mounted. A container that an older lightbox started, before 0.5, has `.pid`, `.pid_start` and `.state` in its own directory: they are read where today's records are missing, and removed with them.
+
+## Bases and snapshots {#bases}
+
+A *base* is a directory that holds a root filesystem: what a container is made from ([Getting started](guide.html#rootfs) puts one in place, and [Configuration](configuration.html#rootfs-order) says which one `create` takes). lightbox never writes to a base, and a container does not go on depending on it. As Docker keeps its images, lightbox keeps a *snapshot* of each base itself, in `<lightbox_dir>/bases/<id>/`:
+
+- **The first `create` from a base takes a snapshot of it**, and says so: `Taking a snapshot of the base /var/lib/lightbox/rootfs...`. It runs `cp -a --reflink=auto` on what is in the base, which shares the base's blocks where the base and `lightbox_dir` are on one filesystem that has reflinks, as btrfs and XFS do, and copies every byte where they are not. Should that `cp` fail, as one that does not know the option does, a plain `cp -a` is run.
+- **Every `create` from that base after it uses the snapshot**, and takes neither the time nor the room of the base's size.
+- **Changing or removing the base afterwards changes no container.** A snapshot is what its base was when it was taken.
+- **A snapshot is found by the path of its base, as it was written.** `create` takes the newest snapshot whose `source` is that path, letter for letter: the same directory under another spelling, a relative path or one with a slash at its end, is another base to lightbox and gets a snapshot of its own. Name a base by one absolute path.
+- **A snapshot's id** is 12 hex digits, from a hash of the base's path and the time. A container's `.conf` names its snapshot as `base=<id>`, and `inspect` shows it.
+
+Three commands look after the snapshots. They take the lock of the store, as `create` does.
+
+```text{.synopsis}
+lightbox base ls
+lightbox base add <dir>
+lightbox base rm <id>...
+```
+
+`base ls` lists the snapshots by id, each with the time it was taken, its base, and the containers on it, or `-` for none:
+
+```console
+# lightbox base ls
+ID            TAKEN (UTC)          SOURCE  CONTAINERS
+23591fc51ab8  2026-11-22 00:40:58  /var/lib/lightbox/rootfs  -
+3f3f51180fc8  2026-11-22 00:32:36  /var/lib/lightbox/rootfs  api, db
+```
+
+`base add <dir>` takes a new snapshot of a base now, for the containers made after it. That is how a base is updated: change what is in the directory, then take a snapshot. The containers made before keep theirs.
+
+```console
+# lightbox base add /var/lib/lightbox/rootfs
+Taking a snapshot of the base /var/lib/lightbox/rootfs...
+Base 23591fc51ab8 taken of /var/lib/lightbox/rootfs; new containers of it use this one
+```
+
+`base rm <id>...` removes snapshots that no container uses, and refuses one that has containers on it, which it names:
+
+```console
+# lightbox base rm 23591fc51ab8 3f3f51180fc8
+Base 23591fc51ab8 removed
+Error: base 3f3f51180fc8 is used by: api, db
+```
+
+A container stays on the snapshot it was made on: `reset` takes it back to that one, not to the newest. To move a container to a newer snapshot, remove it and create it again. Should a snapshot be gone all the same, taken away by hand, its containers are not started: `Error: the base snapshot that the container overlays is not there: 3f3f51180fc8`.
+
+## A container's root is an overlay {#overlay}
+
+A container's root filesystem is an overlay of two directories, which the kernel shows as one:
+
+```text
+  what the container sees as /
+  ┌──────────────────────────────────────────────────────────────┐
+  │  upper   <container_dir>/<name>/rootfs    its own files      │   written to
+  ├──────────────────────────────────────────────────────────────┤
+  │  lower   <lightbox_dir>/bases/<id>/rootfs  the snapshot      │   read only, shared
+  └──────────────────────────────────────────────────────────────┘
+```
+
+- **The snapshot is the lower layer.** Every container of that base has the same one, and nothing writes to it.
+- **`rootfs/` is the upper layer**: what `create` wrote in `/etc`, which is `resolv.conf`, `hostname` and the container's line in `hosts`, and everything the container writes, changes or removes. What it takes out of the base is marked there, the way overlayfs marks it.
+- **`.work/`** is the directory overlayfs needs beside the upper layer for its own use.
+- **The overlay is mounted on `.merged/`, in the container's mount namespace only.** On the host `.merged/` is an empty directory, and `rootfs/` shows the container's own files and nothing of the base. `inspect` gives the path of `rootfs/`.
+
+The overlay is mounted `nodev`, and `nosuid` unless the container is privileged ([Security](security.html#rootfs)). With `--userns` the snapshot is seen through an idmapped mount, so that its files, host root's on the disk, are the container's root's, and `rootfs/` belongs on the host to the container's own range of ids ([user namespaces](security.html#userns)).
+
+:::warning[Changing a container's files from the host]
+A file of the base that you want to change from the host has to be in `rootfs/` first. Appending to `rootfs/etc/passwd` while the container has the base's `passwd` makes a file of only what you appended, which then hides the base's. Change the file inside the container, with `exec`, or copy it into `rootfs/` and change the copy. Do either while the container is stopped: the kernel does not say what an overlay shows when its layers are changed under it. Never change a snapshot.
+:::
+
+## Copies {#copy}
+
+`create --copy` makes a container that is a full copy of its base in `rootfs/`, as every container was before 0.7, with the same `cp` a snapshot is taken with. It takes the time and the room of the base, unless the filesystem shares the blocks, and it depends on no snapshot.
+
+A container is also a copy wherever an overlay cannot be mounted, and `create` says so:
+
+```text
+Note: an overlay cannot be mounted here (errno 1): the container is a copy of its base; lightbox doctor says why
+```
+
+That is the case on a kernel without overlayfs, and for a `create` that is not run as root. `create` tries an overlay with empty layers before it takes a snapshot, so a host that cannot mount one does not copy the base twice. A path of `lightbox_dir` or `container_dir` with a comma, a colon or a backslash in it has the same effect, with a note of its own, as the options of an overlay cannot carry those. `doctor` has a line for the kernel:
+
+```text
+overlayfs: no (a new container is a copy of its base, not an overlay)
+```
+
+What is different about a copy:
+
+- Its `.conf` has no `base` line, and `inspect` shows `storage: copy` where an overlay has `storage: overlay` and the snapshot's id.
+- `reset` refuses it, as it has nothing to be reset to: remove it and create it again.
+- With `--userns` there is no falling back to a copy. Where an overlay cannot be put on an idmapped layer, which needs Linux 5.19, `create --userns` ends and makes nothing; `create --userns --copy` asks for a copy, and needs Linux 5.12 ([user namespaces](security.html#userns)). `--profile agent` refuses `--copy`.
+- Containers made before 0.7 are copies, and stay as they are.
+
+## reset {#reset}
+
+`lightbox reset <name>...` makes a container's root filesystem its base's again, as it was after `create`: what the container wrote, changed and removed is gone. Nothing is copied, so it takes the same time whatever the size of the base.
+
+```console
+# lightbox reset web
+Resetting container 'web'...
+Container 'web' reset: its root filesystem is its base's again
+```
+
+What it does, in this order:
+
+1. A container that runs is stopped first, as `stop` stops it; `-t <seconds>` is `stop`'s.
+2. It looks whether the snapshot is there and an overlay can be mounted, before anything is taken away. If not, the container is left as it was.
+3. It marks the container with `.creating`, and replaces `rootfs/`, `.work/` and `.merged/` by empty ones.
+4. It writes the files of `/etc` again that `create` wrote, the same ones: the address is in `.ip`, and the text of `resolv.conf` in `.resolv`.
+5. It takes the mark away, and the container is `stopped`.
+
+- **Gone:** everything in the container's root filesystem that is not the base's.
+- **Kept:** the volumes, and what is in them; the configuration in `.conf`, the address and the id; `console.log`, and the container's lines in the audit log.
+- **Not changed:** the snapshot. A `reset` goes back to the one the container was made on, not to the newest.
+
+A reset that is cut short leaves the container half made, with its mark: it is shown as `creating`, and `start` refuses it. `reset` again makes it whole.
+
+`reset` needs root. It refuses a container that is a copy of its base. A box of the agent profile is reset between tasks, to throw away all that a task did outside the workspace ([Agent boxes](agents.html#reset)); the [command reference](commands.html#reset) has the options.
+
+## Volumes {#volumes}
+
+A volume is a directory or a file of the host, bound into a container at a path of the container's. What is written to it is written to the host, and stays when the container is reset or removed.
+
+```sh
+# a read-only root filesystem, with one directory to write to and one to read
+lightbox create web --read-only --vol /srv/data:/var/lib/app --vol /srv/www:/var/www:ro
+
+# one file of the host, read-only
+lightbox create conf --vol /srv/config/app.conf:/etc/app.conf:ro
+```
+
+`add-vol` and `rm-vol` change the volumes of a container that is there. A container that runs has the change from its next start, and the commands say so:
+
+```console
+# lightbox add-vol web /srv/config/app.conf:/etc/app.conf:ro
+Added volume to container 'web': /srv/config/app.conf -> /etc/app.conf (ro)
+# lightbox rm-vol web /etc/app.conf
+Removed the volume at /etc/app.conf from container 'web'
+```
+
+Adding the very same volume again does nothing, and says `Volume already present for container 'web'`. `rm-vol` takes the destination as it is in the container; what is in the volume's source is not touched.
+
+### The rules {#volume-rules}
+
+- **A volume is written `<src>:<dst>` or `<src>:<dst>:ro`.** The source is a path on the host and the destination a path in the container. With `:ro` the container cannot write to it; nothing else may follow the destination.
+- **Both paths are absolute**, without a `..` component, a colon or a control character such as a newline, and up to 511 characters long. They are stored in one spelling, with single slashes, no `.` component and no slash at the end, so `/data/` and `/data` are the same destination.
+- **The source may not be under `/proc`, `/sys` or `/dev`.** The destination may not be `/`, nor under `/proc`, `/sys` or `/dev`, nor under `/.old_root`, a name lightbox uses itself while it builds a container.
+- **A container has at most 16 volumes, and one at any destination**: a second one there would be mounted over the first, which would never be seen. A destination inside another volume is another destination.
+- **The source is a directory or a single file.** Its kind decides what is made at the destination where the image has nothing: a directory, with the ones above it, or an empty file. Where the image has something of the other kind there, the start fails.
+- **The source is taken when the container starts.** `create` does not look whether it is there; `add-vol` does. A source that is missing at a start fails the start: `Error: volume source does not exist: /srv/data`.
+- **A volume is the source's own filesystem.** Another filesystem that is mounted on a directory inside the source does not come along: give it a volume of its own.
+- **The destination is looked up inside the container**, when the container's root is in place: where the image has a link on the way, the volume lands where the link leads in the container, and nothing of the host's is reached. A destination that leads nowhere in the container fails the start.
+- **Volumes are mounted on top of everything else**, after `/tmp` and `/run`, so one below those is seen there. Each is mounted `nosuid` and `nodev`, whatever the container is.
+- **`--read-only` does not reach the volumes.** It makes the root filesystem read-only, and a volume without `:ro` stays writable: a read-only root with one volume for data is the usual pair.
+
+What is refused is refused when the volume is given, with the reason, and nothing is stored to be found wrong at the next start:
+
+```text
+Error: a volume is written src:dst[:ro]: /srv/www
+Error: the volume's source must be an absolute path without ..: relative:/data
+Error: a volume may not be mounted over /: /srv/www:/
+Error: a volume's destination may not be under /proc, /sys or /dev: /srv/www:/proc/x
+Error: after the volume's destination only :ro may follow: /srv/www:/data:rw
+Error: --vol: /srv/config:/data/: there is already a volume at that destination
+Error: --vol: /srv/v17:/v17: the container already has the maximum of 16 volumes
+```
+
+### Whose the files are {#volume-ownership}
+
+Without `--userns` a container's users are the host's, by their numbers: what the container's root writes in a volume is root's on the host, and what a command run with `exec --user 1000` writes is uid 1000's.
+
+With `--userns` a container's root is an unprivileged uid of the host's, and a volume is an idmapped mount of its source, made for the source's owner:
+
+- **The container's root stands for the owner and the group of the source.** A file the container's root makes in the volume belongs on the host to that owner and group, and their files are root's in the container.
+- **No other id is mapped.** Files of other owners show as nobody's, the container's other users make nothing in the volume, and its root can give a file neither another owner nor the setuid or setgid bit.
+- **A source that is host root's, by its uid or by its gid, is bound as it is**: no container stands for root. Its files show as nobody's, and the container writes in it only where anyone on the host may.
+- **`start` takes the volumes itself, as host root**, before the container's init exists. The source has to be on a filesystem with idmapped mounts, as the root is; where it is not, `start` says so and the container does not start.
+
+So with `--userns`, give a container a directory that belongs to the user whose files it is to work on, and not one of root's.
+
+`--workspace <dir>` is that as one option: it adds the directory as the volume at `/workspace`, which with `--userns` is its owner's, and makes `/workspace` the directory every `exec` runs in that is given no `--workdir`. The directory has to be there, its path has to be absolute and without a colon, and a box has one workspace, which counts as one of its 16 volumes. [Agent boxes](agents.html#workspace) says how to use one, and that what comes back in it is to be read before it is run.
+
+## The logs as files {#logs}
+
+{.ref}
+| File | What is in it | How it grows |
+|---|---|---|
+| `<container_dir>/<name>/console.log` | The standard output and error of the container's init, of its `/init.sh` and of every service that started: what `lightbox logs <name>` shows ([logs](commands.html#logs)) | Appended to from one start to the next. `reset` keeps it; `rm` removes it with the container |
+| `<lightbox_dir>/audit.log` | Two lines of JSON for every `exec`, and so for the command of every `run`, of every box of the host: what `lightbox logs --audit <name>` shows of one box ([the audit log](commands.html#audit-log)) | Appended to for as long as the host has it. It outlives the boxes it is about |
+
+Both are mode 0600 in a directory of mode 0700, and neither is ever followed through a link. No container has either mounted, so what runs in one can neither read nor change them. What a command run with `exec` prints is in neither: it goes to whoever ran `exec`.
+
+Neither is rotated or limited yet. A container that prints without end fills the disk that `container_dir` is on.
+
+## Disk {#disk}
+
+lightbox does not limit how much disk a container takes. Its memory, its processes, its CPUs and its I/O can be limited; its files cannot.
+
+What takes room:
+
+{.ref}
+| What | How much | To see it |
+|---|---|---|
+| A snapshot | The base's size, once for all its containers; next to nothing where the filesystem shares blocks | `du -sh /var/lib/lightbox/bases/*/rootfs` |
+| An overlay container | What it wrote, changed or removed | `du -sh /var/lib/lightbox/containers/*/rootfs` |
+| A copy | The base's size, each, and what the container wrote | the same |
+| `console.log` | Everything the container's services printed | `ls -lh /var/lib/lightbox/containers/*/console.log` |
+| `audit.log` | Two lines for every `exec` | `ls -lh /var/lib/lightbox/audit.log` |
+| A volume | Whatever the container writes there, on the filesystem of its source | |
+
+To free it:
+
+- `lightbox rm <name>` removes a container with all its own files and its `console.log`. Its volumes' sources stay, and so do its lines in the audit log.
+- `lightbox reset <name>` throws away what an overlay container wrote in its root.
+- `lightbox base ls` shows the snapshots that no container is on, with `-`, and `lightbox base rm <id>` removes them.
+- `console.log` is opened to append, so it can be emptied while the container runs: `truncate -s 0 /var/lib/lightbox/containers/web/console.log`.
+- `audit.log` is opened anew for every line, so it can be moved aside. `logs --audit` then shows what is in the file that is there.
+- A directory in `bases/` whose name begins with a dot and ends in `.new` is a snapshot that a killed command did not finish. Nothing uses it, and it can be removed.
+
+To keep a container from filling a disk, put what it writes where there is a limit already:
+
+- **A read-only root.** With `--read-only` a container writes to its volumes and to the tmpfs filesystems lightbox mounts in it: `/tmp`, `/run`, `/var/tmp`, `/dev` and `/dev/shm`. What is written to a tmpfs is memory, which the container's `--mem` limits.
+- **A volume on a filesystem of its own**, of the size the container may fill.
+- **`container_dir` on a filesystem of its own**, so that the containers fill that and not the host's root.
+
+{.source}
+`lightbox_base.c` keeps the snapshots and has the `base` commands. `lightbox_state.c` names every file of a container and of its records. `lightbox_container.c` decides what a volume may be. `lightbox.c` has `create`, `reset`, and the taking and mounting of volumes; `lightbox_audit.c` writes the audit log.

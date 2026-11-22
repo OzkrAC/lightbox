@@ -1,0 +1,639 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><title>Commands · lightbox</title><meta name="description" content="The command reference of lightbox: every command and option, the values they take, what each prints and refuses, exit statuses, the JSON of ls, inspect and doctor, and the audit log."><script src="https://cdn.luccet.dev/v2.0.0/luccet.js"></script>
+
+:::use
+https://cdn.luccet.dev/themes/v1.0.0/classic.css
+https://cdn.luccet.dev/themes/v1.0.0/github.css
+https://cdn.luccet.dev/code/v1.0.0/code.js
+lightbox-docs.js
+docs.css
+:::
+
+::site-nav
+
+# Commands {#top}
+
+{.brief}
+Every command of lightbox and every option: the values they take, what each prints and what it refuses, the exit statuses, the JSON that `ls`, `inspect` and `doctor` give to programs, and the audit log.
+
+::toc
+
+## How a command is written {#conventions}
+
+```text{.synopsis}
+lightbox [--config <path>] <command> [args]
+```
+
+- **`--config <path>`** names the `lightbox.conf` to read, and comes before the command. Without it lightbox reads the file that the environment variable `LIGHTBOX_CONFIG` names, and otherwise `/etc/lightbox/lightbox.conf` ([Configuration](configuration.html#file)).
+- **Root.** `setup`, `reload`, `start`, `stop`, `restart`, `reset`, `update`, `exec` and `run` are run as root, and so is `create` with `--userns` or `--profile`; each says so before it touches anything. The other commands read and write lightbox's directories, which are root's alone on an installed host.
+- **An option that a command does not know** ends it with `Error: unknown option:` and the option, a word it has no use for with `Error: unexpected argument:` and the word, and an option that came without its value with `Error: option --mem requires a value`. In each case the command does nothing.
+- **A value that is not what its option takes** ends the command with the option named and what it takes, as in `Error: --mem takes <number>[K|M|G|T] or max, not: 0100M`. No value is shortened, and none is stored to be found wrong at the next start.
+- **Several names.** `start`, `stop`, `restart`, `reset` and `rm` take several names, as Docker's do, and do one container after the other, each in a process of its own. One that cannot be done ends nothing for the others: the command names those it did not do at the end, as in `Error: not started: api, db`, and its exit status is the first that was not 0.
+- **One command at a time on a container.** A command that changes a container waits for another that is working on it, and says that it waits. `ls` and `inspect` never wait ([How it works](internals.html#locks)).
+- **Help.** `lightbox help`, `lightbox --help` and `lightbox -h` print the whole usage, and `lightbox help <command>`, or `--help` after a command, that command's part of it. Help that is asked for goes to standard output and the command exits 0. A command line that is none, such as `lightbox` alone or a command that does not exist, gets the usage on standard error and an error.
+
+## Values {#values}
+
+### Names {#names}
+
+A container's name is 1 to 30 characters of `a-z`, `A-Z`, `0-9`, `_` and `-`. It is the container's host name and the name of its directory, and it is part of the name of its cgroup.
+
+### Sizes {#sizes}
+
+`--mem` and `--swap` take a number of bytes, optionally followed by `K`, `M`, `G` or `T`, in either case, for powers of 1024: `512M`, `2G`, `1048576`. `max` means no limit, and `--swap` also takes `0`. A number does not begin with a zero, since the kernel would read `0100M` as octal.
+
+### Durations {#durations}
+
+`--ttl` and `exec --timeout` take digits, optionally a point and one to three more digits, and optionally a unit: `s` for seconds, `m` for minutes, `h` for hours or `d` for days. Without a unit the number is seconds. The shortest is 1 ms and the longest 365 days: `30s`, `5m`, `1.5h`, `0.25`, `7d`.
+
+The `-t` of `start`, `stop`, `restart` and `reset` is different: a whole number of seconds from 0 to 86400.
+
+### Addresses {#addresses}
+
+An IPv4 address is four numbers and three dots, with no zero in front of a number, since programs read `10.0.0.05` differently. A container's address is one of `subnet`, and not its first or its last address, the gateway's or another container's ([Networking](networking.html#addresses)).
+
+### Other values {#other-values}
+
+{.ref}
+| Option | Takes |
+|---|---|
+| `--cpu <num>` | CPUs from 0.01 to 512, with up to two decimals: `2`, `0.5`, `1.25` |
+| `--pids <limit>` | A number of processes from 1 to 4194304, or `max` |
+| `--oom-score <n>` | A whole number from -1000 to 1000 |
+| `--io-max <limit>` | One argument, as the kernel's `io.max` takes a line: a whole disk by its device numbers, `<major>:<minor>`, and one to four of `rbps`, `wbps`, `riops` and `wiops`, each once and each a number or `max`: `"8:0 wbps=10485760 riops=1000"` |
+| `--vol <src>:<dst>[:ro]` | Two absolute paths, and `:ro` for a read-only volume ([Storage](storage.html#volume-rules)) |
+| `--net <mode>` | `outside`, `nat`, `none` or `proxy:<port>` ([Networking](networking.html#net)) |
+
+## Exit statuses {#exit-status}
+
+{.ref}
+| Status | From | Means |
+|---|---|---|
+| 0 | Every command | Done. Also help and `--version` |
+| 1 | Every command but `exec` and `run` | The command failed, or was not given what it needs. For `doctor`: a check failed. For a command with several names: the first status that was not 0 |
+| 128 + n | `start`, `run` | A signal with the number n interrupted the start, which was undone; for `run`, it came while the box was being made or started |
+| The command's | `exec`, `run` | The status the command exited with, or 128 plus the number of the signal that ended it |
+| 124 | `exec`, `run` | `--timeout` ended the command |
+| 125 | `exec`, `run` | lightbox failed before the command ran: an option it does not take, a container that is not running, a box that could not be made or started |
+| 126 | `exec`, `run` | The command could not be run: a file that is not executable, or a `--workdir` that is not there |
+| 127 | `exec`, `run` | The command was not found |
+
+The statuses of `exec` and `run` are those of `env` and `timeout`, so that a program that drives a container can tell what the command did from what lightbox did. A command can return those numbers too.
+
+## Making and changing containers {#making}
+
+### create {#create}
+
+```text{.synopsis}
+lightbox create <name> [<ip>] [options]
+```
+
+Makes a container from a base. Nothing runs yet: `create` makes the container's directory under `container_dir`, takes a snapshot of the base if there is none, writes the container's configuration and its address, and writes `/etc/resolv.conf`, `/etc/hostname` and a line for its own name in `/etc/hosts` among the container's own files.
+
+Without `<ip>` the container gets the lowest free address of the subnet. The address, when there is one, comes straight after the name.
+
+```console
+# lightbox create web --mem 512M --cpu 2
+Creating container 'web'...
+Container 'web' created (ip=10.0.0.2)
+```
+
+A container with `--net none` has no address, and `create` says `created (no network)`.
+
+#### Options {#create-options}
+
+{.ref}
+| Option | Default | What it does |
+|---|---|---|
+| `--rootfs <path>` | `LIGHTBOX_ROOTFS`, then `rootfs` | The base to make the container from ([the order](configuration.html#rootfs-order)) |
+| `--copy` | off | A full copy of the base in the container's directory, and not an overlay of its snapshot ([Storage](storage.html#copy)) |
+| `--mem <limit>` | `256M` | The memory limit: a [size](#sizes), or `max` for none |
+| `--swap <limit>` | `0` | The swap the container may use beyond its memory: `0`, a size, or `max` |
+| `--pids <limit>` | `128` | The most processes and threads it may have, or `max` |
+| `--cpu <num>` | `1` | CPUs, such as `2` or `0.5` |
+| `--io-max <limit>` | none | An I/O limit for one whole disk of the host, such as `"8:0 wbps=10485760"` ([what it takes](#other-values)). Given once; a partition is refused, as the kernel limits whole disks only |
+| `--oom-score <n>` | `500` | The OOM score adjustment of init and of everything `exec` starts. The default makes the kernel end a container's processes before the host's |
+| `--ttl <duration>` | none | How long the container may run from each start. At the end init shuts it down as `stop` does, and it is `expired` ([lifetime](#create-ttl)) |
+| `--vol <src>:<dst>[:ro]` | | A directory or a file of the host's in the container. Repeatable, up to 16, one at a destination ([Storage](storage.html#volumes)) |
+| `--workspace <dir>` | none | A directory of the host's at `/workspace`, where every `exec` then runs ([Agent boxes](agents.html#workspace)) |
+| `--read-only` | off | A root filesystem that cannot be written to. `/tmp`, `/run` and, in such a container, `/var/tmp` are filesystems in memory, and they and the volumes still can |
+| `--userns` | off | A user namespace of its own: the container's root is an unprivileged uid of the host's. As root ([Security](security.html#userns)) |
+| `--seccomp allow|deny` | `allow` | The seccomp profile: the allow-list, or the deny-list ([Security](security.html#seccomp)) |
+| `--privileged` | off | No sandbox: all capabilities, no seccomp filter and no device filter ([Security](security.html#privileged)) |
+| `--net <mode>` | `outside` | What it may reach: `outside`, the internet and its name servers only; `nat`, the host and its networks too, as every container before 0.8; `none`, loopback alone; `proxy:<port>`, that TCP port of the gateway and nothing else ([Networking](networking.html#net)) |
+| `--link <name>` | | Allow traffic between this container and another. Repeatable, up to 8 ([Networking](networking.html#links)) |
+| `--dns <address>` | the host's | A name server for the container. Repeatable, up to 3 ([Networking](networking.html#dns)) |
+| `--profile agent` | none | The agent profile: `--userns`, the allow-list, an overlay, and `--net none` unless `--net outside` or `--net proxy:<port>` is given, with the limits and the lifetime of the `agent_*` settings. As root. It refuses `--privileged`, `--link`, `--net nat`, `--seccomp deny` and `--copy` ([Agent boxes](agents.html#profile)) |
+
+The defaults of `--mem`, `--pids`, `--cpu` and `--oom-score` are the `default_*` settings of `lightbox.conf` ([Configuration](configuration.html#settings)).
+
+#### Limits
+
+- **Memory is a limit, not a hint.** Past it a process is killed and does not go on in swap, unless `--swap` gives the container some. The kernel then ends the whole container, not only the one process, and the next `start`, `stop` or `rm` clears it away.
+- **Controllers.** `start` enables the `memory`, `pids`, `cpu` and `io` cgroup controllers one by one. One that the host does not give the container's cgroup stops the start only when the container has a limit that needs it: `cpu` always, `memory` for `--mem` or `--swap`, `pids` for `--pids` and `io` for `--io-max`. Otherwise `start` says it once and the container runs without it.
+- **A default that cannot be used.** A `default_*` setting that is not a value its option would take stops `create` only for a container that is not given that limit as an option. No container gets a limit that nobody chose.
+
+#### A lifetime {#create-ttl}
+
+`--ttl` counts from each start on the clock of the time since boot, which goes on while the host is suspended. At the end init shuts the container down as `stop` does, with all it runs, the commands of `exec` among them, and writes why in its log. `ls` and `inspect` show it as `expired`, and the next `start`, `stop` or `rm` clears away what it left.
+
+Init keeps the time, inside the container. No process there can send it a signal it does not handle, trace it or set its clock, but a kernel flaw past the sandbox could: the lifetime is a guard against containers that are forgotten or run away, and not a security boundary.
+
+#### What create refuses
+
+Each of these ends `create` before anything is made:
+
+{.ref}
+| When | It says |
+|---|---|
+| The name is taken | `Error: container already exists: web` |
+| The base is not there, is not a directory, is empty or cannot be read | `Error: base rootfs does not exist:`, `is not a directory:`, `is empty:` or `cannot be read:`, and its path |
+| The address is not one | `Error: invalid IPv4 address:` and the text |
+| The address cannot be a container's, or no address is free | An error that names the address and why ([Networking](networking.html#addresses)) |
+| `--net none` with an address or a `--link` | `Error: a container with --net none has no address:` or `has no network for --link` |
+| `--net proxy:<port>` with `--link` or `--dns` | `Error: a container with --net proxy reaches its proxy and nothing else: no --link`, or `has its proxy look up names: no --dns` |
+| `--link` to a container of `--net proxy` | `Error: --link names a container of --net proxy, which reaches its proxy and nothing else:` and its name |
+| `--net outside` or `proxy` with `firewall = false` | An error that says the mode needs lightbox's firewall rules |
+| `--userns` with no free range of ids | `Error: no range of host ids for the container's user namespace:`, why, and the line to add to `/etc/subuid` and `/etc/subgid` |
+| `--userns` where the kernel or the filesystem has no idmapped mounts | An error that says which; nothing falls back to a copy that is chowned |
+
+Where an overlay cannot be mounted, without overlayfs in the kernel or without the right to mount, `create` makes a copy and says so: `Note: an overlay cannot be mounted here (errno 1): the container is a copy of its base; lightbox doctor says why`.
+
+A `create` that is killed half way leaves a container marked as half made. `ls` shows it as `creating`, `start` refuses it, and `rm` removes it.
+
+### update {#update}
+
+```text{.synopsis}
+lightbox update <name> [--mem <limit>] [--pids <limit>] [--cpu <num>]
+```
+
+Changes a container's limits: in its configuration, which every start reads, and at once in the cgroup of a container that runs. At least one of the three options is given, with the values that `create` takes.
+
+```console
+# lightbox update web --mem 1G --cpu 0.5
+Container 'web' updated
+```
+
+For a container that is not running it adds `It is not running: it has them from its next start`. When the cgroup of a running container does not take a limit, as where the host does not give it that controller, the new limit is in the container's configuration all the same: `update` says `Error: the running container did not take the new memory limit (memory.max); it has it from its next start`, and exits 1.
+
+The other options of `create` cannot be changed: remove the container and create it again.
+
+### add-vol {#add-vol}
+
+```text{.synopsis}
+lightbox add-vol <name> <src>:<dst>[:ro]
+```
+
+Adds a volume to a container's configuration. The source has to be there. A running container has the volume from its next start, and `add-vol` says so.
+
+```console
+# lightbox add-vol web /srv/config/app.conf:/etc/app.conf:ro
+Added volume to container 'web': /srv/config/app.conf -> /etc/app.conf (ro)
+```
+
+The very same volume again does nothing, and is no error: `Volume already present for container 'web'`. Another volume at a destination that has one, and a seventeenth volume, are refused ([Storage](storage.html#volume-rules)).
+
+### rm-vol {#rm-vol}
+
+```text{.synopsis}
+lightbox rm-vol <name> <dst>
+```
+
+Takes the volume at a destination out of a container's configuration. The destination is written as it is in the container, and `/data/` and `/data` are the same place. What is in the volume's source is not touched. In a running container the volume stays mounted until the container is restarted.
+
+```console
+# lightbox rm-vol web /etc/app.conf
+Removed the volume at /etc/app.conf from container 'web'
+```
+
+### reset {#reset}
+
+```text{.synopsis}
+lightbox reset <name>... [-t <seconds>]
+```
+
+Makes a container's root filesystem its base's again, as it was after `create`, without copying anything: what the container wrote, changed and took out of its root is gone. Its volumes, its configuration, its address and its log are not touched. A container that runs is stopped first, as `stop` stops it, and `-t` is `stop`'s; it is not started again.
+
+```console
+# lightbox reset web
+Resetting container 'web'...
+Container 'web' reset: its root filesystem is its base's again
+```
+
+A container that is a copy of its base has nothing to be reset to, and is refused. [Storage](storage.html#reset) has the details, and what a reset that was cut short leaves.
+
+### rm {#rm}
+
+```text{.synopsis}
+lightbox rm [-f] <name>...
+```
+
+Removes containers: the directory with their files, their configuration and their log, and what a container that ended without a stop left behind. A container that runs is refused, with `Error: container is running (stop it first):` and its name.
+
+- **`-f`, `--force`** kills a container that runs first, as `stop -t 0` does, and then removes it.
+
+`rm` does not read a container's configuration, so a container whose configuration is damaged can always be removed. Its lines in the audit log stay, and so does the snapshot of its base ([base](#base)).
+
+## Starting and stopping {#running}
+
+### start {#start}
+
+```text{.synopsis}
+lightbox start <name>... [-t <seconds>]
+```
+
+Starts stopped containers, one after the other. For each, `start` makes its cgroup with its limits, its namespaces, its interface on the bridge and its sandbox, lets its init build the container, and waits for the base's `/init.sh`, if there is one, to end.
+
+- **`-t <seconds>`**, `--timeout`: how long to wait for `/init.sh`. The default is `start_timeout`, 30 seconds; 0 does not wait. A hook that is still running then is left to run, and `start` says so and returns.
+
+```console
+# lightbox start web
+Starting container 'web'...
+Container 'web' started (pid=4242, ip=10.0.0.2)
+Attach with: lightbox exec web /bin/sh
+```
+
+What `start` does before and around that:
+
+- **The host's network.** `start` looks for the bridge, lightbox's firewall rules and forwarding, and makes them again as `setup` does when they are not all there, after a reboot for one, saying so.
+- **What an earlier run left.** A container that ended without a stop is cleared away first, and `start` says so.
+- **A hook that fails** fails the start: `start` says which status it exited with, and the container is stopped and cleared away.
+- **Ctrl-C, or a signal,** while `start` is working undoes the start: nothing of the container is left running, and `start` exits with 128 plus the signal's number.
+
+`start` refuses a container that is running already, one that `create` did not finish (`Error: the container was not created completely; remove it and create it again:`), one whose address is not in `subnet` as it is now, and one with links where nothing would keep it to them ([Networking](networking.html#links)). [How it works](internals.html#start) follows a start step by step.
+
+### stop {#stop}
+
+```text{.synopsis}
+lightbox stop <name>... [-t <seconds>]
+```
+
+Stops running containers, one after the other. `stop` sends the container's init a SIGTERM, init passes it on to every process in the container, the ones that `exec` put there included, and the container ends when none is left, or when its time is over and what is left is killed.
+
+- **`-t <seconds>`**, `--timeout`: how long the container's processes get to end. The default is `stop_timeout`, 10 seconds; `-t 0` kills at once.
+
+```console
+# lightbox stop web
+Stopping container 'web'...
+Container 'web' stopped
+```
+
+`stop` returns as soon as the container has ended. It then removes the container's cgroup, its interface and the firewall rules of its links. A container that is not running is an error, `Error: container is not running:` and its name; if it had ended by itself, `stop` first clears away what it left and says so.
+
+### restart {#restart}
+
+```text{.synopsis}
+lightbox restart <name>... [-t <seconds>]
+```
+
+Stops containers that run, as `stop` does and with its `-t`, and starts them. A container that was not running is started. The start waits for the hook as long as `start_timeout` says.
+
+## Running commands {#commands-in}
+
+### exec {#exec}
+
+```text{.synopsis}
+lightbox exec <name> [options] [--] [cmd [args...]]
+```
+
+Runs a command in a running container. Options come before the command, and a command that begins with a dash goes after `--`. Without a command, `exec` runs `/bin/sh`.
+
+```sh
+lightbox exec web cat /etc/os-release
+lightbox exec web --user nobody --env MODE=debug --workdir /var/www -- ls -la
+lightbox exec web --timeout 5m -- /bin/sh -c 'make test'
+lightbox exec web                      # a shell
+```
+
+#### Options {#exec-options}
+
+{.ref}
+| Option | Default | What it does |
+|---|---|---|
+| `--user <name|uid[:gid]>`, `-u` | root | Who the command runs as. A name is looked up in the container's `/etc/passwd`. A value that begins with a digit must be a uid, or a uid and a gid, and nothing else |
+| `--env <KEY=VALUE>`, `-e` | | Sets a variable in the command's environment. Repeatable, up to 64; the later of two for one variable wins |
+| `--workdir <dir>`, `-w` | `/`, or `/workspace` in a box with a workspace | The directory the command runs in, as an absolute path in the container |
+| `--timeout <duration>` | none | How long the command may run, as a [duration](#durations). At the deadline the command and everything it started are ended, and `exec` exits with 124 |
+
+#### Time limits
+
+At the deadline of `--timeout` the command and everything it started are ended, what it put in the background and in sessions of their own too. A command that ends before the deadline takes along what it left running.
+
+Two processes keep the time: the `exec` process, and its worker, which the container cannot reach. When the `exec` process ends while the command runs, killed for one, the worker ends everything at once; when it is held up, stopped for one, the worker does so a second past the deadline. Only root on the host, killing both, can let a command outlive its limit.
+
+Without `--timeout`, what a command left running in the background goes on after `exec` has returned.
+
+#### What the command gets as its streams {#exec-streams}
+
+What the command gets as its standard streams depends on what `exec` itself was given. It is never a terminal of yours.
+
+- **Typed at a terminal**, when standard input and output are both a terminal: the command gets a terminal of its own, a pseudo-terminal of the container, as its controlling terminal. Your terminal is raw for as long as the command runs, so every key goes to the command: Ctrl-C interrupts what runs in the container, not `exec`. The window's size is passed on, also when it changes.
+- **With a terminal on one side only**, as in `lightbox exec web cat file | less` or `lightbox exec web cat > notes`: the command gets a pipe in the place of the terminal, which `exec` reads or fills. Bytes arrive as they were sent.
+- **Without a terminal**, as in a script or a pipeline: the three streams as they are.
+
+In every case the command leads a session of its own, and is given nothing else that was open where `exec` was run. SIGINT, SIGTERM, SIGHUP and SIGQUIT sent to `exec` are passed on to the command.
+
+#### Its environment, user and groups {#exec-environment}
+
+The command is found as a shell finds it: a name without a slash is looked for in the directories of `PATH`. Its environment is:
+
+{.ref}
+| Variable | Value |
+|---|---|
+| `PATH` | `/usr/bin:/bin:/usr/sbin:/sbin` |
+| `HOME` | The home directory of the user the command runs as, from the container's `/etc/passwd`; `/root` for uid 0 and `/` for any other uid that has no account there |
+| `USER`, `LOGNAME` | The name of that user; neither is set for a uid that has no account |
+| `TERM` | The `TERM` that `exec` was run with, when it is a plain name of up to 64 letters, digits, `-`, `_`, `.` and `+`; `xterm` otherwise |
+| `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, and the same in lower case | In a container with `--net proxy:<port>`: where its proxy is ([Networking](networking.html#net-proxy)) |
+| Whatever `--env` sets | As given |
+
+`--env` adds to these and replaces the ones it names. Nothing else of your environment goes into the container. The command's groups are the ones that the container's `/etc/group` lists for its user, and none for a uid that the container has no account for. In a container with `--userns`, `exec` joins the user namespace first, so the command's user is one of the container's range on the host.
+
+#### Its exit status {#exec-status}
+
+`exec` exits with the command's status, or with 128 plus the number of the signal that ended it. Its own statuses are 124 when `--timeout` ended the command, 125 when lightbox failed before the command ran, 126 when the command could not be run, and 127 when it was not found ([Exit statuses](#exit-status)). Every failure of `exec` itself is 125: an option it does not take, a container that is not running, not being root. For 126 and 127 it says which: `cannot execute:` or `command not found:` and the command, or `cannot change to directory:` and the `--workdir`.
+
+#### Its cgroup {#exec-cgroup}
+
+Every `exec` runs in a cgroup of its own, below the container's, whose limits hold for it. The cgroup is named `exec-`, the PID of the `exec` that made it and its start time. Nothing in the container can reach cgroupfs to leave it, so what a command starts is in it until it ends.
+
+Without `--timeout`, what a command left running in the background goes on in that cgroup after `exec` returns, and the cgroup is removed once it is empty, by the next `exec` or by `stop`. `--timeout` ends what is in it with `cgroup.kill`, or, on a kernel before 5.14, by killing what it lists until nothing is left.
+
+Every `exec` is written to the [audit log](#audit-log), as it starts and as it ends. An `exec` whose start cannot be written there does not run.
+
+### run {#run}
+
+```text{.synopsis}
+lightbox run [create options] [exec options] [--] [cmd [args...]]
+```
+
+A box for one command: `run` creates a container under a name of its own, `run-` and 12 hex digits, starts it, runs the command in it as `exec` runs it, and removes it, whatever the command did. Every option of `create` and of `exec` goes before the command, `--timeout` among them. Without a command, `run` runs `/bin/sh`.
+
+```sh
+lightbox run --net none --timeout 10m -- /bin/sh -c 'make test'
+# the same in a box of the agent profile, with this directory as its workspace
+sudo lightbox run --profile agent --workspace "$PWD" --timeout 10m -- make test
+```
+
+- **What it prints** is the command's. `create`, `start` and `rm` say nothing but their errors.
+- **Its exit status** is `exec`'s: the command's status, 124, 126 or 127, and 125 when the box could not be made or started.
+- **Signals.** SIGINT, SIGTERM and SIGHUP sent to `run` go on to the command. One that comes while the box is being made stops `run` there, and it exits with 128 plus the signal's number.
+- **The box is removed** once the command has ended, or when it has not within `stop_timeout`. The removal is in a session of its own, which a terminal's keys do not reach.
+- **A run that is killed outright** cannot remove its box, which runs on. The box's `.runner` names that `run`, by its PID and start time, and the next `run` removes every box whose `run` is gone, and says so. A box that must not outlive a killed `run` for long gets a `--ttl`, as `--timeout` keeps its command to its time in any case.
+
+## Looking at containers {#looking}
+
+### ls {#ls}
+
+```text{.synopsis}
+lightbox ls [--json]
+```
+
+Lists every container, by name.
+
+```console
+# lightbox ls
+NAME                            IP              STATUS    PID
+----                            --              ------    ---
+api                             10.0.0.3        running   4310
+db                              10.0.0.20       running   4242
+web                             10.0.0.2        stopped   -
+```
+
+`IP` is `-` for a container with `--net none`, and `PID` is the container's init on the host, or `-` when it does not run. `STATUS` is one of `stopped`, `running`, `starting`, `stopping`, `exited`, `expired`, `failed` and `creating` ([How it works](internals.html#states)).
+
+`ls` changes nothing: a container that ended without a stop is shown as it is, and cleared away by the next `start`, `stop` or `rm`. It lists up to 1024 containers, and says so when there are more. `--json` gives the same as [JSON](#json).
+
+### inspect {#inspect}
+
+```text{.synopsis}
+lightbox inspect <name> [--json]
+```
+
+Shows a container's state and configuration, a line for each value, with `-` for one it does not have.
+
+```console
+# lightbox inspect web
+name: web
+state: stopped
+running: no
+ip: 10.0.0.2
+host_interface: vb-5ea0e1194872
+dir: /var/lib/lightbox/containers/web
+rootfs: /var/lib/lightbox/containers/web/rootfs
+config_path: /var/lib/lightbox/containers/web/.conf
+ip_path: /var/lib/lightbox/containers/web/.ip
+log_path: /var/lib/lightbox/containers/web/console.log
+audit_path: /var/lib/lightbox/audit.log
+pid_path: /run/lightbox/web/pid
+pid_start_path: /run/lightbox/web/pid_start
+state_path: /run/lightbox/web/state
+pid: -
+pid_starttime: -
+mem: 512M
+swap: 0
+pids: 256
+cpu: 2
+io: -
+storage: overlay
+base: 3f9a1c0b7d2e
+userns: 0
+uid_start: -
+gid_start: -
+oom_score: 500
+privileged: 0
+readonly: 1
+seccomp: allow
+net: outside
+ttl: -
+id: 2c5b2f57f53a5cdd
+profile: -
+workdir: -
+volume: /srv/www:/var/www:ro
+link: -
+```
+
+{.ref}
+| Line | What it is |
+|---|---|
+| `state`, `running` | The state as `ls` shows it, and whether its init runs |
+| `ip`, `host_interface` | Its address, and the name of the host's end of its veth pair, which is there while it runs |
+| `dir`, `rootfs`, `config_path`, `ip_path`, `log_path` | Its directory, its own files, and the files of its configuration, address and log |
+| `audit_path` | The audit log of the host |
+| `pid_path`, `pid_start_path`, `state_path` | Its runtime records, which are there while it runs |
+| `pid`, `pid_starttime` | Its init on the host, and that process's start time as `/proc` has it, which tells it from a later process with the same number |
+| `mem`, `swap`, `pids`, `cpu`, `io`, `oom_score` | Its limits |
+| `storage`, `base` | `overlay` and the id of the snapshot it overlays, or `copy` |
+| `userns`, `uid_start`, `gid_start` | Whether it has a user namespace, and the host's uid and gid of its root |
+| `privileged`, `readonly`, `seccomp` | Its sandbox; `seccomp` is `-` for a privileged container, which has no filter |
+| `net`, `link` | What it may reach, and a line for each container it is linked to |
+| `ttl`, `profile`, `workdir` | Its lifetime, `agent` for a box of the profile, and the directory its commands run in |
+| `id` | The id that `create` drew for it, by which the audit log tells it from a later container of the same name |
+| `volume` | A line for each volume, as `<src>:<dst>[:ro]` |
+
+When a container's configuration cannot be used, `inspect` shows what it can and ends with an error that says what is wrong with it; `inspect --json` gives the error alone.
+
+### logs {#logs}
+
+```text{.synopsis}
+lightbox logs <name> [-f] [--audit]
+```
+
+Prints what the container's init, its hook and its services wrote to standard output and standard error, from every start since the container was made. A container that was never started has an empty log.
+
+- **`-f`, `--follow`** goes on printing for as long as the container runs, and ends when it stops.
+- **`--audit`** prints the lines of the audit log about the box of that name instead: what `exec` and `run` asked of it. They are kept after the box is removed, so the name does not have to be a container's. With `-f` it follows them while the box runs.
+
+The log is the file `console.log` in the container's directory, which only root can read. It is kept from one start to the next, and is not rotated or limited ([Storage](storage.html#logs)).
+
+### The audit log {#audit-log}
+
+Every `exec`, and so the command of every `run`, appends two lines to `<lightbox_dir>/audit.log`: one as the command is about to start, and one when it has ended. Each is one JSON object, written with one `write` on a descriptor opened to append, so that the lines of commands that run at once do not mix. `lightbox logs --audit <name>` prints the lines of one box.
+
+```json
+{"box":"web","box_id":"8c1f0e7a5d3b2a19","time":"2026-11-21T16:39:23.123Z","event":"start","exec_id":"4242-981234","via":"exec","uid":0,"loginuid":1000,"user":null,"workdir":"/srv","timeout":"10m","env":["CI"],"argv":["make","test"]}
+{"box":"web","box_id":"8c1f0e7a5d3b2a19","time":"2026-11-21T16:41:02.456Z","event":"end","exec_id":"4242-981234","status":0,"duration_ms":99333,"timed_out":false}
+```
+
+{.ref}
+| Key | In | What it is |
+|---|---|---|
+| `box` | both | The container's name |
+| `box_id` | both | The id that `create` drew for it, kept in its `.conf` as `id=` and shown by `inspect`. It tells a box from a later one of the same name. A container created before 0.8 has none, and its lines have `null` |
+| `time` | both | When the line was written, in UTC, to the millisecond |
+| `event` | both | `start` or `end` |
+| `exec_id` | both | The PID and start time of the `exec`, as its cgroup is named. It pairs a start with its end |
+| `via` | start | `exec` or `run` |
+| `uid` | start | The caller's uid, which is 0 under `sudo` |
+| `loginuid` | start | The uid of the user who logged in, from `/proc/self/loginuid`, which `sudo` and `su` keep; `null` when no login set one |
+| `user`, `workdir`, `timeout` | start | `--user`, `--workdir` and `--timeout` as given, and `null` when not given. A command that runs in a box's workspace because it was given no `--workdir` has `null` |
+| `env` | start | The keys of `--env`, and not their values, which are often credentials |
+| `argv` | start | The command as given, or `/bin/sh` |
+| `status` | end | What `exec` exited with, 124 to 127 among them |
+| `duration_ms` | end | How long it took, from the moment `exec` began |
+| `timed_out` | end | Whether `--timeout` ended the command |
+
+Every string is ASCII. A character outside it is written as `\uXXXX`, and a byte that is not part of UTF-8 as `\udcXX`, Python's `surrogateescape`, so that `json.loads(line)["argv"][0].encode("utf-8", "surrogateescape")` gives back the bytes that were given. No control sequence or reordering mark in an argument reaches a terminal that shows the log.
+
+- **A command that cannot be recorded does not run.** An `exec` whose start cannot be written in the log exits with 125. One whose end cannot be written says so, and exits as it would have.
+- **A start with no end** is an `exec` whose process was killed.
+- **No box can read it.** The log is mode 0600 in `lightbox_dir`, mode 0700, which no container has mounted: what runs in a box can neither read it nor change it. Root on the host can.
+- **What it is, and is not.** It records what was asked of a box, not what the command then did; what left a box through a proxy is in the proxy's log. Arguments are recorded as given, so the log is as sensitive as the commands are.
+- **It grows.** The log is one file for the host, and is not rotated.
+
+## The host {#host}
+
+### doctor {#doctor}
+
+```text{.synopsis}
+lightbox doctor [--json] [--profile agent]
+```
+
+Checks what lightbox needs of this host, and says how to fix what is missing. It prints the settings in use, then a line for each check, and ends with `overall: ok`, or with `overall: degraded` and exit status 1 when a check failed. A check that fails is followed by a line that begins `to fix:`.
+
+```console
+# lightbox doctor
+...
+root: yes (uid 0)
+kernel: yes (6.12.117; lightbox needs Linux 5.10 or later)
+syscalls: yes (the ones of Linux 5.10 that lightbox makes)
+...
+bin.iptables: ok (/usr/sbin/iptables)
+...
+overall: ok
+```
+
+- **`--json`** gives the same to programs, as [JSON](#json).
+- **`--profile agent`** adds the checks of what a box of the agent profile needs: the kernel's release, a range of ids, idmapped mounts on the filesystems that hold the containers and the snapshots, `nft`, and `cgroup.kill`.
+
+Run as an ordinary user, `doctor` reports what it can see and says which checks only root can make. [Troubleshooting](troubleshooting.html#checks) explains every check and its fix.
+
+### base {#base}
+
+```text{.synopsis}
+lightbox base ls
+lightbox base add <dir>
+lightbox base rm <id>...
+```
+
+The snapshots of bases that containers overlay. A snapshot is taken by the first `create` from a base, and shared by every container made from that base afterwards ([Storage](storage.html#bases)).
+
+- **`base ls`** lists them: the id, when it was taken, the base it was taken of, and the containers on it.
+- **`base add <dir>`** takes a new snapshot of a base, for the containers made after it, as after an update of the base. The containers made before keep theirs. It prints the new id: `Base 3f9a1c0b7d2e taken of /var/lib/lightbox/rootfs; new containers of it use this one`.
+- **`base rm <id>...`** removes snapshots that no container uses. One that is in use is refused, with the names of the containers on it, and the others are still removed.
+
+```console
+# lightbox base ls
+ID            TAKEN (UTC)          SOURCE  CONTAINERS
+3f9a1c0b7d2e  2026-11-17 14:10:03  /var/lib/lightbox/rootfs  api, db, web
+```
+
+### setup {#setup}
+
+```text{.synopsis}
+lightbox setup
+lightbox setup --teardown
+```
+
+`setup` makes the host's side of the network: the bridge, lightbox's firewall rules, and IPv4 forwarding. It is safe to run again, and every `start` does the same when something is missing. `setup --teardown` takes it all away again, once no container runs. [Networking](networking.html#setup) describes both.
+
+### reload {#reload}
+
+```text{.synopsis}
+lightbox reload
+```
+
+Puts lightbox's firewall rules and bridge in again, and the rules of the links and of the `--net` of every running container, after a firewall's reload or flush took them. It changes nothing that is there already. After a firewall's reload it is `reload` that is run, and not `setup`, which leaves the rules of running containers out ([Networking](networking.html#reload)).
+
+## Help and the version {#help}
+
+```text{.synopsis}
+lightbox help [<command>]
+lightbox <command> --help
+lightbox --version
+```
+
+`help` and `--help` print the usage, or one command's part of it, on standard output. `--version` prints the version of lightbox and of the lightc it was built with, as `lightbox 0.8.0 (lightc 0.1.1)`. Neither reads the configuration, so neither prints its warnings.
+
+## JSON for programs {#json}
+
+`ls`, `inspect` and `doctor` take `--json`, and print one line of JSON on standard output. Errors still go to standard error, with the exit status of the command.
+
+### ls --json
+
+An array with an object for each container:
+
+```json
+[{"name":"api","ip":"10.0.0.3","status":"stopped","pid":null},{"name":"web","ip":"10.0.0.2","status":"running","pid":4242}]
+```
+
+`pid` is a number while the container runs, and `null` otherwise. `ip` is `"-"` for a container without an address.
+
+### inspect --json
+
+An array with one object, with the keys of `inspect`'s lines in their order. What has no value is `null`, a flag is `true` or `false`, and `pid`, `uid_start`, `gid_start` and `oom_score` are numbers. `volumes` is an array of objects and `links` an array of names:
+
+```json
+[{"name":"api","state":"stopped","running":false,"ip":"10.0.0.3","host_interface":"vb-e74fc019056a","dir":"/var/lib/lightbox/containers/api","rootfs":"/var/lib/lightbox/containers/api/rootfs","config_path":"/var/lib/lightbox/containers/api/.conf","ip_path":"/var/lib/lightbox/containers/api/.ip","log_path":"/var/lib/lightbox/containers/api/console.log","audit_path":"/var/lib/lightbox/audit.log","pid_path":"/run/lightbox/api/pid","pid_start_path":"/run/lightbox/api/pid_start","state_path":"/run/lightbox/api/state","pid":null,"pid_starttime":null,"mem":"256M","swap":"0","pids":"128","cpu":"1","io":null,"storage":"overlay","base":"3f9a1c0b7d2e","userns":false,"uid_start":null,"gid_start":null,"oom_score":500,"privileged":false,"readonly":false,"seccomp":"allow","net":"nat","ttl":"8h","id":"6eab8c372107f175","profile":null,"workdir":null,"volumes":[{"src":"/srv/www","dst":"/var/www","ro":true}],"links":["db"]}]
+```
+
+The limits are strings, as they were given: `"512M"`, `"max"`, `"0.5"`. A configuration that cannot be used gives no JSON, and an error.
+
+### doctor --json
+
+One object with three members:
+
+```json
+{"settings":{"lightbox_dir":"/var/lib/lightbox","bridge":"br0","subnet":"10.0.0.0/24","firewall":true,"firewall_backend":"iptables","bridge_accept_fwmark":null,"overlayfs":true,"userns_ranges":32768},"checks":[{"check":"root","ok":true,"text":"yes (uid 0)","fix":null},{"check":"bin.nft","ok":false,"text":"missing (/usr/sbin/nft)","fix":"install nftables"}],"overall":"degraded"}
+```
+
+{.ref}
+| Member | What it is |
+|---|---|
+| `settings` | The settings in use and what `doctor` found about the host, by the names of the lines it prints: strings, and `true`, `false`, numbers and `null` where the value is one |
+| `checks` | An array in the order of the lines, each with `check`, the name; `ok`, whether it passed; `text`, what the line says after the name; and `fix`, what to do when it failed, or `null` |
+| `overall` | `"ok"`, or `"degraded"` when a check failed, which is also when `doctor` exits 1 |
+
+The example is shortened: `doctor` prints every setting and every check.
+
+{.source}
+Source: `lightbox.c` for the commands and their options, `lightbox_meta.c` for `ls`, `inspect`, `logs` and `doctor`, `lightbox_base.c` for `base`, `lightbox_audit.c` for the audit log, and `lightbox_container.c` and `lightbox_util.c` for the values.

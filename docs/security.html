@@ -1,0 +1,465 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><title>Security · lightbox</title><meta name="description" content="The sandbox of a lightbox container piece by piece: capabilities, the two seccomp profiles, no_new_privs, the masked parts of /proc and /sys, the device filter, the network, user namespaces and exec, with the threat model and what is left to you."><script src="https://cdn.luccet.dev/v2.0.0/luccet.js"></script>
+
+:::use
+https://cdn.luccet.dev/themes/v1.0.0/classic.css
+https://cdn.luccet.dev/themes/v1.0.0/github.css
+https://cdn.luccet.dev/code/v1.0.0/code.js
+lightbox-docs.js
+docs.css
+:::
+
+::site-nav
+
+# Security {#top}
+
+{.brief}
+What stands between a container and the host, piece by piece: what each defence does, what it does not cover, and the option that changes it. Then the threat model, and the choices for a container that runs code you do not trust.
+
+::toc
+
+## The sandbox {#overview}
+
+Every defence on this page is on for a container that `create` makes without an option about security, but for one: a user namespace, which needs a range of ids on the host first and is asked for with `--userns` (see [User namespaces](#userns)). `--privileged` turns most of the others off at once (see [`--privileged`](#privileged)).
+
+The sandbox covers everything that runs in a container: its init, the `/init.sh` hook and all that the hook starts, and every command of `exec` and `run`. Init puts it on itself once the container is built and before it runs the hook. `exec` puts it on the process that becomes the command, before that process takes the command's user and executes it. In a container that is not privileged, nothing of the image runs before the sandbox is on, and a step of it that fails ends the process: a container does not run with less. A hook that mounts filesystems or configures the network therefore needs a privileged container.
+
+{.ref}
+| Defence | What a container has | Changed by | More |
+|---|---|---|---|
+| Namespaces | Its own PID, mount, UTS, IPC and network namespaces | nothing | [Threat model](#threat-model) |
+| User namespace | None: its root is the host's root. With `--userns`, an unprivileged uid of the host's | `--userns` | [User namespaces](#userns) |
+| Capabilities | 11, in every set that counts | `--privileged` | [Capabilities](#capabilities) |
+| Seccomp | The allow-list filter, which answers a system call it does not name with `ENOSYS` | `--seccomp deny`, `--privileged` | [Seccomp](#seccomp) |
+| `no_new_privs` | Set: no program gains rights when it is executed | `--privileged` | [no_new_privs](#no-new-privs) |
+| `/proc` and `/sys` | The paths that show or change the host are masked or read-only | `--privileged` | [/proc and /sys](#proc) |
+| Root filesystem | `nodev` and `nosuid`, and no file can be given a setuid or setgid bit or a file capability | `--read-only`, `--privileged` | [The root filesystem](#rootfs) |
+| Devices | The eight kinds of device of its own `/dev`, and no other | `--privileged` | [Devices](#devices) |
+| Network | The internet and its name servers; nothing of the host, of a private network or of another container | `--net`, `--link` | [Network](#network) |
+| `exec` | A terminal of the container's, a sealed copy of the binary, a worker that the container cannot look into | nothing | [exec](#exec) |
+| Limits | 256M of memory, no swap, 128 processes, one CPU, and an OOM score of 500 | `--mem`, `--swap`, `--pids`, `--cpu`, `--io-max`, `--oom-score`, `--ttl` | [Limits](#limits) |
+
+[`inspect`](commands.html#inspect) shows which of these a container has, and `seccomp: -` for a privileged one, which has no filter:
+
+```console
+# lightbox inspect web | grep -E '^(userns|privileged|readonly|seccomp|net):'
+userns: 0
+privileged: 0
+readonly: 1
+seccomp: allow
+net: outside
+```
+
+From inside, a command that runs as root in a container that is not privileged reads this in `/proc/self/status`. The lifecycle suite checks these values for init, for the hook and for a command of `exec`:
+
+{.ref}
+| Field | Value | Which says |
+|---|---|---|
+| `CapPrm`, `CapEff`, `CapBnd` | `00000000200405fb` | The 11 capabilities, and no other |
+| `CapInh`, `CapAmb` | `0000000000000000` | Nothing is passed on to a program by inheritance |
+| `NoNewPrivs` | `1` | `no_new_privs` is set |
+| `Seccomp` | `2` | A filter is installed |
+
+## Capabilities {#capabilities}
+
+Root in a container is not what root is on the host. The kernel splits root's rights into about forty capabilities, and a container's processes hold 11 of them:
+
+{.ref}
+| Capability | What it lets a process do |
+|---|---|
+| `CAP_CHOWN` | Change the owner and the group of a file |
+| `CAP_DAC_OVERRIDE` | Read, write and search files and directories whatever their permission bits say |
+| `CAP_FOWNER` | Do to any file what its owner may: change its mode, its times and its attributes |
+| `CAP_FSETID` | Change a file without the kernel clearing its setuid and setgid bits. The filter lets no call set them (see [Seccomp](#seccomp-both)) |
+| `CAP_KILL` | Send a signal to a process of any user |
+| `CAP_SETGID` | Change its gid and its groups |
+| `CAP_SETUID` | Change its uid, as `su`, a service that gives up root and `exec --user` do |
+| `CAP_SETPCAP` | Drop capabilities from its own bounding set |
+| `CAP_NET_BIND_SERVICE` | Listen on a port below 1024 |
+| `CAP_SYS_CHROOT` | Call `chroot` |
+| `CAP_AUDIT_WRITE` | Write a record to the kernel's audit log, as programs that log a user in do |
+
+These are the 14 of Docker's default without three:
+
+- **`CAP_NET_RAW`**, which opens raw and packet sockets: with it a process reads traffic that is not its own and sends packets that no socket of its own would send. A program that needs a raw socket, as some versions of `ping` do, does not work in a container.
+- **`CAP_MKNOD`**, which makes device nodes. A container's devices are the ones lightbox puts in its `/dev`, and it needs to make none (see [Devices](#devices)).
+- **`CAP_SETFCAP`**, which writes a file capability on a program. One that a container's root wrote on a program in a volume would hold on the host, for whoever runs the program there. Inside the container it would give nothing, as `no_new_privs` keeps an `execve` from granting it.
+
+Each set of a process is reduced, and a step that fails ends the process:
+
+- **The bounding set** loses every capability that is not on the list, so no later `execve` gives one back.
+- **The effective and the permitted set**, what the process holds itself, are cut to the list.
+- **The inheritable and the ambient set**, what it would pass on, are emptied.
+
+What follows from the list:
+
+- **None of the capabilities that reach the host is on it.** Without `CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, `CAP_SYS_PTRACE`, `CAP_SYS_MODULE`, `CAP_SYS_TIME` and `CAP_SYS_RAWIO`, nothing in a container mounts a filesystem, changes its interface, its address or its routes, traces a process it could not trace as an ordinary user, loads a kernel module, sets a clock or reaches I/O ports.
+- **A command that `exec --user` runs as another user than root holds none of the 11.** The kernel takes a process's capabilities when it gives up uid 0, and nothing in a container gives them back (see [no_new_privs](#no-new-privs)).
+- **With `--userns` the 11 are those of a user namespace's root.** They hold over what belongs to the container and over nothing of the host's.
+- **A privileged container keeps every capability** of the root that started it.
+
+## Seccomp {#seccomp}
+
+Every process of a container that is not privileged runs under a seccomp filter: a small program that the kernel runs before each system call, and that lets the call through, answers it with an error, or ends the process. lightbox has two, and a container has one of them for as long as it exists.
+
+### The two profiles {#seccomp-profiles}
+
+{.ref}
+| Profile | What it does | Which containers have it |
+|---|---|---|
+| The allow-list, `--seccomp allow` | Allows the calls it names, and answers every other with `ENOSYS` | Every container that `create` makes, unless it is given `--seccomp deny`. A box of the agent profile always |
+| The deny-list, `--seccomp deny` | Refuses the calls it names, and allows every other | A container created with `--seccomp deny`, and every container created before 0.8, which keeps it |
+
+`create --seccomp allow|deny` chooses the profile, and any other value ends `create` with `Error: --seccomp takes allow or deny, not:` and the value. The container's `.conf` has `seccomp=allow` for the allow-list and no line for the deny-list, and `inspect` shows `seccomp: allow` or `seccomp: deny`. A container keeps its profile: no command changes it, and to have the other one a container is created again. `--profile agent` refuses `--seccomp deny`.
+
+Both profiles are one table in `lightbox_seccomp.h`, turned into the program for the architecture lightbox is built for. `make check` compares every number of the table with the kernel's headers, interprets both programs for every system call number on x86_64 and on aarch64, and installs each to probe it (see [the test suites](internals.html#tests)).
+
+### What both refuse {#seccomp-both}
+
+The two profiles share their rules, in this order:
+
+- **Another ABI ends the process.** A system call made through the other ABI of the machine, i386 on x86_64 and AArch32 on aarch64, has other numbers than the table. The filter does not guess: it ends the process. A 32-bit program therefore does not run in a container that is not privileged.
+- **The x32 range, on x86_64, answers `EPERM`.** Calls of the x32 ABI pass as x86_64's with one more bit in the number, so no row would match them, and the whole range is refused.
+- **60 calls on x86_64, and 51 on aarch64, are refused by name.** They follow the deny list of Docker's default profile. All answer `EPERM` but two, `clone3` and `openat2`, which answer `ENOSYS`.
+- **`clone` with a namespace flag answers `EPERM`.** A container makes processes and threads, and no namespace: `CLONE_NEWNS`, `CLONE_NEWCGROUP`, `CLONE_NEWUTS`, `CLONE_NEWIPC`, `CLONE_NEWUSER`, `CLONE_NEWPID` and `CLONE_NEWNET` are refused, and so are `unshare` and `setns`. The flags of `clone3` are behind a pointer that a filter cannot read, so it cannot be allowed for threads alone: it answers `ENOSYS`, the one answer that makes a C library fall back to `clone`.
+- **A mode with the setuid or the setgid bit answers `EPERM`,** in every call that sets the mode of a file: `fchmod`, `fchmodat`, `fchmodat2`, `mknodat` and `openat`, and on x86_64 `chmod`, `creat`, `mknod` and `open` as well. An `open` or `openat` is looked at only when it makes a file, with `O_CREAT` or `O_TMPFILE`. The same calls with a mode without the two bits are allowed. `openat2` has its mode behind a pointer, and answers `ENOSYS` so that a program falls back to `openat`. `mkdir` needs no rule, as the kernel drops both bits from its mode.
+- **`socket` takes four families, and `socketpair` one.** `socket` is allowed for `AF_UNIX`, `AF_INET`, `AF_INET6` and `AF_NETLINK`, which C libraries use to learn a host's addresses, and `socketpair` for `AF_UNIX`. Any other family answers `EAFNOSUPPORT`, as a kernel without that family would: `AF_PACKET` and `AF_XDP`, which need `CAP_NET_RAW` in any case, `AF_VSOCK`, which no network namespace confines, `AF_ALG`, and the families of old and rare protocols, a large part of the kernel that a container needs none of.
+
+:::details[The calls both profiles refuse by name]
+{.ref}
+| What they are for | Calls | Answer |
+|---|---|---|
+| Kernel modules | `init_module` `finit_module` `delete_module`, and on x86_64 `create_module` `get_kernel_syms` `query_module` | `EPERM` |
+| Another kernel, or none | `kexec_load` `kexec_file_load` `reboot` | `EPERM` |
+| The clocks | `clock_settime` `clock_adjtime` `settimeofday` | `EPERM` |
+| Mounts | `umount2` `open_tree` `move_mount` `mount_setattr` `fsopen` `fsconfig` `fsmount` `fspick` | `EPERM` |
+| Swap, quotas and the NFS server | `swapon` `swapoff` `quotactl` `nfsservctl` | `EPERM` |
+| Namespaces | `unshare` `setns` | `EPERM` |
+| Processes and threads with flags the filter cannot read | `clone3` | `ENOSYS` |
+| Other processes | `ptrace` `process_vm_readv` `process_vm_writev` `kcmp` `pidfd_getfd` `process_madvise` | `EPERM` |
+| Profiling | `perf_event_open` `lookup_dcookie` | `EPERM` |
+| The kernel's keyrings | `add_key` `request_key` `keyctl` | `EPERM` |
+| BPF, io_uring and userfaultfd | `bpf` `io_uring_setup` `io_uring_enter` `io_uring_register` `userfaultfd` | `EPERM` |
+| Memory policy across NUMA nodes | `mbind` `get_mempolicy` `set_mempolicy` `set_mempolicy_home_node` `migrate_pages` `move_pages` | `EPERM` |
+| Files by handle | `name_to_handle_at` `open_by_handle_at` | `EPERM` |
+| Accounting and execution domains | `acct` `personality` | `EPERM` |
+| Opening a file with a mode the filter cannot read | `openat2` | `ENOSYS` |
+| I/O ports, on x86_64 | `ioperm` `iopl` | `EPERM` |
+| Calls of old kernels, on x86_64 | `_sysctl` `sysfs` `uselib` `ustat` | `EPERM` |
+:::
+
+### The allow-list {#seccomp-allow}
+
+After the rules above, the allow-list allows 247 calls by name on both architectures and 34 more on x86_64, which has older calls that aarch64 never had, such as `stat`, `rename`, `fork` and `poll`. The list is Docker's default profile, fitted to what agents and the Alpine and Debian images run: a shell, git, Python, Node.js, a C compiler and a package manager. `make test-seccomp` runs git, Python, Node.js and a C compiler under both profiles, where the host has them.
+
+It answers every call it does not name with `ENOSYS`, "function not implemented": what a kernel too old to have the call would answer. A program written for more than one kernel takes that answer as a reason to use an older call, where `EPERM` would read as a failure. Among the calls it does not name:
+
+- **Calls that need a capability a container does not have,** such as `mount`, `pivot_root`, `sethostname` and `syslog`.
+- **`modify_ldt`,** which only 16-bit and 32-bit code needs.
+- **Every call newer than Linux 6.8,** the kernel whose headers the list is checked with, such as `mseal`, and any call a later kernel adds. A new call is refused until the list names it.
+
+:::details[The 247 calls the allow-list names on both architectures]
+`accept` `accept4` `adjtimex` `bind` `brk` `cachestat` `capget` `capset` `chdir` `chroot` `clock_getres` `clock_gettime` `clock_nanosleep` `close` `close_range` `connect` `copy_file_range` `dup` `dup3` `epoll_create1` `epoll_ctl` `epoll_pwait` `epoll_pwait2` `eventfd2` `execve` `execveat` `exit` `exit_group` `faccessat` `faccessat2` `fadvise64` `fallocate` `fanotify_mark` `fchdir` `fchown` `fchownat` `fcntl` `fdatasync` `fgetxattr` `flistxattr` `flock` `fremovexattr` `fsetxattr` `fstat` `fstatfs` `fsync` `ftruncate` `futex` `futex_requeue` `futex_wait` `futex_waitv` `futex_wake` `get_robust_list` `getcpu` `getcwd` `getdents64` `getegid` `geteuid` `getgid` `getgroups` `getitimer` `getpeername` `getpgid` `getpid` `getppid` `getpriority` `getrandom` `getresgid` `getresuid` `getrlimit` `getrusage` `getsid` `getsockname` `getsockopt` `gettid` `gettimeofday` `getuid` `getxattr` `inotify_add_watch` `inotify_init1` `inotify_rm_watch` `io_cancel` `io_destroy` `io_getevents` `io_pgetevents` `io_setup` `io_submit` `ioctl` `ioprio_get` `ioprio_set` `kill` `landlock_add_rule` `landlock_create_ruleset` `landlock_restrict_self` `lgetxattr` `linkat` `listen` `listmount` `listxattr` `llistxattr` `lremovexattr` `lseek` `lsetxattr` `madvise` `map_shadow_stack` `membarrier` `memfd_create` `memfd_secret` `mincore` `mkdirat` `mlock` `mlock2` `mlockall` `mmap` `mprotect` `mq_getsetattr` `mq_notify` `mq_open` `mq_timedreceive` `mq_timedsend` `mq_unlink` `mremap` `msgctl` `msgget` `msgrcv` `msgsnd` `msync` `munlock` `munlockall` `munmap` `nanosleep` `newfstatat` `pidfd_open` `pidfd_send_signal` `pipe2` `pkey_alloc` `pkey_free` `pkey_mprotect` `ppoll` `prctl` `pread64` `preadv` `preadv2` `prlimit64` `process_mrelease` `pselect6` `pwrite64` `pwritev` `pwritev2` `read` `readahead` `readlinkat` `readv` `recvfrom` `recvmmsg` `recvmsg` `remap_file_pages` `removexattr` `renameat` `renameat2` `restart_syscall` `rseq` `rt_sigaction` `rt_sigpending` `rt_sigprocmask` `rt_sigqueueinfo` `rt_sigreturn` `rt_sigsuspend` `rt_sigtimedwait` `rt_tgsigqueueinfo` `sched_get_priority_max` `sched_get_priority_min` `sched_getaffinity` `sched_getattr` `sched_getparam` `sched_getscheduler` `sched_rr_get_interval` `sched_setaffinity` `sched_setattr` `sched_setparam` `sched_setscheduler` `sched_yield` `seccomp` `semctl` `semget` `semop` `semtimedop` `sendfile` `sendmmsg` `sendmsg` `sendto` `set_robust_list` `set_tid_address` `setfsgid` `setfsuid` `setgid` `setgroups` `setitimer` `setpgid` `setpriority` `setregid` `setresgid` `setresuid` `setreuid` `setrlimit` `setsid` `setsockopt` `setuid` `setxattr` `shmat` `shmctl` `shmdt` `shmget` `shutdown` `sigaltstack` `signalfd4` `splice` `statfs` `statmount` `statx` `symlinkat` `sync` `sync_file_range` `syncfs` `sysinfo` `tee` `tgkill` `timer_create` `timer_delete` `timer_getoverrun` `timer_gettime` `timer_settime` `timerfd_create` `timerfd_gettime` `timerfd_settime` `times` `tkill` `truncate` `umask` `uname` `unlinkat` `utimensat` `vmsplice` `wait4` `waitid` `write` `writev`
+:::
+
+:::details[The 34 more it names on x86_64]
+`access` `alarm` `arch_prctl` `chown` `dup2` `epoll_create` `epoll_wait` `eventfd` `fork` `futimesat` `get_thread_area` `getdents` `getpgrp` `inotify_init` `lchown` `link` `lstat` `mkdir` `pause` `pipe` `poll` `readlink` `rename` `rmdir` `select` `set_thread_area` `signalfd` `stat` `symlink` `time` `unlink` `utime` `utimes` `vfork`
+:::
+
+### The deny-list {#seccomp-deny}
+
+The deny-list allows every call that the rules above do not refuse, the calls of a newer kernel among them. `mount` and `pivot_root` are not in its table, as lightbox makes them itself while it builds a container. By the time anything of the image runs, the capabilities that permit them are gone, and the kernel refuses them with `EPERM`: in a container of the deny-list `sethostname` answers "operation not permitted", and in one of the allow-list "function not implemented".
+
+The deny-list is there for a program that the allow-list stops, and for the containers that had it before 0.8. It is the weaker of the two, since what it does not name it allows.
+
+### When a program needs a call that is refused {#seccomp-refused}
+
+lightbox keeps no record of what the filter answered: the program sees the error as the result of its call, and says so in its own words.
+
+{.ref}
+| What the program does | What it gets | What to do |
+|---|---|---|
+| Makes a call the allow-list does not name | `ENOSYS`, "function not implemented" | Most programs fall back by themselves. For one that does not, create the container with `--seccomp deny` |
+| Traces or debugs a process, as `strace`, `gdb` and `perf` do | `EPERM` | Debug the program on the host, or in a container made for that with `--privileged` |
+| Makes a namespace of its own, as a nested container runtime and the sandbox of a browser do | `EPERM` | A privileged container for a program you trust, and a virtual machine for one you do not |
+| Uses io_uring, BPF or userfaultfd | `EPERM` | A program that can do without falls back; one that cannot needs `--privileged` |
+| Is a 32-bit program | Ended at its first call | Use a 64-bit build |
+| Gives a file the setuid or setgid bit, as the packages of `sudo` and `passwd` do when they are installed | `EPERM` | Install the package in the base, on the host (see [The root filesystem](#rootfs)) |
+| Mounts a filesystem | `ENOSYS` under the allow-list, `EPERM` under the deny-list | Mount it on the host and give it to the container as a [volume](storage.html#volumes) |
+
+There is no option for a profile of your own: a container has one of the two, or with `--privileged` none.
+
+## no_new_privs {#no-new-privs}
+
+Init and every command of `exec` set `no_new_privs` before the filter goes on, and everything they start inherits it. Nothing can clear it. With it, an `execve` never gives a process more rights than it had: the setuid and setgid bits of a program and its file capabilities have no effect.
+
+- **A user of the container does not become root through a program.** `su`, `sudo` and a setuid `passwd` in an image run as whoever started them. What has to run as root is started as root, and what should not is given its user with [`exec --user`](commands.html#exec-options).
+- **It is what lets the filter be installed** by a process without `CAP_SYS_ADMIN`, which is why it is set first.
+- **A privileged container does not have it,** and there a setuid program gives its rights as it does on the host.
+
+## /proc and /sys {#proc}
+
+A container has a `/proc` of its own PID namespace, which shows its processes and no other, mounted `nosuid`, `nodev` and `noexec`, and a `/sys` that is read-only. Parts of both show or change the host itself, whatever the namespace. In a container that is not privileged they are covered: the paths that Docker masks or makes read-only by default, with `sysrq-trigger` masked where Docker makes it read-only.
+
+{.ref}
+| Path | What it is | How it is covered |
+|---|---|---|
+| `/proc/kcore` | The memory of the kernel, as a core file | `/dev/null` is bound over it |
+| `/proc/keys` | The keys of the kernel's keyrings | `/dev/null` |
+| `/proc/interrupts` | Every interrupt of the host, by processor and device | `/dev/null` |
+| `/proc/timer_list`, `/proc/timer_stats` | The host's timers, and who set them | `/dev/null` |
+| `/proc/sched_debug` | The scheduler's view of every process of the host | `/dev/null` |
+| `/proc/latency_stats` | Where the host's processes wait | `/dev/null` |
+| `/proc/sysrq-trigger` | A file that, written to, makes the kernel reboot, crash or kill | `/dev/null` |
+| `/proc/acpi`, `/proc/asound`, `/proc/scsi` | The host's power management, sound cards and disks | An empty read-only tmpfs is mounted over each |
+| `/sys/firmware` | The firmware's tables: ACPI, DMI, EFI | An empty read-only tmpfs |
+| `/sys/devices/virtual/powercap` | Energy counters of the processor | An empty read-only tmpfs |
+| `/proc/bus`, `/proc/fs`, `/proc/irq`, `/proc/sys` | The kernel's settings, and its buses, filesystems and interrupts | Bound onto themselves read-only |
+
+- **A file is covered with `/dev/null`** and reads as empty; a directory with a tmpfs of mode 555 that is read-only, `nosuid`, `nodev` and `noexec`, and shows nothing.
+- **A path that the host's kernel does not have is passed over.**
+- **A cover that cannot be made ends the start.** A container does not run with one of these paths left open.
+- **`/proc/sys` is read-only,** so nothing in a container changes a kernel setting, the ones of its own network namespace included.
+- **A privileged container has none of the covers,** and sees `/proc` as it is.
+
+## The root filesystem {#rootfs}
+
+What init mounts for a container, and how:
+
+{.ref}
+| Mount | What it is | Flags |
+|---|---|---|
+| `/` | The overlay of the base's snapshot and the container's own files, or the container's copy | `nodev`; `nosuid` unless the container is privileged; read-only with `--read-only` |
+| `/proc` | The procfs of the container's PID namespace | `nosuid`, `nodev`, `noexec` |
+| `/sys` | A sysfs | read-only |
+| `/dev` | A tmpfs of mode 755, with the container's devices | `nosuid`, `noexec` |
+| `/dev/pts` | A devpts of the container's own | `nosuid`, `noexec` |
+| `/dev/shm` | A tmpfs | `nosuid`, `nodev`, `noexec` |
+| `/tmp`, `/run` | A tmpfs each | `nosuid`, `nodev` |
+| `/var/tmp` | A tmpfs, with `--read-only` only | `nosuid`, `nodev` |
+| A volume | The source on the host, bound | `nosuid`, `nodev`; read-only with `:ro` |
+
+- **`nodev`: a device node in the image is not a device.** The devices a container may use are the ones bound into its `/dev`, which is a mount of its own (see [Devices](#devices)).
+- **`nosuid`: a setuid program of the image keeps its bit and gets nothing from it,** as `no_new_privs` has it already. A privileged container's root is not `nosuid`.
+- **`--read-only` closes the root** once the container is built. What stays writable is the tmpfs mounts, `/tmp`, `/run`, `/var/tmp`, `/dev` and `/dev/shm`, whose content is gone when the container stops, and the volumes that are not `:ro`.
+- **All mounts are private to the container.** A mount or unmount on the host does not reach into it, and the host's root is gone from its mount namespace before anything of the image runs.
+
+### No setuid bit, and no file capability {#no-setuid}
+
+Nothing in a container that is not privileged gives a file the setuid or the setgid bit, or a file capability. The filter refuses a mode with either bit (see [What both refuse](#seccomp-both)), and without `CAP_SETFCAP` no capability is written on a file.
+
+Inside the container the bits would mean nothing. The rule is there for the host: a file that a container makes in a volume is a file on the host too, with its bits and its owner, for whoever runs it there. So no program that a container leaves in a volume, or in its own files under `container_dir`, runs on the host with the rights of its owner, of the volume's owner or of root.
+
+The cost is in packages. One that installs a setuid or setgid program, such as `passwd`, `mount` or `sudo`, or that runs `setcap`, such as `iputils-ping`, fails to install in a container. Install or update it in the base on the host and take a new snapshot with [`base add`](commands.html#base), for the containers made after it, or give the container `--privileged`.
+
+## Devices {#devices}
+
+A container has a `/dev` of its own, a tmpfs that init fills, and may open the devices in it and no other:
+
+{.ref}
+| In `/dev` | Device | Access |
+|---|---|---|
+| `null` | Character device 1:3 | Read and write |
+| `zero` | 1:5 | Read and write |
+| `full` | 1:7 | Read and write |
+| `random` | 1:8 | Read |
+| `urandom` | 1:9 | Read |
+| `tty` | 5:0 | Read and write |
+| `ptmx`, a link to `pts/ptmx` | 5:2, of the container's devpts | Read and write |
+| `pts/0`, `pts/1` and so on | Majors 136 to 143, any minor: the terminals its devpts hands out | Read and write |
+
+Beside them are `/dev/shm`, a tmpfs, and the links `fd`, `stdin`, `stdout` and `stderr` into `/proc/self`. The six devices at the top are the host's nodes, each bound onto an empty file and remounted `nosuid` and `noexec`, and `random` and `urandom` read-only.
+
+What holds a container to the table is not the content of `/dev` but a program in the kernel: an eBPF program of the kind the cgroup device controller runs, which `start` attaches to the container's cgroup before init is in it. The kernel asks it whenever a process of the container opens or makes a block or character device:
+
+- **It goes by the device's numbers, not by its name or place.** A node of another device does not open, wherever it is and whoever made it. In `/dev` itself the program refuses it, with `EPERM`. On the root and in a volume the mount's `nodev` refuses it first, and the program would after it. A second node with the numbers of `/dev/null` opens in `/dev`, as it is the same device.
+- **No block device is opened at all,** and no device is made: `mknod` of a block or character device is refused for every number. Pipes and sockets are not devices and are not asked about. The kernel lets overlayfs make its own marks for removed files without asking.
+- **`random` and `urandom` are for reading.** Their mounts are read-only too, but a read-only mount alone does not keep a device from being written, so the program refuses the write.
+- **It holds for every `exec`.** A command's cgroup is below the container's, the program is the container's until its cgroup is removed, and no cgroup below may have another.
+
+A container that is not privileged does not start without the program. `start` says that the kernel did not load it, and [`doctor`](troubleshooting.html#checks) has a check, `device_filter`, that loads it and lets it go, with its fix: a kernel with `CONFIG_CGROUP_BPF` and `CONFIG_BPF_SYSCALL`.
+
+A program that needs another device, a disk, `/dev/fuse`, `/dev/kvm`, `/dev/net/tun` or a GPU, does not find it in a container. A privileged container has no device program and holds `CAP_MKNOD`, so it opens any device it has a node of in its `/dev` or makes one there: give that only to what you trust with the host's devices.
+
+## Network {#network}
+
+What a container may reach is decided on the host, by firewall rules and a bridge that lightbox owns. [Networking](networking.html) has all of it; this is what it defends.
+
+- **`--net` says what a container reaches.** `outside`, the default, is the internet and the name servers the container was created with, and nothing of the host, of a private network or of the clouds' metadata services. `none` is loopback alone. `proxy:<port>` is one TCP port of the gateway, where a proxy of yours decides. `nat` is the network every container had before 0.8, with the host and its networks in reach (see [What `--net` lets a container reach](networking.html#net)).
+- **Containers do not reach each other.** A container without `--link` is on an isolated port of the bridge, and an isolated port does not reach another, whatever the firewall does. One with `--link` is kept to its links by rules that name the two ports of each (see [Links](networking.html#links)).
+- **The rules hold a container by its address,** which nothing in a container that is not privileged can change, as it has no `CAP_NET_ADMIN`. A privileged container can.
+- **IPv6 is off** in every container, so no rule is missing for it (see [IPv6](networking.html#ipv6)).
+- **The rules are lightbox's firewall rules.** With `firewall = false` in `lightbox.conf` there are none, and `create` refuses `--net outside` and `--net proxy`, which would mean nothing without them.
+- **The filter keeps sockets to the families a container uses** (see [What both refuse](#seccomp-both)), and without `CAP_NET_RAW` there is no raw socket.
+
+A firewall's reload on the host can take lightbox's rules away while containers run. [Networking](networking.html#reload) says what holds until they are back, and how to put them back.
+
+## User namespaces {#userns}
+
+Without `--userns`, uid 0 in a container is uid 0 on the host: what keeps it in is everything else on this page. A container created with `--userns` has a user namespace of its own, and its root is not the host's. Uid 0 in it is an unprivileged uid on the host, and so is each of its other users: a process that got past the sandbox would be nobody there.
+
+### Ranges of ids {#userns-ranges}
+
+Each such container has a range of 65536 uids and 65536 gids of the host that nothing else has. lightbox takes them from the ranges that `/etc/subuid` and `/etc/subgid` give the name `lightbox`, as rootful Podman's `--userns=auto` takes its own from the name `containers`. Add a range to both files before the first such container, as large as you like:
+
+```sh
+echo lightbox:2147483647:2147483648 >> /etc/subuid
+echo lightbox:2147483647:2147483648 >> /etc/subgid
+```
+
+That line gives lightbox the upper half of the 32-bit ids, room for 32768 containers. A line is `lightbox:<first id>:<how many>`.
+
+- **`create --userns` runs as root** and gives the container the first range of 65536 of each file that no container has. A line's ids are cut into ranges of 65536 from its first id on, and a line of fewer gives none. Uids and gids are chosen apart, each from its own file.
+- **The container's `.conf` records it** as `userns=1`, `uid_start` and `gid_start`, the host's uid and gid of its root, and `inspect` shows the three. A range is a container's until the container is removed.
+- **Without a range, `create --userns` makes nothing** and says what to add: `Error: no range of host ids for the container's user namespace`, with the line above. It says the same when every range is a container's.
+- **A range never holds host root or the last id.** A line of `lightbox`'s that is not `first:count`, that starts at 0 or that reaches 4294967295 ends `create` with the file and the line named.
+- **No range is given out while it may be taken.** When the `.conf` of some container cannot be read, `create --userns` stops and names that container, as its range may be the one.
+- **`doctor` says how many ranges the two files hold,** as `userns_ranges`.
+
+### Idmapped mounts {#userns-mounts}
+
+The files of a base belong to host root. A container whose root is another uid on the host would own none of its own files, and the usual answer, a copy of the base with every file given a new owner, costs the time and the room that an overlay saves. lightbox chowns nothing. It mounts the base through an *idmapped mount*, which shows the same files under other ids:
+
+- **The root.** `start` makes the container's root in a mount namespace of its own, as host root: the base's snapshot, idmapped so that a file has in the container the id it has on disk, host root's being the container's root's, and the overlay on it. Init finds it mounted, and nothing changes on the host.
+- **An overlay container's own files,** `rootfs/` under its directory, belong on the host to its range: what its root makes there is the first uid of the range's. The snapshot stays host root's, and other containers of the base go on sharing it.
+- **A `--copy` container's files** keep the base's ids on disk, root's included, as the copy is idmapped as it is. Its directory is root's alone, as every container's is.
+- **A volume** is an idmapped mount of its source for the source's owner: the container's root stands for the owner and group of the source on the host, and no other id is mapped. A source that is host root's is bound as it is, and the container writes in it only where anyone on the host may. `start` takes the volumes itself, as host root, and init attaches them (see [Who owns what a container writes](storage.html#volume-ownership)).
+- **`exec`** joins the user namespace first, and the other namespaces as its root. Its command runs as the container's user, which is a uid of the range on the host.
+
+### What it needs {#userns-needs}
+
+{.ref}
+| For | The host needs |
+|---|---|
+| `--userns --copy` | Linux 5.12, and a filesystem with idmapped mounts under `container_dir` |
+| `--userns` on an overlay, which is the default and what `--profile agent` makes | Linux 5.19, and a filesystem with idmapped mounts under `lightbox_dir` and `container_dir` |
+| A volume of such a container | A filesystem with idmapped mounts under the volume's source |
+
+ext4, xfs and btrfs have idmapped mounts, and tmpfs from Linux 6.3 on.
+
+There is no fallback. Where the kernel or the filesystem cannot idmap, `create --userns` says so, names the call that failed and makes nothing; it does not make a container whose root is host root after all, and it does not chown. Where only the overlay cannot be put on an idmapped layer, it says that `--copy` makes a container with `--userns` that needs 5.12. A volume that cannot be idmapped stops the `start`. [`doctor --profile agent`](troubleshooting.html#agent-checks) tries an idmapped mount on both directories and says which one cannot.
+
+:::note[What a user namespace does not change]
+The kernel is still the host's, and a container still makes the system calls its filter allows. `--userns` takes away what a process is on the host once it is past the sandbox, not the ways past it. For code you do not trust at all, see [What it does not keep out](#not-covered).
+:::
+
+## exec {#exec}
+
+[`exec`](commands.html#exec) is the way into a running container, for `run` too, and is run by someone with a terminal, a set of open files and an environment of their own. None of that goes in.
+
+- **The command never holds your terminal.** Whoever holds a terminal can read what is typed on it and write what is shown on it. Typed at a terminal, `exec` gives the command a pseudo-terminal of the container's own devpts and carries the bytes both ways. Where only some of its streams are a terminal, a pipe stands in for each that is (see [The command's streams](commands.html#exec-streams)).
+- **The command leads a session of its own,** with nothing open but its three streams, and with an environment that lightbox makes: nothing of yours but `TERM` goes in, and what `--env` names (see [The command's environment](commands.html#exec-environment)).
+- **`exec` enters from a copy of the binary that nothing can write to.** A process that enters a container is, to the container, one of its own until it executes the command. So `exec` first executes itself again from a copy in memory whose seals forbid writing, growing, shrinking and taking the seals off, as runc does. The processes it puts in a container are never the installed binary.
+- **Where the kernel refuses to execute such a copy,** with `vm.memfd_noexec = 2`, `exec` takes the binary through a mount of its own that is read-only instead. Where it can have neither, it does not run, and says so. `doctor` says which of the two is in use, as `exec_sealing`.
+- **The worker is not dumpable.** From the moment it enters until the command is executed, the process inside is lightbox. No process of the container can trace it, read its memory or reach its descriptors through `/proc`, whatever uid it has. A container's init is closed the same way: it holds the container's log and the record of how it ends, which are files of the host.
+- **The command's user is looked up inside.** `--user <name>` is read from the container's `/etc/passwd` and `/etc/group` once the worker's root is the container's root, where no path in them leads out.
+- **Every `exec` runs in a cgroup of its own** below the container's, so the container's limits and its device program hold for it. Nothing in a container can reach cgroupfs to leave it, and `--timeout` ends everything in it at once (see [The cgroup of an exec](commands.html#exec-cgroup)).
+- **Every `exec` is on record** in the audit log of the host, which no container has mounted (see [The audit log](commands.html#audit-log)).
+
+## Limits {#limits}
+
+Limits are the defence against a container that takes more than its share, by mistake or on purpose. They are cgroup v2 settings on the container's cgroup, which everything in the container is below.
+
+{.ref}
+| Limit | Default | What happens at the limit |
+|---|---|---|
+| Memory, `--mem` | 256M | A process is killed, and with it the whole container: the kernel ends everything in it, not a part that the rest goes on without |
+| Swap, `--swap` | 0 | None is used: a container past its memory does not go on in swap |
+| Processes, `--pids` | 128 | A `fork` fails, which stops a fork bomb at the container |
+| CPU, `--cpu` | 1 | The container waits: it gets that much of every period, on all processors together |
+| I/O, `--io-max` | none | Reads and writes of the named disk are slowed to the limit |
+| OOM score, `--oom-score` | 500 | When the host itself is short of memory, the kernel takes a container's processes before the host's own |
+
+- **The limits hold for every `exec`,** whose command gets the container's OOM score as well.
+- **No limit goes missing in silence.** `start` turns on the `memory`, `pids`, `cpu` and `io` controllers for the container's cgroup. One that the host does not give stops the start when the container has a limit that needs it, and is a warning when it has none. On a kernel that does not count swap for cgroups, `start` warns that nothing keeps the container from swapping.
+- **Disk is not limited.** A container's own files, its log and the audit log take what the disk has (see [Disk](storage.html#disk)).
+
+Two limits are of time:
+
+- **`exec --timeout`** ends a command and everything it started at the deadline, in the background and in sessions of their own too, and `exec` exits with 124. Two processes keep the time, neither of which the container can reach.
+- **`--ttl`** is how long a container may run from each start. Init keeps the time, on the clock of the time since boot, and shuts the container down as `stop` does. Init is in the container: no process there can send it a signal it does not handle, trace it or set its clock, but a flaw in the kernel past the sandbox could. So a lifetime is a guard against containers that are forgotten or run away, and not a security boundary. What must end is ended from the host, with `stop` or `rm -f`.
+
+## `--privileged` {#privileged}
+
+`create --privileged` makes a container without the sandbox. It is one option, it is stored in the container's `.conf` as `privileged=1`, and `inspect` shows it.
+
+{.ref}
+| What | A container | A privileged container |
+|---|---|---|
+| Capabilities | 11 | All that the root which started it has |
+| Seccomp filter | The allow-list or the deny-list | None |
+| `no_new_privs` | Set | Not set |
+| `/proc` and `/sys` | Masked and read-only where they reach the host | As they are, but for `/sys`, which is still mounted read-only |
+| Device program | Attached | None: any device it has a node of, or makes one of |
+| Root filesystem | `nodev`, `nosuid` | `nodev` |
+| The devices in `/dev` | `nosuid`, `noexec`, and `random` and `urandom` read-only | As bound |
+| Setuid bits and file capabilities | Cannot be set | Can be set, in volumes too |
+
+A privileged container starts with the rest as any container does: its namespaces, its limits and its lifetime, its place on the bridge and the rules of its `--net`, the `nosuid` and `nodev` of its volumes, and all that `exec` does for whoever runs it. With every capability it can undo much of that itself, the address that its network rules hold it by among it. None of it is a boundary for a privileged container.
+
+:::warning[A privileged container is a way to the host]
+Its root has root's capabilities and no filter. Without `--userns` there is nothing between it and the host but its namespaces. Give `--privileged` to what you would run as root on the host, and to nothing else.
+:::
+
+When it is the right choice:
+
+- **A hook that mounts filesystems or configures the network,** which the sandbox refuses.
+- **A program that needs a device,** a call or a capability that no container has, and that you trust.
+- **Installing a package that sets setuid bits or file capabilities,** when the base cannot be changed on the host instead.
+
+`--privileged` and `--userns` can be given together. The container then has every capability and no filter, in a user namespace whose root is an unprivileged uid of the host's: it mounts and configures what is its own, and is nobody to the host. `--profile agent` refuses `--privileged`.
+
+## Threat model {#threat-model}
+
+lightbox keeps what runs in a container away from the host and from the other containers, as far as the kernel's namespaces, the sandbox and the firewall can:
+
+- **The host from a container's processes.** Their own PID, mount, UTS, IPC and network namespaces, and with `--userns` a user namespace in which root is an unprivileged uid of the host's; 11 capabilities and a seccomp filter, with `no_new_privs`; the paths of `/proc` and `/sys` that reach the host masked or read-only; a root filesystem that is `nodev` and `nosuid`, and a device program that lets them open the devices of the container's `/dev` and no other; and limits on memory, swap, processes, CPU and, with `--io-max`, I/O.
+- **The host from what a container leaves in a volume.** Nothing in a container that is not privileged gives a file the setuid or the setgid bit or a file capability, so no program it leaves in a volume, or in its own files, runs on the host with the rights of its owner, of the volume's owner or of root.
+- **Containers from each other.** Each is on an isolated port of the bridge, and with `--link` is kept to its links by firewall rules that lightbox owns and takes away with the container. Each has its own PID and IPC namespace and its own files: containers of one base share a snapshot that none of them writes to.
+- **The host, its networks and the clouds' metadata from a container's traffic.** With `--net outside`, the default, a container reaches the internet and its name servers and nothing of the host's, of a private network or of the metadata services; with `--net proxy:<port>`, its proxy's port and nothing else; with `--net none`, nothing.
+- **The host's terminal and the installed binary from a container.** `exec` gives a command a terminal of the container's, not yours, and enters from a sealed copy of itself.
+- **The record from the container.** What `exec` and `run` asked of a container is in the audit log of the host, mode 0600 in a directory that no container has mounted.
+
+A container has no cgroup namespace and no time namespace of its own: it sees the path of its cgroup on the host and the host's clocks. It can change neither.
+
+## What it does not keep out {#not-covered}
+
+- **The kernel is the host's.** A container is not a virtual machine: every container makes its system calls to the kernel the host runs on, and a flaw in the kernel that an allowed call reaches is a way past every defence on this page. Keep the host's kernel up to date, keep to the allow-list, and create containers with `--userns`. Code from third parties that you do not trust at all, such as a repository nobody has read or an agent that browses the web, belongs in a virtual machine, with lightbox inside it (see [Where it stops](agents.html#stops)).
+- **Without `--userns`, a container's root is the host's root.** What keeps it in is the namespaces and the sandbox. Create the container with `--userns`, or run as root in it only what you would run as root on the host, and the rest with `exec --user`.
+- **`--privileged` turns the sandbox off.** Such a container has all capabilities, no seccomp filter and no device program. Give it only to what needs that (see [`--privileged`](#privileged)).
+- **With `--net nat` the host itself is in reach,** as it was for every container before 0.8, and still is for a container created then: services of the host that listen on the bridge's address, or on all addresses, answer such a container, and so do the host's networks. Give a container `--net outside`, the default, unless it needs them, or keep the services to the addresses they are for.
+- **What a container writes in a volume comes back untrusted.** A file there cannot be setuid, but it can be a script, a Makefile, a git hook or a configuration that names a command, and it runs with your rights when you run it. Read what changed before anything on the host builds, opens or runs it, and mount `:ro` what a container only has to read.
+- **Disk is not limited.** A container's files, its `console.log`, which is not rotated, and the audit log take what the disk has. Keep `lightbox_dir` and `container_dir` on a filesystem of their own if a full disk there must not be a full disk for the host.
+- **A lifetime is kept inside the container.** `--ttl` ends a container that is forgotten, and does not hold one that has got past its sandbox (see [Limits](#limits)).
+- **Whoever runs lightbox is root.** lightbox does not decide who may use it: giving someone `sudo lightbox` is giving them root, as a volume can be any directory of the host.
+- **Images are trusted as files.** `create` takes a base as it is. What it contains runs in the sandbox, with the container's root, and no signature or checksum of it is checked: take a base from where you trust, and check what you download.
+- **The network rules are the firewall's.** A reload or flush of the host's firewall takes them until `lightbox reload` or the next `start` puts them back (see [After a firewall's reload](networking.html#reload)).
+
+## A container for code you do not trust {#hardening}
+
+Most of this is one switch. [`--profile agent`](agents.html#profile) on `create` and `run` makes a box with a user namespace, the allow-list, an overlay root, no network unless it is given a proxy, limits and a lifetime, and refuses the options that would undo it. What follows is the same list by hand, with what the profile leaves to you at the end.
+
+{.ref}
+| Choice | Option or setting | Why |
+|---|---|---|
+| A root that is nobody on the host | `--userns`, with a range for `lightbox` in `/etc/subuid` and `/etc/subgid` | A way past the sandbox ends as an unprivileged uid |
+| The allow-list | The default: no `--seccomp deny` | A call that the list does not name, a new one included, does not reach the kernel |
+| No more network than the work needs | `--net none`, or `--net proxy:<port>` with a short list of names; never `--net nat` | What a container cannot reach it cannot send your files to |
+| No links | No `--link` | A linked container is one more thing in reach |
+| The sandbox | No `--privileged` | Everything on this page |
+| A root that cannot be written | `--read-only`, with volumes for what has to be kept | What a command writes outside its volumes is in a tmpfs, and gone when the container stops |
+| Volumes that are no larger than the work | `--vol <src>:<dst>:ro` where reading is enough; a directory made for the container, never your home, a socket of a daemon or a directory with keys in it | A volume is the one part of the host that a container writes |
+| Limits that fit | `--mem`, `--pids`, `--cpu`, and no `--swap` | A container that runs away stops at its own limits |
+| An end | `--ttl`, and `--timeout` on every `exec` | Nothing runs on after you stopped looking |
+| A user that is not root | `exec --user <name>` | Root in a container is for what needs it |
+| No secret inside | No key in a volume, in `--env` or in the image; credentials stay with a harness or a proxy outside | A key a container can read is a key it can send wherever it can reach |
+| A record | `lightbox logs --audit <name>` | What was asked of a container, kept after it is removed |
+
+What no option does for you:
+
+- **Read what comes back** before you run, build or open it on the host.
+- **Keep the host's kernel up to date,** and put code you do not trust at all in a virtual machine.
+- **Keep `firewall = true`** in `lightbox.conf`, and run `lightbox reload` after the host's firewall reloads.
+- **Run `lightbox doctor`** after a change of kernel or of host, and `doctor --profile agent` before the first box: each check that fails says how to fix it.
+
+{.source}
+Source: `lightbox_seccomp.h` for the two profiles, `lightbox_devices.h` for the devices and their program, `lightbox_userns.c` for ranges and idmapped mounts, and `lightbox.c` for capabilities, the masks, the mounts of a container and `exec`. `tests/seccomp_cases.sh`, `tests/devices_filter.c` and the sandbox cases of `tests/lifecycle.sh` check each of them.

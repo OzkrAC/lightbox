@@ -1,0 +1,33 @@
+#!/usr/bin/make -f
+#
+# lightbox is a static program without a C library. It cannot be a PIE yet,
+# has no stack protector, as lightc sets up no canary, and is not built with
+# link-time optimisation, which no suite has run. Its Makefile holds to that
+# whatever flags it is given; this line keeps dpkg from asking for what it
+# would not get.
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all,-pie,-stackprotector optimize=-lto
+
+%:
+	dh $@
+
+# STRIP=true: the Makefile does not strip the binary, so that dh_strip can
+# keep its symbols in lightbox-dbgsym.
+override_dh_auto_build:
+	dh_auto_build -- STRIP=true
+
+# The suites run in CI's own jobs, on the same commit. CI installs the package
+# and runs the lifecycle suite with the binary it holds.
+override_dh_auto_test:
+
+# dwz rewrites the debugging sections of a binary to make them smaller, and
+# expects a binary as the system's linker script lays one out. lightbox is laid
+# out by lightc's, and the package has nothing to gain from it.
+override_dh_dwz:
+
+override_dh_auto_install:
+	$(MAKE) install STRIP=true PREFIX=/usr DESTDIR=$(CURDIR)/debian/lightbox
+
+# lightbox_dir and container_dir are root's alone, as `make install` has them:
+# root filesystems hold setuid programs and secrets.
+execute_after_dh_fixperms:
+	chmod 0700 debian/lightbox/var/lib/lightbox debian/lightbox/var/lib/lightbox/containers

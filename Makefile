@@ -27,11 +27,14 @@ LIGHTC_LIB := $(LIGHTC)/build/liblightc.a
 
 PREFIX     ?= /usr/local
 BINDIR     ?= $(PREFIX)/bin
+MANDIR     ?= $(PREFIX)/share/man
 # lightbox reads /etc/lightbox/lightbox.conf without --config or
 # LIGHTBOX_CONFIG; a CONFDIR elsewhere has to be named with one of them.
 CONFDIR    ?= /etc/lightbox
 DATADIR    ?= /var/lib/lightbox
-RUNDIR     ?= /run/lightbox
+
+# The release, as lightbox.h has it and --version prints it.
+VERSION := $(shell sh packaging/version.sh)
 
 # ─── Toolchain ──────────────────────────────────────────────────────────────
 # make CC=aarch64-linux-gnu-gcc cross-builds; AR and STRIP follow the prefix.
@@ -68,11 +71,22 @@ ifeq ($(ARCH),aarch64)
   ARCH_CFLAGS := -mno-outline-atomics
 endif
 
-CFLAGS  = $(CSTD) -O2 -DNDEBUG $(WARN) $(HARDEN) $(ARCH_CFLAGS) \
-          -ffreestanding -nostdlib -nostartfiles -nodefaultlibs \
-          -fno-stack-protector -I$(LIGHTC)/include $(EXTRA_CFLAGS)
-LDFLAGS = -static -no-pie -nostdlib -nostartfiles -nodefaultlibs \
-          -T $(LIGHTC)/lightc.ld
+# What whoever builds lightbox may set, on make's command line or in the
+# environment, as a distribution's package build does: optimisation, debugging
+# information, paths. They are added to what lightbox needs, and never stand
+# in its place.
+CFLAGS  ?= -O2
+LDFLAGS ?=
+
+# What lightbox is compiled and linked with. What it needs comes after CFLAGS
+# and LDFLAGS, so that it holds whatever those say: a freestanding, static
+# program without a C library; no stack protector, as lightc sets up no canary
+# yet; and no link-time optimisation, which no suite has run.
+LB_CFLAGS  = $(CSTD) -DNDEBUG $(WARN) $(HARDEN) $(ARCH_CFLAGS) $(CFLAGS) $(EXTRA_CFLAGS) \
+             -ffreestanding -nostdlib -nostartfiles -nodefaultlibs \
+             -fno-stack-protector -fno-lto -I$(LIGHTC)/include
+LB_LDFLAGS = $(LDFLAGS) -static -no-pie -nostdlib -nostartfiles -nodefaultlibs \
+             -fno-lto -T $(LIGHTC)/lightc.ld
 
 SRCS = lightbox.c lightbox_meta.c lightbox_state.c lightbox_container.c lightbox_net.c lightbox_config.c lightbox_util.c lightbox_base.c lightbox_netlink.c lightbox_userns.c lightbox_audit.c
 OBJS = $(SRCS:.c=.o)
@@ -81,18 +95,20 @@ DEPS = $(OBJS:.o=.d)
 # ─── Build ──────────────────────────────────────────────────────────────────
 
 lightbox: $(OBJS) $(LIGHTC_LIB)
-	$(CC) $(LDFLAGS) $(OBJS) $(LIGHTC_LIB) -o $@
+	$(CC) $(LB_LDFLAGS) $(OBJS) $(LIGHTC_LIB) -o $@
 	$(STRIP) $@
 
 %.o: %.c | $(LIGHTC_HDR)
-	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+	$(CC) $(LB_CFLAGS) -MMD -MP -c $< -o $@
 
 -include $(DEPS) tests/seccomp_profile.d tests/unit.d
 
 ifeq ($(LIGHTC_KIND),submodule)
 
+# lightc is built as lightc builds itself: the flags this make was given are
+# lightbox's, and are kept from its configure.
 $(LIGHTC_LIB):
-	cd $(LIGHTC) && ARCH=$(ARCH) CC=$(CC) AR=$(AR) ./configure release && ninja build/liblightc.a
+	cd $(LIGHTC) && CFLAGS= LDFLAGS= ARCH=$(ARCH) CC=$(CC) AR=$(AR) ./configure release && ninja build/liblightc.a
 
 else ifeq ($(LIGHTC_KIND),external)
 
@@ -126,7 +142,7 @@ ANALYZE_FLAGS = -fanalyzer -Werror -Wwrite-strings -Wcast-qual -Wcast-align=stri
 analyze: | $(LIGHTC_HDR)
 	@rc=0; for f in $(SRCS); do \
 	    echo "  ANALYZE $$f"; \
-	    $(CC) $(CFLAGS) $(ANALYZE_FLAGS) -c $$f -o /dev/null || rc=1; \
+	    $(CC) $(LB_CFLAGS) $(ANALYZE_FLAGS) -c $$f -o /dev/null || rc=1; \
 	done; exit $$rc
 
 # lightbox_sys.h, the seccomp table of lightbox_seccomp.h and the device
@@ -156,8 +172,8 @@ HOSTCC ?= cc
 # lightbox's own helpers, called from the command line. Like the seccomp
 # harness below, it is lightbox.c itself with another main().
 tests/unit: tests/unit.c lightbox.c lightbox.h lightbox_sys.h lightbox_seccomp.h lightbox_devices.h $(OBJS) $(LIGHTC_LIB)
-	$(CC) $(CFLAGS) -MMD -MP -c tests/unit.c -o tests/unit.o
-	$(CC) $(LDFLAGS) tests/unit.o $(filter-out lightbox.o,$(OBJS)) $(LIGHTC_LIB) -o $@
+	$(CC) $(LB_CFLAGS) -MMD -MP -c tests/unit.c -o tests/unit.o
+	$(CC) $(LB_LDFLAGS) tests/unit.o $(filter-out lightbox.o,$(OBJS)) $(LIGHTC_LIB) -o $@
 
 # The cgroup device program, interpreted (lightbox_devices.h). Hosted, as it
 # reads the kernel's struct bpf_insn back; the unit suite runs it.
@@ -172,8 +188,8 @@ test-validation: lightbox
 
 # The seccomp harness is lightbox.c itself with another main().
 tests/seccomp_profile: tests/seccomp_profile.c lightbox.c lightbox.h lightbox_sys.h lightbox_seccomp.h lightbox_devices.h $(OBJS) $(LIGHTC_LIB)
-	$(CC) $(CFLAGS) -MMD -MP -c tests/seccomp_profile.c -o tests/seccomp_profile.o
-	$(CC) $(LDFLAGS) tests/seccomp_profile.o $(filter-out lightbox.o,$(OBJS)) $(LIGHTC_LIB) -o $@
+	$(CC) $(LB_CFLAGS) -MMD -MP -c tests/seccomp_profile.c -o tests/seccomp_profile.o
+	$(CC) $(LB_LDFLAGS) tests/seccomp_profile.o $(filter-out lightbox.o,$(OBJS)) $(LIGHTC_LIB) -o $@
 
 # Skipped by the suite when this host cannot build a hosted, threaded program.
 tests/seccomp_thread: tests/seccomp_thread.c
@@ -223,14 +239,18 @@ check: check-sys analyze test
 
 # ─── Install ────────────────────────────────────────────────────────────────
 
+# With DESTDIR this is what a package holds: packaging/ builds the .deb and the
+# .xbps from it. run_dir is not made here: it is on a tmpfs, which a reboot
+# empties, and setup and start make it.
 install: lightbox
 	install -d $(DESTDIR)$(BINDIR)
 	install -m 755 lightbox $(DESTDIR)$(BINDIR)/lightbox
+	install -d $(DESTDIR)$(MANDIR)/man8
+	install -m 644 lightbox.8 $(DESTDIR)$(MANDIR)/man8/lightbox.8
 	install -d -m 755 $(DESTDIR)$(CONFDIR)
 	install -d -m 700 $(DESTDIR)$(DATADIR)
 	install -d -m 755 $(DESTDIR)$(DATADIR)/rootfs
 	install -d -m 700 $(DESTDIR)$(DATADIR)/containers
-	install -d -m 755 $(DESTDIR)$(RUNDIR)
 	@if [ ! -f $(DESTDIR)$(CONFDIR)/lightbox.conf ]; then \
 		install -m 644 lightbox.conf.example $(DESTDIR)$(CONFDIR)/lightbox.conf; \
 		echo "Installed config: $(DESTDIR)$(CONFDIR)/lightbox.conf"; \
@@ -248,10 +268,32 @@ install: lightbox
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/lightbox
+	rm -f $(DESTDIR)$(MANDIR)/man8/lightbox.8
+
+# ─── Source archive ─────────────────────────────────────────────────────────
+# lightbox-<version>.tar.gz: every file that is committed, lightc's at the
+# commit lightbox pins among them, so that the archive builds with "make" and
+# no network. The archive a hosting site makes of a tag leaves a submodule out.
+# The files are taken as they are in the tree, so a tree with changes that are
+# not committed is refused. The same commit gives the same archive: the names
+# in order, root as the owner, and the commit's time on every file.
+DIST := lightbox-$(VERSION)
+
+dist:
+	@test -n "$(VERSION)" || { echo "dist: no LIGHTBOX_VERSION in lightbox.h" >&2; exit 1; }
+	@test -f lightc/configure || { echo "dist: the lightc submodule is not there: git submodule update --init" >&2; exit 1; }
+	@test -z "$$(git status --porcelain --untracked-files=no --ignore-submodules=none)" || \
+	    { echo "dist: the tree has changes that are not committed" >&2; exit 1; }
+	git ls-files -z --recurse-submodules | \
+	    tar --no-recursion --sort=name --owner=0 --group=0 --numeric-owner \
+	        --mode='u+rw,go+r,go-w' --mtime="@$$(git log -1 --format=%ct)" \
+	        --transform='s,^,$(DIST)/,S' --null --files-from=- -cf $(DIST).tar
+	gzip -n -9 -f $(DIST).tar
+	@echo "$(DIST).tar.gz: lightbox $$(git rev-parse --short HEAD) with lightc $$(git -C lightc rev-parse --short HEAD)"
 
 clean:
 	rm -f lightbox $(OBJS) $(DEPS)
 	rm -f $(SECCOMP_TESTS) tests/seccomp_profile.o tests/seccomp_profile.d
 	rm -f tests/unit tests/unit.o tests/unit.d tests/devices_filter
 
-.PHONY: analyze bench check check-sys clean install test test-lifecycle test-seccomp test-unit test-validation uninstall
+.PHONY: analyze bench check check-sys clean dist install test test-lifecycle test-seccomp test-unit test-validation uninstall

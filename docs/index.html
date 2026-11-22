@@ -1,0 +1,132 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><title>lightbox · documentation</title><meta name="description" content="Documentation for lightbox, a minimal, secure container runtime for Linux: one static binary with no libc and no daemon, with a sandbox that is on by default and a profile for boxes that hold AI agents."><script src="https://cdn.luccet.dev/v2.0.0/luccet.js"></script>
+
+:::use
+https://cdn.luccet.dev/themes/v1.0.0/classic.css
+https://cdn.luccet.dev/themes/v1.0.0/github.css
+https://cdn.luccet.dev/code/v1.0.0/code.js
+lightbox-docs.js
+docs.css
+:::
+
+::site-nav
+
+# lightbox {#top}
+
+{.brief}
+A minimal, secure container runtime for Linux: one static binary with no libc and no daemon, built on [lightc](https://github.com/OscarAC/lightc). It makes the system calls it needs itself, a container's network among them, and every container it starts is sandboxed unless you say otherwise.
+
+::toc
+
+:::div{.facts cols="1 1 1 1"}
+**240 KB**
+one static binary, no libc
++++
+**0**
+daemons: a container's init is lightbox itself
++++
+**2**
+architectures, x86_64 and aarch64
++++
+**12 ms**
+to start a container[^start]
+:::
+
+## Overview {#overview}
+
+lightbox turns a directory that holds a Linux root filesystem into containers. `create` makes a container from that base, `start` gives it namespaces, a cgroup with limits, an address on a bridge and a sandbox, `exec` runs commands in it, and `stop` and `rm` take it away again. There is no image format, no registry and no daemon: a container is a directory and a few processes, and every command is one run of the same binary.
+
+Three things hold throughout:
+
+- **The sandbox is the default.** A new container has 11 capabilities, a seccomp filter that allows a list of system calls and answers the rest with `ENOSYS`, `no_new_privs`, a filter on the devices it may open, and a network that reaches the internet and nothing of the host. Each of these is turned off by an option that names it, and `inspect` shows what a container has. [Security](security.html) says what the sandbox keeps out, and what it does not.
+- **Nothing happens in the background.** lightbox has no daemon. A container's PID 1 is lightbox itself, which reaps what the container leaves, keeps its lifetime and shuts it down. What is known about a container is in files: its configuration under `container_dir`, and its state under `run_dir` while it runs. [How it works](internals.html) follows a container from `create` to `rm`.
+- **The kernel is the only library.** lightbox is linked against lightc and nothing else, and it sets up namespaces, mounts, cgroups and the network with system calls of its own. On the host it runs a few tools and no others: `iptables` with `iptables-restore`, or `nft`, for the firewall, and `cp` and `rm` for a container's files. Nothing from an image runs before its `/init.sh`.
+
+lightbox runs on Linux. On macOS it runs in a Linux virtual machine, and on Windows in WSL2.
+
+## What a container is {#container}
+
+| It has | Which is |
+|---|---|
+| Namespaces | Its own PID, mount, UTS, IPC and network namespaces, and with `--userns` a user namespace in which root is an unprivileged uid of the host's |
+| A root filesystem | An overlay of a snapshot of its base, which containers of that base share, with the container's own files on top; or a full copy with `--copy` |
+| Limits | Memory, swap, processes, CPU and I/O through cgroup v2, and with `--ttl` a lifetime |
+| A network | `eth0`, one end of a veth pair on a bridge of the host, with an address of the bridge's subnet; or loopback alone with `--net none` |
+| A sandbox | Capabilities, seccomp, `no_new_privs`, a device filter, and the masked and read-only parts of `/proc` and `/sys`, for init, the hook and every `exec` alike |
+| An init | lightbox, as PID 1, which runs the image's `/init.sh` if there is one |
+| A log | Everything its services print, in `console.log`, and what `exec` and `run` asked of it, in the audit log of the host |
+
+A container with `--profile agent` is a *box*: a container set up to hold an AI agent's working session, in which every command is taken for possibly hostile. [Agent boxes](agents.html) is about those.
+
+## The pages {#pages}
+
+:::div{.cards cols="1 1"}
+### [Getting started](guide.html)
+Building and installing lightbox, a base root filesystem, the host's network, a first container, and the init hook that starts its services.
++++
+### [Commands](commands.html)
+Every command, with its options, the values they take, what it prints, its exit statuses, and the JSON that `ls`, `inspect` and `doctor` give to programs.
++++
+### [Configuration](configuration.html)
+`lightbox.conf` and every setting in it, the environment variables, and the `.conf` that holds a container's own configuration.
++++
+### [Storage](storage.html)
+Bases and their snapshots, overlays and copies, `reset`, volumes, and every file and directory lightbox keeps.
++++
+### [Networking](networking.html)
+The bridge, addresses and name servers, what `--net` lets a container reach, links between containers, the firewall with iptables and with nftables, and a proxy for `--net proxy`.
++++
+### [Security](security.html)
+The sandbox piece by piece, user namespaces, what the threat model covers, and what is left to you.
++++
+### [Agent boxes](agents.html)
+The agent profile, a workspace, time limits, `run` and `reset`, the audit log, and the two places a harness can run.
++++
+### [How it works](internals.html)
+The processes behind `start`, `exec` and `stop`, a container's states, locks, and the source tree with its test suites.
++++
+### [Troubleshooting](troubleshooting.html)
+`doctor` and each of its checks, what to do after a reboot or a firewall's reload, and what the common errors mean.
+:::
+
+## A first look {#first-look}
+
+With lightbox installed and a base root filesystem in place, as [Getting started](guide.html) describes, a container is a few commands. They run as root.
+
+```sh
+lightbox setup                       # the bridge and the firewall rules, once
+lightbox create web --mem 512M       # a container from the base, at the lowest free address
+lightbox start web                   # namespaces, cgroup, network, sandbox, then /init.sh
+lightbox exec web cat /etc/os-release
+lightbox exec web                    # a shell in it, on a terminal of its own
+lightbox ls
+lightbox stop web
+lightbox rm web
+```
+
+A box for one command, which leaves nothing behind, is `run`. This one has the agent profile, no network, a time limit, and the current directory as its workspace:
+
+```sh
+sudo lightbox run --profile agent --workspace "$PWD" --timeout 10m -- make test
+```
+
+## What it needs {#requirements}
+
+|---|---|
+| Kernel | Linux 5.10 or later with namespaces, cgroup v2, bridge and veth, and overlayfs for containers that are not full copies of their base; 5.12 for `--userns`, and 5.19 for the agent profile |
+| Firewall | `iptables` and `iptables-restore`, or `nft` with `firewall_backend = nftables` |
+| Other tools | `cp` and `rm` |
+| Rights | Root, for everything that changes a container or the host |
+| To build | GCC 13 or later, make, and ninja, which builds lightc |
+
+`lightbox doctor` checks all of it on the host it runs on, and says how to fix what is missing. [Getting started](guide.html#requirements) has the details.
+
+## Releases {#releases}
+
+These pages describe the release named at the top of the page. The [changelog](https://github.com/OzkrAC/lightbox/blob/main/CHANGELOG.md) lists what changed in each release for someone who uses lightbox, newest first, with the changes you may have to act on at the top of each.
+
+`lightbox --version` prints the version of lightbox and of the lightc it was built with. A version that ends in `-dev` is a build between two releases.
+
+{.source}
+The source is at [github.com/OzkrAC/lightbox](https://github.com/OzkrAC/lightbox). These pages are in its `docs/` directory, written as [Luccet](https://luccet.dev) notes.
+
+[^start]: The median of ten starts in the continuous integration of 0.8.0 on GitHub's x86_64 runners, and 16 ms on its aarch64 runners. `sudo make bench` measures it on your own host.

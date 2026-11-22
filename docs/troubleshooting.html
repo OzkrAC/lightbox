@@ -1,0 +1,765 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><title>Troubleshooting · lightbox</title><meta name="description" content="Troubleshooting lightbox: how to read doctor and every check it makes, what a reboot and a firewall's reload take and how they come back, what to do about a container in each state, the messages you are most likely to meet, what a container can leave behind, and what to send with a report."><script src="https://cdn.luccet.dev/v2.0.0/luccet.js"></script>
+
+:::use
+https://cdn.luccet.dev/themes/v1.0.0/classic.css
+https://cdn.luccet.dev/themes/v1.0.0/github.css
+https://cdn.luccet.dev/code/v1.0.0/code.js
+lightbox-docs.js
+docs.css
+:::
+
+::site-nav
+
+# Troubleshooting {#top}
+
+{.brief}
+`doctor` and each of its checks, what a reboot and a firewall's reload take and how they come back, what to do about a container in each state, the messages you are most likely to meet, and what to send when you report a problem.
+
+::toc
+
+## Start with doctor {#doctor}
+
+`lightbox doctor` looks at everything lightbox needs of the host it runs on, and says what to do about each thing that is missing. It changes nothing. Run it as root. This is what it prints for an ordinary user, on a host where `setup` has not run yet:
+
+```console
+$ lightbox doctor
+lightbox_dir: /var/lib/lightbox
+rootfs: /var/lib/lightbox/rootfs
+container_dir: /var/lib/lightbox/containers
+run_dir: /run/lightbox
+cgroup_root: /sys/fs/cgroup
+cgroup_base: /sys/fs/cgroup/lightbox
+bridge: br0
+subnet: 10.0.0.0/24
+gw: 10.0.0.1
+firewall: true
+ip_forward: true
+ip_forward_no_drop: false
+ip_masq: true
+firewall_backend: iptables
+bridge_accept_fwmark: none
+bridge_filtering: no (a container with --link will not start; it needs br_netfilter)
+overlayfs: no (a new container is a copy of its base, not an overlay)
+userns_ranges: 0 (create --userns needs a line such as lightbox:2147483647:2147483648 in /etc/subuid and in /etc/subgid)
+host_network: not all there (missing: the bridge, forwarding; start makes it, as lightbox setup does)
+root: no (uid 1000)
+  to fix: run lightbox as root, as setup, start, stop and exec need: sudo lightbox doctor
+kernel: yes (7.0.0-1017-azure; lightbox needs Linux 5.10 or later)
+syscalls: yes (the ones of Linux 5.10 that lightbox makes)
+network: 10.0.0.0/24
+cgroup2: yes (/sys/fs/cgroup)
+cgroup_controllers: yes (cpu memory pids io)
+device_filter: no (not known: only root may load the program)
+  to fix: sudo lightbox doctor
+path.lightbox_dir: ok (/var/lib/lightbox)
+path.rootfs: ok (/var/lib/lightbox/rootfs)
+path.container_dir: ok (/var/lib/lightbox/containers)
+path.cgroup_root: ok (/sys/fs/cgroup)
+path.proc_ip_forward: ok (/proc/sys/net/ipv4/ip_forward)
+bin.iptables: ok (/usr/sbin/iptables)
+bin.iptables-restore: ok (/usr/sbin/iptables-restore)
+bin.cp: ok (/bin/cp)
+bin.rm: ok (/bin/rm)
+exec_sealing: yes (a sealed copy in memory)
+overall: degraded
+```
+
+How to read it:
+
+- **The first lines are the settings**, from `lightbox_dir` to `bridge_accept_fwmark`, as lightbox has them once it has read `lightbox.conf`. A setting that is not what you meant is seen here. What is wrong with the file itself is said before them, on standard error ([the configuration](#errors-conf)).
+- **Five lines tell and are not counted**: `bridge_filtering`, `forward_drops`, which is there with nftables only, `overlayfs`, `userns_ranges` and `host_network`. Each is about something that only some containers need, or that lightbox makes itself when it is missing.
+- **The rest are checks**, each `<name>: <what it found>`. What it found begins with `yes` or `ok` when the check passes, and with `no`, `missing` or `unusable` when it does not; `network` shows the network itself when it passes.
+- **A check that fails is followed by a line that begins with `to fix:`**, which says what to do.
+- **`overall`** is `ok` when every check passed, and `degraded` when one or more did not. `doctor` exits with 0 for `ok` and with 1 for `degraded`, so a script can go by the status alone.
+- **An ordinary user is told less.** Only root can try whether the kernel loads the device program, look at lightbox's firewall rules for `host_network`, and, with nftables, list the chains that drop forwarded packets. `root` fails as well, so the overall is `degraded` whatever the host has.
+
+`doctor --json` gives the same to a program: the settings, the checks with their texts and fixes, and the overall ([JSON output](commands.html#json)). `doctor --profile agent` adds [five checks](#agent-checks) for boxes of the agent profile.
+
+## What doctor checks {#checks}
+
+Each line below is shown as it reads when all is well, in the order `doctor` prints them.
+
+### Lines that tell {#checks-told}
+
+These are not counted: none of them changes `overall` or the exit status.
+
+:::member{#check-firewall}
+```text
+firewall: true
+bridge_accept_fwmark: none
+```
+Two of the settings say more than their value. `firewall: false (lightbox makes no firewall rules)` is a host on which a container with links, with `--net outside` or with `--net proxy` is not started, since nothing would keep it to what it may reach. `bridge_accept_fwmark` is `none`, or the mark, such as `0x10/0xf0`; with iptables it reads `0x10 (not used: with iptables, rules in LIGHTBOX-USER decide first)`. [The firewall's settings](networking.html#firewall-settings) explains both.
+:::
+
+:::member{#check-bridge_filtering}
+```text
+bridge_filtering: yes
+```
+With iptables, whether traffic that the bridge switches from one container to another passes through iptables: `/proc/sys/net/bridge/bridge-nf-call-iptables` is 1, which takes the `br_netfilter` module. Only a container created with `--link` depends on it. Containers without links are kept apart at the bridge itself.
+
+- `no (a container with --link will not start; it needs br_netfilter)`\
+  Before the first container with links: `modprobe br_netfilter && sysctl -w net.bridge.bridge-nf-call-iptables=1`, and the same at every boot. Or set `firewall_backend = nftables`, which needs no `br_netfilter`.
+- `not needed (firewall_backend = nftables filters at the bridge)`\
+  Nothing.
+:::
+
+:::member{#check-forward_drops}
+```text
+forward_drops: none
+```
+With `firewall_backend = nftables` and `firewall = true` only. The chains of other tables whose policy drops forwarded packets: an `accept` in lightbox's table does not get a packet past another table that drops it, so with such a chain containers reach this host and nothing beyond it. iptables' own reads `iptables FORWARD`, and a chain of nftables `<family> <table> <chain>`.
+
+- A list of chains, such as `iptables FORWARD`\
+  Set their policy to accept, with `iptables -P FORWARD ACCEPT` for iptables', or accept the bridge's traffic in them. Docker, ufw, firewalld and lightbox's own `setup` with iptables leave `FORWARD` at DROP.
+- `unknown (doctor is not run as root)`\
+  Run `sudo lightbox doctor`.
+:::
+
+:::member{#check-overlayfs}
+```text
+overlayfs: yes
+```
+Whether `/proc/filesystems` lists overlayfs. Without it a new container is a full copy of its base and not an overlay of its snapshot, and `create` says so. The kernel lists a filesystem only once its module is loaded, so `no` on a host where nothing has mounted an overlay yet can still become `yes`: `create` tries a mount, which loads the module.
+
+- `no (a new container is a copy of its base, not an overlay)`\
+  `modprobe overlay`, or a kernel with `CONFIG_OVERLAY_FS`. Containers work without it, as copies: [Copies](storage.html#copy).
+:::
+
+:::member{#check-userns_ranges}
+```text
+userns_ranges: 32768 (ranges of 65536 ids; a container created with --userns takes one)
+```
+How many ranges of 65536 uids and gids `/etc/subuid` and `/etc/subgid` give the name `lightbox`. Only a container created with `--userns`, which every box of the agent profile is, needs one.
+
+- `0 (create --userns needs a line such as lightbox:2147483647:2147483648 in /etc/subuid and in /etc/subgid)`\
+  Add that line to both files: [User namespaces](security.html#userns).
+- `unreadable (/etc/subuid or /etc/subgid has a line of lightbox's that is no range)`\
+  Correct the line: it is `lightbox:<start>:<count>`, and the range has neither uid 0 nor 4294967295 in it.
+:::
+
+:::member{#check-host_network}
+```text
+host_network: ready
+```
+Whether the bridge is there, lightbox's firewall rules are in, and IPv4 forwarding is on where `ip_forward` is true. The firewall rules are looked at only when `doctor` runs as root.
+
+- `not all there (missing: the bridge, the firewall rules, forwarding; start makes it, as lightbox setup does)`, with whichever of the three are missing\
+  Nothing has to be done: the next `start` makes what is missing, and so does `lightbox setup`. After a [reboot](#reboot) this is the usual state. While containers run and `the firewall rules` are missing, a [firewall's reload](#firewall-reload) took them: run `lightbox reload`.
+:::
+
+### Checks that count {#checks-counted}
+
+A check that fails makes `overall` read `degraded` and `doctor` exit with 1.
+
+:::member{#check-root}
+```text
+root: yes (uid 0)
+```
+Whether `doctor` runs as root, as `setup`, `start`, `stop`, `restart`, `reset`, `update`, `exec` and `run` have to, and `create` with `--userns` or `--profile agent`.
+
+- `no (uid 1000)`\
+  `sudo lightbox doctor`, so that the checks only root can make are made.
+:::
+
+:::member{#check-kernel}
+```text
+kernel: yes (7.0.0-1017-azure; lightbox needs Linux 5.10 or later)
+```
+The kernel's release, from `/proc/sys/kernel/osrelease`, against the oldest that lightbox runs on.
+
+- `no (<release>; lightbox needs Linux 5.10 or later)`\
+  Boot Linux 5.10 or later.
+:::
+
+:::member{#check-syscalls}
+```text
+syscalls: yes (the ones of Linux 5.10 that lightbox makes)
+```
+The newer system calls that `start`, `stop` and `exec` make: `pidfd_open`, `pidfd_send_signal`, `open_tree`, `move_mount`, `openat2`, `close_range` and `faccessat2`. Each is called so that it fails at once without doing anything: a kernel that has it says what is wrong with the arguments, and one that does not answers `ENOSYS`.
+
+- `no (missing: openat2, close_range)`, with the ones that are missing\
+  Boot Linux 5.10 or later. On a kernel that is new enough, something filters lightbox's own system calls and answers `ENOSYS`, as a seccomp profile of a container that lightbox itself runs in does: run lightbox outside it, or let it make these calls.
+:::
+
+:::member{#check-network}
+```text
+network: 10.0.0.0/24
+```
+`subnet` and `gw` read as one network, as `setup`, `create` and `start` read them. When they pass, the line shows the network.
+
+- `unusable (subnet is not <address>/<bits>)`\
+  Write `subnet` as an address and a prefix, such as `10.0.0.0/24`.
+- `unusable (subnet takes 8 to 30 bits after the /)`\
+  A prefix from 8 to 30.
+- `unusable (gw is not an IPv4 address)`\
+  Write `gw` as an address.
+- `unusable (gw is not in the subnet)`\
+  A `gw` inside `subnet`.
+- `unusable (gw is the first or the last address of the subnet, which no interface can have)`\
+  Any other address of the subnet.
+
+The fix line is the same for all five: `set subnet to <address>/<8 to 30> and gw to an address in it in lightbox.conf`. Until it is done, every command that needs the network ends with the setting named, as in `Error: gw in lightbox.conf is not in the subnet: 10.0.1.1 (subnet = 10.0.0.0/24)`. See [`subnet`](configuration.html#conf-subnet) and [`gw`](configuration.html#conf-gw).
+:::
+
+:::member{#check-cgroup2}
+```text
+cgroup2: yes (/sys/fs/cgroup)
+```
+Whether `cgroup_root` is a cgroup v2 hierarchy.
+
+- `no (/sys/fs/cgroup)`\
+  Boot with `cgroup_no_v1=all` on the kernel's command line, so that the host has cgroup v2 alone; or set [`cgroup_root`](configuration.html#conf-cgroup_root) to an empty directory, which `lightbox setup` mounts cgroup2 on.
+:::
+
+:::member{#check-cgroup_controllers}
+```text
+cgroup_controllers: yes (cpu memory pids io)
+```
+The controllers a container's limits need, in `cgroup.controllers` of `cgroup_root`: `cpu`, `memory` and `pids` for every container, and `io` for one with `--io-max`. It is made only when `cgroup2` passed.
+
+- `yes (cpu memory pids; no io, so --io-max cannot be used)`\
+  Nothing, unless a container needs `--io-max`.
+- `no (missing: memory)`, also with `; no io either`\
+  The kernel offers a controller in `cgroup.controllers` of `cgroup_root` unless its command line has `cgroup_disable=` for it: take that out and boot again.
+:::
+
+:::member{#check-device_filter}
+```text
+device_filter: yes (the kernel loads the cgroup device program)
+```
+Whether the kernel loads the program that keeps a container to the devices of its own `/dev` ([Devices](security.html#devices)). `doctor` loads it and lets it go again, which only root may.
+
+- `no (the kernel refuses the cgroup device program: errno <n>)`\
+  Boot a kernel with `CONFIG_CGROUP_BPF` and `CONFIG_BPF_SYSCALL`. Until then only a `--privileged` container starts.
+- `no (not known: only root may load the program)`\
+  `sudo lightbox doctor`.
+:::
+
+:::member{#check-ip_forwarding}
+```text
+ip_forwarding: yes (on)
+```
+With `firewall_backend = nftables` and `ip_forward = true` only: whether IPv4 forwarding is on. With nftables lightbox does not turn it on, as Docker does not with its nftables backend, and `setup` and `start` stop when it is off.
+
+- `no (off, and with firewall_backend = nftables lightbox does not turn it on)`\
+  `sysctl -w net.ipv4.ip_forward=1`, and at every boot, with rules of this host's against forwarding between its other interfaces; or `ip_forward = false` in `lightbox.conf`, with which containers reach this host and nothing beyond it.
+:::
+
+:::member{#check-path}
+```text
+path.lightbox_dir: ok (/var/lib/lightbox)
+path.rootfs: ok (/var/lib/lightbox/rootfs)
+path.container_dir: ok (/var/lib/lightbox/containers)
+path.cgroup_root: ok (/sys/fs/cgroup)
+path.proc_ip_forward: ok (/proc/sys/net/ipv4/ip_forward)
+```
+The directories and the file that the settings name. `path.rootfs` is the base that `create` takes when it is given no `--rootfs`: a directory with something in it.
+
+- `path.lightbox_dir: missing (/var/lib/lightbox)`, and the same for `path.container_dir`\
+  `lightbox setup` makes both, for root alone.
+- `path.rootfs: missing (/var/lib/lightbox/rootfs is not there)`, or `is not a directory`, `is empty` or `cannot be read`\
+  Put a root filesystem there, such as Alpine's minirootfs: [A base root filesystem](guide.html#rootfs). A host on which every `create` names its base with `--rootfs` can leave this one failing.
+- `path.cgroup_root: missing (…)`\
+  `lightbox setup` mounts cgroup2 at an empty directory there.
+- `path.proc_ip_forward: missing (…)`\
+  `/proc` is not mounted: `mount -t proc proc /proc`.
+:::
+
+:::member{#check-bin}
+```text
+bin.iptables: ok (/usr/sbin/iptables)
+bin.iptables-restore: ok (/usr/sbin/iptables-restore)
+bin.cp: ok (/bin/cp)
+bin.rm: ok (/bin/rm)
+```
+The host tools lightbox runs. With `firewall_backend = nftables` the two of iptables are not looked for, and `bin.nft: ok (/usr/sbin/nft)` stands in their place. lightbox does not search `PATH`: it looks for each tool in `/usr/sbin`, `/sbin`, `/usr/bin` and `/bin`, for `cp` and `rm` in `/bin` and `/usr/bin`, and takes the first that is there. The file has to be executable.
+
+- `bin.iptables: missing (/usr/sbin/iptables)`, or `bin.iptables-restore`\
+  Install iptables.
+- `bin.nft: missing (/usr/sbin/nft)`\
+  Install nftables.
+- `bin.cp: missing (/bin/cp)`, or `bin.rm`\
+  Install coreutils, or whatever gives this host `cp` and `rm` in one of those directories.
+:::
+
+:::member{#check-exec_sealing}
+```text
+exec_sealing: yes (a sealed copy in memory)
+```
+How `exec` and `run` take the binary into a container: from a copy of itself that nothing can write to ([The binary exec enters with](security.html#exec)).
+
+- `yes (a read-only mount of the binary; executable memfds are refused here)`\
+  Nothing. The host has `vm.memfd_noexec=2`, and lightbox takes the binary through a read-only mount of its own instead.
+- `no (exec will not run: it needs memfd_create, or root and Linux 5.12)`\
+  Boot Linux 5.12 or later and run `exec` as root, or let memfds be executed with `vm.memfd_noexec = 0`.
+:::
+
+:::member{#check-overall}
+```text
+overall: ok
+```
+`ok` when every check that counts passed, and `degraded` when one or more did not. There is no third value. `doctor` exits with 0 for `ok` and 1 for `degraded`.
+:::
+
+## The checks of the agent profile {#agent-checks}
+
+`doctor --profile agent` makes every check above and then five for what a box of the [agent profile](agents.html#profile) needs beyond them. They count: one that fails makes the overall `degraded`. Only root can make the third of them, so run it as root:
+
+```sh
+sudo lightbox doctor --profile agent
+```
+
+:::member{#check-agent-kernel}
+```text
+agent.kernel: yes (7.0.0-1017-azure; the profile needs Linux 5.19 or later, for an overlay on an idmapped layer)
+```
+A box's root is an overlay on an idmapped snapshot of its base, which the kernel can mount from 5.19 on.
+
+- `no (<release>; the profile needs Linux 5.19 or later, for an overlay on an idmapped layer)`\
+  Boot Linux 5.19 or later. On an older kernel `create --profile agent` makes nothing, as the profile refuses `--copy`; a container with `--userns --copy` needs 5.12.
+:::
+
+:::member{#check-agent-userns_ranges}
+```text
+agent.userns_ranges: yes (32768 ranges of 65536 ids, one for each box)
+```
+The ranges of ids that `/etc/subuid` and `/etc/subgid` give the name `lightbox`. Every box takes one, for as long as it exists.
+
+- `no (none of lightbox's in /etc/subuid and /etc/subgid)`\
+  Give `lightbox` a range in both files, such as `lightbox:2147483647:2147483648`.
+- `no (/etc/subuid or /etc/subgid has a line of lightbox's that is no range)`\
+  Correct the line: `lightbox:<start>:<count>`, without uid 0 or 4294967295 in the range.
+:::
+
+:::member{#check-agent-idmap}
+```text
+agent.idmap: yes (/var/lib/lightbox/bases and /var/lib/lightbox/containers)
+```
+Whether the filesystems that hold the snapshots and the containers take an idmapped mount. `doctor` makes a user namespace and an idmapped copy of the mount at each of the two directories, and lets both go again: nothing is ever attached. Before the first snapshot is taken, `lightbox_dir` stands for the directory of the snapshots.
+
+- `no (<directory> cannot be idmapped: <step>, errno <n>)`\
+  Keep `lightbox_dir` and `container_dir` on a filesystem with idmapped mounts, such as ext4, xfs or btrfs.
+- `no (<directory> is not there)`\
+  `lightbox setup` makes it.
+- `no (a user namespace cannot be made: errno <n>)`\
+  Boot a kernel with `CONFIG_USER_NS`, and set `user.max_user_namespaces` above 0.
+- `no (not known: only root may make an idmapped mount)`\
+  `sudo lightbox doctor --profile agent`.
+:::
+
+:::member{#check-agent-nft}
+```text
+agent.nft: ok (/usr/sbin/nft)
+```
+The `nft` program, looked for with either firewall backend. With `firewall_backend = nftables` lightbox filters a box's traffic at the bridge, which with iptables needs `br_netfilter`.
+
+- `missing (/usr/sbin/nft)`\
+  Install nftables, and set `firewall_backend = nftables` in `lightbox.conf`.
+:::
+
+:::member{#check-agent-cgroup_kill}
+```text
+agent.cgroup_kill: yes (/sys/fs/cgroup/lightbox/cgroup.kill)
+```
+`cgroup.kill`, with which `exec --timeout` and `stop` end everything a box started at once, what forks while it is being ended included. `doctor` looks in `cgroup_base`, or, before a container has made that, in the cgroup it runs in itself.
+
+- `no (<path>)`\
+  Boot Linux 5.14 or later. Without `cgroup.kill` a box's processes are ended a list at a time, until none is left.
+- `no (not known: no cgroup but the root one to look in)`\
+  The root cgroup has no `cgroup.kill` to look for. Start a container, which makes `cgroup_base`, and run `doctor` again.
+:::
+
+## After a reboot {#reboot}
+
+A reboot ends every container, and takes everything lightbox keeps in the kernel and in `/run`:
+
+- the bridge, lightbox's firewall rules, and IPv4 forwarding unless the host turns it on at boot;
+- every cgroup;
+- the records of the containers that ran, in `run_dir`, so that `ls` shows every container as `stopped`.
+
+What is on disk stays: the containers with their configuration, addresses and logs, the snapshots of their bases, and the audit log. A container that `create` had not finished is still `creating`.
+
+Nothing has to be run before the first `start`. It finds the host's network missing, says so, and makes it again as `setup` does, with `run_dir`:
+
+```text
+lightbox's host network is not all there, as after a reboot: making it again
+```
+
+Until then `doctor` shows `host_network: not all there`, with what is missing. What a `start` does not bring back:
+
+- **The containers themselves.** lightbox has no daemon and installs no service, so nothing starts by itself. A container that is to run after a boot is started by something of this host's, such as a unit or a script that runs `lightbox start web db`.
+- **Forwarding with nftables.** With `firewall_backend = nftables` lightbox does not turn IPv4 forwarding on, and a `start` stops while it is off. Have the host set `net.ipv4.ip_forward=1` at boot.
+- **`br_netfilter`** and its switch, which a container with links needs with iptables: load the module and set `net.bridge.bridge-nf-call-iptables=1` at boot.
+- **cgroup2 at a `cgroup_root` of your own.** Only `setup` and `reload` mount it there. Where `cgroup_root` is not the host's own `/sys/fs/cgroup`, run `lightbox setup` at boot.
+- **A proxy** for containers with `--net proxy`, which listens on the bridge's address and so has to start after the bridge is there: [A proxy](networking.html#proxy).
+
+A lifetime counts from each start, so a box that is started after a reboot has the whole of its `--ttl` again.
+
+## After a firewall's reload {#firewall-reload}
+
+A reload or a flush of the host's firewall takes lightbox's rules while containers run: `firewall-cmd --reload`, `iptables -F`, a service that loads its own rules, `nft flush ruleset`, or an `/etc/nftables.conf` that begins with `flush ruleset`. With them go the rules of every running container's links, and the rules that hold a container to what its `--net` lets it reach.
+
+What it looks like, until they are back:
+
+- A container reaches nothing beyond this host: nothing masquerades its traffic, and nothing accepts it on its way out.
+- Two containers without links still do not reach each other, as their ports on the bridge are isolated. A container with links is another matter: with the `FORWARD` policy at DROP, as `setup` leaves it when it turned forwarding on, nothing passes between it and the others, its links included; with ACCEPT, as a host that forwarded before keeps it, it reaches and is reached by every container on the bridge.
+- As root, `doctor` shows `host_network: not all there (missing: the firewall rules; …)`.
+
+:::warning[A container's own limits on the network are among the rules]
+What keeps a container of `--net outside` from this host and from private networks, and a container of `--net proxy` to its proxy's port, are rules in lightbox's chains or tables. While they are gone, what such a container reaches of this host is what the host's own firewall lets anything on the bridge reach. Put the rules back at once, and do not leave it to the next `start`.
+:::
+
+Two things put them back:
+
+- **`lightbox reload`** puts in again what `setup` makes, and the rules of every running container: it says `The links of container 'api' are in again` and `The --net outside rules of container 'web' are in again` for each, and `Host networking ready` at the end. It changes nothing that is there already. A container that another lightbox command is working on is left to that command, and `reload` says so.
+- **The next `start`** of any container finds setup's rules gone, makes them again and puts back the rules of the containers that run.
+
+lightbox has no daemon to hear of a reload by itself. Have whatever reloads the firewall run `lightbox reload` right after it: a hook of the firewall's own, or the same script or unit. `lightbox setup` alone is not enough while containers run: it makes its own chains or tables again, and leaves the rules of running containers to `reload`.
+
+## A container that is not running {#states}
+
+`ls` shows a state for every container, and `inspect <name>` the same with the files behind it. [States](internals.html#states) says what each means; this is what to do about each.
+
+{.ref}
+| `ls` shows | What happened | What to do |
+|---|---|---|
+| `stopped` | It was stopped, never started, or the host was rebooted | `lightbox start <name>` |
+| `exited` | Its init has ended, and no `stop` did it: it was told to stop by a signal from somewhere else, from inside the container too, or it was killed, as by the kernel when the container ran out of memory | Read `lightbox logs <name>`. The next `start`, `stop` or `rm` of it clears away what it left, and says so |
+| `failed` | Its start or its `/init.sh` failed, or it ended without a stop and with a status other than 0 | `start` said why when it failed, and what the hook printed is in `lightbox logs <name>`. Correct that, and start it again |
+| `expired` | Its `--ttl` ran out, and its init shut it down | `lightbox start <name>` for another lifetime, or `rm`. See [A lifetime](agents.html#ttl) |
+| `creating` | A `create` or a `reset` was cut short, and the container is half made. `start` refuses it | `lightbox rm <name>` and create it again. After a `reset` that was cut short, `lightbox reset <name>` makes it whole |
+| `starting` for long | A `start` is at work: it gives init 30 seconds to build the container, and then waits for `/init.sh`, 30 seconds unless `-t` or `start_timeout` says otherwise | If no `lightbox start` is running any more, it was killed there: the next `start`, `stop` or `rm` of the container clears away what it left |
+| `stopping` for long | A `stop` is at work: it gives the container's processes 10 seconds to end, unless `-t` or `stop_timeout` says otherwise, and then kills them | The same: if no `lightbox stop` is running any more, the next command on the container clears up |
+
+A container that ended without a stop leaves its cgroup, the host's end of its interface and its firewall rules. `ls` and `inspect` only look, and change nothing. The next `start`, `stop` or `rm` of the container takes them away first, and says which of three things it found:
+
+```text
+Note: container 'web' had stopped by itself; what it left has been cleared away
+Note: container 'web' had ended without a stop; what it left has been cleared away
+Note: container 'web' came to the end of its --ttl; what it left has been cleared away
+```
+
+The first is an init that ended with status 0, and leaves the container `exited`; the second is one that was killed or failed, and leaves it `failed`; the third leaves it `expired`. A `stop` then ends with `Error: container is not running`, having cleared up; a `start` goes on and starts the container.
+
+## When a container does not do what you expect {#symptoms}
+
+{.ref}
+| What you see | Why | What to do |
+|---|---|---|
+| A program in the container says `Function not implemented` | The allow-list seccomp filter answers every system call it does not name with `ENOSYS`, as an older kernel would. Most programs fall back; this one did not | [Seccomp](security.html#seccomp) lists what the filter allows. A container whose program needs a call beyond it can be created with `--seccomp deny`, which allows every call but the ones on its list, and so leaves more of the kernel in the container's reach |
+| A package fails to install with `Operation not permitted` | Nothing in a container gives a file the setuid or the setgid bit or a file capability. A package that installs such a program, such as `passwd`, `mount` or `sudo`, or that runs `setcap`, such as `iputils-ping`, fails there | Update or install it in the base, on the host, and create the container from the new base; or give the container `--privileged` |
+| A connection to this host or to an address of your network is refused at once | `--net outside`, the default, reaches the internet and its name servers, and refuses the host and every private range | That is what it is for. A container that has to reach the host or its networks is created with `--net nat`: [What a container may reach](networking.html#net) |
+| Names do not resolve | A container asks the name servers it was created with, written in its `/etc/resolv.conf` then. A container of `--net proxy` has none: its proxy looks names up | `lightbox inspect <name>` shows its `net`, and `lightbox exec <name> cat /etc/resolv.conf` the name servers it asks. A container gets others with `create --dns`, or from `dns` in `lightbox.conf`: [Name servers](networking.html#dns) |
+| Nothing beyond this host is reached, by any container | The host's network is not all there, or a firewall drops what lightbox accepts | `sudo lightbox doctor`: look at `host_network` and, with nftables, at `forward_drops`. After a firewall's reload, [`lightbox reload`](#firewall-reload) |
+| The container is gone from `ls`' `running` after it used much memory | A container's memory limit is a limit: past it the kernel ends the whole container, and `ls` shows it as `exited` | `lightbox update <name> --mem <limit>` gives it more, and `--swap` at `create` lets it swap. Then start it again |
+| `Permission denied` in a volume of a container with `--userns` | The container's root stands for the volume's owner on the host and for no one else. Files of other ids are nobody's, and a volume that is host root's cannot be written | Give the volume's source to the user whose files it holds: [Volumes and user namespaces](storage.html#volume-ownership) |
+| `exec` says `command not found` for a program that is in the image | A command without a slash is looked for in `/usr/bin`, `/bin`, `/usr/sbin` and `/sbin`, and nothing of your own `PATH` goes into the container | Name it by its path, or give the `exec` `--env PATH=…` |
+| `start` says that `/init.sh` is still running | The hook runs its service in the foreground and does not return | Start the service in the background, or `start -t 0`, which does not wait: [The init hook](guide.html#init) |
+| A hook that mounts, or that configures the network, fails | The hook runs in the container's sandbox, without the capabilities for either | Such a container is created with `--privileged`, which turns the sandbox off: [--privileged](security.html#privileged) |
+
+## Messages {#errors}
+
+The messages you are most likely to meet, as lightbox prints them, with the names and paths of an example. Every one goes to standard error. A command that fails exits with 1; `exec` and `run` exit with 125 when lightbox failed, and with 126 or 127 for a command that could not be run ([exit statuses](commands.html#exit-status)).
+
+### Creating a container {#errors-create}
+
+:::member
+```text
+Error: base rootfs does not exist: /var/lib/lightbox/rootfs
+Error: base rootfs is empty: /var/lib/lightbox/rootfs
+```
+There is no base to make the container from. Also `is not a directory` and `cannot be read`. Put a root filesystem in that directory, or name another: `--rootfs <dir>`, the variable `LIGHTBOX_ROOTFS`, or `rootfs` in `lightbox.conf`, in [that order](configuration.html#rootfs-order). `sudo` does not pass a variable of your shell's on unless it is told to. [A base root filesystem](guide.html#rootfs) has where to get one.
+:::
+
+:::member
+```text
+Error: container already exists: web
+Error: container name must only contain [a-zA-Z0-9_-]
+Error: container name must be 30 characters or fewer
+```
+A name is 1 to 30 characters of `a-z`, `A-Z`, `0-9`, `_` and `-`, and one container has it. `lightbox ls` shows the names that are taken, those of containers that are stopped too.
+:::
+
+:::member
+```text
+Error: every address of the subnet has a container: 10.0.0.0/24
+```
+`create` without an address takes the lowest of `subnet` that no container has, running or not, and there is none left. Remove containers that are no longer needed, or give lightbox a larger `subnet`: [Addresses](networking.html#addresses).
+:::
+
+:::member
+```text
+Error: a container cannot have the address 10.0.1.5: it is outside the subnet of lightbox.conf
+Error: a container cannot have the address 10.0.0.1: it is the gateway's, the address of the bridge
+Error: a container cannot have the address 10.0.0.2: it is the address of the container 'web'
+Error: invalid IPv4 address: 10.0.0.05
+```
+A container's address is one of `subnet`, and not the subnet's own address, its broadcast address, `gw` or another container's. It is written as four numbers without a zero in front of any. `start` says the same of a container whose address is no longer in `subnet`, after the setting was changed: remove it and create it again, or change `subnet` back.
+:::
+
+:::member
+```text
+Error: no range of host ids for the container's user namespace: no range of 65536 ids
+Add one of at least 65536 ids for lightbox to both /etc/subuid and /etc/subgid, such as:
+  lightbox:2147483647:2147483648
+```
+`create --userns`, and so `create --profile agent`, found no range for the name `lightbox`. Add the line to both files. `every range of 65536 ids is a container's` in its place says that the ranges are all given out: make the range larger, or remove containers that have one. [User namespaces](security.html#userns) has the whole of it.
+:::
+
+:::member
+```text
+Error: the kernel or the filesystem cannot make an idmapped mount here (mount_setattr, errno 22): --userns needs Linux 5.12 and a filesystem with idmapped mounts
+  of: /var/lib/lightbox/containers/web/.try-lower
+Error: an overlay cannot be put on an idmapped layer here (errno 22): that needs Linux 5.19; --copy makes a container with --userns that needs 5.12
+```
+A container with `--userns` has its root as an idmapped mount, and there is no fallback that changes the owner of files instead: nothing is made. Keep `lightbox_dir` and `container_dir` on ext4, xfs or btrfs, on Linux 5.12 or later, and 5.19 for an overlay; the step and the number in the message are the kernel's. `sudo lightbox doctor --profile agent` tries both directories, for any container with `--userns`. `start` says the like of a volume whose filesystem cannot idmap it: `a volume of a container with --userns needs a filesystem with idmapped mounts`.
+:::
+
+:::member
+```text
+Note: an overlay cannot be mounted here (errno 1): the container is a copy of its base; lightbox doctor says why
+```
+Not an error: the container is made, as a full copy of its base. Number 1 is a `create` that did not run as root, and 19 a kernel without overlayfs. [Copies](storage.html#copy) says what that changes.
+:::
+
+:::member
+```text
+Error: lightbox create --profile agent must be run as root
+Error: --profile agent refuses --privileged
+```
+What the agent profile needs and refuses: [The profile](agents.html#profile).
+:::
+
+### Starting and stopping {#errors-start}
+
+:::member
+```text
+Error: lightbox start must be run as root
+```
+`setup`, `start`, `stop`, `restart`, `reset`, `update`, `exec` and `run` say this before they touch anything, and `create` with `--userns` or `--profile agent`. Run them as root.
+:::
+
+:::member
+```text
+Error: container does not exist: web
+Error: container is already running: web
+Error: container is not running: web
+Error: container is running (stop it first): web
+```
+The first is a name that `ls` does not have. The others say that the container is not in the state the command needs: `start` takes one that is not running, `stop` and `exec` one that is, and `rm` one that is not, unless it is given `-f`. `exec` exits with 125 for it. A container that is `exited`, `failed` or `expired` [is not running](#states).
+:::
+
+:::member
+```text
+Error: the container was not created completely; remove it and create it again: web
+```
+The container is `creating`: a `create` was killed before it was done. `lightbox rm web`, and create it again.
+:::
+
+:::member
+```text
+Error: the init hook /init.sh failed with exit status 3
+What the hook printed is in the container's log: lightbox logs web
+```
+The image's `/init.sh` exited with a status other than 0, which fails the start: the container is stopped and cleaned up, and is `failed`. `lightbox logs web` has what the hook printed.
+:::
+
+:::member
+```text
+Note: /init.sh is still running after 30 s. The container is started, and this command no
+longer waits for the hook. start -t <seconds> sets how long it waits; 0 does not
+wait at all.
+```
+Not an error: the container runs. The hook did not return within `start_timeout`, as one that runs its service in the foreground does not. A hook that fails later still stops the container.
+:::
+
+:::member
+```text
+Error: the container's cgroup has no pids controller, and the container has a process limit
+```
+The host does not give the container's cgroup a controller that one of its limits needs: `memory` for `--mem` or `--swap`, `pids` for `--pids`, `io` for `--io-max`, and `cpu` for every container. `doctor` shows what the host offers as `cgroup_controllers`. Give the host the controller, or take the limit away: `lightbox update web --pids max`. A controller that is missing and that no limit needs is a warning, once, and the container runs without it.
+:::
+
+:::member
+```text
+Error: container 'api' has links, and on this host bridged traffic does not pass
+through iptables. A linked container shares the bridge with the others, and
+only the firewall keeps it to its links. Let the firewall see that traffic,
+then start the container again:
+  modprobe br_netfilter && sysctl -w net.bridge.bridge-nf-call-iptables=1
+or set firewall_backend = nftables in lightbox.conf, which needs no br_netfilter
+```
+A container with `--link` is not started where nothing would keep it to its links. Do either of the two things the message names. `doctor` shows this beforehand as `bridge_filtering`.
+:::
+
+:::member
+```text
+Error: this host has an interface vb-5ea0e1194872 that lightbox did not make for this container; it is left alone
+```
+The name that the host's end of the container's interface would have is taken by an interface without lightbox's alias: see [What was left behind](#leftovers).
+:::
+
+:::member
+```text
+Error: required host tool is missing: nft (expected at /usr/sbin/nft)
+```
+A command needs a host tool that is not there. `doctor` checks them all as `bin.*`.
+:::
+
+:::member
+```text
+Error: IPv4 forwarding is off. With firewall_backend = nftables lightbox does not turn it
+on, as Docker does not: turn it on with rules of this host's against forwarding between
+its other interfaces (sysctl -w net.ipv4.ip_forward=1), or set ip_forward = false in
+lightbox.conf, and containers reach this host and nothing beyond it
+```
+`setup`, and a `start` that has to make the host's network again, with nftables. Do one of the two.
+:::
+
+:::member
+```text
+Error: interrupted by signal 2; the start was undone
+```
+Ctrl-C, or a `kill`, while `start` was working. Nothing of the container is left running, and the exit status is 128 plus the signal's number.
+:::
+
+### Running a command {#errors-exec}
+
+:::member
+```text
+Error: command not found: mke
+Error: no such command: /usr/local/bin/tool
+Error: cannot execute: /srv/notes.txt
+Error: cannot change to directory: /no/such/dir
+```
+The command itself could not be run: `exec` exits with 127 for the first two, and with 126 for a file that is not a program and for a `--workdir` that is not there. A name without a slash is looked for in `/usr/bin`, `/bin`, `/usr/sbin` and `/sbin` of the container.
+:::
+
+:::member
+```text
+Error: the command ran past its time limit, --timeout 2s, and it and all it started were ended
+```
+`exec --timeout` ended the command, and `exec` exits with 124: [Time limits](agents.html#timeouts).
+:::
+
+:::member
+```text
+Error: unknown option: --rm
+A command that begins with a dash goes after --.
+```
+`exec` and `run` take their own options before the command, and what begins with a dash there is taken for one. Put `--` before the command.
+:::
+
+:::member
+```text
+Error: cannot write to the audit log /var/lib/lightbox/audit.log (errno 28), and an exec that it does not record is not run
+```
+An `exec` whose start cannot be recorded does not run, and exits with 125. Number 28 is a disk that is full: the audit log and the containers' logs are not rotated, so make room.
+:::
+
+:::member
+```text
+Note: removing the box 'run-3f9a1c0d5e7b', whose run is gone
+Error: the box 'run-3f9a1c0d5e7b' could not be removed; the next run removes it, or lightbox rm -f does
+```
+A `run` that was killed outright left its box, and the next `run` removes it. The second line is a box that could not be removed just then.
+:::
+
+### The configuration {#errors-conf}
+
+:::member
+```text
+Warning: /etc/lightbox/lightbox.conf: line 5: a key lightbox does not know: colour
+Warning: /etc/lightbox/lightbox.conf: line 6: not a setting, which is <key> = <value>: this is no setting
+```
+A key that is misspelt, or that a newer lightbox knows and this one does not, and a line that is no setting. Both change nothing, and every command says them again until the file is corrected. [Settings](configuration.html#settings) has every key.
+:::
+
+:::member
+```text
+Warning: default_mem in lightbox.conf is not <number>[K|M|G|T] or max: lots; a container that needs it will be refused
+Error: default_mem: this setting of lightbox.conf cannot be used, and no option gave the container that limit
+```
+A `default_*` or an `agent_*` setting that is not a value its option would take. Every command warns, and only the `create` that would have needed the setting stops: no container gets a limit that nobody chose. Correct the setting, or give the limit as an option.
+:::
+
+:::member
+```text
+Warning: firewall in lightbox.conf is not true or false: maybe; using true
+Warning: start_timeout in lightbox.conf is not a number of seconds from 0 to 86400: soon; using 30
+```
+A setting that is not what it takes keeps its built-in value, and the warning says which.
+:::
+
+:::member
+```text
+Error: gw in lightbox.conf is not in the subnet: 10.0.1.1 (subnet = 10.0.0.0/24)
+```
+`subnet` and `gw` are not one network, and every command that needs the network ends here. `doctor` shows the same as [`network`](#check-network).
+:::
+
+:::member
+```text
+Error: the container's configuration cannot be used: /var/lib/lightbox/containers/web/.conf: line 1: was written by a newer lightbox than this one
+```
+A container's `.conf` begins with its version, and a file that a newer lightbox wrote is refused, not guessed at. Use the lightbox that made the container, or a newer one. Other things after the path say what is wrong with a file that was changed by hand: `a key lightbox does not know`, `a key the file already has`, or a value that is not one. `rm` does not need the file, so a container whose configuration is damaged can always be removed.
+:::
+
+### Any command {#errors-any}
+
+:::member
+```text
+Waiting for another lightbox command to finish with container 'web'...
+Waiting for another lightbox command to finish with the container store...
+```
+Not an error. `start`, `stop`, `restart`, `reset`, `update`, `rm`, `add-vol` and `rm-vol` take a lock on the container they change, and `create` and `setup` one on the whole store, so that two commands do their work one after the other. The command goes on when the other is done. A wait that does not end is another lightbox command that hangs: look for it with `ps`. The lock is the process's and goes with it, however it ends, so nothing has to be cleared by hand.
+:::
+
+:::member
+```text
+Error: not started: db, cache
+```
+`start`, `stop`, `restart`, `reset` and `rm` take several names and do one container after the other. One that could not be done ends nothing for the others; each has said why, the last line names them all, with `not stopped`, `not restarted`, `not reset` or `not removed` for the other commands, and the exit status is the first that was not 0.
+:::
+
+## What was left behind {#leftovers}
+
+lightbox clears up after itself, also after a container that ended without a stop. A few things it leaves alone on purpose, and a few it gets to only at the next command.
+
+- **A container that ended by itself.** Its cgroup, the host's end of its interface and its firewall rules stay until the next `start`, `stop` or `rm` of that container, which takes them away and [says so](#states). `lightbox setup --teardown` does it for every container, once none runs.
+- **An interface without lightbox's alias.** The host's end of a container's interface is `vb-` and twelve hex digits made from the container's name, and `lightbox inspect <name>` shows it as `host_interface`. lightbox gives it the alias `lightbox:<name>` as it joins the bridge, and removes only interfaces that carry the alias. A `start` that was killed in the moment between the two left one without, and the next start of that container says that the host has an interface that lightbox did not make. Look at it, and take it away yourself:
+
+  ```sh
+  ip link show vb-5ea0e1194872
+  ip link delete vb-5ea0e1194872
+  ```
+
+- **A cgroup that cannot be removed.** A container's cgroup is `<cgroup_base>/<name>`, `/sys/fs/cgroup/lightbox/<name>` unless `lightbox.conf` says otherwise, and each `exec` has one below it, `exec-<pid>-<start time>`. `stop` kills what is left in them and removes them, and says `Error: cannot remove the cgroup` with the path when it could not, which is a process that the kernel has not let go of yet. `cgroup.procs` in it lists what is there. Once that is gone, the next `start`, `stop` or `rm` of the container removes the cgroup. The cgroup of an `exec` whose command left something running in the background stays for as long as that runs, and is removed by the next `exec` or by `stop` once it is empty.
+- **The box of a `run` that was killed.** It runs on, under its name, `run-` and twelve hex digits, which `ls` shows. The next `run` removes every such box, and `lightbox rm -f <name>` removes one by hand. A box with a `--ttl` stops by itself in the meantime.
+- **A container that is half made.** `ls` shows it as `creating`. `lightbox rm <name>` removes it.
+- **Snapshots that no container uses.** `lightbox base ls` lists them with the containers on each, and `lightbox base rm <id>` removes one that has none: [Bases and snapshots](storage.html#bases).
+- **Logs.** A container's `console.log` goes with the container. The audit log stays, as it is the record of boxes that are gone, and neither is rotated: [Logs](storage.html#logs).
+- **The host's network.** `lightbox setup --teardown` takes away the bridge, lightbox's firewall rules and `cgroup_base`, once no container runs, and names the containers that still do when it refuses. Containers and their files stay.
+
+## Reporting a problem {#reporting}
+
+Problems are reported at [github.com/OzkrAC/lightbox/issues](https://github.com/OzkrAC/lightbox/issues). A report that can be acted on has:
+
+```sh
+lightbox --version
+uname -r
+sudo lightbox doctor
+sudo lightbox inspect <name>
+sudo lightbox logs <name>
+```
+
+- **The command** that went wrong, as it was typed, and everything it printed. lightbox says what it could not do and usually why, with the number of the kernel's error.
+- **`lightbox --version`**, which names lightbox's version and lightc's, and the kernel's release.
+- **`doctor`'s output**, run as root, with `--profile agent` when a box of the profile is concerned. It has the settings and what the host lacks.
+- **`inspect`** of the container, which has its state, its configuration and where its files are, and the end of its log.
+- **The firewall backend**, and what else on the host makes firewall rules, such as Docker, ufw or firewalld, when the network is concerned.
+
+Read what you send first. `inspect` shows the paths of volumes, a container's log holds whatever its services printed, and the audit log holds every command with its arguments as they were given.
+
+{.source}
+Source: `doctor` and its checks in `lightbox_meta.c`; the states, the records and the locks in `lightbox_state.c`; `start`, `stop`, `exec` and `run` with their messages in `lightbox.c`; the host's network, `setup` and `reload` in `lightbox_net.c`; the settings in `lightbox_config.c`, and a container's `.conf` in `lightbox_container.c`.

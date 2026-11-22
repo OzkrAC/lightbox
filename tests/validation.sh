@@ -1670,8 +1670,10 @@ t_config_lookup_order() {
 }
 
 # make install puts everything under DESTDIR, the configuration in
-# DESTDIR/etc/lightbox, and writes nothing in the home of whoever runs it. A
-# configuration that is there already is kept.
+# DESTDIR/etc/lightbox and the manual page with the others of its section,
+# and writes nothing in the home of whoever runs it. What it puts there is
+# what a package holds, so run_dir, which is on a tmpfs and which setup and
+# start make, is not among it. A configuration that is there already is kept.
 t_make_install_stays_in_destdir() {
     src=$(dirname "$LB")
     [ -f "$src/Makefile" ] && [ -f "$src/lightbox.conf.example" ] || { echo "no source tree beside $LB"; return 77; }
@@ -1681,6 +1683,10 @@ t_make_install_stays_in_destdir() {
     find "$W/dest" -type f | sed "s#^$W/dest##" | sort
     [ -x "$W/dest/usr/local/bin/lightbox" ] && cmp -s "$W/dest/etc/lightbox/lightbox.conf" "$src/lightbox.conf.example" ||
         { echo "the binary or the configuration is not under DESTDIR"; return 1; }
+    cmp -s "$W/dest/usr/local/share/man/man8/lightbox.8" "$src/lightbox.8" || { echo "the manual page is not under DESTDIR"; return 1; }
+    [ "$(mode_of "$W/dest/var/lib/lightbox")" = 700 ] && [ "$(mode_of "$W/dest/var/lib/lightbox/containers")" = 700 ] ||
+        { echo "lightbox_dir or container_dir is not made for its owner alone"; return 1; }
+    [ ! -e "$W/dest/run" ] || { echo "run_dir is made under DESTDIR: $(find "$W/dest/run")"; return 1; }
     [ -z "$(ls -A "$W/installer")" ] || { echo "written in the home of whoever ran it: $(find "$W/installer")"; return 1; }
     echo 'bridge = brkept' >> "$W/dest/etc/lightbox/lightbox.conf"
     inst || { cat "$W/install.out"; return 1; }

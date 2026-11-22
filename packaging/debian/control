@@ -1,0 +1,24 @@
+Source: lightbox
+Section: admin
+Priority: optional
+Maintainer: OzkrAC <OzkrAC@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13), gcc (>= 4:13), ninja-build
+Standards-Version: 4.7.0
+Homepage: https://github.com/OzkrAC/lightbox
+Vcs-Git: https://github.com/OzkrAC/lightbox.git
+Vcs-Browser: https://github.com/OzkrAC/lightbox
+Rules-Requires-Root: no
+
+Package: lightbox
+Architecture: amd64 arm64
+Depends: ${misc:Depends}, iptables | nftables
+Suggests: squid
+Description: minimal, secure container runtime in one static binary
+ lightbox turns a directory that holds a Linux root filesystem into
+ containers: namespaces, cgroup v2 limits, an address on a bridge of the
+ host's, and a sandbox that is on unless an option turns it off. It has no
+ daemon and is linked without a C library.
+ .
+ A profile for boxes that hold an AI agent's working session adds a user
+ namespace, an allow-list seccomp filter, no network or a proxy alone, time
+ limits, and an audit log of every command.

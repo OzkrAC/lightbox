@@ -1,0 +1,497 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><title>Configuration · lightbox</title><meta name="description" content="lightbox.conf and every setting in it, with defaults and what a wrong value does; the environment variables lightbox reads; the order in which a container's base is chosen; and the .conf that holds a single container's configuration."><script src="https://cdn.luccet.dev/v2.0.0/luccet.js"></script>
+
+:::use
+https://cdn.luccet.dev/themes/v1.0.0/classic.css
+https://cdn.luccet.dev/themes/v1.0.0/github.css
+https://cdn.luccet.dev/code/v1.0.0/code.js
+lightbox-docs.js
+docs.css
+:::
+
+::site-nav
+
+# Configuration {#top}
+
+{.brief}
+The settings of a host are in one optional file, `lightbox.conf`: where lightbox keeps things, the network of the containers, the limits a container gets when no option gives it one, and the firewall. This page has every setting, the environment variables lightbox reads, and the `.conf` that holds a single container's configuration.
+
+::toc
+
+## Where the settings come from {#file}
+
+Every command but `help` and `--version` begins by putting its settings together: the built-in values, then what one `lightbox.conf` says, then what the environment says. The file is optional, as every setting has a built-in value. It is the first of these that applies:
+
+1. The file that `--config <path>` names. The option stands before the command, as in `lightbox --config /etc/lightbox/staging.conf ls`; after the command it is an option the command does not know.
+2. The file that the environment variable `LIGHTBOX_CONFIG` names, when it is set and not empty.
+3. `/etc/lightbox/lightbox.conf`, when it is there. `make install` puts the example file there, in which every setting is a comment.
+4. `~/.config/lightbox/lightbox.conf`, where lightbox looked before 0.6, when it is there and the file in `/etc` is not. `~` is what `HOME` names, and `/root` without one.
+
+A file that `--config` or `LIGHTBOX_CONFIG` names has to be there. When it cannot be read the command ends:
+
+```text
+Error: cannot read the configuration: /etc/lightbox/staging.conf
+```
+
+The file in `/etc`, or the one in `~`, that is there and cannot be read is a warning, and the built-in values are used.
+
+The file in `~` is read with a warning:
+
+```text
+Warning: the configuration is read from /root/.config/lightbox/lightbox.conf, where lightbox 0.7 will
+not look. Move it to /etc/lightbox/lightbox.conf, or name it with --config or LIGHTBOX_CONFIG
+```
+
+The message was written for 0.6 and still names 0.7. This release reads the file all the same; move it as the message asks, and do not count on the next release reading it. With a file in both places the one in `/etc` is read, and a note says that the other is not.
+
+`lightbox doctor` begins with every setting as lightbox has read it, which is the quickest way to see what a host is configured with ([Troubleshooting](troubleshooting.html#doctor)).
+
+## The file {#syntax}
+
+```ini
+# /etc/lightbox/lightbox.conf
+lightbox_dir = /srv/lightbox        # a comment begins after a space or a tab
+subnet = 10.20.0.0/24
+gw = 10.20.0.1
+default_mem = 512M
+```
+
+- A line is `<key> = <value>`, a blank line, or a comment that begins with `#`. Spaces and tabs before the key, around the `=` and after the value are part of neither, so `key=value` says the same.
+- A `#` after a space or a tab begins a comment, and so does one right after the `=`. A `#` that follows another character directly is part of the value.
+- A carriage return at the end of a line is no part of it, as files written on Windows have one.
+- Keys are spelled as they are on this page, in lower case. A value is taken as it stands: quotes around it would be part of it.
+- A setting that the file gives twice has the value of the later line.
+
+What a file gets wrong is said on standard error, and how much it matters depends on the setting:
+
+{.ref}
+| What is wrong | What happens |
+|---|---|
+| A key lightbox does not know, or a line that is no setting | A warning that names the file and the line. Nothing changes |
+| `firewall`, `ip_forward`, `ip_forward_no_drop`, `ip_masq`, `firewall_backend`, `bridge_accept_fwmark`, `start_timeout` or `stop_timeout` with something it does not take | A warning that says which value is used: the one the setting had, which is the built-in one unless an earlier line set another. A firewall setting that is wrong does not get to open the firewall |
+| A `default_*` or `agent_*` setting with something its option would not take | A warning, from every command. The setting then has no value, and `create` refuses the container that would have needed it: no container gets a limit that nobody chose |
+| `subnet` and `gw` that are not one network | The commands that put an address to use end, with the setting named: see [`subnet`](#conf-subnet) |
+| A directory, `bridge`, `subnet`, `gw` or `dns` that is too long; any value of 512 characters or more; a file of 16383 bytes or more | The command ends, whichever it is. No value is cut to fit: the first part of a path or a name would be the path or the name of something else |
+
+These are the warnings of one file with six mistakes in it, as every command prints them before it does its work:
+
+```text
+Warning: /etc/lightbox/lightbox.conf: line 5: a key lightbox does not know: colour
+Warning: /etc/lightbox/lightbox.conf: line 6: not a setting, which is <key> = <value>: this line is no setting
+Warning: default_mem in lightbox.conf is not <number>[K|M|G|T] or max: lots; a container that needs it will be refused
+Warning: start_timeout in lightbox.conf is not a number of seconds from 0 to 86400: soon; using 30
+Warning: ip_masq in lightbox.conf is not true or false: yes; using true
+Warning: firewall_backend in lightbox.conf is not iptables or nftables: pf; using iptables
+```
+
+## Settings {#settings}
+
+Each entry shows the setting as the file has it, with its built-in value. Sizes, counts and durations are written as the options of `create` take them ([Commands](commands.html#values)).
+
+### Directories {#settings-directories}
+
+A directory setting may be up to 448 characters long, so that every path lightbox builds below it fits in the 511 characters it gives a path. A longer one ends every command:
+
+```text
+Error: lightbox_dir is longer than the 448 characters a directory setting may have: /srv/…
+```
+
+[Storage](storage.html#layout) shows what each of these directories holds.
+
+:::member{#conf-lightbox_dir}
+```ini
+lightbox_dir = /var/lib/lightbox
+```
+Where lightbox keeps what belongs to the host as a whole: the snapshots of bases, in `bases/`, and the audit log, `audit.log`. Unless they are set themselves, `rootfs` and `container_dir` are `rootfs/` and `containers/` in it, wherever in the file the three lines stand.
+
+`setup` makes the directory, or restricts one that is there to mode 0700 and says so: it has to be a directory that only lightbox uses. It makes the directory itself and not the ones above it. For containers to be overlays the path may hold no comma, colon or backslash, which the options of an overlay cannot carry; the same goes for `container_dir`.
+:::
+
+:::member{#conf-rootfs}
+```ini
+rootfs = /var/lib/lightbox/rootfs
+```
+The base that `create` and `run` make a container from when they are given no `--rootfs`: a directory that holds a root filesystem. It is `<lightbox_dir>/rootfs` unless it is set. `LIGHTBOX_ROOTFS` comes before it, and `--rootfs` before both ([the order](#rootfs-order)).
+
+Only `make install` makes this directory, and makes it empty; an empty base is refused. [Getting started](guide.html#rootfs) puts a root filesystem in it.
+:::
+
+:::member{#conf-container_dir}
+```ini
+container_dir = /var/lib/lightbox/containers
+```
+Where the containers are, one directory for each, named after its container. It is `<lightbox_dir>/containers` unless it is set. `setup` makes it, mode 0700, as it makes `lightbox_dir`; `create` does not, and fails on a host where neither `setup` nor `make install` has run.
+
+Every directory in it whose name could be a container's is a container to lightbox. Anything else in it is left alone and left out of `ls`. The lock of the whole store, which `create`, `setup` and `base` take, is a lock on this directory.
+:::
+
+:::member{#conf-run_dir}
+```ini
+run_dir = /run/lightbox
+```
+The records of the containers that run: `<run_dir>/<name>/` holds the PID of a container's init, its state, and how it ended. It belongs on a tmpfs, as `/run` is: a reboot ends every container and has to take these records along, and a container without them is stopped.
+
+`setup` makes it mode 0700, and `start` makes it again, with the directories above it, when a reboot took it. `setup --teardown` removes it when nothing is left in it.
+:::
+
+:::member{#conf-cgroup_root}
+```ini
+cgroup_root = /sys/fs/cgroup
+```
+Where cgroup v2 is mounted. `setup` looks at it before it changes anything on the host: a cgroup2 hierarchy is left as it is, and a directory that is missing or empty gets cgroup2 mounted on it. A cgroup v1 hierarchy, another filesystem or a directory with something in it stops `setup`, which says why and that the host can boot with `cgroup_no_v1=all`.
+
+`start` enables the `memory`, `pids`, `cpu` and `io` controllers below it, one at a time.
+:::
+
+:::member{#conf-cgroup_base}
+```ini
+cgroup_base = /sys/fs/cgroup/lightbox
+```
+The cgroup that holds the containers': a container's is `<cgroup_base>/<name>`, and the cgroup of each `exec` is below that. It is `<cgroup_root>/lightbox` unless it is set, and the example file does not name it, as there is rarely a reason to set it.
+
+The first `start` makes it. `setup --teardown` removes it, unless it is `cgroup_root` itself.
+:::
+
+### The network {#settings-network}
+
+[Networking](networking.html#bridge) explains the bridge and the addresses of containers; these three settings name them.
+
+:::member{#conf-bridge}
+```ini
+bridge = br0
+```
+The name of the bridge that `setup` makes and that every container with a network has a port on. The kernel gives an interface a name of up to 15 characters; with `firewall_backend = nftables` the name may hold letters, digits, `_`, `-` and `.` only, as it goes into lightbox's rules as it is. A value of more than 31 characters ends every command.
+
+`setup` leaves a bridge of that name that is there as it is.
+:::
+
+:::member{#conf-subnet}
+```ini
+subnet = 10.0.0.0/24
+```
+The network the containers are on, as `<address>/<bits>` with 8 to 30 bits. The address may be any of the subnet's, and the bridge and every container have its prefix. A container's address is one of the subnet that is not its first, its last, `gw` or another container's ([addresses](networking.html#addresses)), so a subnet of 24 bits holds 253 containers.
+
+`subnet` and `gw` are read as one network by `setup`, `reload`, `setup --teardown`, `create`, `start`, an `exec` into a container of `--net proxy`, and `doctor`. When the two are not one, each of those commands ends with the setting named, and `doctor` reports the network as unusable:
+
+```text
+Error: subnet in lightbox.conf takes 8 to 30 bits after the /: 10.0.0.0/31
+Error: gw in lightbox.conf is not in the subnet: 10.0.1.1 (subnet = 10.0.0.0/24)
+```
+
+`start` refuses a container whose address is not in `subnet` as it is now. After a change of `subnet` or `gw`, delete the bridge while no container runs and run `setup` again ([Networking](networking.html#bridge)).
+:::
+
+:::member{#conf-gw}
+```ini
+gw = 10.0.0.1
+```
+The address of the bridge, which is the gateway of every container: an address of `subnet` that is neither its first nor its last. It is written as every address is, four numbers with no zero in front of any.
+:::
+
+### Limits of new containers {#settings-limits}
+
+What `create` and `run` give a container that no option gives a limit. Each takes what its option takes. `create` writes the limit into the container's own `.conf`, so a change here holds for the containers made after it and changes none that is there.
+
+:::member{#conf-default_mem}
+```ini
+default_mem = 256M
+```
+The memory limit, as `--mem` takes it: a number of bytes, optionally with `K`, `M`, `G` or `T`, or `max` for none.
+:::
+
+:::member{#conf-default_pids}
+```ini
+default_pids = 128
+```
+The most processes, as `--pids` takes it: 1 to 4194304, or `max`.
+:::
+
+:::member{#conf-default_cpu}
+```ini
+default_cpu = 1
+```
+CPUs, as `--cpu` takes them: 0.01 to 512 with up to two decimals, such as `2` or `0.5`.
+:::
+
+:::member{#conf-default_oom}
+```ini
+default_oom = 500
+```
+The OOM score adjustment of a container's processes, as `--oom-score` takes it: -1000 to 1000. Above 0, the kernel's OOM killer prefers a container's processes to the host's own when the host runs out of memory.
+:::
+
+### The agent profile {#settings-agent}
+
+What `create --profile agent` and `run --profile agent` give a box that no option gives a limit or a lifetime: `--mem`, `--pids`, `--cpu` and `--ttl` still choose for one box. A setting that cannot be used is reported, and a box of the profile that would have needed it is refused. The box keeps what it was given in its `.conf`. [Agent boxes](agents.html#profile) has the profile as a whole.
+
+:::member{#conf-agent_mem}
+```ini
+agent_mem = 2G
+```
+The memory limit of a box of the profile, as `--mem` takes it.
+:::
+
+:::member{#conf-agent_pids}
+```ini
+agent_pids = 512
+```
+The most processes in a box of the profile, as `--pids` takes it.
+:::
+
+:::member{#conf-agent_cpu}
+```ini
+agent_cpu = 2
+```
+The CPUs of a box of the profile, as `--cpu` takes them.
+:::
+
+:::member{#conf-agent_ttl}
+```ini
+agent_ttl = 8h
+```
+How long a box of the profile may run from each start, as `--ttl` takes it: a duration from 1 ms to 365 days. It also takes `none`, for boxes with no lifetime.
+:::
+
+### Timeouts {#settings-timeouts}
+
+Whole seconds, from 0 to 86400. One that is anything else is warned about, and the setting keeps the value it had: a timeout that cannot be read must not stop every command, `stop` among them.
+
+:::member{#conf-start_timeout}
+```ini
+start_timeout = 30
+```
+How long `start`, `restart` and `run` wait for a container's `/init.sh` to end. When the time has passed, `start` says so and returns, and the container stays up. `0` does not wait at all. `start -t <seconds>` chooses for one start ([the init hook](guide.html#init)).
+:::
+
+:::member{#conf-stop_timeout}
+```ini
+stop_timeout = 10
+```
+How long a container's processes get to end after `stop` has sent them SIGTERM; what still runs then is killed. `stop`, `restart` and `reset` take `-t <seconds>` to choose for one command, and `0` kills at once. A `run` that is sent a signal gives its command this long to end, and then removes its box all the same.
+
+A start hands the value to the container's init, which uses it when a SIGTERM reaches it from somewhere other than `lightbox stop`.
+:::
+
+### Name servers {#settings-dns}
+
+:::member{#conf-dns}
+```ini
+# dns = 9.9.9.9, 149.112.112.112
+```
+The name servers that `create` writes into a new container's `/etc/resolv.conf`: up to three IPv4 addresses, separated by commas or spaces. It has no built-in value. `create --dns <address>` comes before it. Without either, a container gets the servers this host asks, without the host's own loopback such as `127.0.0.53`, and `1.1.1.1` and `8.8.8.8` when none of them is of use to a container ([name servers](networking.html#dns)).
+
+A value of more than 63 characters ends every command. One that is not such a list is found by the `create` that needs it, which ends:
+
+```text
+Error: the dns setting in lightbox.conf is not a list of up to 3 IPv4 addresses
+```
+:::
+
+### The firewall {#settings-firewall}
+
+The settings of Docker's `daemon.json`, with its names in the descriptions. Each of the first four is `true` or `false`. [Networking](networking.html#firewall-settings) says what each means for a host and its containers.
+
+:::member{#conf-firewall}
+```ini
+firewall = true
+```
+Whether lightbox makes firewall rules at all (Docker's `iptables`). With `false` a container with links is not started, as nothing would keep it to its links, and neither is one of `--net outside`, which is the default of `create`, or of `--net proxy`: `create` refuses both, and for the default it names `--net nat` and `--net none` as what can be had.
+:::
+
+:::member{#conf-ip_forward}
+```ini
+ip_forward = true
+```
+Whether `setup` turns IPv4 forwarding on when it is off (Docker's `ip-forward`). With `false` it leaves forwarding as it is, and says so when it is off. With `firewall_backend = nftables`, `setup` never turns it on, and stops when it is off and this setting is `true`.
+:::
+
+:::member{#conf-ip_forward_no_drop}
+```ini
+ip_forward_no_drop = false
+```
+Whether `setup`, when it is the one that turns forwarding on, leaves the `FORWARD` policy as it is (Docker's `ip-forward-no-drop`). With `false` the policy becomes DROP first, so that the host forwards what a rule accepts and nothing else.
+:::
+
+:::member{#conf-ip_masq}
+```ini
+ip_masq = true
+```
+Whether what containers send out by any interface but the bridge is masqueraded (Docker's `ip-masq`). With `false` nothing is masqueraded, and containers reach beyond the host only where the networks there route their subnet back.
+:::
+
+:::member{#conf-firewall_backend}
+```ini
+firewall_backend = iptables
+```
+`iptables` or `nftables` (Docker's `firewall-backend`): whether lightbox's rules are chains of its own in iptables, or the two nftables tables `ip lightbox` and `bridge lightbox`. Anything else is warned about, and the value the setting had is used. A `setup` after a change takes out the rules of the other backend ([the firewall](networking.html#firewall)).
+:::
+
+:::member{#conf-bridge_accept_fwmark}
+```ini
+# bridge_accept_fwmark = 0x10/0xf0
+```
+With nftables, the mark of packets that lightbox's rules accept before they drop anything (Docker's `bridge-accept-fwmark`): a mark, or a mark and a mask with a `/` between, each in decimal or as `0x` and hex digits. It has no built-in value. A chain of the host's that comes before lightbox's sets the mark on what it wants let through.
+
+A decimal number has no zero in front, and a hex number up to eight digits. A mark of 0, which is every unmarked packet's, a mask of 0 and a mark with a bit outside its mask are refused with a warning, and the mark the setting had is used, or none.
+:::
+
+## The environment {#environment}
+
+lightbox reads four variables of the environment it is run in, and uses none of the others.
+
+{.ref}
+| Variable | What it is for |
+|---|---|
+| `LIGHTBOX_CONFIG` | The `lightbox.conf` to read, when `--config` names none. A file it names has to be there. Set and empty, it counts as not set |
+| `LIGHTBOX_ROOTFS` | The base that `create` and `run` use when they are given no `--rootfs`. It comes before `rootfs` in `lightbox.conf`, and counts whether there is a `lightbox.conf` or not. Up to 448 characters; set and empty, it counts as not set |
+| `HOME` | Only to find `~/.config/lightbox/lightbox.conf`, the file of [before 0.6](#file) |
+| `TERM` | `exec` and `run` give it to the command they run, when it is a name of up to 64 letters, digits, `-`, `_`, `.` and `+`. Otherwise the command has `TERM=xterm` |
+
+`sudo` does not pass a user's environment on unless it is set up to: under it, `--config` and `--rootfs` are the surer way to say the same.
+
+Two more things are worth knowing:
+
+- **`PATH` is not used.** lightbox looks for its tools in fixed places and nowhere else: `iptables`, `iptables-restore` and `nft` in `/usr/sbin`, `/sbin`, `/usr/bin` and `/bin`, in that order, with `iptables-nft` and `iptables-nft-restore` in the same places after them; `cp` and `rm` in `/bin` and `/usr/bin`. It runs them with `PATH=/usr/bin:/bin:/usr/sbin:/sbin` and nothing else of its environment. `doctor` shows the path it found for each.
+- **`LIGHTBOX_EXEC_SEALED` is lightbox's own.** `exec` sets it for the copy of itself that it executes before it enters a container ([Security](security.html#exec)). Do not set it: an `exec` that finds it set, and is not that copy, ends with an error.
+
+Nothing of the environment reaches a container. What a command in one gets is a short list that lightbox makes itself ([the environment of a command](commands.html#exec-environment)).
+
+## Which base a container is made from {#rootfs-order}
+
+`create` and `run` take the first of these:
+
+1. `--rootfs <path>` on the command line.
+2. `LIGHTBOX_ROOTFS`, when it is set and not empty.
+3. `rootfs` in `lightbox.conf`.
+4. `<lightbox_dir>/rootfs`, which is `/var/lib/lightbox/rootfs` on a host that sets neither.
+
+The base has to be a directory with something in it; a link to one is followed. `create` looks before it makes anything, so a refusal leaves nothing behind:
+
+```text
+Error: base rootfs does not exist: /opt/rootfs/alpine
+```
+
+and likewise `is not a directory`, `cannot be read` and `is empty`.
+
+A container is not a copy of its base but an overlay of a snapshot of it, which lightbox finds by the base's path as it is written. Name a base by the same absolute path each time ([Storage](storage.html#bases)).
+
+## A container's own configuration {#container-conf}
+
+What a container is configured with is in `<container_dir>/<name>/.conf`: lines of `key=value` that begin with `version=1`, with no spaces around the `=` and no comments. `create` writes it from its options and from the settings above, and from then on the container goes by its own file. `start` reads it once and hands it to the container's init; `exec`, `inspect`, `reset` and `base` read it too.
+
+This is the file of a container made with
+
+```sh
+lightbox create web --mem 512M --swap 64M --cpu 2 --pids 256 --read-only --ttl 8h \
+    --dns 9.9.9.9 --io-max "8:0 wbps=10485760" --vol /srv/www:/var/www:ro
+```
+
+```ini
+version=1
+mem=512M
+swap=64M
+pids=256
+cpu=2
+oom_score=500
+readonly=1
+seccomp=allow
+net=outside
+dns=9.9.9.9
+io=8:0 wbps=10485760
+ttl=8h
+id=123161a3dd5a1832
+vol=/srv/www:/var/www:ro
+```
+
+It was made by an ordinary user, who cannot mount an overlay, so the container is a copy of its base and the file has no `base` line; made by root it has one, such as `base=3f3f51180fc8`.
+
+The keys, in the order the file has them:
+
+{.ref}
+| Key | When the file has it, and what it holds |
+|---|---|
+| `version` | Always, as the first line: `1` |
+| `mem` | Always: the memory limit, as `--mem` or `default_mem` gave it |
+| `swap` | When `--swap` was given: the swap the container may use. Without the line it has none |
+| `pids` | Always: the most processes, or `max` |
+| `cpu` | Always: CPUs, such as `2` or `0.5` |
+| `oom_score` | Always: -1000 to 1000 |
+| `privileged` | With `--privileged`: `1` |
+| `readonly` | With `--read-only`: `1` |
+| `seccomp` | For the allow-list: `allow`. Without the line the container has the deny-list: `create --seccomp deny` makes that, and every container from before 0.8 has it |
+| `net` | Unless it is `nat`: `outside`, `none` or `proxy:<port>`. Without the line the container has `nat`: `create --net nat` makes that, and every container from before 0.8 has it |
+| `dns` | With `--net outside`: the name servers `create` gave the container, with commas between, which are the ones `--net outside` lets it ask |
+| `userns`, `uid_start`, `gid_start` | With `--userns`: `1`, and the uid and the gid of the host's that are 0 in the container, the first of a range of 65536 each |
+| `io` | With `--io-max`: the line `io.max` is given, `<major>:<minor>` and `rbps`, `wbps`, `riops` or `wiops` |
+| `base` | For an overlay: the id of the snapshot the container overlays, 12 hex digits. Without the line the container is a copy of its base |
+| `ttl` | With `--ttl`, or from `agent_ttl`: the lifetime as it was given, such as `8h` |
+| `id` | Always, since 0.8: 16 hex digits that `create` draws, by which the audit log tells a box from a later one of its name |
+| `profile` | With `--profile agent`: `agent` |
+| `workdir` | With `--workspace`: `/workspace`, where an `exec` without `--workdir` runs |
+| `vol` | Once for each volume, in the order they are mounted: `<src>:<dst>` or `<src>:<dst>:ro` |
+| `link` | Once for each link: the name of the container linked to |
+
+What `--profile agent` gave a box is in the file under each setting's own key, with `profile=agent` beside them, so a later change to the `agent_*` settings, or to what the profile means, changes no box that is there.
+
+### How it is read and written {#container-conf-rules}
+
+One piece of code reads the file and one writes it, and the option, the setting and the line of the file are all held to the same rule of what a value may be.
+
+- **It is read strictly.** In a file with the version line, a key lightbox does not know, a key given twice, a line that is not `key=value` and a value that is not one are errors that name the file and the line. A file written by a newer lightbox, with a higher version, is refused and not guessed at. So is a file of 20479 bytes or more, and one with a control character or a NUL byte in it.
+- **It is written whole.** `create`, `update`, `add-vol` and `rm-vol` are the commands that write it. Each puts the new file in place in one step, by a rename, mode 0600, and waits for the disk. Before that, the text is read back with the reader: a configuration that would not come back as it is, is not written.
+- **A file from before the version line** is read as it was then: what lightbox does not know in it is passed over, and of a key given twice the first counts. The next `update`, `add-vol` or `rm-vol` writes it in today's form. It keeps the deny-list and `nat`, as it has neither line.
+- **A file that lacks one of `mem`, `pids`, `cpu` and `oom_score`**, which only a hand-made or a very old one does, takes the `default_*` setting each time it is read.
+- **`rm` does not read it,** so a container whose configuration is damaged can always be removed. `ls` does not read it either. `inspect` prints what it knows without the file, then the error.
+
+A configuration that cannot be read ends the command that needs it, with the reason:
+
+```text
+Error: the container's configuration cannot be used: /var/lib/lightbox/containers/web/.conf: line 9: a key lightbox does not know
+Error: the container's configuration cannot be used: /var/lib/lightbox/containers/web/.conf: line 3: pids is not a number from 1 to 4194304 or max
+Error: the container's configuration cannot be used: /var/lib/lightbox/containers/web/.conf: line 1: was written by a newer lightbox than this one
+```
+
+Change a container with `update`, `add-vol` and `rm-vol`, and not by editing the file: they take the container's lock, check every value, and leave a file that reads back.
+
+### The files beside it {#container-conf-siblings}
+
+{.ref}
+| File | What it holds |
+|---|---|
+| `.ip` | The address `create` gave the container, and nothing else. A container of `--net none` has no such file. `start` refuses a container with a network whose address is not on record, or is not in `subnet` as it is now |
+| `.resolv` | What `create` wrote into the container's `/etc/resolv.conf`, kept so that `reset` writes the same again. A container from before lightbox kept it gets the `resolv.conf` that `create` would write now, and `reset` says so |
+
+Both are mode 0600 and written in one step, as `.conf` is. [Storage](storage.html#layout) has every file of a container.
+
+## Limits {#limits}
+
+The limits that are built in. None of them is a setting.
+
+{.ref}
+| What | Limit |
+|---|---|
+| A container's name | 1 to 30 characters of `a-z`, `A-Z`, `0-9`, `_` and `-` |
+| Containers on a host | One address of `subnet` for each that has a network: 253 with 24 bits. Past 1024 containers `ls` says that its list is incomplete, and `create` refuses a container with a network, as it cannot tell which addresses are taken |
+| Volumes of a container | 16, one at a destination, a workspace among them |
+| Links of a container | 8 |
+| Name servers of a container | 3, as many as a resolver reads |
+| `--env` options of an `exec` | 64 |
+| Groups of the user an `exec` runs as | 64 |
+| Words of a `run` command line | 65536 |
+| A path: a volume's source or destination, `--rootfs`, `--workspace` | 511 characters |
+| A directory setting, and `LIGHTBOX_ROOTFS` | 448 characters |
+| `bridge`, `subnet`, `gw`, `dns` in `lightbox.conf` | 31, 19, 15 and 63 characters |
+| `lightbox.conf` | 16382 bytes |
+| A container's `.conf` | 20478 bytes, which the largest configuration that the other limits allow fits in |
+| `--mem`, `--swap` | A number of bytes that does not begin with 0, with `K`, `M`, `G` or `T`, in either case, for powers of 1024, up to 2<sup>63</sup> − 1 bytes in all; or `max`; `--swap` also takes `0` |
+| `--pids` | 1 to 4194304, or `max` |
+| `--cpu` | 0.01 to 512, with up to two decimals |
+| `--oom-score` | -1000 to 1000 |
+| `--io-max` | One disk, by a major number of 1 to 4095 and a minor of 0 to 1048575, with each of `rbps`, `wbps`, `riops` and `wiops` at most once, a number from 1 or `max` |
+| `--ttl`, `--timeout`, `agent_ttl` | 1 ms to 365 days: digits, up to three more after a point, and `s`, `m`, `h` or `d`, or no unit for seconds |
+| `-t`, `start_timeout`, `stop_timeout` | 0 to 86400 seconds |
+| `subnet` | 8 to 30 bits |
+| The port of `--net proxy:<port>` | 1 to 65535 |
+| A box's `id`; a snapshot's id | 16 and 12 hex digits |
+
+{.source}
+`lightbox_config.c` reads `lightbox.conf` and the environment. `lightbox_container.c` reads and writes a container's `.conf`, and decides what a limit, a volume and a `--net` may be. `lightbox.conf.example` is the file `make install` puts in `/etc/lightbox`.

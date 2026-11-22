@@ -1,0 +1,23 @@
+#!/bin/sh
+#
+# What xbps runs when it installs or updates lightbox: before it unpacks the
+# package, with "pre" as the first argument, and after, with "post". The
+# working directory is the root of the system that is installed to, so the
+# paths here are relative, as xbps asks of such a script.
+#
+# An xbps package holds no empty directory. These are the ones that
+# `make install` makes: lightbox_dir and container_dir, for root alone, and
+# the place of the default base, which is the administrator's to fill. One
+# that is there already is left as it is.
+
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+
+case "${1:-}" in
+post)
+    [ -d var/lib/lightbox ] || install -d -m 700 var/lib/lightbox
+    [ -d var/lib/lightbox/containers ] || install -d -m 700 var/lib/lightbox/containers
+    [ -d var/lib/lightbox/rootfs ] || install -d -m 755 var/lib/lightbox/rootfs
+    ;;
+esac
+
+exit 0

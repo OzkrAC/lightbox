@@ -185,3 +185,9 @@ jobs:
           file lightbox
           file lightbox | grep -q 'ARM aarch64'
           file lightbox | grep -q 'statically linked'
+
+  # The .deb and the .xbps, for both architectures: each is built, installed
+  # and used, and kept as an artifact of the run. packages.yml has the jobs.
+  packages:
+    name: Packages
+    uses: ./.github/workflows/packages.yml

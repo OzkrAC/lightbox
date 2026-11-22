@@ -1,0 +1,223 @@
+/* docs.css: the look of the lightbox documentation, with lightbox-docs.js.
+ *
+ * The layout is that of Luccet's own documentation: the site's navigation is a
+ * sidebar on a wide screen and a bar with a Menu button on a narrow one, the
+ * page's contents are a card under its title, the title stands over a short
+ * rule, and every fence has a Copy button.
+ *
+ * The colours of the page are the theme's, the one listed before this file in
+ * :::use: every rule here is built on its --t-* custom properties, so the
+ * pages follow it in the light and in the dark mode. The navigation alone has
+ * colours of its own, as it is dark in both. Rules are keyed on the renderer's
+ * classes and data-t attributes, never on tags. Listed last, so it wins at
+ * equal specificity.
+ */
+
+:root {
+  --t-width: 48rem;
+  --t-size: 1rem;
+  --t-font: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --docs-nav: 16rem;            /* the sidebar's width */
+  --docs-r: 10px;               /* a panel's radius */
+  --docs-r-sm: 6px;
+  --docs-accent: var(--t-link); /* rules and small labels */
+  --docs-shadow: 0 1px 2px rgb(31 35 40 / .06), 0 1px 1px rgb(31 35 40 / .04);
+  --docs-nav-bg: #0f1b2d; --docs-nav-glow: #1c3558; --docs-nav-fg: #e6edf3; --docs-nav-muted: #9fb0c7; --docs-nav-accent: #79c0ff;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --docs-nav-bg: #070c14; --docs-nav-glow: #12233f;
+    --docs-shadow: 0 1px 2px rgb(0 0 0 / .35);
+  }
+}
+
+/* ---- headings: the page's title over a short rule */
+.luccet h1 {
+  font-size: 2.1rem; letter-spacing: -0.01em; padding-block-end: .6rem;
+  background: linear-gradient(var(--docs-accent), var(--docs-accent)) no-repeat 0 100% / 3.5rem 3px;
+}
+.luccet h2 { font-size: 1.5rem; }
+.luccet h3 { font-size: 1.2rem; }
+/* a heading that a link leads to is not flush with the window's edge */
+.luccet :is(h2, h3, h4)[id] { scroll-margin-top: .8rem; }
+/* a heading's link to itself, shown when the heading is pointed at */
+.luccet .anchor { margin-inline-start: .4em; text-decoration: none; font-weight: 400; color: var(--t-muted); opacity: 0; }
+.luccet :is(h2, h3, h4):hover > .anchor, .luccet .anchor:focus { opacity: 1; }
+
+/* the line under a page's title */
+.luccet .brief { font-size: 1.1em; }
+
+/* ---- the site's navigation: a bar with a Menu button on a narrow screen, a
+   sidebar on a wide one. It is dark in both modes. The current page is bold
+   and marked with a bar and aria-current, not by colour alone. */
+.luccet .site-nav {
+  font-family: var(--t-sans); font-size: .92rem; line-height: 1.4; margin-block: -1.5rem 2rem;
+  padding: .35rem .6rem; border-radius: var(--docs-r); color: var(--docs-nav-fg);
+  background: radial-gradient(120% 90% at 20% 0%, var(--docs-nav-glow), transparent 70%), var(--docs-nav-bg);
+}
+.docs-nav-bar { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding-block: .25rem; }
+.docs-nav-name { display: inline-flex; align-items: baseline; gap: .6rem; }
+.luccet .docs-nav-home { text-decoration: none; font: 700 1.3rem/1.2 var(--t-sans); letter-spacing: -0.02em; color: var(--docs-nav-fg); }
+.luccet .docs-nav-home:hover, .luccet .docs-nav-home[aria-current="page"] { color: var(--docs-nav-accent); }
+.luccet .docs-nav-version {
+  padding: 0 .5em; border-radius: 999px; text-decoration: none; font-size: .78rem; line-height: 1.5;
+  color: var(--docs-nav-muted); border: 1px solid color-mix(in srgb, var(--docs-nav-muted) 55%, transparent);
+}
+.luccet .docs-nav-version:hover { color: var(--docs-nav-accent); border-color: var(--docs-nav-accent); }
+.docs-nav-toggle {
+  font: inherit; color: var(--docs-nav-fg); background: transparent; border-radius: var(--docs-r-sm);
+  border: 1px solid color-mix(in srgb, var(--docs-nav-accent) 45%, transparent); padding: .35rem .8rem; cursor: pointer;
+}
+.docs-nav-toggle:focus-visible, .site-nav a:focus-visible { outline: 2px solid var(--docs-nav-accent); outline-offset: 2px; }
+.luccet .docs-nav-list, .luccet .docs-nav-list ul { list-style: none; margin: 0; padding: 0; }
+.luccet .docs-nav-list { display: none; padding-block: .5rem; }
+.luccet .docs-nav-open .docs-nav-list { display: block; }
+.luccet .docs-nav-list a {
+  display: block; padding: .32rem .7rem; border-radius: var(--docs-r-sm);
+  border-inline-start: 2px solid transparent; color: var(--docs-nav-fg); text-decoration: none;
+}
+.luccet .docs-nav-list a:hover { background: rgb(255 255 255 / .07); color: var(--docs-nav-accent); }
+.luccet .docs-nav-list a[aria-current="page"] {
+  font-weight: 700; border-inline-start-color: var(--docs-nav-accent);
+  border-start-start-radius: 0; border-end-start-radius: 0;
+  background: color-mix(in srgb, var(--docs-nav-accent) 14%, transparent); color: var(--docs-nav-accent);
+}
+.luccet .docs-nav-list ul a { padding-inline-start: 1.4rem; color: var(--docs-nav-muted); }
+.docs-nav-heading {
+  display: block; padding: 1rem .7rem .35rem; color: var(--docs-nav-muted);
+  font: 600 .72rem/1.4 var(--t-sans); text-transform: uppercase; letter-spacing: .12em;
+}
+/* the heading after the navigation starts the page */
+.luccet > .site-nav + h1 { margin-block-start: .5rem; }
+
+@media (min-width: 64rem) {
+  /* room for the sidebar: by :has() where a browser has it, and by the class
+     that lightbox-docs.js sets where it has not */
+  body:has(> main.luccet > .site-nav) { padding-inline-start: calc(var(--docs-nav) + 2.5rem); }
+  .docs-has-nav body { padding-inline-start: calc(var(--docs-nav) + 2.5rem); }
+  .luccet .site-nav {
+    position: fixed; inset-block: 0; inset-inline-start: 0; inline-size: var(--docs-nav); box-sizing: border-box;
+    margin: 0; padding: 1.6rem 1rem 2rem; overflow-y: auto; border-radius: 0;
+    border-inline-end: 1px solid color-mix(in srgb, var(--docs-nav-accent) 30%, transparent);
+  }
+  .docs-nav-bar { padding-inline: .7rem; margin-block-end: .5rem; }
+  .docs-nav-toggle { display: none; }
+  .luccet .docs-nav-list { display: block; }
+  .luccet > .site-nav + h1 { margin-block-start: 0; }
+}
+
+/* ---- the page's contents: a quiet card, links without underlines until
+   pointed at, the second level on a guide line. Two columns where there is
+   room for them. */
+.luccet .toc {
+  font-family: var(--t-sans); font-size: .9rem; line-height: 1.5;
+  border: 1px solid var(--t-line); border-block-start: 2px solid var(--docs-accent);
+  border-radius: var(--docs-r); box-shadow: var(--docs-shadow);
+  background: color-mix(in srgb, var(--t-soft) 55%, var(--t-bg));
+  padding: 1rem 1.25rem; margin-block: 1.5rem 2.5rem;
+}
+.luccet .toc > .t-label {
+  display: block; margin-block-end: .5rem; color: var(--t-muted);
+  font: 600 .74rem/1.4 var(--t-sans); text-transform: uppercase; letter-spacing: .12em;
+}
+.luccet .toc ol { list-style: none; margin: 0; padding-inline-start: 0; }
+.luccet .toc ol ol { padding-inline-start: 1rem; margin-block: .1rem; border-inline-start: 1px solid var(--t-line); }
+.luccet .toc li { margin: .05rem 0; }
+.luccet .toc a { color: var(--t-fg); text-decoration: none; display: block; padding: .12rem .4rem; border-radius: 4px; }
+.luccet .toc a:hover { color: var(--t-link); background: var(--t-soft); }
+.luccet .toc > ol > li > a { font-weight: 600; }
+.luccet .toc ol ol a { color: var(--t-muted); }
+@media (min-width: 46rem) {
+  .luccet .toc > ol { columns: 2; column-gap: 2rem; }
+  .luccet .toc > ol > li { break-inside: avoid; }
+}
+
+/* ---- callouts: a label in the title, a coloured rule and a tint behind it */
+.luccet .callout {
+  --docs-c: var(--t-link);
+  margin-block: 1.3rem; padding: .75rem 1.1rem; border-radius: var(--docs-r-sm);
+  border-inline-start: 4px solid var(--docs-c);
+  background: color-mix(in srgb, var(--docs-c) 6%, color-mix(in srgb, var(--t-soft) 60%, var(--t-bg)));
+}
+.luccet [data-t="note"] { --docs-c: var(--t-muted); }
+.luccet [data-t="tip"] { --docs-c: var(--t-code-meta, var(--t-link)); }
+.luccet [data-t="important"] { --docs-c: var(--t-link); }
+.luccet [data-t="warning"] { --docs-c: var(--t-warn); }
+.luccet [data-t="danger"] { --docs-c: var(--t-error); }
+.luccet .callout > .t-title { font-weight: 600; margin-block-end: .3rem; }
+.luccet .callout > .t-title > .t-label {
+  margin-inline-end: .5em; color: var(--docs-c);
+  font-size: .78em; text-transform: uppercase; letter-spacing: .1em;
+}
+.luccet .callout > .t-title + * { margin-block-start: 0; }
+.luccet .callout > :last-child { margin-block-end: 0; }
+
+/* ---- code in the text: a short piece, such as an option, stays on one line */
+.luccet code.short { white-space: nowrap; }
+
+/* ---- the Copy button that lightbox-docs.js puts on every fence */
+.luccet pre.docs-copyable { position: relative; }
+.docs-copy {
+  position: absolute; inset-block-start: .4rem; inset-inline-end: .4rem; margin: 0; padding: .3em .6em;
+  font: 600 .75rem/1 var(--t-sans); color: var(--t-muted); background: var(--t-bg);
+  border: 1px solid var(--t-line-strong); border-radius: 4px; cursor: pointer;
+  user-select: none; -webkit-user-select: none; opacity: 0; transition: opacity .12s;
+}
+.docs-copyable:hover > .docs-copy, .docs-copy:focus-visible, .docs-copy[data-done] { opacity: 1; }
+.docs-copy:hover, .docs-copy:focus-visible { color: var(--t-fg); }
+.docs-copy:focus-visible { outline: 2px solid var(--t-link); outline-offset: 1px; }
+.docs-copy[data-done="yes"] { border-color: var(--t-fg); }
+.docs-copy[data-done="no"] { color: var(--t-error); border-color: var(--t-error); }
+/* a screen with no pointer to hover with shows the button at rest */
+@media (hover: none) { .docs-copy { opacity: 1; } }
+.docs-copy-status { position: absolute; inline-size: 1px; block-size: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+
+/* ---- a command's synopsis */
+.luccet pre.synopsis { border-inline-start: 4px solid var(--docs-accent); border-radius: 0 var(--docs-r-sm) var(--docs-r-sm) 0; }
+
+/* ---- members: one entry of a reference, its first fence as its header */
+.luccet .member { margin-block: 1.2rem; border: 1px solid var(--t-line); border-radius: var(--docs-r); padding: 0 0 .7rem; box-shadow: var(--docs-shadow); }
+.luccet .member > pre:first-child, .luccet .member > .t-title + pre {
+  margin: 0 0 .7rem; border: 0; border-block-end: 1px solid var(--t-line);
+  border-radius: var(--docs-r) var(--docs-r) 0 0; background: var(--t-soft);
+}
+.luccet .member > *:not(pre:first-child) { margin-inline: 1rem; }
+/* a table scrolls inside its member, and does not reach past its side margins */
+.luccet .member > table { max-inline-size: calc(100% - 2rem); }
+.luccet .member > :last-child { margin-block-end: 0; }
+
+/* ---- the cards of an index (a +++ grid with .cards) */
+.luccet .cards { gap: 1rem; margin-block: 1.5rem; }
+.luccet .cards .t-cell {
+  padding: .9rem 1.1rem; border: 1px solid var(--t-line); border-radius: var(--docs-r);
+  background: color-mix(in srgb, var(--t-soft) 55%, var(--t-bg)); box-shadow: var(--docs-shadow);
+}
+.luccet .cards .t-cell h3 { margin-block-start: .1rem; font-size: 1.05rem; }
+.luccet .cards .t-cell > :last-child { margin-block-end: 0; }
+
+/* ---- the strip of facts on the first page */
+.luccet .facts { gap: .8rem; margin-block: 1.5rem; }
+.luccet .facts .t-cell {
+  text-align: center; padding: .8rem .6rem; border: 1px solid var(--t-line); border-radius: var(--docs-r);
+  font-family: var(--t-sans); font-size: .9em;
+}
+.luccet .facts .t-cell p { margin: 0; }
+.luccet .facts strong { display: block; font-size: 1.6em; line-height: 1.15; color: var(--docs-accent); }
+
+/* ---- the line at the foot of a page */
+.luccet .source { margin-block-start: 3rem; padding-block-start: .5rem; border-block-start: 1px dotted var(--t-line); font-size: .9em; color: var(--t-muted); }
+
+/* ---- tables */
+.luccet table { font-size: .94em; }
+.luccet :is(th, td) { vertical-align: top; }
+/* A table of options or settings: the first column is the thing described,
+   and an option in it is not broken in two. On a narrow screen the table
+   scrolls sideways, as every wide table does. */
+.luccet table.ref td:first-child code { white-space: nowrap; }
+
+/* ---- print: no navigation, and no buttons */
+@media print {
+  body:has(> main.luccet > .site-nav) { padding-inline-start: 0; }
+  .docs-has-nav body { padding-inline-start: 0; }
+  .luccet .site-nav, .luccet .anchor, .docs-copy { display: none !important; }
+}

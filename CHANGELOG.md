@@ -2,9 +2,30 @@
 
 What changed for someone who uses lightbox, newest first. `ROADMAP.md` has the reasons and the finding each change closes.
 
+## 0.9.0
+
+Not tagged yet: what is written of the next release so far.
+
+### Changes you may have to act on
+
+- **`make install` no longer makes `/run/lightbox`.** `run_dir` is on a tmpfs, which a reboot empties, and `setup` and `start` make it, as they did after every reboot. What `make install` puts under `DESTDIR` is now what a package holds, and `RUNDIR` is no longer a variable of the Makefile.
+- **`CFLAGS` and `LDFLAGS` are added to what lightbox is built with.** Given on make's command line, they stood in the place of lightbox's own flags and broke the build; set in the environment, they were not read. Both are now added, with what lightbox needs after them: a freestanding, static program, without a stack protector and without link-time optimisation, whatever they say. A shell that exports `CFLAGS` for something else now gives them to lightbox's build too.
+
+### Added
+
+- **Packages.** `packaging/build-deb.sh` builds lightbox as a `.deb`, for Debian and Ubuntu, and `packaging/build-xbps.sh` as an `.xbps`, for Void Linux with glibc and with musl, each for x86_64 and aarch64. A package holds what `make install` installs: the binary, the manual page, the example configuration as a configuration file, and lightbox's directories. CI builds both on every run and keeps them as the run's artifacts; it installs each, and runs the lifecycle suite with the binary of the installed `.deb`. `packaging/README.md` says how to build and install them.
+- **A manual page.** `lightbox(8)` lists the commands and their options, and `make install` puts it in `$(PREFIX)/share/man/man8`.
+- **`make dist`** makes `lightbox-<version>.tar.gz`: every file that is committed, with lightc's at the commit lightbox pins in their place, so that it builds with `make` and no network, which the archive a hosting site makes of a tag does not. The same commit gives the same archive.
+- **A licence.** lightbox is under the MIT licence, as lightc is: `LICENSE`.
+- **Documentation**, in `docs/`: ten pages on getting started, every command, the configuration, storage, the network, the sandbox, agent boxes, how lightbox works and what to do when something is wrong. They are Luccet notes, which a browser renders, and describe 0.8.0.
+
+### Changed
+
+- **lightc is built with its own flags.** The `lightc/` submodule is configured and built as lightc builds itself, whatever flags `make` was given.
+
 ## 0.8.0
 
-Phase 8 of the roadmap: the agent profile, a box for an AI agent's working session, in which every command is taken for possibly hostile. `create --profile agent` and `run --profile agent` turn on with one switch what the phase built: a user namespace whose root is an unprivileged uid of the host's, on idmapped mounts, with volumes that keep their owner; the allow-list seccomp profile, now every new container's; a device program that keeps a container to its own `/dev`; `--net none`, or `--net proxy:<port>` to one port of the gateway, with `--net outside` the default for other containers; limits and a lifetime of their own; and `--workspace`. Beside it: `exec` statuses of its own and `--timeout`, `run`, `reset` and `--ttl`, the audit log of every `exec` and `run`, `doctor --profile agent`, and README's "Running an agent in a box", which says where the profile stops. On GitHub's runners a start takes a median of 11.7 ms on x86_64 and 16.2 ms on aarch64, and a stop 9.3 and 9.9.
+Tagged `v0.8.0`, at `1bf6360`, the merge of pull request 8. Phase 8 of the roadmap: the agent profile, a box for an AI agent's working session, in which every command is taken for possibly hostile. `create --profile agent` and `run --profile agent` turn on with one switch what the phase built: a user namespace whose root is an unprivileged uid of the host's, on idmapped mounts, with volumes that keep their owner; the allow-list seccomp profile, now every new container's; a device program that keeps a container to its own `/dev`; `--net none`, or `--net proxy:<port>` to one port of the gateway, with `--net outside` the default for other containers; limits and a lifetime of their own; and `--workspace`. Beside it: `exec` statuses of its own and `--timeout`, `run`, `reset` and `--ttl`, the audit log of every `exec` and `run`, `doctor --profile agent`, and README's "Running an agent in a box", which says where the profile stops. On GitHub's runners a start takes a median of 11.7 ms on x86_64 and 16.2 ms on aarch64, and a stop 9.3 and 9.9.
 
 ### Changes you may have to act on
 

@@ -1,0 +1,464 @@
+.\" lightbox.8: the manual page of lightbox.
+.\"
+.\" It lists the commands and their options, as "lightbox help" does, with a
+.\" line or two on each. It is kept in step with the binary by hand, as
+.\" README.md and the pages of docs/ are: no test reads it. The date below is
+.\" that of its last change.
+.TH LIGHTBOX 8 2026-11-22 lightbox "System Administration"
+.SH NAME
+lightbox \- minimal, secure container runtime
+.SH SYNOPSIS
+.B lightbox
+.RB [ \-\-config
+.IR path ]
+.I command
+.RI [ arguments ]
+.br
+.B lightbox help
+.RI [ command ]
+.br
+.B lightbox \-\-version
+.SH DESCRIPTION
+.B lightbox
+turns a directory that holds a Linux root filesystem, a
+.IR base ,
+into containers.
+.B create
+makes a container from a base,
+.B start
+gives it namespaces, a cgroup with its limits, an address on a bridge of the
+host's and a sandbox,
+.B exec
+runs commands in it, and
+.B stop
+and
+.B rm
+take it away again.
+There is no daemon: the init of a container is lightbox itself, and what is
+known about a container is in files.
+.PP
+A new container is sandboxed unless an option says otherwise.
+It has 11 capabilities, a seccomp filter that allows a list of system calls
+and answers the rest with ENOSYS, no_new_privs, a filter on the devices it may
+open, and a network that reaches the internet and nothing of the host.
+.PP
+.BR setup ,
+.BR reload ,
+.BR start ,
+.BR stop ,
+.BR restart ,
+.BR reset ,
+.BR update ,
+.B exec
+and
+.B run
+are run as root, and so is
+.B create
+with
+.B \-\-userns
+or
+.BR \-\-profile .
+The directories lightbox keeps its data in are root's alone, so in practice
+every command is.
+.PP
+This page lists the commands and their options.
+The documentation of lightbox has every value they take, what each command
+prints and refuses, the settings of
+.IR lightbox.conf ,
+the network, the sandbox and how to run an AI agent in a box: see
+.BR "SEE ALSO" .
+.SH OPTIONS
+.TP
+.BI \-\-config " path"
+The
+.I lightbox.conf
+to read.
+It comes before the command.
+Without it lightbox reads the file that
+.B LIGHTBOX_CONFIG
+names, and otherwise
+.IR /etc/lightbox/lightbox.conf .
+.TP
+.BR \-\-help ", " \-h ", " help " [\fIcommand\fR]"
+Print the usage, or one command's part of it, on standard output.
+.B \-\-help
+after a command does the same.
+.TP
+.B \-\-version
+Print the version of lightbox and of the lightc it was built with.
+.SH COMMANDS
+A container's name is 1 to 30 characters of a\-z, A\-Z, 0\-9, _ and \-.
+A size is a number of bytes, optionally with K, M, G or T, or
+.BR max .
+A duration is a number, optionally with a point and up to three more digits,
+and s, m, h or d; without a unit it is seconds.
+.SS Making and changing containers
+.TP
+.BI create " name" " \fR[\fIip\fR] [\fIoptions\fR]"
+Create a container from a base.
+Without
+.I ip
+it gets the lowest free address of the subnet.
+.RS
+.TP
+.BI \-\-rootfs " path"
+The base to make the container from.
+The default is what
+.B LIGHTBOX_ROOTFS
+names, then
+.B rootfs
+in
+.IR lightbox.conf .
+.TP
+.B \-\-copy
+A full copy of the base, and not an overlay of its snapshot.
+.TP
+.BI \-\-mem " limit"
+The memory limit: a size, or
+.B max
+for none.
+The default is 256M.
+.TP
+.BI \-\-swap " limit"
+The swap the container may use beyond its memory: 0, a size, or
+.BR max .
+The default is 0.
+.TP
+.BI \-\-pids " limit"
+The most processes, from 1 to 4194304, or
+.BR max .
+The default is 128.
+.TP
+.BI \-\-cpu " num"
+CPUs, from 0.01 to 512, such as 2 or 0.5.
+The default is 1.
+.TP
+.BI \-\-io\-max " limit"
+An I/O limit for one whole disk, as the kernel's io.max takes a line, such as
+"8:0 wbps=10485760", with rbps, wbps, riops and wiops.
+.TP
+.BI \-\-oom\-score " n"
+The OOM score adjustment, from \-1000 to 1000.
+The default is 500.
+.TP
+.BI \-\-ttl " duration"
+How long the container may run from each start.
+Then it stops as
+.B stop
+stops it, and is
+.IR expired .
+.TP
+.BI \-\-vol " src" : dst\fR[\fB:ro\fR]
+A directory or a file of the host's in the container.
+Repeatable, up to 16.
+.TP
+.BI \-\-workspace " dir"
+A directory of the host's at
+.IR /workspace ,
+where every
+.B exec
+then runs.
+.TP
+.B \-\-read\-only
+A root filesystem that cannot be written to.
+.TP
+.B \-\-userns
+A user namespace of its own: the container's root is an unprivileged uid of
+the host's, from the range that
+.I /etc/subuid
+and
+.I /etc/subgid
+give the name lightbox.
+.TP
+.BR \-\-seccomp " " allow | deny
+The seccomp profile: the allow\-list, which is the default, or the deny\-list.
+.TP
+.B \-\-privileged
+No sandbox: all capabilities, no seccomp filter and no device filter.
+.TP
+.BI \-\-net " mode"
+What the container may reach.
+.BR outside ,
+the default, is the internet and its name servers only;
+.B nat
+the host and its networks too;
+.B none
+loopback alone;
+.BI proxy: port
+that TCP port of the gateway, where a proxy listens, and nothing else.
+.TP
+.BI \-\-link " name"
+Allow traffic between this container and another.
+Repeatable, up to 8.
+.TP
+.BI \-\-dns " address"
+A name server for the container.
+Repeatable, up to 3.
+The default is the host's.
+.TP
+.B \-\-profile agent
+A box for an AI agent's session: a user namespace, the allow\-list, an
+overlay, and the network of
+.B \-\-net none
+unless
+.B \-\-net outside
+or
+.BI "\-\-net proxy:" port
+is given, with the limits and the lifetime of the agent_* settings.
+It refuses
+.BR \-\-privileged ,
+.BR \-\-link ,
+.BR "\-\-net nat" ,
+.B \-\-seccomp deny
+and
+.BR \-\-copy .
+.RE
+.TP
+.BI update " name" " \fR[\fB\-\-mem\fR \fIlimit\fR] [\fB\-\-pids\fR \fIlimit\fR] [\fB\-\-cpu\fR \fInum\fR]"
+Change a container's limits: at once if it runs, and from its next start in
+any case.
+.TP
+.BI add\-vol " name src" : dst\fR[\fB:ro\fR]
+Add a volume to a container.
+One that runs has it from its next start.
+.TP
+.BI rm\-vol " name dst"
+Remove the volume at a destination.
+.TP
+.BI reset " name\fR... [\fB\-t\fR \fIseconds\fR]"
+Make the root filesystem of containers their base's again, without a copy.
+One that runs is stopped first.
+Volumes are kept.
+.TP
+.BR rm " [" \-f "] \fIname\fR..."
+Remove containers.
+.B \-f
+kills one that runs first.
+.SS Starting and stopping
+.TP
+.BI start " name\fR... [\fB\-t\fR \fIseconds\fR]"
+Start stopped containers, one after the other.
+.B \-t
+is how long to wait for the base's
+.IR /init.sh :
+30 seconds unless set, and 0 does not wait.
+.TP
+.BI stop " name\fR... [\fB\-t\fR \fIseconds\fR]"
+Stop running containers, one after the other.
+.B \-t
+is how long their processes get to end before they are killed: 10 seconds
+unless set.
+.TP
+.BI restart " name\fR... [\fB\-t\fR \fIseconds\fR]"
+Stop containers that run, as
+.B stop
+does, and start them.
+.SS Running commands
+.TP
+.BI exec " name" " \fR[\fIoptions\fR] [\fB\-\-\fR] [\fIcommand\fR [\fIarguments\fR]]"
+Run a command in a running container.
+Options come before the command, and a command that begins with a dash goes
+after
+.BR \-\- .
+Without a command,
+.B exec
+runs
+.IR /bin/sh .
+.RS
+.TP
+.BR \-\-user ", " \-u " \fIname\fR|\fIuid\fR[\fB:\fIgid\fR]"
+Who the command runs as.
+The default is root.
+.TP
+.BR \-\-env ", " \-e " \fIKEY\fB=\fIVALUE\fR"
+Set a variable in the command's environment.
+Repeatable.
+.TP
+.BR \-\-workdir ", " \-w " \fIdir\fR"
+The directory the command runs in.
+The default is /, or
+.I /workspace
+in a box with a workspace.
+.TP
+.BI \-\-timeout " duration"
+End the command, and all it started, after this long.
+.B exec
+then exits with 124.
+.RE
+.TP
+.BR run " [\fIcreate options\fR] [\fIexec options\fR] [" \-\- "] [\fIcommand\fR [\fIarguments\fR]]"
+Create a box, start it, run a command in it as
+.B exec
+runs it, and remove it.
+A box whose
+.B run
+was killed is removed by the next
+.BR run .
+.SS Looking at containers
+.TP
+.BR ls " [" \-\-json ]
+List all containers, with their addresses and states.
+.TP
+.BI inspect " name" " \fR[\fB\-\-json\fR]"
+Show a container's configuration and state.
+.TP
+.BI logs " name" " \fR[\fB\-f\fR] [\fB\-\-audit\fR]"
+Show what the container has printed.
+.B \-f
+follows it.
+.B \-\-audit
+shows what
+.B exec
+and
+.B run
+asked of it, which is kept after it is removed.
+.SS The host
+.TP
+.BR doctor " [" \-\-json "] [" "\-\-profile agent" ]
+Check what lightbox needs of this host, and say how to fix what is missing.
+It exits with 1 when a check fails.
+.B \-\-profile agent
+checks what a box of that profile needs too.
+.TP
+.B base ls
+List the snapshots of bases that containers overlay.
+.TP
+.BI "base add" " dir"
+Take a new snapshot of a base, for the containers made after it.
+.TP
+.BI "base rm" " id\fR..."
+Remove snapshots that no container uses.
+.TP
+.B setup
+Make the host's side of the network: the bridge, lightbox's firewall rules,
+and IPv4 forwarding.
+Every
+.B start
+does the same when something of it is missing.
+.TP
+.B setup \-\-teardown
+Take lightbox's host network away, when no container runs.
+.TP
+.B reload
+Put lightbox's firewall rules and bridge in again, and the rules of running
+containers, after a reload of the host's firewall took them.
+.SH EXIT STATUS
+.TP
+.B 0
+Done.
+.TP
+.B 1
+The command failed.
+For
+.BR doctor :
+a check failed.
+For a command with several names: the first status that was not 0.
+.PP
+.B exec
+and
+.B run
+exit with the status of the command they ran, or with 128 plus the number of
+the signal that ended it.
+Their own statuses are those of
+.BR env (1)
+and
+.BR timeout (1):
+.TP
+.B 124
+.B \-\-timeout
+ended the command.
+.TP
+.B 125
+lightbox failed before the command ran.
+.TP
+.B 126
+The command could not be run.
+.TP
+.B 127
+The command was not found.
+.SH ENVIRONMENT
+.TP
+.B LIGHTBOX_CONFIG
+The
+.I lightbox.conf
+to read, when
+.B \-\-config
+names none.
+.TP
+.B LIGHTBOX_ROOTFS
+The base that
+.B create
+and
+.B run
+use when they are given no
+.BR \-\-rootfs .
+.PP
+Nothing of the environment reaches a container.
+.SH FILES
+.TP
+.I /etc/lightbox/lightbox.conf
+The settings of the host.
+Every setting has a built\-in value, so the file is optional.
+.TP
+.I /var/lib/lightbox
+What lightbox keeps: the snapshots of bases in
+.IR bases ,
+the containers in
+.IR containers ,
+the audit log in
+.IR audit.log ,
+and the default base in
+.IR rootfs .
+.TP
+.I /run/lightbox
+The records of the containers that run.
+.TP
+.IR /etc/subuid ", " /etc/subgid
+The ranges of ids for the name lightbox, which
+.B \-\-userns
+takes one of for each container.
+.SH EXAMPLES
+Make the host's network once, then create, start and use a container:
+.PP
+.RS
+.EX
+lightbox setup
+lightbox create web \-\-mem 512M \-\-cpu 2
+lightbox start web
+lightbox exec web cat /etc/os\-release
+lightbox stop web
+lightbox rm web
+.EE
+.RE
+.PP
+Run one command in a box of the agent profile, with no network, a time limit
+and the current directory as its workspace:
+.PP
+.RS
+.EX
+lightbox run \-\-profile agent \-\-workspace "$PWD" \-\-timeout 10m \-\- make test
+.EE
+.RE
+.PP
+Check the host:
+.PP
+.RS
+.EX
+lightbox doctor
+.EE
+.RE
+.SH SEE ALSO
+.BR iptables (8),
+.BR nft (8),
+.BR namespaces (7),
+.BR user_namespaces (7),
+.BR cgroups (7),
+.BR capabilities (7),
+.BR seccomp (2)
+.PP
+.UR https://github.com/OzkrAC/lightbox
+The repository of lightbox
+.UE
+has its documentation, in the
+.I docs
+directory, its source and its changelog.

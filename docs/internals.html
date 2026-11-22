@@ -1,0 +1,478 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><title>How it works · lightbox</title><meta name="description" content="What lightbox does on the host for each command: the processes behind create, start, exec and stop, a container's init, its states, the locks and records that keep commands apart, its cgroups, the tools lightbox runs, the source tree and the test suites."><script src="https://cdn.luccet.dev/v2.0.0/luccet.js"></script>
+
+:::use
+https://cdn.luccet.dev/themes/v1.0.0/classic.css
+https://cdn.luccet.dev/themes/v1.0.0/github.css
+https://cdn.luccet.dev/code/v1.0.0/code.js
+lightbox-docs.js
+docs.css
+:::
+
+::site-nav
+
+# How it works {#top}
+
+{.brief}
+What happens on the host for each command: the processes behind `create`, `start`, `exec` and `stop`, what a container's init does, the states a container is in, the locks and records that keep commands apart, its cgroups, the tools lightbox runs, and the source tree with its tests.
+
+::toc
+
+## Overview {#overview}
+
+lightbox is one statically linked binary with no daemon behind it. Every command is one run of that binary: it reads what is on record, does its work with system calls of its own, writes what has changed and ends. What stays while a container runs is the container. Its PID 1 is lightbox itself, a clone of the `start` that made it, and everything else in it descends from that process or was put there by an `exec`.
+
+```text
+ on the host                               in the container
+ ───────────                               ────────────────
+ lightbox start web
+   │ clone, into new namespaces
+   └─────────────────────────────────────▶ lightbox           init, PID 1
+                                             ├─ sh /init.sh     the hook
+                                             ├─ nginx           what it started
+                                             └─ …
+ lightbox exec web ps
+   └─ lightbox  (the worker)
+        │ joins the namespaces, forks
+        └────────────────────────────────▶ ps                 a session of its own
+```
+
+{.ref}
+| Process | Where it is | What it does |
+|---|---|---|
+| `start` | The host, as root | The checks and the lock, the host's network, the cgroup with its limits and its device program, the pair of interfaces, the maps and the idmapped mounts of a user namespace, the records, the firewall rules |
+| Init | PID 1 of the container, in all of its namespaces | The mounts, `/dev`, the change of root, the masks of `/proc`, the address and the route, the sandbox, the hook, reaping, the lifetime of `--ttl`, the shutdown |
+| `exec` | The host, as root | The cgroup of the exec, the two lines of the audit log, `--timeout`, the modes of your terminal, the exit status |
+| The worker of an `exec` | The container's namespaces, but for the PID namespace, which only its children are in | Who the command runs as, its terminal or pipes, carrying bytes and signals, the time limit once more |
+| The command | The container | Takes on the sandbox and its user, then executes |
+
+`start` does from the host what only the host can do, and init does the rest from inside, where every path means what it means in the container. The two talk over two pipes, and each takes the other's pipe closing as the other being gone. Once the hook has ended, `start` returns and init goes on alone.
+
+Nothing is kept in memory between commands. A container's configuration is in its directory under `container_dir`, written to stay; what is known about one that runs is in `run_dir`, which a reboot empties. [Storage](storage.html#layout) lists every file, and [Runtime records](#records) says what each record is for. A command that changes a container takes the container's lock first, so two of them do their work one after the other and each sees what the other left.
+
+Every command begins the same way. It makes sure that descriptors 0, 1 and 2 are open, filling one that the caller left closed with `/dev/null`, so that no file it opens later is taken for a standard stream, by lightbox or by a container. It takes `--config` when that is its first argument, answers `--help` and `--version` without reading any configuration, and otherwise loads its settings: the built-in values, then `lightbox.conf`, then the environment. From there on a failure ends the process with status 1, or with 125 in `exec` and `run`, whose other statuses are the command's (see [the exit status of exec](commands.html#exec-status)).
+
+## create {#create}
+
+`create` makes a container's directory and everything in it, and starts nothing. In this order:
+
+1. **The checks that need nothing made.** The name, 1 to 30 characters of `a-z`, `A-Z`, `0-9`, `_` and `-`; `subnet` and `gw` as one network, and the address if one was given; every option and its value; the settings of `lightbox.conf` that fill in a limit no option gave; root, for `--userns` and `--profile agent`; that no container of that name is there; and that the base is a directory with something in it. A refusal here leaves nothing behind.
+2. **The store's lock.** One `create` at a time decides about names and addresses. Under the lock it refuses a `--link` to a container of `--net proxy`, and chooses the address and, with `--userns`, the range of ids. The address is the one asked for, if no container has it, or the lowest of the subnet that is free: not its first or its last address, not `gw`, and not the address in the `.ip` of any container, running or not. The range is the first 65536 uids and gids of `lightbox`'s in `/etc/subuid` and `/etc/subgid` that no container's `.conf` holds.
+3. **The directory, its lock and its mark.** `<container_dir>/<name>/` is made for root alone, mode 0700, and locked. Runtime records that a container of that name left when it was removed by hand are forgotten, and the mark `.creating` is written and synced to the disk. Until the mark is taken away the container is half made: `ls` shows it as `creating`, and `start` refuses it.
+4. **Whether an overlay can be mounted here.** This is tried before anything is copied. A child with a mount namespace of its own mounts an overlay of four empty directories made beside the container's (`.try-lower`, `.try-upper`, `.try-work` and `.try-root`), which are removed again at once. With `--userns` the lower one is made an idmapped mount first, as the real one will be. Where the trial fails the container becomes a copy of its base, and `create` says so; with `--userns` there is no such fallback, and `create` ends, naming `--copy`.
+5. **The root as an overlay.** The newest snapshot of the base is looked for in `<lightbox_dir>/bases`, and one is taken if there is none: `cp -a --reflink=auto` of what is in the base, or a plain `cp -a` where that fails, into a directory that gets its name only when it is whole. Then `rootfs/`, which is the overlay's upper layer, `.work` and `.merged` are made, and a child mounts the overlay at `.merged` in a mount namespace of its own, to write the files of step 7 through it. With `--userns`, `rootfs/` is given to the container's root on the host, and the child writes as that uid.
+6. **Or the root as a copy.** With `--copy`, or where step 4 found no overlay: `cp -a --reflink=auto` of what is in the base into `rootfs/`, or a plain `cp -a` where that fails. With `--userns` this comes after a look whether the filesystem takes idmapped mounts at all, so that nothing is copied for a container that could not start.
+7. **The files in `/etc`.** `resolv.conf`, `hostname`, and the image's `hosts` with a line for the container's own name added, at `127.0.1.1` for a container of `--net none`. They are written in the root as the container will see it: through the overlay, or into the copy with every name looked up as a process whose root is `rootfs/` would find it. A link in the image, of `etc` or of one of the three files, cannot send them anywhere else. An `/etc` that is missing is made.
+8. **What goes on record.** `.ip` with the address, unless the container has none; `.resolv` with what went into `resolv.conf`, for `reset` to write again; an id of 16 hex digits from the kernel's random numbers, by which the audit log tells this container from a later one of its name; and `.conf`. Each is written under another name, synced and renamed into place, and `.conf` only after its own reader has read the text back as the configuration it was made from. Last, `.creating` is removed and the removal synced: the container is `stopped`.
+
+A step that fails removes the whole directory again and ends `create` with what failed. A `create` that is killed cannot do that: its directory stays, with the mark. Nothing starts such a container. `rm` removes it, and so that a damaged one can always be removed, `rm` needs nothing that is in it. A snapshot that was being taken stays under the name it was being made under, which no container is ever given.
+
+[Storage](storage.html#bases) has more about snapshots, overlays and copies, and [Configuration](configuration.html#container-conf) every key of `.conf`.
+
+## start {#start}
+
+`start` is where most of the work is. For several names it does one container after the other, each in a process of its own, so that what ends the command for one ends it for that one only. For each:
+
+1. **Root, and the lock.** `start` says that it must be run as root before it touches anything, and takes the container's lock, which it holds to its end.
+2. **Whether there is something to start.** A container with the mark `.creating` is refused, and so is one that runs. What an earlier run left that [ended without a stop](#ended) is cleared away now.
+3. **The configuration, read once.** `.conf` is read here for the whole start. Init gets it with the memory it is cloned with, and reads no file for it.
+4. **The host's network.** Unless the container has `--net none`, `start` looks for the bridge, in `/proc/net/dev`; for forwarding, in `/proc/sys`, unless `ip_forward = false`; and for lightbox's firewall rules, unless `firewall = false`, with `iptables -C` for each of its two jumps or with one `nft list chains`. If they are not all there, as after a reboot, it takes the store's lock, makes them as `setup` does, says so, and puts back the rules of the other containers that run.
+5. **What the configuration needs of the host.** The container's address has to be one of `subnet` as it is set now. `--net outside`, `--net proxy` and links need `firewall = true`, and links with iptables need `br_netfilter`, as [Networking](networking.html#links) explains. The tool that puts rules in has to be there, and so has the snapshot of a container that overlays one. Each of these ends the start before anything is set up.
+6. **Signals held back.** From here on SIGINT, SIGTERM and SIGHUP do not end `start` where it stands, which would leave an interface, a cgroup and perhaps an init behind. They are read from a descriptor, and `start` then undoes what it did. The state `starting` goes on record.
+7. **A port left from before.** The host's end of the container's interface has a name made from the container's, `vb-` and twelve hex digits. One of that name which carries lightbox's alias for this container is removed. One which does not is somebody else's: it is left alone, and the start ends.
+8. **The log and the exit record.** `console.log` is opened to append, never through a link, and `<run_dir>/<name>/exit` is made empty: init will write its exit status there as the last thing it does.
+9. **With `--userns`, what only host root can make.** `start` gives itself a mount namespace of its own. In it the snapshot, or the copy, is replaced by an idmapped mount of itself with the container's range of ids, and the overlay is mounted on that. Each volume's source is cloned as a mount and idmapped to its owner; one that is host root's is cloned as it is. Init inherits all of it, and nothing changes on the host.
+10. **The clone.** Init is cloned with `CLONE_NEWPID`, `CLONE_NEWNS`, `CLONE_NEWUTS`, `CLONE_NEWIPC` and `CLONE_NEWNET`, and with `CLONE_NEWUSER` for `--userns`, on a stack of 1 MiB of its own. It closes what it inherited and waits for a byte.
+11. **Around the waiting init.** While init waits it is certainly there, so everything that names its PID or its network namespace has something to name. `start` writes its `uid_map` and `gid_map`, makes its [cgroup](#cgroups) with the limits and the device program and moves it in, switches IPv6 off in its network namespace, makes the pair of interfaces, with the container's end made in the container's namespace as `eth0`, gives the host's end lightbox's alias as it joins the bridge, isolates that port unless the container has links, and sets init's OOM score.
+12. **The first byte.** Init builds the container, as [the next section](#init) describes, and reports that it is built. `start` waits 30 seconds for that; init mounts and pivots and runs nothing, so only something stuck takes that long.
+13. **On record.** `pid_start` and then `pid` are written, so a PID is never on record without the start time that tells it from a later process with the same number. The firewall rules of the container's links and of its `--net` go in with one `iptables-restore --noflush` or one `nft -f -`, after their record is written, so that a command killed in between leaves a record of what there may be to take out.
+14. **The second byte.** Init runs `/init.sh`, and reports how it ended. `start` waits for that as long as `-t` or `start_timeout` says, 30 seconds unless set. A hook that is still running then is left running, and `start` says so and returns. With 0 it does not wait at all.
+15. **`running`.** The state goes on record, and `start` prints the PID of init on the host and the container's address.
+
+### The two pipes {#start-pipes}
+
+{.ref}
+| Pipe | Direction | What goes over it |
+|---|---|---|
+| go | `start` to init | One byte at a time. The first says that the cgroup and the network are in place, and init may build the container. The second says that init is on record, and may run the hook |
+| report | Init to `start` | That the container is built, and later that the hook has ended, with its exit status as a shell gives it |
+
+Init is put on record before the hook runs, between the two bytes, so there is no moment at which programs of the image run in a container that `stop` and `ls` cannot find.
+
+### When a start does not finish {#start-failure}
+
+- **`start` goes away.** An init that does not get its byte exits, and takes its namespaces with it. Before the first byte it has made nothing; before the second it has run nothing of the image. So a `start` that is killed outright leaves no process behind that no record names. It can leave a cgroup, an interface or the record `starting`, which the next `start`, `stop` or `rm` clears away. The one thing they leave alone is an interface that was made and had not got lightbox's alias yet, which [Networking](networking.html#interfaces) says how to remove.
+- **Init goes away.** `start` sees the report pipe close before the report it waits for, and undoes the start.
+- **Something fails, or the hook does.** Every failure after step 6 goes one way: init is killed, which ends every process of its PID namespace, and waited for; then the interface, the cgroup, the firewall rules and the record of init are removed, and the state `failed` is recorded. A hook that exits with a status other than 0 is such a failure, and `start` names the status and the log.
+- **Ctrl-C, or a `kill`.** A held-back signal ends the wait it arrives in. The start is undone the same way, and `start` exits with 128 plus the signal's number.
+
+## The container's init {#init}
+
+Init is the clone, and from its first instruction it is PID 1 of a new PID namespace with a copy of `start`'s mount namespace, and an empty network namespace.
+
+### Before it builds {#init-begin}
+
+- **Its signals are blocked,** SIGHUP, SIGINT, SIGQUIT, SIGTERM and SIGCHLD, to be read from a signalfd later. The kernel drops a signal sent to a namespace's init that init neither blocks nor handles, and one that arrives while the container is being built has to be acted on afterwards. SIGPIPE is blocked too, so that writing to a `start` that is gone is an error to act on and nothing else.
+- **It is not dumpable.** Init holds descriptors of files on the host, its log and its exit record. It is nobody's to trace, or to look into under `/proc`, but the host's root.
+- **It leaves the session of `start`.** The terminal `start` was typed on is not init's: Ctrl-C there signals the command and not the container.
+- **It closes what it inherited:** every descriptor but its ends of the two pipes, what becomes its standard streams, the exit record and the volumes that `start` took for it. The locks `start` holds are among what it closes.
+
+Then it waits for the first byte.
+
+### Building the container {#init-build}
+
+Each step that fails ends init with the reason on the standard error of `start`, which sees the pipe close.
+
+1. Every mount is made private, so that nothing mounted on the host later shows up in the container.
+2. The overlay of the snapshot and `rootfs/` is mounted at `.merged`, in this mount namespace only. With `--userns` it is there already, and a copy has no overlay.
+3. The hostname is set to the container's name.
+4. The volumes are taken, as clones of their sources' mounts that hang nowhere yet, while the host's paths still mean what they mean on the host. With `--userns` they were taken by `start`.
+5. The root is bound onto itself and made `nodev`, and `nosuid` unless the container is privileged, and init changes into it by a descriptor. In a user namespace init then becomes uid and gid 0 there, the first ids of its range on the host.
+6. `/dev` is made in it, as the table below has it.
+7. `pivot_root` makes it the root. `/proc` and `/sys` are mounted while the host's are still in sight under the old root, as the kernel mounts them in a user namespace only then, and the old root is detached and its directory removed. Init ends if anything of it is still reachable.
+8. `/dev/pts`, `/dev/shm`, the links in `/dev`, `/tmp` and `/run` follow, and then the volumes, on top of all of it, each looked up with the container's root as the root.
+9. Unless the container is privileged, the parts of `/proc` and `/sys` that show or change the host are masked or made read-only ([Security](security.html#proc) lists them). A mask that cannot be made ends the start.
+10. With `--read-only`, the root is remounted read-only.
+11. Loopback is brought up, and then `eth0`, which gets the container's address and the default route through the gateway, with requests init makes itself from inside the namespace. From the pivot to the hook nothing of the image is run: its tools are not needed, and are not trusted with what init may do.
+
+{.ref}
+| Mounted at | What | With |
+|---|---|---|
+| `/` | The overlay, or the copy, bound onto itself | `nodev`; `nosuid` unless privileged; read-only with `--read-only` |
+| `/dev` | A tmpfs of mode 755 | `nosuid`, `noexec` |
+| `/dev/null`, `zero`, `full`, `random`, `urandom`, `tty` | The host's nodes, each bound onto an empty file | Unless privileged: `nosuid` and `noexec`, and `random` and `urandom` read-only |
+| `/dev/pts` | A devpts instance of the container's own, with `ptmxmode=0666` | `nosuid`, `noexec` |
+| `/dev/shm` | A tmpfs | `nosuid`, `nodev`, `noexec` |
+| `/proc` | proc, of the container's PID namespace | `nosuid`, `nodev`, `noexec` |
+| `/sys` | sysfs | read-only |
+| `/tmp` | A tmpfs | `nosuid`, `nodev` |
+| `/run` | A tmpfs of mode 755 | `nosuid`, `nodev` |
+| `/var/tmp` | A tmpfs, with `--read-only` only | `nosuid`, `nodev` |
+| A volume's destination | The clone of its source's mount | `nosuid`, `nodev`; read-only with `:ro` |
+
+`/dev/fd`, `/dev/stdin`, `/dev/stdout` and `/dev/stderr` are links into `/proc/self/fd`, and `/dev/ptmx` one to `pts/ptmx`. `/proc`, `/sys`, `/tmp`, `/run`, `/var` and `/var/tmp` are made where the image lacks them.
+
+### The sandbox, and its order {#init-sandbox}
+
+Once the container is built, and unless it is privileged, init confines itself: the capability sets are reduced to the 11 a container keeps, then `no_new_privs` is set, then the seccomp filter is installed. It does this before the hook, so the hook and everything it starts inherit all three. The filter comes last because the kernel takes one from a process without `CAP_SYS_ADMIN`, which is not among the 11, only once `no_new_privs` is set. Any step that fails ends init, as a container must not run with more than this. [Security](security.html#capabilities) says what each of the three keeps out.
+
+A lifetime, `--ttl`, counts from this moment, on the clock of the time since boot, which goes on while the host is suspended.
+
+### The hook, and what init does for the rest of its life {#init-loop}
+
+Init makes its signalfd, puts `/dev/null` on its standard input and the container's log on its output and error, reports that the container is built, and waits for the second byte. Without that byte no record names this container, and init exits without running anything.
+
+If the root has an `/init.sh`, init runs it as a child: `/bin/sh /init.sh`, with no signal blocked, with `PATH`, `HOME=/root` and `TERM=xterm` and nothing else of the environment `start` was given, and in a container of `--net proxy` with the variables that say where its proxy is. Init's own descriptors are close-on-exec and do not reach it. Without one, init reports at once what it would report for a hook that ended with 0.
+
+From then on init waits on its signalfd, and does three things:
+
+- **It reaps.** Every process of the container whose parent has ended becomes init's child, and init waits for each that ends. The hook is one child among the others. Init has its signals in hand before the hook starts, so a hook that takes long, or never returns, leaves the container with someone to reap its processes and to hear a stop. When the hook ends, init reports its exit status to `start`. A status other than 0 ends init, and with it the container, whenever it comes; if `start` is no longer there to be told, init writes the status in the log.
+- **It keeps the lifetime.** With `--ttl` it waits no longer than the deadline. When that comes it writes `lightbox: the container's --ttl is over; it stops` in the log, shuts the container down as below, and ends with a status of its own, 2, that says so.
+- **It shuts down when asked.** SIGTERM, SIGINT, SIGHUP and SIGQUIT all ask for that, from `stop` or from anywhere else.
+
+To shut down, init sends SIGTERM to every process of its PID namespace but itself, the services, what they started and the commands that `exec` put there, and SIGCONT with it, so that a stopped process gets to see the SIGTERM. It reaps, and asks the kernel whether anyone is left, every tenth of a second, as a command of an `exec` is not its child and ends without a SIGCHLD for init. When no one is left, or when the time is over, it returns. The time is `stop_timeout` as it was set when the container started, or the seconds that a `stop` sent along with its signal. Whatever is still there when init exits dies with it: the kernel kills a PID namespace whose init ends.
+
+The last thing init does is write its exit status into the exit record: 0 after it was asked to stop, 2 after its lifetime, and 1 after the hook failed. An init that is killed writes nothing, and that is how the next command tells.
+
+## exec {#exec}
+
+`exec` runs as three processes: the one you started, a worker, and the command.
+
+### The process you started {#exec-caller}
+
+1. **A copy that cannot be written to.** Until it executes the command, a process that enters a container is this binary, and a file that is being executed can be reached by others through `/proc/<pid>/exe`. So `exec` first executes itself again from a copy of the binary in memory, a memfd sealed against writing, growing, shrinking and unsealing. Where the kernel refuses to execute memfds (`vm.memfd_noexec = 2`) it takes the binary itself through a mount of its own that is read-only. It checks which of the two it runs from, and if neither can be had, `exec` does not run. A variable in its environment marks the second run, so that it tries once and never again. `doctor` says which of the two this host uses.
+2. **The checks.** The options, root, that the container runs, and its `.conf`: what the command may do in the container is what the container may, so without its configuration nothing is run in it.
+3. **The terminal's modes** are noted, to be put back at the end whatever becomes of the worker.
+4. **A cgroup for this exec,** `exec-<pid>-<start time>`, below the container's, named after this process, a name no other process has had since boot. See [cgroups](#cgroups). SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGWINCH and SIGCHLD are read from a descriptor from here on.
+5. **The first line of the audit log.** An `exec` whose start cannot be recorded does not run. From here on any failure writes the line of the end too. [The audit log](commands.html#audit-log) has the format.
+6. **The worker is forked,** and this process waits for it. It passes on to the worker the signals that another process sent it; the ones a terminal sent have reached the worker by themselves, as both are in the terminal's foreground group.
+7. **At the end** it puts the terminal's modes back, ends what is left in the exec's cgroup if there was a time limit, removes the cgroup if it is empty and the empty ones that earlier execs left, writes the second line of the audit log, and exits with the command's status.
+
+### The worker {#exec-worker}
+
+The worker is the part that enters. It is made not dumpable first, so that its memory and its descriptors are closed to the container's processes whatever uid those have. Then, in this order:
+
+1. It opens the root of the container's init and its namespaces, under `/proc/<pid>` on the host.
+2. It joins the exec's cgroup, so that everything forked from here on is in it, opens that cgroup's `cgroup.kill` and `cgroup.procs` if there is a time limit, and takes the container's OOM score.
+3. It joins the user namespace, if the container has one, and becomes its root. That root then joins the mount, UTS, IPC and network namespaces, which it owns, so what it makes there is the container's.
+4. It changes its root to the container's. The container's `/etc/passwd` and `/etc/group` are read here, where no path in them leads out of the container, and only as regular files of at most 16 MiB: a pipe would never end, and a device could say anything for ever. They give the uid, the gid, the home directory and the groups of the user the command runs as, and no group for a uid that has no account.
+5. It makes what the command gets in the place of your terminal: a pseudo-terminal from the container's own `/dev/pts`, when the standard input and output of `exec` are both a terminal, or else a pipe in the place of each of the three streams that is a terminal. The command's end of the pseudo-terminal is opened from the worker's end, by no path at all, and given to the command's user.
+6. It joins the PID namespace, which takes effect for its children, and forks the command.
+
+Then it carries the bytes. Each direction is read only when nothing of it waits to be written, and written only when its descriptor takes something, so neither side can hold up the other. With a pseudo-terminal your terminal is raw for that time, every key goes to the command, and a change of the window's size is passed on. SIGINT, SIGTERM, SIGHUP and SIGQUIT are passed on to the command. When the command has ended, what it wrote last is still delivered; what something it left behind may write later is not waited for.
+
+### The command {#exec-command}
+
+The child of the worker is the first of the three that is a process of the container. It unblocks its signals, becomes the leader of a session of its own, takes the pseudo-terminal as its controlling terminal if it got one, puts its three streams in place and closes everything else that was open in whoever ran lightbox. Unless the container is privileged it takes on the sandbox, in the order init does. Then it takes on its identity, the groups first, while there is the right to; puts together its environment, `PATH`, `HOME`, `TERM`, and `USER` and `LOGNAME` for a uid that has a name, with what `--env` adds or replaces; changes to its directory; and executes the command, found as a shell finds it. [Commands](commands.html#exec-environment) has the details, and the statuses 126 and 127 for a command that cannot be run or is not there.
+
+### The time limit {#exec-timeout}
+
+`--timeout` is counted from the first moment of `exec`, and kept twice. The process you started ends everything in the exec's cgroup at the deadline, with `cgroup.kill` or, on a kernel before Linux 5.14, by killing what the cgroup lists until it is empty. The worker keeps watch too, with a pidfd of that process and the two files it opened while it was still on the host: when the process you started ends while the command runs, killed or otherwise, the worker ends everything in the cgroup at once, itself last; and when that process is held up, stopped for one, the worker does so a second past the deadline. The container can reach neither of the two, and nothing in it can leave the cgroup, as it has no cgroupfs to write to. `exec` then exits with 124.
+
+Without a time limit, what a command left running in the background goes on in the exec's cgroup after `exec` has returned, and the cgroup is removed once it is empty, by a later `exec` or by `stop`.
+
+### run {#run}
+
+`run` is `create`, `start`, `exec` and `rm -f` in one, each as a child of `run`, so that a step that ends its process when it fails does not keep the box from being removed. Before anything is made it executes itself again from a sealed copy, as `exec` does, looks at the options of both kinds, and removes the boxes of runs that are gone.
+
+- **The name** is `run-` and 12 hex digits from the kernel's random numbers.
+- **`.runner`** in the box's directory holds the PID and the start time of the `run` that made it. `create` writes it right after the mark `.creating`, so no box of `run` can be started without it. The next `run` removes every box whose `.runner` names a process that is no longer there, and says so.
+- **What the steps print** is put away, but for their errors: `create`, `start` and the removal have `/dev/null` as their standard input and output. What `run` prints is the command's.
+- **Signals.** SIGINT, SIGTERM and SIGHUP for `run` go on to a start, which undoes itself, and to the command, as `exec` passes them on. A `create` is let finish. If the command has not ended within `stop_timeout` of the first signal, the box is removed with it.
+- **The removal** has a session of its own, so that a terminal's keys do not cut it short.
+- **The exit status** is the command's, as `exec` gives it, 125 when the box could not be made or started, and 128 plus the signal's number when a signal ended `run` before the command ran.
+
+## stop {#stop}
+
+1. **Root, the lock, and whether it runs.** A container that does not run is not stopped, but what it left if it [ended without a stop](#ended) is cleared away on the way.
+2. **A pidfd for init.** It is taken before `stop` looks once more whether the record is init's. From there on it names that process and no other, whatever becomes of the number, and it reads as ready when init has ended.
+3. **`stopping`** goes on record.
+4. **The signal that carries the time.** `stop` sends init a SIGTERM through the pidfd, with the seconds the container may take as the signal's value: `-t`, or `stop_timeout`, 10 unless set. Init passes SIGTERM on to everything in the container and exits when all of it has ended or the time is over, as [above](#init-loop).
+5. **The wait.** `stop` waits on the pidfd, so it returns as soon as the container has ended. It gives init its seconds and two more. Only if init is still there after that is it killed, which the kernel follows by killing everything in its PID namespace.
+6. **What is left on the host.** Everything still in the container's cgroup and in the cgroups of its execs is ended, with `cgroup.kill` or by killing what they list, and `stop` waits up to five seconds for the kernel to say that the cgroup is empty. Then the cgroups are removed, the execs' first. The firewall rules that the record of them names are taken out, and so is the host's end of the interface, if the kernel has not removed it with the container's network namespace already.
+7. **No record, so stopped.** The runtime records and their directory are removed. A container without them is `stopped`.
+
+If something could not be removed, `stop` says what, says that the container is stopped all the same, and exits with 1.
+
+The other commands that end or change a container are built from these parts:
+
+{.ref}
+| Command | What it does |
+|---|---|
+| `restart` | Stops the container if it runs, in a process of its own and with `-t` as `stop` has it, and starts it as `start` does, with `start_timeout` |
+| `rm` | Refuses a container that runs. Clears away what one that ended without a stop left, takes out the firewall rules its records name, and is not done while those are there. Removes its cgroup, its directory, with `rm -rf`, and its runtime records. `rm -f` first stops one that runs, with no time to end by itself |
+| `reset` | For a container that overlays a snapshot: stops it if it runs, takes its lock, and tries, as `create` does, whether an overlay mounts here before it takes anything away. Then it writes the mark `.creating`, replaces `rootfs/`, `.work` and `.merged` by empty ones, writes the files of `/etc` through the overlay again, from `.ip` and `.resolv`, and removes the mark. Cut short, it leaves the container half made, and a `reset` again makes it whole |
+| `update` | Takes the lock, writes the new limits into `.conf` first, and then, if the container runs, into `memory.max`, `pids.max` and `cpu.max` of its cgroup. A limit that the running container does not take is said, and holds from its next start |
+| `add-vol`, `rm-vol` | Take the lock and rewrite `.conf`. A container that runs has the change from its next start |
+
+## States {#states}
+
+`ls` and `inspect` show a state for each container. It is what is on record, corrected by what they see: whether the process on record as its init is there, with that PID, that start time and a PID namespace of its own.
+
+{.ref}
+| State | What it means | How a container leaves it |
+|---|---|---|
+| `creating` | `create`, or `reset`, has not finished: the mark `.creating` is in the container's directory | `rm`; `reset` again, for one that a reset left |
+| `stopped` | Nothing is on record about a run: it was created and never started, it was stopped, or the host was rebooted | `start` |
+| `starting` | A `start` is setting it up, and its init is not on record yet | The start goes on to `running`, or fails |
+| `running` | Its init is on record and is there. A container shows as `running` whatever the record says while that holds, so also while its hook still runs and while a `stop` waits for it to end | `stop`, or its own end |
+| `stopping` | A `stop` has asked its init to end. Seen for a moment at most: while init is there the container shows as `running`, and once it is gone as `exited`, until `stop` has removed the records | `stop` finishes |
+| `exited` | Its init is on record and gone, and nothing has cleared up yet; or it ended by itself with status 0, as it does when a signal from anywhere asks it to stop, and a later command recorded that | `start` or `rm`; `stop` clears away what it left and changes no more |
+| `expired` | Its `--ttl` ended it: init said so in its exit record | The same |
+| `failed` | Its start failed, was interrupted, or its hook failed while `start` waited; or its init was killed, or ended with another status than 0 or 2, and a later command recorded that | `start` or `rm` |
+
+```text
+        create               start                         stop
+ ──────────────▶ stopped ──────────▶ starting ──▶ running ─────────▶ stopped
+    │                                    │           │
+    │ cut short                          │ fails     │ init ends by itself, its --ttl
+    ▼                                    ▼           ▼ ends it, or it is killed
+ creating                             failed      exited, expired or failed
+```
+
+A query never changes what is on record, and for a reason: a caller who is not root, or a host that hides other users' processes, cannot tell a process that is gone from one it may not look at. Only "no such process" counts as gone. [Troubleshooting](troubleshooting.html#states) says what to do about each state.
+
+## A container that ended without a stop {#ended}
+
+When init is killed, or is told to stop by a signal from somewhere other than `lightbox stop`, from inside the container too, or when its hook fails after `start` has returned, nobody is there to clear up. The kernel has ended every process of the container, and takes its network namespace and the pair of interfaces away with it. What is left on the host is the cgroup, the host's end of the pair if the kernel has not got to it yet, the firewall rules of its links and of its `--net`, and the runtime records.
+
+`ls` shows such a container as `exited`, or `expired`, and changes nothing. The next command that changes the container clears it away, with the container's lock held and before it does anything else: `start`, `stop`, `rm` and `reset`, and `setup --teardown` for every container. It does what step 6 of `stop` does, forgets which process init was, records how the container ended, and says so on its standard error:
+
+{.ref}
+| The exit record says | State recorded | What the command says |
+|---|---|---|
+| 0 | `exited` | `Note: container '<name>' had stopped by itself; what it left has been cleared away` |
+| 2 | `expired` | `Note: container '<name>' came to the end of its --ttl; what it left has been cleared away` |
+| Anything else, or nothing | `failed` | `Note: container '<name>' had ended without a stop; what it left has been cleared away` |
+
+The same happens to a container whose record says `starting`, `running` or `stopping` while no init is there to match: with the lock held no command is at work on it, so the command that wrote the record died there.
+
+## Locks {#locks}
+
+A lock is an `flock` on a directory, held on a descriptor that stays open until the process ends: the container's directory for a container, and `container_dir` for the store. The descriptor is close-on-exec, and a container's init closes everything it inherits, so no tool lightbox runs and no container holds a lock on.
+
+{.ref}
+| Command | Takes |
+|---|---|
+| `create` | The store's lock, and then the lock of the container it makes |
+| `start`, `stop`, `update`, `add-vol`, `rm-vol`, `rm` | The container's lock |
+| `restart`, `reset` | The container's lock, after the stop, which takes it in a process of its own |
+| `run` | What its four steps take, each in its own process |
+| `setup`, `reload`, `base add`, `base rm` | The store's lock |
+| `start`, when it has to make the host's network again | The store's lock as well, for as long as that takes |
+| `setup --teardown` | The store's lock, and each container's without waiting: one that a command is working on, or that runs, ends it |
+| `ls`, `inspect` | Each container's lock shared, and only if it is free |
+| `exec`, `logs`, `doctor`, `base ls` | None |
+
+A command that has to wait says so first, `Waiting for another lightbox command to finish with container '<name>'...`, or `... with the container store...`, and then waits for as long as it takes. `ls` and `inspect` never wait: where a command holds the lock they read what is there. A command that got a lock looks whether the directory it locked is still the one at that path, as an `rm` may have removed the container while it waited.
+
+`setup`, `reload`, `start`, `stop`, `restart`, `reset`, `update`, `exec` and `run` check that they run as root before they touch anything, and so do `create --userns` and `create --profile agent`. The message is `Error: lightbox <command> must be run as root`.
+
+## Runtime records {#records}
+
+`<run_dir>/<name>/` is made by `start`, for root alone, and removed by `stop`. Its files are written in one step each, under another name and renamed, but without waiting for the disk: no reboot outlives them anyway, and `run_dir` belongs on a tmpfs for that reason ([run_dir](configuration.html#conf-run_dir)).
+
+{.ref}
+| Record | Holds | What it is for |
+|---|---|---|
+| `pid` | The PID of init, on the host | Finding init: for `exec` to enter by, for `stop` to signal |
+| `pid_start` | The start time of that process, field 22 of `/proc/<pid>/stat` | Telling init from a later process with the same PID. It is written before `pid`, so a PID is never on record without it |
+| `state` | `starting`, `running`, `stopping`, `exited`, `expired` or `failed` | What a command was doing, or how the last run ended |
+| `exit` | The exit status init wrote as the last thing it did; empty until then | Telling a container that was asked to stop from one whose lifetime ended and from one that failed or was killed |
+| `firewall` | The chain, or the set elements, of the container's link rules | Taking out exactly what was put in, whatever `.conf` says by then and whether it can be read |
+| `egress` | The same for the rules of `--net outside` and `--net proxy` | The same |
+
+`<run_dir>/.forwarding` is not a container's: `setup` writes it when it turned IPv4 forwarding on, for `setup --teardown` to say so.
+
+A container that lightbox before 0.5 started, and that still runs, has `.pid`, `.pid_start` and `.state` in its own directory instead. They are read where today's records are missing, so that such a container is seen to run and can be stopped, and they are removed with today's. [Storage](storage.html#layout) shows where all of this is on disk.
+
+## cgroups {#cgroups}
+
+```text
+ <cgroup_root>                 /sys/fs/cgroup, a cgroup v2 hierarchy
+ └─ lightbox                   cgroup_base, made by the first start
+    ├─ web                     a container: limits, device program, init
+    │  ├─ exec-4242-981234     an exec: PID and start time of its lightbox
+    │  └─ exec-…
+    └─ db
+```
+
+`start` enables the `memory`, `pids`, `cpu` and `io` controllers one at a time, in `cgroup.subtree_control` of `cgroup_root` and of `cgroup_base`, so that one a level cannot have does not keep the others from it. What the container's `cgroup.controllers` then lists is what the container has. A controller that it lacks ends the start only when the container has a limit that needs it: `cpu` always, `memory` for a memory or a swap limit, `pids` for a process limit and `io` for an I/O limit. Otherwise `start` says so once, and the container runs without it.
+
+{.ref}
+| File | Written with | When |
+|---|---|---|
+| `memory.max` | `--mem`, as given | At start; again by `update` |
+| `memory.swap.max` | `--swap`, or `0` without it | At start. On a kernel that does not count swap for cgroups, a container with a swap limit does not start, and one without is warned about |
+| `memory.oom.group` | `1` | At start: what the kernel kills for a container that is out of memory is the whole container, not a part of it that the rest goes on without |
+| `pids.max` | `--pids` | At start; again by `update` |
+| `cpu.max` | The quota of every period of 100 ms on all CPUs together: `50000 100000` for `--cpu 0.5` | At start; again by `update` |
+| `io.max` | `--io-max`, as given | At start, when the container has one |
+| `cgroup.procs` | The PID of init; for an exec's cgroup, the PID of its worker | Init is moved in while it waits for its first byte, after the limits and the device program are in place |
+| `cgroup.kill` | `1` | By `stop`, by `exec --timeout` and by the removal of a cgroup, on Linux 5.14 and later. Without it, the PIDs the cgroup lists are killed, again and again until the kernel reports it empty |
+
+The device program is attached to the container's cgroup before init is moved in, unless the container is privileged. It is the cgroup's until the cgroup is removed, and holds for the cgroups below it; [Security](security.html#devices) says what it lets through. A container that is not privileged does not start without it.
+
+An exec's cgroup has no limits of its own. The container's hold for it, as they hold for everything below the container's cgroup, and the OOM score of the worker and the command is the container's. Its use is to say what belongs to one `exec`: nothing in the container can reach cgroupfs to leave it, so what a command starts, in the background or in a session of its own, is in it until it ends. That is what `--timeout` ends, and what tells an exec's processes from the services of the container.
+
+Whether a cgroup is empty is read from `cgroup.events`, the kernel's own account, and not from a list that happens to be empty. A removal that the kernel answers with "busy" is tried again for up to five seconds, as the last process can be gone before the kernel has finished with it.
+
+## Tools and system calls {#tools}
+
+lightbox runs a handful of host tools and no others. Each is looked for at fixed paths, `/usr/sbin`, `/sbin`, `/usr/bin` and `/bin` for the firewall's, with `iptables-nft` and `iptables-nft-restore` taken where the plain names are missing, and `/bin` and `/usr/bin` for the other two. Each runs with an environment of its own, `PATH=/usr/bin:/bin:/usr/sbin:/sbin` and nothing of the caller's.
+
+{.ref}
+| Tool | Run by | For |
+|---|---|---|
+| `iptables` | `setup`, `reload`, `setup --teardown`, `doctor`, and every `start` of a container with a network | Looking whether lightbox's chains and jumps are there, and with nftables as the backend, whether a chain of iptables' drops what is forwarded; removing chains piece by piece where a transaction did not |
+| `iptables-restore` | `setup`, `reload`, and a `start`, `stop` or `rm` of a container with links or with `--net outside` or `--net proxy` | Putting rules in and taking them out, a transaction at a time: once for a start |
+| `nft` | The same commands, with `firewall_backend = nftables` | The same, in lightbox's two tables: one `nft list chains` to look, one `nft -f -` to change |
+| `cp` | `create`, `base add` | A snapshot of a base, or a container's copy of it: `cp -a --reflink=auto`, then `cp -a` |
+| `rm` | `rm`, `reset`, `base rm`, and `create` | `rm -rf` of a container's directory, of its layers, of a snapshot, of the four directories of `create`'s trial, and of what a `create` that failed had made |
+
+Whether a tool could be executed at all is learned through a close-on-exec pipe: a successful `execve` closes it, and a failed one is followed by its errno. Everything else is system calls of lightbox's own: namespaces, mounts, cgroups, the bridge and the interfaces over rtnetlink, the user namespace maps, the seccomp and device programs, signals and terminals. Since 0.7 it runs neither `ip` nor `nsenter`. Nothing from an image is run before its `/init.sh`.
+
+### Private system calls {#syscalls}
+
+lightc wraps the system calls a freestanding program usually needs. lightbox makes some that it does not wrap yet, and `lightbox_sys.h` is the only place in lightbox that may hold a raw system call number: `fcntl`, `flock`, `fsync`, `fchdir`, `chroot`, `getuid`, `geteuid`, `capget`, `capset`, `statfs`, `statx`, `faccessat`, `renameat`, `ppoll`, `getrandom`, `memfd_create`, `execveat`, `bpf`, `pidfd_open`, `pidfd_send_signal`, `open_tree`, `move_mount`, `mount_setattr`, `openat2` and `close_range`, each with its number for x86_64 and for aarch64, beside the kernel constants and structure layouts they take.
+
+A wrong number does not fail to build; it calls another system call. So `make check-sys` compiles `tests/sys_check.c` and `tests/sys_check_net.c`, which compare every number, constant and layout of `lightbox_sys.h`, every number in the seccomp tables and every constant of the device program with the kernel's own headers, with the native compiler and with each cross compiler that is installed. Nothing is linked or run: a value that differs is a compile error. An entry is deleted when lightc ships the wrapper for it.
+
+## The source tree {#source}
+
+{.ref}
+| File | What is in it |
+|---|---|
+| `lightbox.c` | `main` and the usage; `create`, `start`, `stop`, `restart`, `reset`, `update`, `rm`, `add-vol`, `rm-vol`, `exec` and `run`; a container's init; cgroups; capabilities and the masks of `/proc`; the sealed copy; the relay of an exec's streams |
+| `lightbox.h` | The release that `--version` prints, and every limit, structure and declaration the files share |
+| `lightbox_container.c` | A container's `.conf`: its one reader and its one writer, and the rules for what a limit, a volume and a `--net` may be, which options, settings and the file are all held to |
+| `lightbox_config.c` | `lightbox.conf`: where it is read from, its settings and their built-in values |
+| `lightbox_state.c` | Where a container's files are, the runtime records, the probe that says whether its init is there, the locks and the listing of containers |
+| `lightbox_base.c` | Base snapshots and the `base` command |
+| `lightbox_net.c` | Addresses, the firewall with either backend, `setup`, `reload`, the teardown, and what a start puts in for a container |
+| `lightbox_netlink.c` | rtnetlink: the bridge, the interface pair, addresses and routes, one request at a time |
+| `lightbox_userns.c` | Ranges of ids from `/etc/subuid` and `/etc/subgid`, the maps of a user namespace, and idmapped mounts |
+| `lightbox_audit.c` | The audit log: its lines, as JSON in ASCII, and the filter of `logs --audit` |
+| `lightbox_meta.c` | `ls`, `inspect`, `logs` and `doctor` |
+| `lightbox_util.c` | Text that must arrive whole, numbers and durations, files written in one step, running a tool, `mount`, and the loading of the device program |
+| `lightbox_seccomp.h` | The two seccomp profiles as tables, and the functions that turn them into the program for an architecture |
+| `lightbox_devices.h` | The devices of a container's `/dev` as one table, and the cgroup device program made from it |
+| `lightbox_sys.h` | The private system call numbers, constants and wrappers |
+| `lightbox.conf.example` | Every setting with its built-in value, which `make install` puts in `/etc/lightbox` |
+| `contrib/proxy/` | A Squid configuration for containers of `--net proxy` |
+| `tests/`, `bench/` | The suites below, and the timing script |
+| `lightc/` | lightc, pinned as a git submodule |
+
+Two rules run through the code. No text is ever cut to fit: a path, a name or a value that is too long is refused where it is read, with the option or the setting named, as the first part of it would be the name of something else. And what a container could have written is handled as that: its `.conf` is in a directory of root's alone, outside its root; its account files are read only by a process whose root is the container's; and `create` and `reset` write into its root only by names looked up inside it.
+
+### The build {#build}
+
+lightbox is C23, compiled freestanding and linked statically against lightc and nothing else, with lightc's linker script and without a C library, an interpreter or a dynamic section. `make` builds it for the target of `CC`, x86_64 or aarch64, and strips it.
+
+{.ref}
+| Flags | Why |
+|---|---|
+| `-std=c23`, or `-std=c2x` for GCC 13 | The language |
+| `-O2 -DNDEBUG -Wall -Wextra -Wpedantic` | Optimised, with the usual warnings |
+| `-ffreestanding -nostdlib -nostartfiles -nodefaultlibs` | No C library: `_start`, the system calls and the string functions are lightc's |
+| `-static -no-pie`, `-T lightc.ld` | One static executable, laid out by lightc's linker script, which also marks the stack as not executable |
+| `-fstack-clash-protection`, `-ftrivial-auto-var-init=zero`, and on x86_64 `-fcf-protection=full` | Hardening that needs no runtime support, each where the compiler has it |
+| `-fno-stack-protector` | The stack protector needs a canary that lightc does not set up yet |
+| `-mno-outline-atomics`, on aarch64 | No calls into a runtime library for atomic operations |
+
+[Getting started](guide.html#build) has the commands, and where `make` looks for lightc.
+
+## Tests {#tests}
+
+`make check` runs everything that needs no root. One more suite starts real containers, and needs it.
+
+{.ref}
+| Target | What it does | What it needs |
+|---|---|---|
+| `make check-sys` | Compiles the two files that compare lightbox's private numbers, constants and layouts with the kernel's headers, for both architectures where their compilers are installed | Kernel headers; a cross compiler for the other architecture, if it is to be checked too |
+| `make analyze` | Compiles every source file with `-fanalyzer` and a strict set of warnings, each of them an error | A GCC with `-fanalyzer`. The gate is kept clean for GCC 14, as an analyzer's findings change from release to release |
+| `make test-unit` | Runs lightbox's own helpers from the command line. The harness is `lightbox.c` itself with another `main`, so it runs the code lightbox runs and not a copy: the one that starts programs; the ones that mount, make directories and bring up loopback, in a user namespace of their own; both sides of a start, with a real init in a PID namespace; and the device program, interpreted | For some cases, unprivileged user namespaces, and a range of ids of your own in `/etc/subuid` and `/etc/subgid`; a case that lacks what it needs is skipped |
+| `make test-validation` | Runs the built binary as an ordinary user, with `HOME` and every directory it is configured to use inside one temporary directory: options and their values, the configuration, refusals, and what `ls`, `inspect` and `doctor` print | Nothing; it starts no container |
+| `make test-seccomp` | Installs each of the two real profiles and probes them: every system call of the deny table, every call that sets a file's mode, `socket` of families it takes and does not, and for the allow-list a call it does not name. Runs git, Python, Node.js and a C compiler under each, where the host has them. Interprets the program of each architecture for every system call number, whatever machine this is | Nothing; cases whose tool is missing are skipped |
+| `make test` | The three suites above | |
+| `make check` | `check-sys`, `analyze` and `test` | |
+| `sudo make test-lifecycle` | Starts real containers: `setup`, `create`, `start`, `exec`, `run`, `stop`, `reset` and `rm`, volumes, limits, the init hook, the sandbox, user namespaces, the network between containers and what `--net` lets out, with iptables and with nftables | Root; a kernel with bridge, veth and cgroup v2; a statically linked busybox to make the containers' image from; iproute2's `ip` and util-linux's `nsenter`, which the suite looks with |
+| `sudo make bench` | Measures the wall time of `create`, `start`, `exec`, `stop` and `rm`, counts the processes one start makes, and times `create` from a base of 1 GB. It compares nothing: numbers are worth comparing only from the same kind of machine | What the lifecycle suite needs |
+
+The suites share one runner, `tests/lib.sh`. A case is a shell function that returns 0 to pass, 77 to skip, and anything else to fail, and its output is shown only when the result is not the expected one, or with `V=1`. A case can be marked as an expected failure instead: it states the right behaviour, and is expected to fail. The day it passes, the suite fails until the mark is taken off, so a fix cannot land without the suite recording it.
+
+### The lifecycle suite {#lifecycle-suite}
+
+The suite does not use the host, and leaves nothing on it. It runs itself again in private network, mount and PID namespaces with a configuration of its own, so its bridge, firewall rules, interfaces and mounts exist only there, and every process it starts dies with the PID namespace. cgroups cannot be private in that way: its containers live under `/sys/fs/cgroup/lightbox-test-<pid>`, which is removed at the end. The host's virtual interfaces, firewall rules and cgroups are compared before and after, and a difference fails the run. Kernel modules that get loaded on the way stay loaded. Every case is a process of its own with a time limit, so a command that hangs fails its case and not the run, and `ip` and `nsenter` are masked for lightbox's own commands, with a case that looks that nothing ran them.
+
+`sudo` drops the environment, so the options go on make's command line, as in `sudo make test-lifecycle V=1 KEEP=1`. Build first, as yourself: the target builds nothing, so that `sudo` leaves no file of root's in the tree.
+
+{.ref}
+| Option | What it does |
+|---|---|
+| `LIGHTBOX_TEST_ROOTFS=<dir>` | Makes the containers from a copy of that root filesystem and not from the suite's own busybox image. `sudo tests/fetch_image.sh alpine <dir>`, or `debian <dir>`, fetches one of the two images the allow-list is fitted to, pinned by its SHA-256, and unpacks it there |
+| `LIGHTBOX_TEST_USERNS=overlay` | Makes every container with `--userns` |
+| `LIGHTBOX_TEST_USERNS=copy` | The same with `--copy`, but in the cases about overlays |
+| `LIGHTBOX_TEST_SECCOMP=deny` | Makes every container with `--seccomp deny`, but where a case chooses the profile; alone, or with either of the two above |
+| `BUSYBOX=<path>` | The static busybox to make the image from. It goes into every image at `/lbt/busybox` too, for the cases that look at the network from inside a container |
+| `LIGHTBOX_TEST_MODPROBE=1` | Loads `br_netfilter` when it is not loaded. On a workstation that changes how every bridge is filtered |
+| `CASE_TIMEOUT=<seconds>` | How long one case may take: 90 unless set |
+| `KEEP=1` | Keeps the work directory |
+| `V=1` | Shows the output of every case |
+
+## Continuous integration {#ci}
+
+`.github/workflows/ci.yml` runs on every push to `main`, on every pull request, and by hand. A newer run for the same branch cancels the one before it.
+
+{.ref}
+| Job | Runs on | What it runs |
+|---|---|---|
+| Checks (x86_64) | `ubuntu-24.04`, GCC 14, with the aarch64 cross compiler installed | `make`, then `make check`, so `check-sys` covers both architectures |
+| Checks (x86_64 with GCC 13) | `ubuntu-24.04`, the GCC that Ubuntu installs | `make`, then `make check-sys test`: an analyzer's findings change from release to release, so the gate is not run with this one |
+| Checks (aarch64) | `ubuntu-24.04-arm`, GCC 14 | `make`, then `make check`, natively: an emulator would refuse to install a seccomp filter |
+| Lifecycle suite, six times on each of x86_64 and aarch64 | `ubuntu-24.04` and `ubuntu-24.04-arm` | `sudo make test-lifecycle` on the suite's own image as it is; with `LIGHTBOX_TEST_USERNS=overlay`; with `=copy`; with `LIGHTBOX_TEST_SECCOMP=deny`; and on the Alpine and the Debian image that `tests/fetch_image.sh` fetches. The job on the suite's own image runs `sudo make bench` afterwards |
+| Cross-build for aarch64 | `ubuntu-24.04` | `make CC=aarch64-linux-gnu-gcc`, and a look that the result is a static aarch64 executable |
+
+Under GitHub Actions the runner writes annotations, which a run's summary page lists without opening a log: each suite's totals as a notice that names every case it skipped, each failed case as an error with the first and the last lines of its output, and for expected failures the last line each printed, so that a reader can see that it fails for the reason its name gives. The timing is a notice of its own. A job that fails prints the end of the kernel log.
+
+{.source}
+Source: `lightbox.c` for the commands and init; `lightbox_state.c` for records, states and locks; `lightbox_base.c`, `lightbox_container.c`, `lightbox_util.c`, `lightbox_net.c` and `lightbox_userns.c` for what they call; `lightbox_sys.h`; the `Makefile`; `tests/lib.sh` and the heads of the suites; `.github/workflows/ci.yml`.

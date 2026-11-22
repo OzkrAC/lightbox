@@ -31,7 +31,15 @@ lightc is pinned as a git submodule in `lightc/`. `make` configures and builds i
 
 The Makefile looks for lightc in `LIGHTC=`, then in the `lightc/` submodule, then in a sibling `../lightc/`. The submodule is the only copy it configures and builds itself. A sibling or `LIGHTC=` tree is someone else's working copy: lightbox links its `build/liblightc.a` and stops with a hint if that file is missing.
 
-`make CC=aarch64-linux-gnu-gcc` cross-builds; lightc must be built for the same architecture.
+`make CC=aarch64-linux-gnu-gcc` cross-builds; lightc must be built for the same architecture. `CFLAGS` and `LDFLAGS`, on make's command line or in the environment, are added to what lightbox is built with; what it needs comes after them and holds whatever they say.
+
+`sudo make install` installs the binary in `/usr/local/bin`, the manual page, `lightbox(8)`, the example configuration in `/etc/lightbox` and lightbox's directories in `/var/lib/lightbox`; `PREFIX` and `DESTDIR` say where.
+
+### Packages
+
+`packaging/build-deb.sh` builds lightbox as a `.deb` on Debian or Ubuntu, and `packaging/build-xbps.sh` as an `.xbps` on Void Linux, for the machine's architecture. A package holds what `make install` installs. CI builds both on every run, for x86_64 and aarch64, installs each, and keeps them as the run's artifacts. [packaging/README.md](packaging/README.md) has the details.
+
+`make dist` makes `lightbox-<version>.tar.gz`: the sources with lightc's inside, which build with `make` and no network.
 
 ### Checks
 
@@ -678,3 +686,7 @@ echo lightbox:2147483647:2147483648 >> /etc/subgid
 - `lightbox add-vol <name> <src>:<dst>[:ro]` appends a volume to an existing container's config. Adding the very same volume again does nothing.
 - `lightbox rm-vol <name> <dst>` takes the volume at that destination out of the config. What is in the volume's source is not touched.
 - If the container is already running, added and removed volumes take effect after a restart.
+
+## License
+
+MIT, as lightc is. See [LICENSE](LICENSE).
