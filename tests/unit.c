@@ -113,6 +113,15 @@
  *                                             "entries <n>", "sockets <n>", "attributes-left <n>",
  *                                             "bytes <n>" and "sha256 <digest>" of the archive;
  *                                             or "failed: <entry>: <why>" and status 1
+ *   unit untar <archive> <dir> [tree|upper|upper-user [<uid_start> <gid_start> [<piece>]]]
+ *                                             tar_read_tree of the file <archive> into <dir>: as
+ *                                             one tree, or as an overlay's upper directory, root's
+ *                                             or one mounted with userxattr; with ids the two
+ *                                             starts more; the archive given in pieces of at most
+ *                                             <piece> bytes. Lines "entries <n>", "devices <n>",
+ *                                             "attributes-left <n>", "bytes <n>" and
+ *                                             "sha256 <digest>" of what was read; or
+ *                                             "failed: <entry>: <why>" and status 1
  *   unit volspec <spec>                       parse_volume_spec: "<src> -> <dst> ro|rw",
  *                                             or "invalid: <what is wrong>"
  *   unit volumes <root> <spec>... [-- <probe>...]
@@ -786,6 +795,17 @@ static int unit_tar_write(void *to, const void *data, size_t len) {
     sha256_update(&sink->hash, data, len);
     sink->bytes += len;
     return lc_kernel_write_all(sink->fd, data, len) < 0 ? -1 : 0;
+}
+
+/* "unit untar": the archive from a file, in pieces of no more than a length */
+struct unit_tar_source {
+    int32_t  fd;
+    uint32_t piece;
+};
+
+static int64_t unit_tar_read(void *from, void *data, size_t len) {
+    const struct unit_tar_source *source = from;
+    return lc_kernel_read_retry(source->fd, data, source->piece && source->piece < len ? source->piece : len);
 }
 
 int main(int argc, char **argv, char **envp) {
@@ -1656,6 +1676,54 @@ int main(int argc, char **argv, char **envp) {
         put_int64((int64_t)w.attributes_left);
         put("bytes ");
         put_int64((int64_t)to.bytes);
+        put_line("sha256 ", hex);
+        return 0;
+    }
+    if (argc >= 4 && argc <= 8 && streq(argv[1], "untar")) {
+        static tar_reader r;
+        static struct unit_tar_source from;
+        bool usage = argc == 6;
+        if (argc >= 5) {
+            if (streq(argv[4], "upper"))
+                r.into = TAR_INTO_UPPER;
+            else if (streq(argv[4], "upper-user"))
+                r.into = TAR_INTO_UPPER_USERXATTR;
+            else if (!streq(argv[4], "tree"))
+                usage = true;
+        }
+        if (argc >= 7 && (!parse_u32_text(argv[5], &r.uid_start) || !parse_u32_text(argv[6], &r.gid_start)))
+            usage = true;
+        if (argc == 8 && (!parse_u32_text(argv[7], &from.piece) || !from.piece))
+            usage = true;
+        if (usage)
+            die("usage: unit untar <archive> <dir> [tree|upper|upper-user [<uid_start> <gid_start> [<piece>]]]");
+        lc_sysret in = lc_kernel_open_file(argv[2], O_RDONLY, 0);
+        if (in < 0)
+            die2("unit: cannot read ", argv[2]);
+        lc_sysret dirfd = lc_kernel_open_file(argv[3], O_RDONLY | O_DIRECTORY, 0);
+        if (dirfd < 0)
+            die2("unit: cannot open the directory ", argv[3]);
+        from.fd = (int32_t)in;
+        r.source = unit_tar_read;
+        r.from = &from;
+        if (tar_read_tree(&r, (int32_t)dirfd) != 0) {
+            put("failed: ");
+            put(r.failed_at);
+            put(": ");
+            put(r.failure ? r.failure : "(no reason given)");
+            put("\n");
+            return 1;
+        }
+        char hex[SHA256_HEX + 1];
+        sha256_hex(r.digest, hex);
+        put("entries ");
+        put_int64((int64_t)r.entries);
+        put("devices ");
+        put_int64((int64_t)r.devices);
+        put("attributes-left ");
+        put_int64((int64_t)r.attributes_left);
+        put("bytes ");
+        put_int64((int64_t)r.bytes);
         put_line("sha256 ", hex);
         return 0;
     }

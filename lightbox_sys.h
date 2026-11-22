@@ -29,16 +29,21 @@
 #define LB_SYS_flock      73
 #define LB_SYS_fsync      74
 #define LB_SYS_fchdir     81
+#define LB_SYS_fchmod     91
+#define LB_SYS_umask      95
 #define LB_SYS_getuid     102
 #define LB_SYS_geteuid    107
 #define LB_SYS_capget     125
 #define LB_SYS_capset     126
 #define LB_SYS_statfs     137
 #define LB_SYS_chroot     161
+#define LB_SYS_fsetxattr  190
 #define LB_SYS_fgetxattr  193
 #define LB_SYS_flistxattr 196
 #define LB_SYS_renameat   264
+#define LB_SYS_linkat     265
 #define LB_SYS_ppoll      271
+#define LB_SYS_utimensat  280
 #define LB_SYS_memfd_create 319
 #define LB_SYS_getrandom  318
 #define LB_SYS_execveat   322
@@ -53,18 +58,23 @@
 #define LB_SYS_openat2    437
 #define LB_SYS_mount_setattr 442
 #elif defined(__aarch64__)
+#define LB_SYS_fsetxattr  7
 #define LB_SYS_fgetxattr  10
 #define LB_SYS_flistxattr 13
 #define LB_SYS_fcntl      25
 #define LB_SYS_flock      32
+#define LB_SYS_linkat     37
 #define LB_SYS_renameat   38
 #define LB_SYS_statfs     43
 #define LB_SYS_fchdir     50
 #define LB_SYS_chroot     51
+#define LB_SYS_fchmod     52
 #define LB_SYS_ppoll      73
 #define LB_SYS_fsync      82
+#define LB_SYS_utimensat  88
 #define LB_SYS_capget     90
 #define LB_SYS_capset     91
+#define LB_SYS_umask      166
 #define LB_SYS_getuid     174
 #define LB_SYS_geteuid    175
 #define LB_SYS_memfd_create 279
@@ -104,7 +114,10 @@
 #define LB_EINVAL                 22
 #define LB_ENOSYS                 38
 #define LB_ENOTDIR                20
+#define LB_EISDIR                 21
 #define LB_ERANGE                 34
+#define LB_ENOTEMPTY              39
+#define LB_ELOOP                  40
 #define LB_ENODATA                61
 #define LB_EOPNOTSUPP             95
 
@@ -135,6 +148,11 @@
 
 /* statx of the file a descriptor is open on, given an empty path (linux/fcntl.h) */
 #define LB_AT_EMPTY_PATH          0x1000
+
+/* utimensat(2): a time that is left as it is, in the place of its
+ * nanoseconds (the C library's bits/stat.h; the kernel's headers for programs
+ * do not name it) */
+#define LB_UTIME_OMIT             ((1L << 30) - 2L)
 
 #define LB_STATX_TYPE             0x00000001U
 #define LB_STATX_INO              0x00000100U
@@ -674,6 +692,33 @@ static inline lc_sysret lb_sys_flistxattr(int32_t fd, char *list, size_t size) {
 
 static inline lc_sysret lb_sys_fgetxattr(int32_t fd, const char *name, void *value, size_t size) {
     return lc_syscall4(LB_SYS_fgetxattr, fd, (int64_t)name, (int64_t)value, (int64_t)size);
+}
+
+static inline lc_sysret lb_sys_fsetxattr(int32_t fd, const char *name, const void *value, size_t size) {
+    return lc_syscall5(LB_SYS_fsetxattr, fd, (int64_t)name, (int64_t)value, (int64_t)size, 0);
+}
+
+/* A second name for a file. Without flags a link at the end of the old name
+ * is not followed: the link itself gets the name. */
+static inline lc_sysret lb_sys_linkat(int32_t olddirfd, const char *oldpath,
+                                      int32_t newdirfd, const char *newpath, int32_t flags) {
+    return lc_syscall5(LB_SYS_linkat, olddirfd, (int64_t)oldpath, newdirfd, (int64_t)newpath, flags);
+}
+
+/* The two times of a file, of its last reading and of its last change: by
+ * its name, or with no name the file the descriptor is open on. */
+static inline lc_sysret lb_sys_utimensat(int32_t dirfd, const char *path, const lc_timespec times[2],
+                                         int32_t flags) {
+    return lc_syscall4(LB_SYS_utimensat, dirfd, (int64_t)path, (int64_t)times, flags);
+}
+
+static inline lc_sysret lb_sys_fchmod(int32_t fd, uint32_t mode) {
+    return lc_syscall2(LB_SYS_fchmod, fd, mode);
+}
+
+/* The bits a new file's mode never has, for this process: what they were. */
+static inline lc_sysret lb_sys_umask(uint32_t mask) {
+    return lc_syscall1(LB_SYS_umask, mask);
 }
 
 static inline lc_sysret lb_sys_statfs(const char *path, struct lb_statfs *buf) {

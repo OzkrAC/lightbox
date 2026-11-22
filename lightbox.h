@@ -510,7 +510,7 @@ void sha256_final(sha256_ctx *ctx, uint8_t digest[SHA256_BYTES]);
 void sha256_hex(const uint8_t digest[SHA256_BYTES], char out[SHA256_HEX + 1]);
 [[nodiscard]] bool sha256_hex_ok(const char *text);
 
-/* ─── tar (lightbox_tar.c, ROADMAP I.2) ─────────────────────────────────── */
+/* ─── tar (lightbox_tar.c, ROADMAP I.2 and I.3) ─────────────────────────── */
 
 /* The longest name an archive's entry may have from its root, a link's
  * target too, with the NUL: the kernel's own limit for a path. */
@@ -547,6 +547,49 @@ typedef struct {
 /* The tree under a directory, which is not an entry itself, and the
  * archive's end: 0, or -1 with failure and failed_at set. */
 [[nodiscard]] int tar_write_tree(tar_writer *w, int32_t dirfd);
+
+/* Where an archive's bytes come from, in order: how many were put at data,
+ * at most len, 0 at the archive's end, or less than 0 to end the reading.
+ * It is called in the process that unpacks, not in the caller's. */
+typedef int64_t (*tar_source)(void *from, void *data, size_t len);
+
+/* What the directory an archive is unpacked into is. An image marks what a
+ * layer takes out of the ones under it with names that begin with .wh. */
+typedef enum {
+    TAR_INTO_TREE,              /* one tree for all layers: a mark takes out what it names */
+    TAR_INTO_UPPER,             /* an overlay's upper directory: a mark becomes the overlay's own */
+    TAR_INTO_UPPER_USERXATTR,   /* the same, for an overlay mounted with userxattr */
+} tar_into;
+
+/*
+ * An archive unpacked into a directory, by a process of its own whose root is
+ * that directory: no name and no link of the archive leads out of it. The
+ * caller, which has to be root there, sets the first five members; the others
+ * say afterwards what was made and what was not.
+ */
+typedef struct {
+    tar_source  source;
+    void       *from;
+    /* Ids are made these more, and with a start that is not 0 one that is
+     * not in the 65536 from it ends the unpacking. */
+    uint32_t    uid_start;
+    uint32_t    gid_start;
+    tar_into    into;
+
+    uint64_t    entries;            /* made, or taken out by a mark */
+    uint64_t    devices;            /* not made: a container's devices are lightbox's to give */
+    uint64_t    attributes_left;    /* extended attributes that were not set */
+    uint64_t    bytes;              /* read from the source, to its end */
+    uint8_t     digest[SHA256_BYTES];   /* and their SHA-256, when the unpacking did not fail */
+    const char *failure;            /* NULL, or what ended the unpacking */
+    /* and the entry it was at, as the archive names it, with a ? for each
+     * byte that is not printable: empty before the first */
+    char        failed_at[TAR_PATH_MAX];
+} tar_reader;
+
+/* The archive's entries under a directory, to the source's end: 0, or -1
+ * with failure and failed_at set. What was made before a failure stays. */
+[[nodiscard]] int tar_read_tree(tar_reader *r, int32_t dirfd);
 
 /* ─── Base snapshots (lightbox_base.c) ──────────────────────────────────── */
 

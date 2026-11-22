@@ -206,6 +206,10 @@ in_namespace_with_ids() { # script
         UNIT=$1; D=$2
         '"$1" _ "$UNIT" "$dir"
     rc=$?
+    # as that namespace's root once more: a directory of another of its ids,
+    # with something in it, is not this user's to empty
+    unshare --map-root-user --map-users="1:$uids:65536" --map-groups="1:$gids:65536" -- \
+        find "$dir" -mindepth 1 -delete 2>/dev/null
     rm -rf -- "$dir"
     return $rc
 }
@@ -3628,43 +3632,64 @@ for d, dirs, files in sorted(os.walk(sys.argv[1])):
     }
     field() { printf "%s\n" "$2" | sed -n "s/^$1 //p"; }
     long=$(printf "n%.0s" $(seq 1 120))
+    # A tree with every kind of entry an archive has, 19 of them and a
+    # socket: names of 120 and 255 bytes, a link to a name of 362, several
+    # owners, a file no mode lets anyone read, a second name of a file.
+    # $attrs says whether the filesystem took the user attributes.
+    make_tree() {
+        mkdir -p "$1/sub/deep" "$1/empty-dir" || return 1
+        (
+            cd "$1" || exit 1
+            printf "hello\n" > file
+            : > empty
+            head -c 512 /dev/urandom > block
+            head -c 513 /dev/urandom > block-and-one
+            head -c 200000 /dev/urandom > sub/big
+            ln file sub/second-name
+            ln -s ../file sub/symlink
+            ln -s /nowhere/at/all dangling
+            mkfifo sub/fifo
+            chmod 4755 block
+            chmod 000 empty
+            printf "long\n" > "sub/$long"
+            mkdir -p "sub/deep/$long/$long"
+            printf "deeper\n" > "sub/deep/$long/$long/file"
+            ln -s "$long/$long/$long" sub/long-link
+            printf "spaces\n" > "a name with spaces"
+            printf "utf8\n" > "ünïcödé"
+            chown 1000:2000 block-and-one
+            chown 65536:65536 sub/big
+            chown -h 7:8 sub/symlink
+            chown 33:33 empty-dir
+            touch -d "2001-02-03 04:05:06 UTC" file sub/deep
+            python3 -I -c "import socket; s = socket.socket(socket.AF_UNIX); s.bind(\"sub/socket\")"
+        ) || return 1
+        attrs=yes
+        python3 -I -c "
+import os, sys
+os.setxattr(sys.argv[1] + \"/file\", \"user.note\", b\"kept\")
+os.setxattr(sys.argv[1] + \"/sub\", \"user.b\", b\"2\")
+os.setxattr(sys.argv[1] + \"/sub\", \"user.a\", bytes(range(256)))" "$1" 2>/dev/null || attrs=no
+    }
+    # Two trees are one: names, kinds, modes, owners, times, links, the names
+    # of one file, sizes, bytes and, where there are any, attributes.
+    same_tree() {
+        listing "$1" > one.list
+        listing "$2" > other.list
+        diff one.list other.list || { echo "$2 is another tree than $1"; return 1; }
+        diff -r --no-dereference "$1" "$2" 2>&1 | grep -v "socket\|fifo" | grep . &&
+            { echo "a file of $2 is another than in $1"; return 1; }
+        [ $attrs = yes ] || return 0
+        attributes "$1" > one.attrs
+        attributes "$2" > other.attrs
+        diff one.attrs other.attrs || { echo "the attributes of $2 are others than those of $1"; return 1; }
+    }
 }
 
 tar_tree_case() {
     cd "$D" || exit 1
-    mkdir -p tree/sub/deep tree/empty-dir out
-    (
-        cd tree || exit 1
-        printf "hello\n" > file
-        : > empty
-        head -c 512 /dev/urandom > block
-        head -c 513 /dev/urandom > block-and-one
-        head -c 200000 /dev/urandom > sub/big
-        ln file sub/second-name
-        ln -s ../file sub/symlink
-        ln -s /nowhere/at/all dangling
-        mkfifo sub/fifo
-        chmod 4755 block
-        chmod 000 empty
-        printf "long\n" > "sub/$long"
-        mkdir -p "sub/deep/$long/$long"
-        printf "deeper\n" > "sub/deep/$long/$long/file"
-        ln -s "$long/$long/$long" sub/long-link
-        printf "spaces\n" > "a name with spaces"
-        printf "utf8\n" > "ünïcödé"
-        chown 1000:2000 block-and-one
-        chown 65536:65536 sub/big
-        chown -h 7:8 sub/symlink
-        chown 33:33 empty-dir
-        touch -d "2001-02-03 04:05:06 UTC" file sub/deep
-        python3 -I -c "import socket; s = socket.socket(socket.AF_UNIX); s.bind(\"sub/socket\")"
-    ) || { echo "the tree could not be made"; exit 1; }
-    attrs=yes
-    python3 -I -c "
-import os
-os.setxattr(\"tree/file\", \"user.note\", b\"kept\")
-os.setxattr(\"tree/sub\", \"user.b\", b\"2\")
-os.setxattr(\"tree/sub\", \"user.a\", bytes(range(256)))" 2>/dev/null || attrs=no
+    mkdir out
+    make_tree tree || { echo "the tree could not be made"; exit 1; }
 
     said=$("$UNIT" tar tree a.tar) || { echo "$said"; exit 1; }
     echo "$said"
@@ -3810,5 +3835,409 @@ check 'a tree is one archive, which GNU tar unpacks to a tree that gives it agai
 check "an overlay's marks are written the way an image has them" t_tar_overlay
 check "ids are written less the start of a container's range, and none from outside it" t_tar_ids
 check 'what an archive cannot hold ends the writing, with the entry named' t_tar_refusals
+
+# I.3: an archive unpacked into a directory, by a process whose root that
+# directory is. The cases run as the root of a user namespace, as I.2's do:
+# only a root makes a directory its root and gives files to other ids.
+# tests/tar_archives.py writes the archives no tar program does.
+
+untar_helpers() {
+    # the names in a tree, on one line
+    names() { (cd "$1" && find . -mindepth 1 -printf "%P\n" | LC_ALL=C sort | paste -sd" "); }
+    # what was got and what it has to be
+    is() { # what it is about, got, wanted
+        [ "$2" = "$3" ] || { echo "$1: $2"; echo "$1, not: $3"; bad=1; }
+    }
+}
+
+untar_tree_case() {
+    cd "$D" || exit 1
+    mkdir out pieces
+    make_tree tree || { echo "the tree could not be made"; exit 1; }
+    wrote=$("$UNIT" tar tree a.tar) || { echo "$wrote"; exit 1; }
+    said=$("$UNIT" untar a.tar out) || { echo "$said"; exit 1; }
+    echo "$said"
+    bad=0
+    is "entries, devices, attributes left" \
+        "$(field entries "$said") $(field devices "$said") $(field attributes-left "$said")" "19 0 0"
+    is "the bytes read and their digest" "$(field bytes "$said") $(field sha256 "$said")" \
+        "$(stat -c %s a.tar) $(field sha256 "$wrote")"
+    same_tree tree out || bad=1
+    "$UNIT" tar out b.tar >/dev/null && cmp a.tar b.tar || { echo "the unpacked tree gives another archive"; bad=1; }
+
+    # the archive as a pipe may give it, a few bytes at a time
+    "$UNIT" untar a.tar pieces tree 0 0 7 >/dev/null && same_tree tree pieces ||
+        { echo "read in pieces of 7 bytes, it is another tree"; bad=1; }
+
+    # over a tree that is there: every entry takes the place of what is at its name
+    printf "changed\n" > out/file
+    : > out/sub/symlink.new && mv -f out/sub/symlink.new out/sub/symlink
+    "$UNIT" untar a.tar out >/dev/null && same_tree tree out || { echo "unpacked over itself, it is another tree"; bad=1; }
+    exit $bad
+}
+t_untar_tree() {
+    in_namespace_with_ids "$(declare -f tar_helpers untar_helpers untar_tree_case); tar_helpers; untar_helpers; untar_tree_case"
+}
+
+untar_ids_case() {
+    cd "$D" || exit 1
+    mkdir tree shifted archives made range none
+    (
+        cd tree || exit 1
+        : > roots
+        : > others
+        mkdir dir
+        ln -s roots link
+        mkfifo pipe
+        chown 500:700 others
+        chown 65535:65535 dir
+        chown -h 5:6 link
+        chown 9:10 pipe
+    ) || { echo "the tree could not be made"; exit 1; }
+    bad=0
+    "$UNIT" tar tree a.tar >/dev/null || exit 1
+    said=$("$UNIT" untar a.tar shifted tree 1 1) || { echo "$said"; exit 1; }
+    is "with a start of 1:1" "$(cd shifted && stat -c "%n %u:%g" * | paste -sd" ")" \
+        "dir 65536:65536 link 6:7 others 501:701 pipe 10:11 roots 1:1"
+    # and written less the start again, it is the archive that was unpacked
+    "$UNIT" tar shifted b.tar 1 1 >/dev/null && cmp a.tar b.tar || { echo "written less 1:1, it is another archive"; bad=1; }
+
+    python3 -I "$HERE/tar_archives.py" archives "$D" || exit 1
+    # the directories an archive has no entry for belong to the root of the range
+    "$UNIT" untar archives/missing-directories.tar made tree 1 1 >/dev/null
+    is "directories without an entry" "$(stat -c %u:%g made/p made/p/q/r made/s/t | paste -sd" ")" "1:1 1:1 1:1"
+
+    # an id that is not one of a range's 65536, and the one that is no id
+    said=$("$UNIT" untar archives/id-outside-range.tar range tree 1 1)
+    is "an id of 65536 in a range" "$said" "failed: out: belongs to an id that does not fit the container's range"
+    is "and what is in the tree after it" "$(names range) $(stat -c %u:%g range/in)" "in 65536:65536"
+    said=$("$UNIT" untar archives/id-no-id.tar none)
+    is "the id 4294967295" "$said" "failed: file: belongs to an id that does not fit the container's range"
+    exit $bad
+}
+t_untar_ids() {
+    in_namespace_with_ids "HERE=$(printf %q "$HERE"); $(declare -f tar_helpers untar_helpers untar_ids_case)
+        tar_helpers; untar_helpers; untar_ids_case"
+}
+
+untar_others_case() {
+    cd "$D" || exit 1
+    make_tree tree || { echo "the tree could not be made"; exit 1; }
+    # a smaller tree for the formats without a place for a long name: its
+    # longest is 126 bytes, which ustar keeps in two of a header's fields
+    p=$(printf "p%.0s" $(seq 1 60))
+    q=$(printf "q%.0s" $(seq 1 60))
+    mkdir -p small/dir "small/$p/$q" || exit 1
+    printf "small\n" > small/dir/file
+    printf "split\n" > "small/$p/$q/file"
+    ln -s dir/file small/link
+    ln small/dir/file small/second-name
+    chown 12:34 small/dir/file
+    # and one for the oldest format, whose names end at 99 bytes
+    mkdir -p seventh/dir || exit 1
+    printf "seventh\n" > seventh/dir/file
+    ln -s dir/file seventh/link
+    ln seventh/dir/file seventh/second-name
+    chown 12:34 seventh/link
+    bad=0
+    n=0
+    # the program and the format in words, the archive, the tree it is of,
+    # and "attributes" or "times" where the format keeps those too
+    unpacks() {
+        n=$((n + 1))
+        mkdir "out.$n"
+        [ -s "$2" ] || { echo "$1: no archive was written"; bad=1; return; }
+        said=$("$UNIT" untar "$2" "out.$n") || { echo "$1: $said"; bad=1; return; }
+        held=$attrs
+        case " ${4:-} " in *" attributes "*) ;; *) attrs=no ;; esac
+        same_tree "$3" "out.$n" || { echo "$1: unpacked, it is not the tree"; bad=1; }
+        attrs=$held
+        case " ${4:-} " in *" times "*)
+            (cd "$3" && find . -mindepth 1 ! -type s -printf "%P %T@\n" | LC_ALL=C sort) > one.times
+            (cd "out.$n" && find . -mindepth 1 -printf "%P %T@\n" | LC_ALL=C sort) > other.times
+            diff one.times other.times || { echo "$1: the times are not the tree's to the nanosecond"; bad=1; } ;;
+        esac
+    }
+
+    if tar --version 2>/dev/null | grep -q GNU; then
+        tar --format=gnu -cf gnu.tar -C tree . 2>/dev/null
+        unpacks "GNU tar, its own format" gnu.tar tree
+        tar --format=pax --xattrs --xattrs-include="user.*" -cf gnu-pax.tar -C tree . 2>/dev/null
+        unpacks "GNU tar, pax" gnu-pax.tar tree "attributes times"
+        tar --format=ustar -cf gnu-ustar.tar -C small . 2>/dev/null
+        unpacks "GNU tar, ustar" gnu-ustar.tar small
+        tar --format=v7 -cf gnu-v7.tar -C seventh . 2>/dev/null
+        unpacks "GNU tar, the format of Seventh Edition Unix" gnu-v7.tar seventh
+    else
+        echo "tar here is not GNU tar: none of its archives was unpacked"
+    fi
+    if command -v bsdtar >/dev/null; then
+        # bsdtar writes a socket's name where GNU tar leaves it out, and no
+        # program has a kind of entry for one: the trees it is given have none
+        python3 -I -c "import os; os.unlink(\"tree/sub/socket\")"
+        bsdtar -cf bsd.tar -C tree . 2>/dev/null
+        unpacks "bsdtar, its own choice" bsd.tar tree "attributes times"
+        bsdtar --format=pax -cf bsd-pax.tar -C tree . 2>/dev/null
+        unpacks "bsdtar, pax" bsd-pax.tar tree "attributes times"
+        bsdtar --format=gnutar -cf bsd-gnu.tar -C tree . 2>/dev/null
+        unpacks "bsdtar, GNU tar's format" bsd-gnu.tar tree
+        bsdtar --format=ustar -cf bsd-ustar.tar -C small . 2>/dev/null
+        unpacks "bsdtar, ustar" bsd-ustar.tar small
+    else
+        echo "no bsdtar here: none of its archives was unpacked"
+    fi
+    [ $n -gt 0 ] || exit 77
+    exit $bad
+}
+t_untar_others() {
+    in_namespace_with_ids "$(declare -f tar_helpers untar_helpers untar_others_case); tar_helpers; untar_helpers; untar_others_case"
+}
+
+untar_taken_case() {
+    cd "$D" || exit 1
+    mkdir archives
+    python3 -I "$HERE/tar_archives.py" archives "$D" || exit 1
+    bad=0
+    unpack() { # an archive, into a directory of its name: sets $said
+        mkdir "$1"
+        said=$("$UNIT" untar "archives/$1.tar" "$1") || { echo "$1: $said"; bad=1; return 1; }
+    }
+    part=$(printf "n%.0s" $(seq 1 200))
+    long=$part/$part/$part/file
+    link=$(printf "t%.0s" $(seq 1 300))
+
+    # pax: what its records say of a name, a link, a size, the ids and a
+    # time is taken before what the header says, and its attributes are set
+    if unpack pax-all; then
+        is "pax: size, ids and time of the file with a long name" "$(stat -c "%s %u:%g %.9Y" "pax-all/$long")" \
+            "5 1234:4321 1234567890.123456789"
+        is "pax: its content" "$(cat "pax-all/$long")" 12345
+        is "pax: a link to a long name" "$(readlink pax-all/long-link)" "$link"
+        is "pax: a time before 1970, of a link" "$(stat -c %.9Y pax-all/long-link)" "-1.250000000"
+        is "pax: a record that says nothing" "$(cat pax-all/empty-record)" e
+        is "pax: entries" "$(field entries "$said")" 4
+        # one attribute is carried; SELinux's and an overlay's are left
+        case $(field attributes-left "$said") in
+            2) is "pax: the attributes" \
+                   "$(python3 -I -c "import os, sys; print([(a, os.getxattr(sys.argv[1], a)) for a in os.listxattr(sys.argv[1])])" "pax-all/$long")" \
+                   "[('user.note', b'with\\x00every\\nbyte')]" ;;
+            3) echo "no user attributes on this filesystem: the one of the archive was left" ;;
+            *) echo "pax: attributes left: $(field attributes-left "$said")"; bad=1 ;;
+        esac
+    fi
+    if unpack gnu; then
+        is "GNU: a long name" "$(cat "gnu/$long")" gnu
+        is "GNU: a link to a long name" "$(readlink gnu/long-link)" "$link"
+        is "GNU: numbers in base 256" "$(stat -c "%s %u:%g %Y" gnu/numbers)" "3 1234:4321 -86400"
+    fi
+    if unpack ustar-prefix; then
+        p=$(printf "p%.0s" $(seq 1 60))
+        q=$(printf "q%.0s" $(seq 1 60))
+        x=$(printf "x%.0s" $(seq 1 100))
+        y=$(printf "y%.0s" $(seq 1 155))
+        is "ustar: a name in two fields" "$(names ustar-prefix)" "$p $p/$q $p/$q/file $y $y/$x"
+    fi
+    if unpack old; then
+        is "the kinds from before ustar" "$(cd old && stat -c "%n %F %a" olddir olddir/file contiguous | paste -sd" ")" \
+            "olddir directory 750 olddir/file regular file 644 contiguous regular file 644"
+    fi
+    if unpack names; then
+        is "names with . and // in them, and the root's own" "$(names names)" "a a/b a/b/c a/b/d a/b/d/e"
+    fi
+    if unpack global-records; then
+        is "records for a whole archive" "$(names global-records)" file
+    fi
+    if unpack missing-directories; then
+        is "directories without an entry" "$(cd missing-directories && stat -c "%n %a" p p/q/r s/t | paste -sd" ")" \
+            "p 755 p/q/r 755 s/t 755"
+        is "a second name in one of them" "$(stat -c "%h %s" missing-directories/s/t/second)" "2 4"
+    fi
+    if unpack replaced; then
+        is "what is at a name is replaced" "$(cd replaced && stat -c "%n %F" x y y/in kept kept/first | paste -sd" ")" \
+            "x regular file y directory y/in regular file kept directory kept/first regular file"
+        is "a directory stays for a directory, with the later mode and time" "$(stat -c "%a %Y" replaced/kept)" \
+            "750 1111111111"
+    fi
+    if unpack tape-record; then
+        is "zeros after the end, to a tape's record" "$(field bytes "$said") $(names tape-record)" "10240 only"
+    fi
+    if unpack devices; then
+        is "devices are counted and not made" "$(field devices "$said") $(field entries "$said") $(names devices)" "2 1 beside"
+    fi
+    exit $bad
+}
+t_untar_taken() {
+    in_namespace_with_ids "HERE=$(printf %q "$HERE"); $(declare -f tar_helpers untar_helpers untar_taken_case)
+        tar_helpers; untar_helpers; untar_taken_case"
+}
+
+untar_marks_case() {
+    cd "$D" || exit 1
+    mkdir -p upper/kept upper/opaque archives again roots
+    printf "new\n" > upper/kept/file
+    printf "its own\n" > upper/opaque/file
+    mknod upper/gone c 0 0 || { echo "this kernel lets no one but root make a whiteout"; exit 77; }
+    mknod upper/kept/gone-too c 0 0
+    chown 5:6 upper/gone
+    python3 -I -c "import os; os.setxattr(\"upper/opaque\", \"user.overlay.opaque\", b\"y\")" 2>/dev/null ||
+        { echo "no user attributes on this filesystem"; exit 77; }
+    bad=0
+    "$UNIT" tar upper o.tar overlay >/dev/null || exit 1
+
+    # Into an overlay's upper directory each mark is the overlay's own again,
+    # and the directory gives the archive it was unpacked from.
+    said=$("$UNIT" untar o.tar again upper-user) || { echo "$said"; exit 1; }
+    is "the marks of names" "$(stat -c "%n %F %t:%T %u:%g" again/gone again/kept/gone-too | paste -sd" ")" \
+        "again/gone character special file 0:0 5:6 again/kept/gone-too character special file 0:0 0:0"
+    is "the mark of a directory" \
+        "$(python3 -I -c "import os; print(os.getxattr(\"again/opaque\", \"user.overlay.opaque\"))")" "b'y'"
+    is "the names" "$(names again)" "gone kept kept/file kept/gone-too opaque opaque/file"
+    is "entries" "$(field entries "$said")" 7
+    "$UNIT" tar again o2.tar overlay >/dev/null && cmp o.tar o2.tar || { echo "the upper directory gives another archive"; bad=1; }
+
+    # As root mounts an overlay, a directory's mark is an attribute that
+    # only the root of the machine sets.
+    said=$("$UNIT" untar o.tar roots upper)
+    is "as root's overlay, in a user namespace" "$said" \
+        "failed: opaque: could not mark its directory as one that hides its base's"
+
+    # Into one tree, over what a layer under it left there: what a mark
+    # names is taken out, and all that is in a directory with one.
+    mkdir -p flat/kept flat/opaque/deep/er
+    : > flat/gone
+    : > flat/kept/gone-too
+    : > flat/kept/stays
+    : > flat/opaque/deep/er/low
+    "$UNIT" untar o.tar flat >/dev/null || { echo "the upper directory's archive was not unpacked into a tree"; bad=1; }
+    is "an upper directory's archive over a tree" "$(names flat)" "kept kept/file kept/stays opaque opaque/file"
+
+    # A mark is about the layers under its own, wherever in its archive it
+    # comes: what the archive itself has under the name stays.
+    python3 -I "$HERE/tar_archives.py" archives "$D" || exit 1
+    for order in first last; do
+        mkdir "tree-$order"
+        "$UNIT" untar archives/layer-under.tar "tree-$order" >/dev/null &&
+            said=$("$UNIT" untar "archives/layer-marks-$order.tar" "tree-$order") ||
+            { echo "with the marks $order: $said"; bad=1; continue; }
+        is "with the marks $order" "$(names "tree-$order")" "d d/own d/sub d/sub/own stays x x/new"
+        is "with the marks $order, entries" "$(field entries "$said")" 12
+    done
+    # and one at the top is about the whole tree, which an overlay's upper
+    # directory has no way to say: its base is always under it
+    mkdir tree-new upper-new
+    "$UNIT" untar archives/layer-under.tar tree-new >/dev/null && "$UNIT" untar archives/layer-all-new.tar tree-new >/dev/null
+    is "with a mark at the top" "$(names tree-new)" alone
+    said=$("$UNIT" untar archives/layer-all-new.tar upper-new upper-user)
+    is "a mark at the top of an upper directory" "$said" \
+        "failed: : could not mark its directory as one that hides its base's"
+    exit $bad
+}
+t_untar_marks() {
+    in_namespace_with_ids "HERE=$(printf %q "$HERE"); $(declare -f tar_helpers untar_helpers untar_marks_case)
+        tar_helpers; untar_helpers; untar_marks_case"
+}
+
+untar_refusals_case() {
+    cd "$D" || exit 1
+    chmod 755 .
+    mkdir archives jail plain
+    printf "outside\n" > jail/secret
+    python3 -I "$HERE/tar_archives.py" archives "$D/jail" || exit 1
+    bad=0
+    # an archive, what is said of it, and what its root has afterwards
+    refused() {
+        mkdir "jail/$1"
+        said=$("$UNIT" untar "archives/$1.tar" "jail/$1")
+        [ $? = 1 ] || { echo "$1: it was not refused"; bad=1; }
+        is "$1" "$said" "failed: $2"
+        is "$1: its root" "$(names "jail/$1")" "${3:-}"
+    }
+
+    # names that lead out of the root, or would if they were followed
+    refused dotdot              "../outside: has .. in its name"
+    refused dotdot-inside       "a/b/../../../outside: has .. in its name" a
+    refused dotdot-pax          "a/../../outside: has .. in its name"
+    refused dotdot-long         "a/../../outside: has .. in its name"
+    refused absolute            "/outside: has a name that begins at the root"
+    refused absolute-outside    "$(printf "%s" "$D/jail/made" | cut -c1-100): has a name that begins at the root"
+    refused no-name             ": has no name"
+    refused unprintable         "a?[2Jb??/../c: has .. in its name"
+    refused pax-name-too-long   "short: has a name too long for a path"
+    refused long-name-too-long  ": what follows has a name too long for a path"
+    refused link-out            "out/through: could not be made" out
+    refused second-name-dotdot  "h: is a second name of a file named with .."
+    refused second-name-absolute "h: is a second name of a file named from the root"
+    refused second-name-through "h: is a second name of a file that is not in the tree" up
+    refused second-name-of-directory "h: is a second name of a file that is not in the tree" d
+
+    # archives that end before they say so, and ones that say what is not so
+    refused cut-in-content      "big: the archive ends before it says so" "big first"
+    refused cut-in-header       "first: the archive ends before it says so" first
+    refused cut-before-end      "only: the archive ends before it says so" only
+    refused cut-in-end          "only: the archive ends before it says so" only
+    refused cut-in-records      "first: the archive ends before it says so" first
+    refused size-too-large      "liar: the archive ends before it says so" liar
+    refused size-too-small      "liar: what follows is no header of an archive" liar
+    refused empty               ": the archive ends before it says so"
+    refused not-an-archive      ": what follows is no header of an archive"
+    refused bad-checksum        ": what follows is no header of an archive"
+    refused zeros-then-entry    "first: what follows is no header of an archive" first
+    refused more-after-end      "only: the archive has more after its end" only
+    refused bad-number          "file: has a number that is no number"
+    refused blank-number        "file: has a number that is no number"
+    refused negative-size       "file: has a number that is no number"
+    refused kind                "strange: is of a kind this reader does not know"
+    refused kind-volume         "label: is of a kind this reader does not know"
+    refused pax-broken          "after: has pax records that cannot be read"
+    refused pax-length-lies     "after: has pax records that cannot be read"
+    refused pax-no-equals       "after: has pax records that cannot be read"
+    refused pax-name-with-nul   "after: has pax records that cannot be read"
+    refused pax-number          "after: has a number that is no number"
+    refused pax-sparse          "holes: is a file with holes written GNU's way, which is not read"
+    refused pax-too-many-records ": what follows has more pax records than are read for one entry"
+
+    # names with .wh. in them that are no marks of a layer
+    refused mark-of-nothing     ".wh.: has a name with .wh. in it that is no mark of a layer"
+    refused mark-of-dot         ".wh..: has a name with .wh. in it that is no mark of a layer"
+    refused mark-aufs           ".wh..wh.plnk: has a name with .wh. in it that is no mark of a layer"
+    refused mark-on-the-way     "a/.wh.b/c: has a name with .wh. in it that is no mark of a layer"
+    refused mark-directory      ".wh.dir: has a name with .wh. in it that is no mark of a layer"
+    refused mark-link           "d/.wh..wh..opq: has a name with .wh. in it that is no mark of a layer"
+    refused mark-of-dotdot      "d/.wh...: has a name with .wh. in it that is no mark of a layer" d
+
+    # What is unpacked: a link is replaced by the entry of its name and
+    # never written through, and what a link names is looked up under the root.
+    for a in link-up link-replaced second-name-of-link; do
+        mkdir "jail/$a"
+        "$UNIT" untar "archives/$a.tar" "jail/$a" >/dev/null || { echo "$a was refused"; bad=1; }
+    done
+    is "a file through a link to .." "$(names jail/link-up) $(cat jail/link-up/through)" "through up inside"
+    is "a file at the name of a link" \
+        "$(cd jail/link-replaced && stat -c "%n %F" s t target | paste -sd" ") $(cat jail/link-replaced/target)" \
+        "s regular file t regular file target regular file original"
+    is "a second name of a link" "$(stat -c "%F %h" jail/second-name-of-link/h)" "symbolic link 2"
+
+    # beside the roots nothing was made, and what was there is as it was
+    is "the directory the roots are in" \
+        "$(find jail -mindepth 1 -maxdepth 1 ! -type d | paste -sd" ") $(cat jail/secret) $(stat -c %h jail/secret) $(ls | paste -sd" ")" \
+        "jail/secret outside 1 archives jail plain"
+
+    # and who may not make a directory its root unpacks nothing
+    said=$(setpriv --reuid=1000 --regid=1000 --clear-groups "$UNIT" untar archives/names.tar plain 2>&1)
+    is "as a user who is no root" "$said" "failed: : the directory could not be made the root of the process that unpacks"
+    is "and its directory" "$(names plain)" ""
+    exit $bad
+}
+t_untar_refusals() {
+    in_namespace_with_ids "HERE=$(printf %q "$HERE"); $(declare -f tar_helpers untar_helpers untar_refusals_case)
+        tar_helpers; untar_helpers; untar_refusals_case"
+}
+
+check 'what the writer wrote is unpacked to the same tree, which gives the same bytes' t_untar_tree
+check "ids are made the start of a container's range more, and none that does not fit it" t_untar_ids
+check 'archives of GNU tar and of bsdtar are unpacked to the trees they are of' t_untar_others
+check 'what tar programs write in ways of their own is read' t_untar_taken
+check "a layer's marks become an overlay's own, or take out what they name" t_untar_marks
+check 'what is no archive of a tree is refused, and nothing is made outside the root' t_untar_refusals
 
 summary unit
