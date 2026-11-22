@@ -37,7 +37,7 @@ The Makefile looks for lightc in `LIGHTC=`, then in the `lightc/` submodule, the
 
 ### Packages
 
-`packaging/build-deb.sh` builds lightbox as a `.deb` on Debian or Ubuntu, and `packaging/build-xbps.sh` as an `.xbps` on Void Linux, for the machine's architecture. A package holds what `make install` installs. CI builds both on every run, for x86_64 and aarch64, installs each, and keeps them as the run's artifacts. [packaging/README.md](packaging/README.md) has the details.
+`packaging/build-deb.sh` builds lightbox as a `.deb` on Debian or Ubuntu, and `packaging/build-xbps.sh` as an `.xbps` on Void Linux, for the machine's architecture. A package holds what `make install` installs. CI builds both on every run, for x86_64 and aarch64, installs each, and keeps them as the run's artifacts. From 0.9.0 on a release holds them, with the source archive and the SHA-256 sums of all of them. [packaging/README.md](packaging/README.md) has the details.
 
 `make dist` makes `lightbox-<version>.tar.gz`: the sources with lightc's inside, which build with `make` and no network.
 

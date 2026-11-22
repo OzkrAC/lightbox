@@ -1,0 +1,132 @@
+name: Release
+
+# A tag v<version> gives a draft release with what lightbox hands out: the two
+# .deb, the four .xbps and the source archive of "make dist", their SHA-256
+# sums, and for every file a record, signed by GitHub, of the run that built
+# it. The maintainer makes the tag and publishes the draft; this does neither.
+#
+# Run by hand from a branch, or by a push to main that changes this file, it
+# is a rehearsal: it builds, sums and records the same files, keeps them as
+# the artifact release-files of the run, and makes no release.
+#
+# packages.yml builds the files, as it does in CI. packaging/README.md has
+# the steps of a release.
+
+on:
+  push:
+    tags: ['v*']
+    branches: [main]
+    paths: ['.github/workflows/release.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # v0.9.0 is tagged on the commit whose lightbox.h says 0.9.0. A tag on
+  # another commit would hand out packages that name another version, so it
+  # stops here, before anything is built.
+  version:
+    name: Version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Compare
+        run: |
+          version=$(sh packaging/version.sh)
+          echo "lightbox.h has $version; this run is of the $GITHUB_REF_TYPE $GITHUB_REF_NAME"
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error title=Release::The tag is $GITHUB_REF_NAME and lightbox.h has $version. A release is tagged on the commit whose lightbox.h names it."
+            exit 1
+          fi
+
+  packages:
+    name: Packages
+    needs: version
+    uses: ./.github/workflows/packages.yml
+
+  # The files of the release in one place, with their sums, the record of
+  # their build and the notes. This job cannot write to the repository: the
+  # one after it can, and runs nothing of the tree.
+  files:
+    name: Files, sums and the record of the build
+    needs: packages
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write         # to sign the record of the build
+      attestations: write     # to keep it
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: lightbox-*
+          merge-multiple: true
+          path: release
+      - name: The files, and their SHA-256 sums
+        run: |
+          trap 'echo "::error title=Release::this failed: $BASH_COMMAND"' ERR
+          cd release
+          ls -l
+          test "$(ls | grep -c '\.deb$')" = 2
+          test "$(ls | grep -c '\.xbps$')" = 4
+          test "$(ls | grep -c '\.tar\.gz$')" = 1
+          test "$(ls | wc -l)" = 7
+          sha256sum -- * > "$RUNNER_TEMP/SHA256SUMS"
+          mv "$RUNNER_TEMP/SHA256SUMS" .
+          ../.github/annotate.sh notice "Files of the release" SHA256SUMS
+      - name: Record where each file was built
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: release/*
+      - name: Notes, from the changelog
+        run: |
+          packaging/release-notes.sh > notes.md
+          cat notes.md
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-files
+          path: |
+            release/
+            notes.md
+          if-no-files-found: error
+
+  # A draft is the maintainer's to look at and to publish. One that is there
+  # already, from a run before this one, gets the files again; a release that
+  # is published keeps the files it has.
+  draft:
+    name: Draft release
+    if: ${{ github.ref_type == 'tag' }}
+    needs: files
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write         # to make the draft release
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-files
+      - name: Make the draft, or give the one that is there its files again
+        run: |
+          trap 'echo "::error title=Release::this failed: $BASH_COMMAND"' ERR
+          tag=$GITHUB_REF_NAME
+          if draft=$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null); then
+            if [ "$draft" != true ]; then
+              echo "::error title=Release::$tag is published already, and its files are not replaced."
+              exit 1
+            fi
+            gh release upload "$tag" release/* --clobber
+            gh release edit "$tag" --draft --title "lightbox ${tag#v}" --notes-file notes.md
+          else
+            gh release create "$tag" release/* --draft --verify-tag --title "lightbox ${tag#v}" --notes-file notes.md
+          fi
+          echo "::notice title=Release::A draft release of $tag is made, with $(ls release | wc -l) files. It is the maintainer's to publish."

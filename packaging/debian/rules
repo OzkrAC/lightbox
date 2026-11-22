@@ -33,3 +33,15 @@ override_dh_auto_install:
 # root filesystems hold setuid programs and secrets.
 execute_after_dh_fixperms:
 	chmod 0700 debian/lightbox/var/lib/lightbox debian/lightbox/var/lib/lightbox/containers
+
+# CHANGELOG.md is in the package once, with the documents and under its own
+# name, which debian/lightbox.docs sees to. The package built on Ubuntu 24.04
+# had no changelog.gz made of it; where debhelper does make one, this keeps it
+# from being there twice.
+override_dh_installchangelogs:
+	dh_installchangelogs -XCHANGELOG.md
+
+# xz, which every dpkg reads. Ubuntu's dpkg-deb writes zstd unless told, and
+# Debian's dpkg reads that from Debian 12 on only.
+override_dh_builddeb:
+	dh_builddeb -- -Zxz

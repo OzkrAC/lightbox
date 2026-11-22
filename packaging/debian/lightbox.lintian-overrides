@@ -1,0 +1,14 @@
+# lightbox links no C library. It is built on lightc, a freestanding runtime
+# of its own, and a static binary is what it is meant to be.
+lightbox: statically-linked-binary [usr/bin/lightbox]
+
+# lightbox_dir and container_dir are root's alone, as "make install" makes
+# them: the root filesystems of containers hold setuid programs and secrets
+# that no other user of the host is to reach.
+lightbox: non-standard-dir-perm 0700 != 0755 [var/lib/lightbox/]
+lightbox: non-standard-dir-perm 0700 != 0755 [var/lib/lightbox/containers/]
+
+# The package is not uploaded to Debian, so there is no bug of an intent to
+# package for its changelog to close. packaging/build-deb.sh writes that
+# changelog, with one entry, for the version it builds.
+lightbox: initial-upload-closes-no-bugs [usr/share/doc/lightbox/changelog.Debian.gz:1]

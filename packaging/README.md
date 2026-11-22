@@ -1,6 +1,6 @@
 # Packages
 
-lightbox as a `.deb`, for Debian and Ubuntu, and as an `.xbps`, for Void Linux, for x86_64 and aarch64. CI builds both on every run and keeps them as the run's artifacts, and installs each to see that it works.
+lightbox as a `.deb`, for Debian and Ubuntu, and as an `.xbps`, for Void Linux, for x86_64 and aarch64. CI builds both on every run, installs each to see that it works, and keeps them as the run's artifacts. A tag gives a draft release that holds them, with the source archive and their SHA-256 sums.
 
 | File | What it is |
 | --- | --- |
@@ -9,8 +9,9 @@ lightbox as a `.deb`, for Debian and Ubuntu, and as an `.xbps`, for Void Linux, 
 | `debian/` | The control files of the `.deb`. The build copies them into place: the tree has no `debian/` of its own |
 | `build-xbps.sh` | Builds the two `.xbps`, with `xbps-create`, on Void |
 | `xbps/INSTALL` | What xbps runs when it has unpacked the package: it makes lightbox's directories |
+| `release-notes.sh` | The notes of a release: the changelog's section for the version, how to install the files and how to check a download |
 
-`.github/workflows/packages.yml` is the CI: it builds each package on both architectures, installs it with its package manager, checks what was installed, and for the `.deb` runs the lifecycle suite with the installed binary. It also makes the source archive of `make dist`, twice, and builds lightbox from it.
+`.github/workflows/packages.yml` is the CI: it builds each package on both architectures, installs it with its package manager, checks what was installed, and for the `.deb` runs the lifecycle suite with the installed binary. The `.deb` is built on Ubuntu 24.04 and installed there and in Debian 12 and 13; the `.xbps` is built and installed in Void's container image. It also makes the source archive of `make dist`, twice, and builds lightbox from it. `.github/workflows/release.yml` is the release: see [A release](#a-release).
 
 ## What a package holds
 
@@ -23,7 +24,7 @@ What `make install PREFIX=/usr` installs, and nothing else of lightbox's own:
 | `/etc/lightbox/lightbox.conf` | The example configuration, in which every setting is a comment. A configuration file to the package manager: one that was changed is kept when the package is updated |
 | `/var/lib/lightbox`, mode 0700 | `lightbox_dir`, with `containers`, mode 0700, and `rootfs`, the place of the default base, which is yours to fill |
 
-and what each distribution asks for beside it: the licence, and in the `.deb` the changelog and the README.
+and what each distribution asks for beside it: the licence, and in the `.deb` also `README.md` and `CHANGELOG.md`, in `/usr/share/doc/lightbox`, and the answers to what lintian says of the package, `debian/lightbox.lintian-overrides`, each with its reason.
 
 A package starts nothing and changes nothing on the host: lightbox has no daemon. `lightbox setup` makes the host's network, and `lightbox doctor` says what the host lacks. `run_dir`, `/run/lightbox`, is in no package: it is on a tmpfs, and `setup` and `start` make it.
 
@@ -54,9 +55,22 @@ xbps-rindex -a dist/lightbox-*.xbps
 sudo xbps-install --repository="$PWD/dist" lightbox
 ```
 
+The `.deb` is compressed with xz, which every dpkg reads; Ubuntu's own default, zstd, is read by Debian from Debian 12 on only.
+
 ## Versions
 
 `lightbox.h` has the version, and `version.sh` gives it to both formats. A build between two releases, `0.9.0-dev`, is `0.9.0~dev` in a `.deb` and `0.9.0pre` in an `.xbps`: each sorts before `0.9.0` in its package manager, so the release replaces it.
+
+## A release
+
+1. On `main`, with CI green: `LIGHTBOX_VERSION` in `lightbox.h` loses its `-dev`, the changelog's section for the version gets its summary, and `VERSION` in `docs/lightbox-docs.js` follows. Commit, push, and wait for CI.
+2. Tag that commit and push the tag: `git tag v0.9.0 && git push origin v0.9.0`. The tag is the version of `lightbox.h` with a `v` before it; the Release workflow stops at any other, before it builds.
+3. The workflow builds the packages and the source archive with the jobs CI runs, and makes a draft release that holds the two `.deb`, the four `.xbps`, `lightbox-<version>.tar.gz` and `SHA256SUMS`, with notes from the changelog. A draft is seen by the maintainer alone: look at it under Releases, and publish it.
+4. `LIGHTBOX_VERSION` becomes the next version with `-dev`.
+
+For each file GitHub keeps an attestation: a record, which it signs, of the repository, the commit and the workflow run that built the file. `gh attestation verify <file> --repo OzkrAC/lightbox` checks a download against it. No signing key is kept for this. The record is public, in GitHub's attestations for the repository and in Sigstore's public log.
+
+Run by hand from a branch, under Actions, or by a push to `main` that changes `release.yml`, the workflow is a rehearsal: it builds, sums and records the same files and keeps them as the artifact `release-files`, and makes no release. If a run for a tag fails after the draft was made, run it again: a draft that is there gets its files again, and a release that is published is left as it is.
 
 ## What the packages are not
 

@@ -65,23 +65,57 @@ jobs:
         run: |
           {
             ls -l dist/*.deb
+            echo "members: $(ar t dist/lightbox_*.deb | tr '\n' ' ')"
+            echo "lightbox.c was compiled with:"
+            grep -m 1 -E ' -c lightbox\.c ' "$RUNNER_TEMP/build.log" | tr ' ' '\n' | grep -E '^-[fmOgWD]' | grep -v -e '-prefix-map' | tr '\n' ' ' | fold -s -w 200 || true
+            echo
             dpkg-deb --info dist/lightbox_*.deb
             dpkg-deb --contents dist/lightbox_*.deb
           } 2>&1 | tee "$RUNNER_TEMP/package.log"
           .github/annotate.sh notice ".deb (${{ matrix.arch }})" "$RUNNER_TEMP/package.log" 80
-      # What Debian's own checker says of the package. It reports and fails
-      # nothing yet: a static binary that is no PIE is what it is there to
-      # find, and which of its tags are to be answered is decided from what
-      # it prints here. The annotation has the tags without their
-      # explanations, which the log has.
+      # What Debian's own checker says of the package. The tags it had for the
+      # first package are answered in packaging/debian/lightbox.lintian-overrides,
+      # each with its reason, and are printed here as overridden, O. An error
+      # or a warning that is not answered is a warning of the run; it fails
+      # nothing until a run has shown the overrides to hold. The annotation
+      # has the tags without their explanations, which the log has.
       - name: lintian
         run: |
-          lintian --info --display-info --pedantic dist/lightbox_*.deb > "$RUNNER_TEMP/lintian.log" 2>&1 || true
+          lintian --info --display-info --pedantic --show-overrides dist/lightbox_*.deb > "$RUNNER_TEMP/lintian.log" 2>&1 || true
           cat "$RUNNER_TEMP/lintian.log"
           grep -E '^[EWIPXOC]: ' "$RUNNER_TEMP/lintian.log" > "$RUNNER_TEMP/lintian-tags.log" || true
           [ -s "$RUNNER_TEMP/lintian-tags.log" ] ||
             { echo "no tag; lintian's first lines:"; head -n 5 "$RUNNER_TEMP/lintian.log"; } > "$RUNNER_TEMP/lintian-tags.log"
           .github/annotate.sh notice "lintian (${{ matrix.arch }})" "$RUNNER_TEMP/lintian-tags.log" 80
+          if grep -E '^[EW]: ' "$RUNNER_TEMP/lintian-tags.log" > "$RUNNER_TEMP/lintian-open.log"; then
+            .github/annotate.sh warning "lintian (${{ matrix.arch }}), not answered" "$RUNNER_TEMP/lintian-open.log" 40
+          fi
+      # The package is built on Ubuntu and holds a static binary that asks
+      # nothing of a C library, so it is the package for Debian too. It is
+      # installed in Debian's own images, to see that apt finds what it
+      # depends on there and that the binary runs.
+      - name: Install the package on Debian
+        id: debian
+        run: |
+          for release in 12 13; do
+            docker run --rm -e DEBIAN_FRONTEND=noninteractive -v "$PWD/dist:/dist:ro" "debian:$release" sh -euxc '
+              apt-get update -q
+              apt-get install -y -q /dist/lightbox_*.deb
+              test "$(command -v lightbox)" = /usr/bin/lightbox
+              lightbox --version
+              test "$(stat -c %a /var/lib/lightbox)" = 700
+              test "$(stat -c %a /var/lib/lightbox/containers)" = 700
+              test -f /etc/lightbox/lightbox.conf
+              lightbox doctor || true
+              apt-get purge -y -q lightbox
+              test ! -e /usr/bin/lightbox
+              test ! -e /etc/lightbox/lightbox.conf
+            ' 2>&1 | tee "$RUNNER_TEMP/debian.log"
+            echo "::notice title=.deb on Debian $release (${{ matrix.arch }})::installed with apt, run and purged: $(grep -m 1 '^lightbox [0-9]' "$RUNNER_TEMP/debian.log")"
+          done
+      - name: Why it failed on Debian
+        if: ${{ failure() && steps.debian.outcome == 'failure' }}
+        run: .github/annotate.sh error ".deb on Debian (${{ matrix.arch }}), the end of the output" "$RUNNER_TEMP/debian.log"
       # Each line is something a user of the package relies on. The one that
       # fails is named in an annotation.
       - name: Install the package
@@ -95,6 +129,8 @@ jobs:
           file /usr/bin/lightbox | grep -q 'statically linked'
           test -f /usr/share/man/man8/lightbox.8.gz
           test -f /usr/share/doc/lightbox/copyright
+          test -f /usr/share/doc/lightbox/CHANGELOG.md.gz
+          test -f /usr/share/lintian/overrides/lightbox
           dpkg-query -W -f='${Conffiles}\n' lightbox | grep -q ' /etc/lightbox/lightbox.conf '
           test "$(sudo stat -c %a /var/lib/lightbox)" = 700
           test "$(sudo stat -c %a /var/lib/lightbox/containers)" = 700
