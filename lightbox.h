@@ -18,7 +18,7 @@
 
 /* What --version says: the release, set when it is tagged, and "-dev" after
  * it on the way to the next one. */
-#define LIGHTBOX_VERSION "0.9.0"
+#define LIGHTBOX_VERSION "0.10.0-dev"
 
 #define MAX_PATH         512
 #define NAME_MAX_LEN     30
@@ -483,6 +483,70 @@ void id_map_line(char out[ID_MAP_LINE_MAX], const id_map *map);
  * unless privileged. Its descriptor, or minus an errno and *step the call. */
 [[nodiscard]] int idmapped_tree(const char *path, int userns_fd, bool privileged, const char **step);
 [[nodiscard]] int attach_tree(int tree, const char *target);
+
+/* ─── SHA-256 (lightbox_sha256.c, ROADMAP I.1) ──────────────────────────── */
+
+/*
+ * What a blob of an image is named by. The input is taken in pieces of any
+ * length, so that a layer is hashed while it is written or read:
+ *
+ *   sha256_init, sha256_update for each piece, sha256_final
+ */
+#define SHA256_BYTES 32
+#define SHA256_HEX   64         /* a digest's digits, without their NUL */
+#define SHA256_BLOCK 64         /* the bytes the hash takes at a time */
+typedef struct {
+    uint32_t state[8];
+    uint64_t length;                /* the bytes taken so far */
+    uint8_t  block[SHA256_BLOCK];   /* those of them that do not fill a block yet */
+} sha256_ctx;
+void sha256_init(sha256_ctx *ctx);
+void sha256_update(sha256_ctx *ctx, const void *data, size_t len);
+/* The digest of all that was taken. The context is spent and wiped: it takes
+ * a sha256_init before it is used again. */
+void sha256_final(sha256_ctx *ctx, uint8_t digest[SHA256_BYTES]);
+/* A digest as 64 lowercase hex digits and their NUL, and whether a text is
+ * one: the way a blob's name and a descriptor have it. */
+void sha256_hex(const uint8_t digest[SHA256_BYTES], char out[SHA256_HEX + 1]);
+[[nodiscard]] bool sha256_hex_ok(const char *text);
+
+/* ─── tar (lightbox_tar.c, ROADMAP I.2) ─────────────────────────────────── */
+
+/* The longest name an archive's entry may have from its root, a link's
+ * target too, with the NUL: the kernel's own limit for a path. */
+#define TAR_PATH_MAX 4096
+
+/* Where an archive's bytes go, all of them and in order: 0, or anything else
+ * to end the writing. */
+typedef int (*tar_sink)(void *to, const void *data, size_t len);
+
+/*
+ * A tree written as a tar archive, the way a layer of an image is one. The
+ * same tree gives the same bytes every time. The caller sets the first five
+ * members; the others say afterwards what was written and what was not.
+ */
+typedef struct {
+    tar_sink    sink;
+    void       *to;
+    /* Ids are written less these, and one that is not in the 65536 from a
+     * start that is not 0 ends the writing: a container's with --userns has
+     * its files under its own range, and an image has them from 0. */
+    uint32_t    uid_start;
+    uint32_t    gid_start;
+    /* The tree is an overlay's upper directory: what it marks as taken out
+     * of its base is written as an image marks it. */
+    bool        overlay;
+
+    uint64_t    entries;            /* written */
+    uint64_t    sockets;            /* left out: a socket is of a process that is gone */
+    uint64_t    attributes_left;    /* extended attributes an archive does not carry */
+    const char *failure;            /* NULL, or what ended the writing */
+    char        failed_at[TAR_PATH_MAX];    /* and the entry it was at, from the tree's root */
+} tar_writer;
+
+/* The tree under a directory, which is not an entry itself, and the
+ * archive's end: 0, or -1 with failure and failed_at set. */
+[[nodiscard]] int tar_write_tree(tar_writer *w, int32_t dirfd);
 
 /* ─── Base snapshots (lightbox_base.c) ──────────────────────────────────── */
 

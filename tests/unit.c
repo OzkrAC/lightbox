@@ -102,6 +102,17 @@
  *                                             reconcile, as start, stop and rm call it for a
  *                                             container that ended without a stop: "cleared" or
  *                                             "nothing", then "state <what is on record now>"
+ *   unit sha256 <file> [<piece>]              the SHA-256 of a file, given to sha256_update in
+ *                                             pieces of at most that many bytes, 65536 without
+ *                                             one: its 64 hex digits
+ *   unit sha256-name <text>                   sha256_hex_ok: ok or refused
+ *   unit tar <dir> <archive> [overlay] [<uid_start> <gid_start>]
+ *                                             tar_write_tree of what is in <dir> into the file
+ *                                             <archive>, as an overlay's upper directory with
+ *                                             "overlay" and with ids less the two starts: lines
+ *                                             "entries <n>", "sockets <n>", "attributes-left <n>",
+ *                                             "bytes <n>" and "sha256 <digest>" of the archive;
+ *                                             or "failed: <entry>: <why>" and status 1
  *   unit volspec <spec>                       parse_volume_spec: "<src> -> <dst> ro|rw",
  *                                             or "invalid: <what is wrong>"
  *   unit volumes <root> <spec>... [-- <probe>...]
@@ -761,6 +772,20 @@ static void unit_request(int argc, char **argv, struct exec_request *req, struct
     req->argv = command < argc ? (const char *const *)(uintptr_t)(argv + command) : shell;
     request_term(req);
     resolve_identity(req, argv[2], argv[3], id);
+}
+
+/* "unit tar": the archive into a file, hashed and counted on its way */
+struct unit_tar_sink {
+    int32_t    fd;
+    sha256_ctx hash;
+    uint64_t   bytes;
+};
+
+static int unit_tar_write(void *to, const void *data, size_t len) {
+    struct unit_tar_sink *sink = to;
+    sha256_update(&sink->hash, data, len);
+    sink->bytes += len;
+    return lc_kernel_write_all(sink->fd, data, len) < 0 ? -1 : 0;
 }
 
 int main(int argc, char **argv, char **envp) {
@@ -1559,6 +1584,83 @@ int main(int argc, char **argv, char **envp) {
             die("unit: the read-only clone could not be executed");
         }
         unit_report_sealed(argc, argv);
+        return 0;
+    }
+    if ((argc == 3 || argc == 4) && streq(argv[1], "sha256")) {
+        static uint8_t piece[65536];
+        int size = (int)sizeof(piece);
+        if (argc == 4 && !parse_int_in(argv[3], 1, (int)sizeof(piece), &size))
+            die("unit: a piece is 1 to 65536 bytes");
+        lc_sysret fd = lc_kernel_open_file(argv[2], O_RDONLY, 0);
+        if (fd < 0)
+            die2("unit: cannot open ", argv[2]);
+        sha256_ctx ctx;
+        sha256_init(&ctx);
+        for (;;) {
+            lc_sysret n = lc_kernel_read_retry((int32_t)fd, piece, (size_t)size);
+            if (n < 0)
+                die2("unit: cannot read ", argv[2]);
+            if (n == 0)
+                break;
+            sha256_update(&ctx, piece, (size_t)n);
+        }
+        uint8_t digest[SHA256_BYTES];
+        char hex[SHA256_HEX + 1];
+        sha256_final(&ctx, digest);
+        sha256_hex(digest, hex);
+        /* what sha256_hex writes is what sha256_hex_ok takes */
+        if (!sha256_hex_ok(hex))
+            die("unit: sha256_hex wrote what sha256_hex_ok refuses");
+        put(hex);
+        put("\n");
+        return 0;
+    }
+    if (argc >= 4 && argc <= 7 && streq(argv[1], "tar")) {
+        static tar_writer w;
+        static struct unit_tar_sink to;
+        int at = 4;
+        if (at < argc && streq(argv[at], "overlay")) {
+            w.overlay = true;
+            at++;
+        }
+        if (at != argc && (at + 2 != argc || !parse_u32_text(argv[at], &w.uid_start) ||
+                           !parse_u32_text(argv[at + 1], &w.gid_start)))
+            die("usage: unit tar <dir> <archive> [overlay] [<uid_start> <gid_start>]");
+        lc_sysret dirfd = lc_kernel_open_file(argv[2], O_RDONLY | O_DIRECTORY, 0);
+        if (dirfd < 0)
+            die2("unit: cannot open the directory ", argv[2]);
+        lc_sysret out = lc_kernel_open_file(argv[3], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (out < 0)
+            die2("unit: cannot write ", argv[3]);
+        to.fd = (int32_t)out;
+        sha256_init(&to.hash);
+        w.sink = unit_tar_write;
+        w.to = &to;
+        if (tar_write_tree(&w, (int32_t)dirfd) != 0) {
+            put("failed: ");
+            put(w.failed_at);
+            put(": ");
+            put(w.failure ? w.failure : "(no reason given)");
+            put("\n");
+            return 1;
+        }
+        uint8_t digest[SHA256_BYTES];
+        char hex[SHA256_HEX + 1];
+        sha256_final(&to.hash, digest);
+        sha256_hex(digest, hex);
+        put("entries ");
+        put_int64((int64_t)w.entries);
+        put("sockets ");
+        put_int64((int64_t)w.sockets);
+        put("attributes-left ");
+        put_int64((int64_t)w.attributes_left);
+        put("bytes ");
+        put_int64((int64_t)to.bytes);
+        put_line("sha256 ", hex);
+        return 0;
+    }
+    if (argc == 3 && streq(argv[1], "sha256-name")) {
+        put(sha256_hex_ok(argv[2]) ? "ok\n" : "refused\n");
         return 0;
     }
     if (argc == 3 && (streq(argv[1], "nameservers") || streq(argv[1], "dnslist"))) {

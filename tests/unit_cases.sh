@@ -3544,4 +3544,271 @@ check 'init says how it ends, and nothing it starts can look into it' t_init_rep
 check 'a container that ended without a stop is cleared away, and how it ended recorded' t_reconcile
 check 'the device program lets a container open its own devices and nothing else' t_device_program
 
+# ─── Images (ROADMAP Track I) ───────────────────────────────────────────────
+
+# I.1: a blob of an image is named by its SHA-256. The harness gives a file to
+# sha256_update in pieces of a given length, as a layer is hashed while it is
+# written.
+t_sha256() {
+    D=$(mktemp -d "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    bad=0
+    expect() { # digest, file, [piece]
+        got=$("$UNIT" sha256 "$2" ${3:+"$3"})
+        [ "$got" = "$1" ] || { echo "${2##*/}${3:+ in pieces of $3}: $got, not $1"; bad=1; }
+    }
+
+    # the messages FIPS 180-4's examples use: none, one block, two blocks,
+    # and a million times the letter a
+    : > "$D/empty"
+    printf abc > "$D/abc"
+    printf abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq > "$D/two-blocks"
+    head -c 1000000 /dev/zero | tr '\0' a > "$D/million"
+    expect e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 "$D/empty"
+    expect ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad "$D/abc"
+    expect 248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1 "$D/two-blocks"
+    expect cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0 "$D/million"
+    expect cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0 "$D/million" 7
+
+    # Every length around a block's 64 bytes, where the padding ends in the
+    # same block or takes one more, and around a megabyte; each in one piece
+    # and in pieces that cut a block anywhere. sha256sum says what it is.
+    if command -v sha256sum >/dev/null; then
+        head -c 1048700 /dev/urandom > "$D/random"
+        for len in $(seq 0 130) 1048575 1048576 1048577 1048700; do
+            head -c "$len" "$D/random" > "$D/part"
+            want=$(sha256sum < "$D/part")
+            want=${want%% *}
+            pieces="65536 1 3 63 64 65"
+            [ "$len" -gt 130 ] && pieces="65536 63 64 65 4097"
+            for piece in $pieces; do
+                expect "$want" "$D/part" "$piece"
+            done
+        done
+    else
+        echo "no sha256sum here: only the standard's messages were compared"
+    fi
+
+    # a digest as text is 64 lowercase hex digits, and nothing else is one
+    zeros=$(printf '%063d' 0)
+    for name in '' abc "${zeros}" "${zeros}00" "${zeros}A" "${zeros}g" "${zeros} " "sha256:${zeros#??????}"; do
+        [ "$("$UNIT" sha256-name "$name")" = refused ] || { echo "taken for a digest: '$name'"; bad=1; }
+    done
+    for name in "${zeros}0" e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855; do
+        [ "$("$UNIT" sha256-name "$name")" = ok ] || { echo "a digest was refused: $name"; bad=1; }
+    done
+
+    rm -rf -- "$D"
+    return $bad
+}
+check 'SHA-256 is the standard'"'"'s and sha256sum'"'"'s, in whatever pieces the input comes' t_sha256
+
+# I.2: a tree as a tar archive, the way a layer of an image is one. The cases
+# run as the root of a user namespace that has 65536 more ids, so that files
+# have several owners and a file of mode 000 is read, as root reads one. Each
+# is a function that in_namespace_with_ids runs there, with $UNIT and $D.
+
+# what a tree is, a line for each entry but sockets: name, kind, mode, owner,
+# seconds of its time, a link's target, the number of its names, a file's size
+tar_helpers() {
+    listing() {
+        (cd "$1" && find . -mindepth 1 ! -type s -printf "%P|%y|%m|%U:%G|%Ts|%l|%n|" \
+            \( -type f -printf "%s" -o -true \) -printf "\n" | LC_ALL=C sort)
+    }
+    # the user attributes of every file and directory of a tree
+    attributes() {
+        python3 -I -c "
+import os, sys
+for d, dirs, files in sorted(os.walk(sys.argv[1])):
+    for n in sorted(dirs + files):
+        p = os.path.join(d, n)
+        if os.path.islink(p) or not (os.path.isfile(p) or os.path.isdir(p)): continue
+        for a in sorted(os.listxattr(p)):
+            print(os.path.relpath(p, sys.argv[1]), a, os.getxattr(p, a))
+" "$1"
+    }
+    field() { printf "%s\n" "$2" | sed -n "s/^$1 //p"; }
+    long=$(printf "n%.0s" $(seq 1 120))
+}
+
+tar_tree_case() {
+    cd "$D" || exit 1
+    mkdir -p tree/sub/deep tree/empty-dir out
+    (
+        cd tree || exit 1
+        printf "hello\n" > file
+        : > empty
+        head -c 512 /dev/urandom > block
+        head -c 513 /dev/urandom > block-and-one
+        head -c 200000 /dev/urandom > sub/big
+        ln file sub/second-name
+        ln -s ../file sub/symlink
+        ln -s /nowhere/at/all dangling
+        mkfifo sub/fifo
+        chmod 4755 block
+        chmod 000 empty
+        printf "long\n" > "sub/$long"
+        mkdir -p "sub/deep/$long/$long"
+        printf "deeper\n" > "sub/deep/$long/$long/file"
+        ln -s "$long/$long/$long" sub/long-link
+        printf "spaces\n" > "a name with spaces"
+        printf "utf8\n" > "ünïcödé"
+        chown 1000:2000 block-and-one
+        chown 65536:65536 sub/big
+        chown -h 7:8 sub/symlink
+        chown 33:33 empty-dir
+        touch -d "2001-02-03 04:05:06 UTC" file sub/deep
+        python3 -I -c "import socket; s = socket.socket(socket.AF_UNIX); s.bind(\"sub/socket\")"
+    ) || { echo "the tree could not be made"; exit 1; }
+    attrs=yes
+    python3 -I -c "
+import os
+os.setxattr(\"tree/file\", \"user.note\", b\"kept\")
+os.setxattr(\"tree/sub\", \"user.b\", b\"2\")
+os.setxattr(\"tree/sub\", \"user.a\", bytes(range(256)))" 2>/dev/null || attrs=no
+
+    said=$("$UNIT" tar tree a.tar) || { echo "$said"; exit 1; }
+    echo "$said"
+    bad=0
+    [ "$(field entries "$said")" = 19 ] || { echo "not 19 entries"; bad=1; }
+    [ "$(field sockets "$said")" = 1 ] || { echo "the socket was not left out and counted"; bad=1; }
+    [ "$(field attributes-left "$said")" = 0 ] || { echo "attributes were left out"; bad=1; }
+    size=$(stat -c %s a.tar)
+    [ "$(field bytes "$said")" = "$size" ] && [ $((size % 512)) = 0 ] || { echo "the archive is $size bytes"; bad=1; }
+    sum=$(sha256sum < a.tar)
+    [ "$(field sha256 "$said")" = "${sum%% *}" ] || { echo "the digest is not the file's"; bad=1; }
+
+    # one tree, one archive
+    "$UNIT" tar tree b.tar >/dev/null && cmp a.tar b.tar || { echo "a second archive of the tree differs"; bad=1; }
+
+    # GNU tar reads it as the tree it is: names, kinds, modes, owners, times,
+    # links, the two names of one file, sizes, bytes, attributes
+    tar --version | grep -q GNU || { echo "tar here is not GNU tar: nothing else was compared"; exit $bad; }
+    tar -xpf a.tar -C out --same-owner --xattrs --xattrs-include="user.*" || { echo "GNU tar could not unpack it"; exit 1; }
+    listing tree > tree.list
+    listing out > out.list
+    diff tree.list out.list || { echo "unpacked, the tree is another"; bad=1; }
+    [ "$(wc -l < tree.list)" = 19 ] || { echo "the tree does not have 19 entries"; bad=1; }
+    diff -r --no-dereference tree out 2>&1 | grep -v "socket\|fifo" | grep . && { echo "unpacked, a file is another"; bad=1; }
+    if [ $attrs = yes ]; then
+        attributes tree > tree.attrs
+        attributes out > out.attrs
+        # three attributes, one of them seen under both names of its file
+        diff tree.attrs out.attrs && [ "$(wc -l < tree.attrs)" = 4 ] || { echo "the attributes did not arrive"; bad=1; }
+    else
+        echo "no user attributes on this filesystem: none were written"
+    fi
+
+    # and that tree, made by another program in another order and with other
+    # inodes, gives the archive again, byte for byte
+    "$UNIT" tar out c.tar >/dev/null && cmp a.tar c.tar || { echo "the unpacked tree gives another archive"; bad=1; }
+
+    if command -v bsdtar >/dev/null; then
+        [ "$(bsdtar -tf a.tar | LC_ALL=C sort)" = "$(tar -tf a.tar | LC_ALL=C sort)" ] ||
+            { echo "bsdtar lists other names than GNU tar"; bad=1; }
+    else
+        echo "no bsdtar here: GNU tar alone read the archive"
+    fi
+    exit $bad
+}
+t_tar_tree() { in_namespace_with_ids "$(declare -f tar_helpers tar_tree_case); tar_helpers; tar_tree_case"; }
+
+tar_overlay_case() {
+    cd "$D" || exit 1
+    mkdir -p upper/kept upper/opaque
+    printf "new\n" > upper/kept/file
+    printf "its own\n" > upper/opaque/file
+    mknod upper/gone c 0 0 || { echo "this kernel lets no one but root make a whiteout"; exit 77; }
+    mknod upper/kept/gone-too c 0 0
+    python3 -I -c "import os; os.setxattr(\"upper/opaque\", \"user.overlay.opaque\", b\"y\")" 2>/dev/null ||
+        { echo "no user attributes on this filesystem"; exit 77; }
+    bad=0
+
+    # as an overlay's upper directory: each mark the image's way, in the
+    # place of the name it stands for
+    said=$("$UNIT" tar upper o.tar overlay) || { echo "$said"; exit 1; }
+    got=$(tar -tvf o.tar --numeric-owner | awk "{ print substr(\$1, 1, 1), \$3, \$NF }")
+    want="- 0 .wh.gone
+d 0 kept/
+- 4 kept/file
+- 0 kept/.wh.gone-too
+d 0 opaque/
+- 0 opaque/.wh..wh..opq
+- 8 opaque/file"
+    [ "$got" = "$want" ] || { echo "as an overlay:"; echo "$got"; bad=1; }
+    [ "$(field attributes-left "$said")" = 0 ] || { echo "the overlay's own attribute was counted as left out"; bad=1; }
+
+    # as a tree of its own: a device is a device, and nothing is a mark
+    said=$("$UNIT" tar upper p.tar) || { echo "$said"; exit 1; }
+    got=$(tar -tvf p.tar --numeric-owner | awk "{ print substr(\$1, 1, 1), \$NF }")
+    want="c gone
+d kept/
+- kept/file
+c kept/gone-too
+d opaque/
+- opaque/file"
+    [ "$got" = "$want" ] || { echo "as a tree:"; echo "$got"; bad=1; }
+    exit $bad
+}
+t_tar_overlay() { in_namespace_with_ids "$(declare -f tar_helpers tar_overlay_case); tar_helpers; tar_overlay_case"; }
+
+tar_ids_case() {
+    cd "$D" || exit 1
+    mkdir tree
+    : > tree/root-of-the-range
+    : > tree/another
+    chown 1000:1000 tree/root-of-the-range
+    chown 1500:1700 tree/another
+    bad=0
+    said=$("$UNIT" tar tree a.tar 1000 1000) || { echo "$said"; exit 1; }
+    got=$(tar -tvf a.tar --numeric-owner | awk "{ print \$2, \$NF }")
+    [ "$got" = "500/700 another
+0/0 root-of-the-range" ] || { echo "less 1000:1000, the owners are:"; echo "$got"; bad=1; }
+
+    # an id below the range is of no container of that range
+    : > tree/host-roots
+    said=$("$UNIT" tar tree b.tar 1000 1000)
+    [ $? = 1 ] && [ "$said" = "failed: host-roots: belongs to an id outside the container's range" ] ||
+        { echo "a file of an id below the range: $said"; bad=1; }
+    exit $bad
+}
+t_tar_ids() { in_namespace_with_ids "$(declare -f tar_helpers tar_ids_case); tar_helpers; tar_ids_case"; }
+
+tar_refusals_case() {
+    cd "$D" || exit 1
+    bad=0
+    refused() { # what was said, what it has to be
+        [ "$1" = "$2" ] || { echo "said: $1"; echo "not:  $2"; bad=1; }
+    }
+    # a name an image would take for a mark
+    mkdir -p marks/dir
+    : > marks/dir/.wh.file
+    refused "$("$UNIT" tar marks m.tar)" \
+        "failed: dir/.wh.file: has a name that begins with .wh., which in an image marks what a layer removes"
+
+    # a name longer than a path may be: 18 directories of 240 letters
+    mkdir deep
+    (
+        cd deep || exit 1
+        part=$(printf "d%.0s" $(seq 1 240))
+        for i in $(seq 1 18); do mkdir "$part" && cd "$part" || exit 1; done
+    ) || { echo "the deep tree could not be made"; exit 1; }
+    said=$("$UNIT" tar deep d.tar)
+    case $said in
+        "failed: d"*": has an entry whose name is too long for an archive"|"failed: d"*": has a name too long for an archive") ;;
+        *) echo "a name too long: $(printf "%s" "$said" | cut -c1-60)...$(printf "%s" "$said" | tail -c 70)"; bad=1 ;;
+    esac
+
+    # nowhere to write
+    mkdir one
+    : > one/file
+    refused "$("$UNIT" tar one /dev/full)" "failed: file: the archive could not be written"
+    exit $bad
+}
+t_tar_refusals() { in_namespace_with_ids "$(declare -f tar_helpers tar_refusals_case); tar_helpers; tar_refusals_case"; }
+
+check 'a tree is one archive, which GNU tar unpacks to a tree that gives it again' t_tar_tree
+check "an overlay's marks are written the way an image has them" t_tar_overlay
+check "ids are written less the start of a container's range, and none from outside it" t_tar_ids
+check 'what an archive cannot hold ends the writing, with the entry named' t_tar_refusals
+
 summary unit

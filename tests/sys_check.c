@@ -86,6 +86,8 @@ SAME_NR(mount_setattr);
 SAME_NR(move_mount);
 SAME_NR(pidfd_send_signal);
 SAME_NR(statx);
+SAME_NR(fgetxattr);
+SAME_NR(flistxattr);
 SAME_NR(faccessat);
 SAME_NR(bpf);
 
@@ -103,6 +105,19 @@ SAME_VALUE(LB_EEXIST, EEXIST);
 SAME_VALUE(LB_EACCES, EACCES);
 SAME_VALUE(LB_ENOTDIR, ENOTDIR);
 SAME_VALUE(LB_S_IFREG, S_IFREG);
+SAME_VALUE(LB_S_IFMT, S_IFMT);
+SAME_VALUE(LB_S_IFDIR, S_IFDIR);
+SAME_VALUE(LB_S_IFLNK, S_IFLNK);
+SAME_VALUE(LB_S_IFCHR, S_IFCHR);
+SAME_VALUE(LB_S_IFBLK, S_IFBLK);
+SAME_VALUE(LB_S_IFIFO, S_IFIFO);
+SAME_VALUE(LB_S_IFSOCK, S_IFSOCK);
+SAME_VALUE(LB_STATX_NLINK, STATX_NLINK);
+SAME_VALUE(LB_STATX_MTIME, STATX_MTIME);
+SAME_VALUE(LB_STATX_SIZE, STATX_SIZE);
+SAME_VALUE(LB_ERANGE, ERANGE);
+SAME_VALUE(LB_ENODATA, ENODATA);
+SAME_VALUE(LB_EOPNOTSUPP, EOPNOTSUPP);
 SAME_VALUE(LB_AT_EMPTY_PATH, AT_EMPTY_PATH);
 SAME_VALUE(LB_O_EXCL, O_EXCL);
 SAME_VALUE(LB_LOCK_SH, LOCK_SH);
@@ -240,6 +255,17 @@ SAME_FIELD(lb_statx, statx, stx_attributes_mask);
 SAME_FIELD(lb_statx, statx, stx_dev_major);
 SAME_FIELD(lb_statx, statx, stx_dev_minor);
 SAME_FIELD(lb_statx, statx, stx_mnt_id);
+SAME_FIELD(lb_statx, statx, stx_nlink);
+SAME_FIELD(lb_statx, statx, stx_ino);
+SAME_FIELD(lb_statx, statx, stx_size);
+SAME_FIELD(lb_statx, statx, stx_rdev_major);
+SAME_FIELD(lb_statx, statx, stx_rdev_minor);
+/* stx_mtime is a struct of the kernel's, which lightbox has as its two numbers */
+_Static_assert(offsetof(struct lb_statx, stx_mtime_sec) == offsetof(struct statx, stx_mtime.tv_sec) &&
+               offsetof(struct lb_statx, stx_mtime_nsec) == offsetof(struct statx, stx_mtime.tv_nsec) &&
+               sizeof(((struct lb_statx *)0)->stx_mtime_sec) == sizeof(((struct statx *)0)->stx_mtime.tv_sec) &&
+               sizeof(((struct lb_statx *)0)->stx_mtime_nsec) == sizeof(((struct statx *)0)->stx_mtime.tv_nsec),
+               "struct lb_statx's mtime does not match the kernel's struct statx");
 
 /* siginfo_t is a typedef, and its fields past the first three are macros
  * into a union: compared one by one. */

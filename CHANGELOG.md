@@ -2,9 +2,13 @@
 
 What changed for someone who uses lightbox, newest first. `ROADMAP.md` has the reasons and the finding each change closes.
 
+## 0.10.0
+
+Not tagged yet: what is written of the next release so far.
+
 ## 0.9.0
 
-Phase 9 of the roadmap: packages. lightbox is something that is installed, and not only built: a release holds a `.deb` for Debian and Ubuntu and an `.xbps` for Void Linux, each for x86_64 and aarch64, with a source archive that builds without a network, the SHA-256 sums of all of them, and a signed record of the run that built each. With them come a manual page, a licence, which is MIT, the documentation in `docs/`, and `SECURITY.md`. Two fixes that writing the documentation found change what lightbox does on a host, and are the first two entries below: it no longer turns IPv4 forwarding on where it makes no firewall rules, and it no longer reads its settings from a home directory. Nothing in this release changes how a container starts or stops: on GitHub's runners a start took a median of 13.5 ms on x86_64 and 17.3 ms on aarch64 in the run of the release commit, and 11.7 and 16.6 in the run before it, which is how far two runs of one binary differ there.
+Tagged `v0.9.0`, at `ac1ba66`. Phase 9 of the roadmap: packages. lightbox is something that is installed, and not only built: a release holds a `.deb` for Debian and Ubuntu and an `.xbps` for Void Linux, each for x86_64 and aarch64, with a source archive that builds without a network, the SHA-256 sums of all of them, and a signed record of the run that built each. With them come a manual page, a licence, which is MIT, the documentation in `docs/`, and `SECURITY.md`. Two fixes that writing the documentation found change what lightbox does on a host, and are the first two entries below: it no longer turns IPv4 forwarding on where it makes no firewall rules, and it no longer reads its settings from a home directory. Nothing in this release changes how a container starts or stops: on GitHub's runners a start took a median of 13.5 ms on x86_64 and 17.3 ms on aarch64 in the run of the release commit, and 11.7 and 16.6 in the run before it, which is how far two runs of one binary differ there.
 
 ### Changes you may have to act on
 
