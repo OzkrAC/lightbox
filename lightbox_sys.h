@@ -126,6 +126,7 @@
 #define LB_SIGCONT                18
 #define LB_SIGTTOU                22
 #define LB_SIGWINCH               28
+#define LB_SIGSYS                 31
 
 /* si_code of a signal that was queued with a value (asm-generic/siginfo.h) */
 #define LB_SI_QUEUE               (-1)

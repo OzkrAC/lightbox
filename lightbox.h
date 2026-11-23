@@ -573,6 +573,10 @@ typedef enum {
 typedef struct {
     tar_source  source;
     void       *from;
+    /* The one descriptor the source reads: the process that unpacks keeps
+     * it, the root's and the pipe it answers on, and closes every other one
+     * before it reads a byte (ROADMAP I.12). */
+    int32_t     source_fd;
     /* Ids are made these more, and with a start that is not 0 one that is
      * not in the 65536 from it ends the unpacking. */
     uint32_t    uid_start;
@@ -827,10 +831,12 @@ void image_notes(const image *img, const image_unpacked *unpacked);
  * what create and base add are told is a base, by mistake */
 bool image_layout_at(const char *dir);
 
-/* What a host tool runs under that reads bytes somebody else wrote, as gzip
- * does a layer: no network of the host's, nobody's ids, no capability, no
- * new privilege, and the allow-list. Ends the process where it cannot. */
-void sandbox_host_tool(void);
+/* What the host's gzip runs under, which reads bytes somebody else wrote: no
+ * network of the host's, nobody's ids, no capability, no new privilege, and
+ * a filter of the calls gzip makes, with execve of program alone, at this
+ * address, which is what the caller then runs (ROADMAP I.12). Ends the
+ * process where it cannot. */
+void sandbox_host_tool(const char *program);
 
 /*
  * What a container is made of is in <container_dir>/<name>/ and is written

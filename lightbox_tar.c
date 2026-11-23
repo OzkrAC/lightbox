@@ -1,4 +1,5 @@
 #include "lightbox.h"
+#include "lightbox_seccomp.h"
 
 #include <lightc/memory.h>
 
@@ -715,6 +716,8 @@ int tar_write_tree(tar_writer *w, int32_t dirfd) {
 enum read_failure {
     READ_OK,
     READ_PROCESS,
+    READ_CALL,
+    READ_CONFINE,
     READ_NO_ROOT,
     READ_NO_MEMORY,
     READ_SOURCE,
@@ -752,6 +755,8 @@ enum read_failure {
  * read where the text speaks of what follows or of the archive. */
 static const char *const read_failures[READ_FAILURES] = {
     [READ_PROCESS]       = "the process that unpacks ended without a result",
+    [READ_CALL]          = "the process that unpacks made a system call that unpacking does not make, and was ended",
+    [READ_CONFINE]       = "the process that unpacks could not be held to what unpacking needs",
     [READ_NO_ROOT]       = "the directory could not be made the root of the process that unpacks",
     [READ_NO_MEMORY]     = "there is no memory to unpack it with",
     [READ_SOURCE]        = "the archive could not be read",
@@ -1925,6 +1930,41 @@ static int unpack(struct in *in) {
     }
 }
 
+/*
+ * What the process that unpacks is held to before it reads a byte (ROADMAP
+ * I.12): every descriptor closed but the archive's, the root's and the pipe
+ * it answers on, and a seccomp filter of the calls the reader makes, which
+ * ends it at any other. Nothing of an archive is run; this is for a fault of
+ * the reader's own that bytes of an archive could reach, which would then
+ * have little more than the directory it fills. 0, or -1.
+ */
+static int confine(int32_t source, int32_t root, int32_t say) {
+    int32_t keep[3] = { source, root, say };
+    for (int i = 0; i < 3; i++)
+        for (int j = i + 1; j < 3; j++)
+            if (keep[j] < keep[i]) {
+                int32_t t = keep[i];
+                keep[i] = keep[j];
+                keep[j] = t;
+            }
+    if (keep[0] < 0 || keep[0] == keep[1] || keep[1] == keep[2])
+        return -1;
+    uint32_t from = 0;
+    for (int i = 0; i < 3; i++) {
+        if ((uint32_t)keep[i] > from && lb_sys_close_range(from, (uint32_t)keep[i] - 1, 0) < 0)
+            return -1;
+        from = (uint32_t)keep[i] + 1;
+    }
+    if (lb_sys_close_range(from, ~0U, 0) < 0)
+        return -1;
+    static struct lb_sock_filter filter[LB_SECCOMP_UNPACK_PROG_LEN];
+    struct lb_sock_fprog prog = { .len = (uint16_t)lb_seccomp_build_unpack(filter), .filter = filter };
+    if (prog.len != LB_SECCOMP_UNPACK_PROG_LEN || lc_kernel_prctl(LB_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 ||
+        lc_kernel_prctl(LB_PR_SET_SECCOMP, LB_SECCOMP_MODE_FILTER, (uint64_t)&prog, 0, 0) < 0)
+        return -1;
+    return 0;
+}
+
 /* The process that unpacks: it says how it went, and ends. */
 static _Noreturn void unpack_and_end(tar_reader *r, int32_t dirfd, int32_t say) {
     /* this process's own: the one that started it never writes to them */
@@ -1947,7 +1987,10 @@ static _Noreturn void unpack_and_end(tar_reader *r, int32_t dirfd, int32_t say) 
         in.listing = listing.value;
         /* a mode is the archive's, with nothing taken from it */
         (void)lb_sys_umask(0);
-        (void)unpack(&in);
+        if (confine(r->source_fd, (int32_t)root, say) != 0)
+            (void)lose(&in, READ_CONFINE);
+        else
+            (void)unpack(&in);
     }
 
     out.failure = in.failure;
@@ -1992,6 +2035,11 @@ int tar_read_tree(tar_reader *r, int32_t dirfd) {
         }
     }
 
+    /* ended by its filter: a call the reader does not make */
+    if (pid > 0 && status != -1 && (status & 0x7f) == LB_SIGSYS) {
+        r->failure = read_failures[READ_CALL];
+        return -1;
+    }
     /* what came back is not taken on trust */
     if (got != (lc_sysret)sizeof(out) || status != 0 || out.failure >= READ_FAILURES ||
         out.at_len >= TAR_PATH_MAX) {

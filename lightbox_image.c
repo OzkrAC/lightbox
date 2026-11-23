@@ -1319,8 +1319,9 @@ static lc_sysret gzip_start(int32_t blob, int32_t *out) {
         if (lc_kernel_duplicate_fd(blob, STDIN, 0) < 0 || lc_kernel_duplicate_fd(pipe[1], STDOUT, 0) < 0 ||
             lb_sys_close_range(STDERR + 1, ~0u, 0) < 0)
             die("Error: cannot give gzip the layer and a pipe, and nothing else");
-        sandbox_host_tool();
-        lc_sysret failed = exec_program(tool_path_gzip(), argv, TOOL_ENV);
+        const char *gzip = tool_path_gzip();
+        sandbox_host_tool(gzip);
+        lc_sysret failed = exec_program(gzip, argv, TOOL_ENV);
         (void)failed;
         print_str(STDERR, "Error: cannot run gzip to unpack a layer that is compressed\n");
         lc_kernel_exit(127);
@@ -1360,7 +1361,7 @@ int image_unpack(const image *img, int first, int count, const char *dir, tar_in
             break;
         }
 
-        r = (tar_reader){ .source = layer_read, .from = &source, .uid_start = uid_start, .gid_start = gid_start,
+        r = (tar_reader){ .source = layer_read, .from = &source, .source_fd = source, .uid_start = uid_start, .gid_start = gid_start,
                           .into = into };
         int unpacked = tar_read_tree(&r, (int32_t)dirfd);
         bool gzip_failed = false;

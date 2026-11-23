@@ -3,7 +3,12 @@
  * allow-list, and checks their verdict for every syscall number (ROADMAP 2.4
  * and 8.3); for the calls that set a mode, their verdict for every bit of the
  * mode and for the flags of an open (8.2); and for socket and socketpair,
- * both programs' for every family.
+ * both programs' for every family. And the two of what reads bytes from
+ * elsewhere (I.12): that of the process that unpacks an archive, which
+ * allows its calls, mmap without PROT_EXEC, and kills on anything else; and
+ * that of the host's gzip, which allows its calls, execve of one address
+ * alone, ioctl to ask whether a descriptor is a terminal alone, and answers
+ * anything else ENOSYS.
  *
  * The program is built for the architecture named at compile time,
  *
@@ -56,7 +61,7 @@ struct data {
     uint64_t args[6];
 };
 
-static struct lb_sock_filter prog[LB_SECCOMP_PROG_MAX];
+static struct lb_sock_filter prog[LB_SECCOMP_PROG_MAX + LB_SECCOMP_GZIP_PROG_LEN + LB_SECCOMP_UNPACK_PROG_LEN];
 static size_t prog_len;
 static int allow_mode;          /* the program being checked is the allow-list */
 static unsigned long verdicts, failures;
@@ -379,9 +384,142 @@ static void check_program(int allow) {
            verdicts - verdicts_before, failures - failures_before);
 }
 
+static int in_table(const uint32_t *table, size_t len, uint32_t nr) {
+    for (size_t i = 0; i < len; i++)
+        if (table[i] == nr)
+            return 1;
+    return 0;
+}
+
+/* What is said of a program of I.12 that was checked */
+static void said(const char *which, unsigned long verdicts_before, unsigned long failures_before) {
+    printf("  %s %s: %zu instructions, %lu verdicts checked, %lu wrong\n", TARGET, which, prog_len,
+           verdicts - verdicts_before, failures - failures_before);
+}
+
+/* the head both begin with: another ABI, and on x86_64 the x32 range, killed */
+static void check_head(void) {
+    static const uint32_t foreign[] = { OTHER_ARCH, AUDIT_ARCH_I386, AUDIT_ARCH_ARM, 0 };
+    struct data d;
+    for (size_t f = 0; f < sizeof(foreign) / sizeof(foreign[0]); f++)
+        for (uint32_t nr = 0; nr < NR_LIMIT; nr++) {
+            d = (struct data){ .nr = nr, .arch = foreign[f] };
+            expect("foreign architecture", &d, LB_SECCOMP_RET_KILL_PROCESS);
+        }
+#if defined(LB_SECCOMP_TARGET_X86_64)
+    for (uint32_t nr = 0; nr < NR_LIMIT; nr++) {
+        d = (struct data){ .nr = LB_X32_SYSCALL_BIT | nr, .arch = LB_SECCOMP_AUDIT_ARCH };
+        expect("x32 number", &d, LB_SECCOMP_RET_KILL_PROCESS);
+    }
+#endif
+}
+
+static void check_unpack(void) {
+    prog_len = lb_seccomp_build_unpack(prog);
+    if (prog_len != LB_SECCOMP_UNPACK_PROG_LEN) {
+        printf("  %s unpack: built %zu instructions, its length says %zu\n", TARGET, prog_len,
+               (size_t)LB_SECCOMP_UNPACK_PROG_LEN);
+        failures++;
+        return;
+    }
+    unsigned long v = verdicts, f = failures;
+    check_head();
+    for (size_t i = 0; i < LB_SECCOMP_UNPACK_TABLE_LEN; i++)
+        if (LB_SECCOMP_UNPACK_TABLE[i] == LB_SECCOMP_NR_MMAP) {
+            printf("  mmap is in the table of the process that unpacks, which has a rule for it\n");
+            failures++;
+        }
+    for (uint32_t nr = 0; nr < NR_LIMIT; nr++) {
+        struct data d = { .nr = nr, .arch = LB_SECCOMP_AUDIT_ARCH };
+        uint32_t want = in_table(LB_SECCOMP_UNPACK_TABLE, LB_SECCOMP_UNPACK_TABLE_LEN, nr) ? LB_SECCOMP_RET_ALLOW
+                                                                                            : LB_SECCOMP_RET_KILL_PROCESS;
+        if (nr == LB_SECCOMP_NR_MMAP)
+            want = LB_SECCOMP_RET_ALLOW;
+        expect("a call of the process that unpacks", &d, want);
+        if (nr != LB_SECCOMP_NR_MMAP) {
+            for (int i = 0; i < 6; i++)
+                d.args[i] = UINT64_MAX;
+            expect("a call of the process that unpacks, with arguments", &d, want);
+        }
+    }
+    /* mmap: pages of data, never of code, whatever else its arguments say */
+    for (uint32_t prot = 0; prot < 16; prot++) {
+        struct data d = { .nr = LB_SECCOMP_NR_MMAP, .arch = LB_SECCOMP_AUDIT_ARCH, .args = { 0, 1 << 20, prot, 0x22, UINT64_MAX, 0 } };
+        expect(prot & LB_SECCOMP_PROT_EXEC ? "mmap with PROT_EXEC" : "mmap without PROT_EXEC", &d,
+               prot & LB_SECCOMP_PROT_EXEC ? LB_SECCOMP_RET_KILL_PROCESS : LB_SECCOMP_RET_ALLOW);
+        d.args[2] = prot | 0xffffff00U;
+        expect("mmap with other bits", &d, prot & LB_SECCOMP_PROT_EXEC ? LB_SECCOMP_RET_KILL_PROCESS : LB_SECCOMP_RET_ALLOW);
+    }
+    /* what it never does */
+    static const uint32_t never[] = { LB_SECCOMP_NR_EXECVE, LB_SECCOMP_NR_IOCTL, LB_SECCOMP_NR_SOCKET, LB_SECCOMP_NR_CLONE };
+    for (size_t i = 0; i < sizeof(never) / sizeof(never[0]); i++) {
+        struct data d = { .nr = never[i], .arch = LB_SECCOMP_AUDIT_ARCH };
+        expect("a call the reader never makes", &d, LB_SECCOMP_RET_KILL_PROCESS);
+    }
+    said("process that unpacks", v, f);
+}
+
+static void check_gzip(void) {
+    /* an address of a path above 4 GiB, so that both halves are held to it */
+    const uint64_t path = 0x00007f12345678a0ULL;
+    prog_len = lb_seccomp_build_gzip(prog, path);
+    if (prog_len != LB_SECCOMP_GZIP_PROG_LEN) {
+        printf("  %s gzip: built %zu instructions, its length says %zu\n", TARGET, prog_len, (size_t)LB_SECCOMP_GZIP_PROG_LEN);
+        failures++;
+        return;
+    }
+    unsigned long v = verdicts, f = failures;
+    check_head();
+    for (uint32_t nr = 0; nr < NR_LIMIT; nr++) {
+        if (nr == LB_SECCOMP_NR_EXECVE || nr == LB_SECCOMP_NR_IOCTL)
+            continue;
+        struct data d = { .nr = nr, .arch = LB_SECCOMP_AUDIT_ARCH };
+        uint32_t want = in_table(LB_SECCOMP_GZIP_TABLE, LB_SECCOMP_GZIP_TABLE_LEN, nr) ? LB_SECCOMP_RET_ALLOW
+                                                                                        : DENY(LB_SC_ENOSYS);
+        expect("a call of gzip", &d, want);
+        for (int i = 0; i < 6; i++)
+            d.args[i] = path;
+        expect("a call of gzip, with arguments", &d, want);
+    }
+    if (in_table(LB_SECCOMP_GZIP_TABLE, LB_SECCOMP_GZIP_TABLE_LEN, LB_SECCOMP_NR_EXECVE) ||
+        in_table(LB_SECCOMP_GZIP_TABLE, LB_SECCOMP_GZIP_TABLE_LEN, LB_SECCOMP_NR_IOCTL)) {
+        printf("  execve or ioctl is in the table of gzip, which has a rule for each\n");
+        failures++;
+    }
+    /* execve of that address and of no other, nor of one that has a half of it */
+    struct data d = { .nr = LB_SECCOMP_NR_EXECVE, .arch = LB_SECCOMP_AUDIT_ARCH, .args = { path, 1, 2 } };
+    expect("execve of the path it was given", &d, LB_SECCOMP_RET_ALLOW);
+    static const uint64_t others[] = { 0, path + 1, path & 0xffffffffULL, path & ~0xffffffffULL,
+                                       (path << 32) | (path >> 32), UINT64_MAX };
+    for (size_t i = 0; i < sizeof(others) / sizeof(others[0]); i++) {
+        d.args[0] = others[i];
+        expect("execve of another path", &d, DENY(LB_SC_EPERM));
+    }
+    d = (struct data){ .nr = LB_SECCOMP_NR_EXECVE, .arch = LB_SECCOMP_AUDIT_ARCH, .args = { 1, path, path } };
+    expect("execve with the path in another argument", &d, DENY(LB_SC_EPERM));
+    /* ioctl: whether a descriptor is a terminal, and nothing else */
+    static const uint32_t requests[] = { 0x5401, 0x5412 /* TIOCSTI */, 0x5402, 0x541b /* FIONREAD */, 0, 0xffffffffU };
+    for (size_t i = 0; i < sizeof(requests) / sizeof(requests[0]); i++) {
+        d = (struct data){ .nr = LB_SECCOMP_NR_IOCTL, .arch = LB_SECCOMP_AUDIT_ARCH, .args = { 2, requests[i], 0 } };
+        expect(requests[i] == LB_SECCOMP_TCGETS ? "ioctl TCGETS" : "another ioctl", &d,
+               requests[i] == LB_SECCOMP_TCGETS ? LB_SECCOMP_RET_ALLOW : DENY(LB_SC_ENOTTY));
+    }
+    d = (struct data){ .nr = LB_SECCOMP_NR_IOCTL, .arch = LB_SECCOMP_AUDIT_ARCH, .args = { LB_SECCOMP_TCGETS, 0x5412, 0 } };
+    expect("ioctl with TCGETS in another argument", &d, DENY(LB_SC_ENOTTY));
+    /* what it may not do */
+    static const uint32_t never[] = { LB_SECCOMP_NR_SOCKET, LB_SECCOMP_NR_CLONE };
+    for (size_t i = 0; i < sizeof(never) / sizeof(never[0]); i++) {
+        d = (struct data){ .nr = never[i], .arch = LB_SECCOMP_AUDIT_ARCH };
+        expect("a call gzip may not make", &d, DENY(LB_SC_ENOSYS));
+    }
+    said("gzip", v, f);
+}
+
 int main(void) {
     check_tables();
     check_program(0);
     check_program(1);
+    check_unpack();
+    check_gzip();
     return failures ? 1 : 0;
 }

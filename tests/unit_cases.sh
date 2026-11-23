@@ -4626,14 +4626,19 @@ check "what Python's reader takes of 3000 texts, and gives, is what this one doe
 
 # I.6: a layer that is compressed is unpacked by the host's gzip, which reads
 # what somebody else wrote. What it runs under: nobody's ids and no group
-# besides, no capability in any set, no new privilege, the allow-list, and a
-# network of its own with nothing in it but its loopback.
+# besides, no capability in any set, no new privilege, a seccomp filter, and
+# a network of its own with nothing in it but its loopback. Since I.12 the
+# filter is gzip's own, which leaves it its calls and no other program: what
+# it runs under is seen through gzip itself, which with -dcf gives a file
+# that is not compressed as it is, here those of /proc of its own process. A
+# shell does not get as far as a second program.
 tool_sandbox_case() {
-    out=$("$UNIT" tool-sandbox "$SH" -c "id -u; id -g; id -G; grep -E \"^(Cap(Inh|Prm|Eff|Bnd|Amb)|NoNewPrivs|Seccomp):\" /proc/self/status" 2>&1 | tr -s "\t" " ")
+    status() { "$UNIT" tool-sandbox "$GZIP" -dcf /proc/self/status 2>&1 | tr -s "\t" " "; }
+    out=$(status | grep -E "^(Uid|Gid|Groups|Cap(Inh|Prm|Eff|Bnd|Amb)|NoNewPrivs|Seccomp):")
     printf "%s\n" "$out"
-    [ "$out" = "65534
-65534
-65534
+    [ "$out" = "Uid: 65534 65534 65534 65534
+Gid: 65534 65534 65534 65534
+Groups: 
 CapInh: 0000000000000000
 CapPrm: 0000000000000000
 CapEff: 0000000000000000
@@ -4641,24 +4646,35 @@ CapBnd: 0000000000000000
 CapAmb: 0000000000000000
 NoNewPrivs: 1
 Seccomp: 2" ] || { echo "a host tool is not held to that"; exit 1; }
-    links=$("$UNIT" tool-sandbox "$SH" -c "sed -n \"s/^ *\\([^ :]*\\):.*/\\1/p\" /proc/net/dev" 2>&1 | paste -sd" " -)
+    links=$("$UNIT" tool-sandbox "$GZIP" -dcf /proc/self/net/dev 2>&1 | sed -n "s/^ *\([^ :]*\):.*/\1/p" | paste -sd" " -)
     [ "$links" = lo ] || { echo "a host tool has more of a network than a loopback: $links"; exit 1; }
-    # what is no root of its own may not write what root may
-    : > "$D/roots" && chmod 600 "$D/roots"
-    "$UNIT" tool-sandbox "$SH" -c "echo x > \"$D/roots\"" 2>/dev/null && { echo "a host tool wrote a file of root's"; exit 1; }
+    # what is no root of its own may not read what root may
+    echo secret > "$D/roots" && chmod 600 "$D/roots"
+    out=$("$UNIT" tool-sandbox "$GZIP" -dcf "$D/roots" 2>&1) && { echo "a host tool read a file of root's: $out"; exit 1; }
+    case $out in *secret*) echo "a host tool read a file of root's"; exit 1 ;; esac
+    # it unpacks what it is there for, from its standard input to its standard output
+    printf "layer\n%.0s" $(seq 1 3000) | gzip -c > "$D/layer.gz" && chmod 644 "$D/layer.gz" && chmod 755 "$D"
+    [ "$("$UNIT" tool-sandbox "$GZIP" -dc < "$D/layer.gz" | wc -l)" = 3000 ] || { echo "gzip does not unpack under its filter"; exit 1; }
+    # and no second program is started: the path it was given is the one execve takes
+    out=$("$UNIT" tool-sandbox "$SH" -c "exec \"$SH\" -c \"echo second\"" 2>&1)
+    printf "%s\n" "$out" | tail -n 1
+    case $out in *second*) echo "a second program was started under the filter of a host tool"; exit 1 ;; esac
     exit 0
 }
 t_tool_sandbox() {
-    in_namespace_with_ids "SH=$(printf %q "$SH"); $(declare -f tool_sandbox_case); tool_sandbox_case"
+    command -v gzip >/dev/null || { echo "no gzip here"; return 77; }
+    in_namespace_with_ids "SH=$(printf %q "$SH") GZIP=$(printf %q "$(command -v gzip)"); $(declare -f tool_sandbox_case); tool_sandbox_case"
 }
 # Where nobody has no id, in a user namespace that an ordinary user made of
 # one id, the ids stay, and the rest holds all the same. Without the right to
 # a network of its own, which an ordinary user has not, nothing is run.
 t_tool_sandbox_without_ids() {
     unshare -r --mount true 2>/dev/null || { echo "user namespaces with capabilities are not available to this user"; return 77; }
-    out=$(unshare -r "$UNIT" tool-sandbox "$SH" -c 'id -u; grep -E "^(Cap(Prm|Eff|Bnd)|NoNewPrivs|Seccomp):" /proc/self/status' 2>&1 | tr -s '\t' ' ')
+    command -v gzip >/dev/null || { echo "no gzip here"; return 77; }
+    out=$(unshare -r "$UNIT" tool-sandbox "$(command -v gzip)" -dcf /proc/self/status 2>&1 | tr -s '\t' ' ' |
+          grep -E "^(Uid|Cap(Prm|Eff|Bnd)|NoNewPrivs|Seccomp):")
     printf '%s\n' "$out"
-    [ "$out" = '0
+    [ "$out" = 'Uid: 0 0 0 0
 CapPrm: 0000000000000000
 CapEff: 0000000000000000
 CapBnd: 0000000000000000
@@ -4747,6 +4763,37 @@ t_image_base() {
         tar_helpers; untar_helpers; image_base_case"
 }
 check "an image's layers are unpacked into a snapshot once, which is found by them after" t_image_base
+
+# I.12: the process that unpacks is held to what unpacking needs before it
+# reads a byte of the archive. Every archive of I.3's cases gives what it
+# gave, which those cases show, as each is unpacked by such a process now.
+# Here: of the first 1024 descriptors it has three, the archive's, the
+# root's and the pipe it answers on, however many the command had open; and
+# a call the reader never makes ends it, which the command says as a failure
+# of the unpacking, with nothing more made.
+untar_held_case() {
+    cd "$D" || exit 1
+    mkdir -p tree/sub out.1 out.2 out.3 && echo x > tree/sub/file || exit 1
+    "$UNIT" tar tree a.tar > /dev/null || exit 1
+    bad=0
+    exec 5< a.tar 6< a.tar 9< /dev/null
+    said=$("$UNIT" untar-held descriptors a.tar out.1) || { echo "with more descriptors open: $said"; bad=1; }
+    [ "$(cat out.1/sub/file 2>/dev/null)" = x ] || { echo "it was not unpacked"; bad=1; }
+    exec 5<&- 6<&- 9<&-
+    said=$("$UNIT" untar-held call a.tar out.2)
+    rc=$?
+    echo "$said"
+    [ $rc -ne 0 ] && [ "$said" = "failed: : the process that unpacks made a system call that unpacking does not make, and was ended" ] ||
+        { echo "a call the reader does not make: status $rc"; bad=1; }
+    [ -z "$(ls -A out.2)" ] || { echo "it made something before the call"; bad=1; }
+    # and the same archive as the reader has it
+    "$UNIT" untar a.tar out.3 > /dev/null && [ "$(cat out.3/sub/file)" = x ] || { echo "the archive is not unpacked as it was"; bad=1; }
+    exit $bad
+}
+t_untar_held() {
+    in_namespace_with_ids "$(declare -f untar_held_case); untar_held_case"
+}
+check 'the process that unpacks has three descriptors, and a call the reader never makes ends it' t_untar_held
 
 # An overlay of a container is mounted with redirect_dir and metacopy off
 # (ROADMAP I.14), whatever the host's settings are, and an upper directory

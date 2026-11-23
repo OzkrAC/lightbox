@@ -823,14 +823,38 @@ static int unit_tar_write(void *to, const void *data, size_t len) {
     return lc_kernel_write_all(sink->fd, data, len) < 0 ? -1 : 0;
 }
 
-/* "unit untar": the archive from a file, in pieces of no more than a length */
+/* "unit untar": the archive from a file, in pieces of no more than a length.
+ * "unit untar-held": the same, and the first read, which is made in the
+ * process that unpacks once it is held to what unpacking needs (ROADMAP
+ * I.12), looks at that: with "descriptors", how many it has open of the
+ * first 1024, which statx, one of its calls, tells, and the archive cannot
+ * be read unless they are three; with "call", a call that the reader never
+ * makes, getpid, which its filter ends it at. */
 struct unit_tar_source {
     int32_t  fd;
     uint32_t piece;
+    int      probe;     /* 0, or 1 descriptors, 2 a call */
+    bool     probed;
 };
 
+/* set by "untar-held" for "untar" */
+static struct unit_tar_source *unit_source;
+
 static int64_t unit_tar_read(void *from, void *data, size_t len) {
-    const struct unit_tar_source *source = from;
+    struct unit_tar_source *source = from;
+    if (source->probe && !source->probed) {
+        source->probed = true;
+        if (source->probe == 2)
+            (void)lc_kernel_get_process_id();
+        int open = 0;
+        for (int32_t fd = 0; fd < 1024; fd++) {
+            struct lb_statx st;
+            if (lb_sys_statx(fd, "", LB_AT_EMPTY_PATH, LB_STATX_TYPE, &st) == 0)
+                open++;
+        }
+        if (open != 3)
+            return -1;
+    }
     return lc_kernel_read_retry(source->fd, data, source->piece && source->piece < len ? source->piece : len);
 }
 
@@ -1252,7 +1276,7 @@ int main(int argc, char **argv, char **envp) {
         die2("unit: cannot execute ", argv[2]);
     }
     if (argc >= 3 && streq(argv[1], "tool-sandbox")) {
-        sandbox_host_tool();
+        sandbox_host_tool(argv[2]);
         exec_program(argv[2], (const char *const *)(argv + 2), TOOL_ENV);
         die2("unit: cannot execute ", argv[2]);
     }
@@ -1790,9 +1814,21 @@ int main(int argc, char **argv, char **envp) {
         put_line("sha256 ", hex);
         return 0;
     }
+    if (argc == 5 && streq(argv[1], "untar-held")) {
+        static struct unit_tar_source from;
+        static char *again[5];
+        if (!streq(argv[2], "descriptors") && !streq(argv[2], "call"))
+            die("usage: unit untar-held descriptors|call <archive> <dir>");
+        from.probe = streq(argv[2], "descriptors") ? 1 : 2;
+        unit_source = &from;
+        again[0] = argv[0], again[1] = "untar", again[2] = argv[3], again[3] = argv[4], again[4] = NULL;
+        argv = again;
+        argc = 4;
+    }
     if (argc >= 4 && argc <= 8 && streq(argv[1], "untar")) {
         static tar_reader r;
-        static struct unit_tar_source from;
+        static struct unit_tar_source plain;
+        struct unit_tar_source *source = unit_source ? unit_source : &plain;
         bool usage = argc == 6;
         if (argc >= 5) {
             if (streq(argv[4], "upper"))
@@ -1804,7 +1840,7 @@ int main(int argc, char **argv, char **envp) {
         }
         if (argc >= 7 && (!parse_u32_text(argv[5], &r.uid_start) || !parse_u32_text(argv[6], &r.gid_start)))
             usage = true;
-        if (argc == 8 && (!parse_u32_text(argv[7], &from.piece) || !from.piece))
+        if (argc == 8 && (!parse_u32_text(argv[7], &source->piece) || !source->piece))
             usage = true;
         if (usage)
             die("usage: unit untar <archive> <dir> [tree|upper|upper-user [<uid_start> <gid_start> [<piece>]]]");
@@ -1814,9 +1850,10 @@ int main(int argc, char **argv, char **envp) {
         lc_sysret dirfd = lc_kernel_open_file(argv[3], O_RDONLY | O_DIRECTORY, 0);
         if (dirfd < 0)
             die2("unit: cannot open the directory ", argv[3]);
-        from.fd = (int32_t)in;
+        source->fd = (int32_t)in;
         r.source = unit_tar_read;
-        r.from = &from;
+        r.from = source;
+        r.source_fd = (int32_t)in;
         if (tar_read_tree(&r, (int32_t)dirfd) != 0) {
             put("failed: ");
             put(r.failed_at);

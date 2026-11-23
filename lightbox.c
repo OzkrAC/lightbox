@@ -815,7 +815,10 @@ static void apply_sandbox(bool allow_list) {
  *     root's is its own;
  *   - no capability, in any set, and none to be had: the bounding set is
  *     emptied and no_new_privs is set;
- *   - the allow-list, as a container has it.
+ *   - a seccomp filter of gzip's calls (ROADMAP I.12), with execve of
+ *     program alone, which is then run, and every other call answered
+ *     ENOSYS: tighter than the allow-list a container has, which this was
+ *     before.
  *
  * In a user namespace that maps no id for nobody, as one that an ordinary
  * user made for a test has none, the ids stay: its root is that user, and
@@ -823,7 +826,7 @@ static void apply_sandbox(bool allow_list) {
  */
 #define NOBODY_ID 65534u
 
-void sandbox_host_tool(void) {
+void sandbox_host_tool(const char *program) {
     if (lc_kernel_unshare(CLONE_NEWNET | CLONE_NEWIPC) < 0)
         die("Error: cannot give a host tool a network of its own, with nothing in it");
     for (int cap = 0; cap < 64; cap++) {
@@ -853,7 +856,16 @@ void sandbox_host_tool(void) {
         die("Error: failed to clear a host tool's ambient capability set");
     if (lc_kernel_prctl(LB_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
         die("Error: failed to enable no_new_privs for a host tool");
-    apply_seccomp(true);
+    /* the calls of gzip, and of no other program: tighter than the allow-list
+     * a container has, which was this filter before I.12 */
+    static struct lb_sock_filter filter[LB_SECCOMP_GZIP_PROG_LEN];
+    struct lb_sock_fprog prog = {
+        .len = (uint16_t)lb_seccomp_build_gzip(filter, (uint64_t)(uintptr_t)program),
+        .filter = filter,
+    };
+    if (prog.len != LB_SECCOMP_GZIP_PROG_LEN ||
+        lc_kernel_prctl(LB_PR_SET_SECCOMP, LB_SECCOMP_MODE_FILTER, (uint64_t)&prog, 0, 0) < 0)
+        die("Error: failed to install the seccomp filter of a host tool");
 }
 
 /* ─── Security: /proc masking ───────────────────────────────────────────── */

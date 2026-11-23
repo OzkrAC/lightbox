@@ -382,7 +382,11 @@ layer, and the container's own files.
 Any other image is one snapshot.
 A layer compressed with gzip is unpacked through
 .BR gzip (1),
-which runs as nobody, without capabilities or a network.
+which runs as nobody, without capabilities or a network, under a seccomp
+filter of its own calls.
+The process that unpacks a layer has its root in the directory it fills, no
+descriptor but the layer's, the root's and the pipe it answers on, and a
+seccomp filter of the calls the reader makes.
 The limits that no option gives are the image's, where they are no more than
 .I lightbox.conf
 gives a new container; what is more is said and not taken, and the option
