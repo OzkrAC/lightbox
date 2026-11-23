@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, track-i]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -49,8 +49,14 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: recursive
+      # apt asks a mirror again that does not answer for 30 s, three times. In
+      # the first run of this workflow for Track I, on 2026-11-23, this step
+      # of two jobs on x86_64 took the job's 15 minutes and was cancelled,
+      # while the same step of other jobs took 10 s to 3 minutes.
       - name: Install the toolchain
         run: |
+          echo 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";' |
+            sudo tee /etc/apt/apt.conf.d/80-lightbox-ci > /dev/null
           sudo apt-get update
           sudo apt-get install -y ninja-build uidmap libarchive-tools skopeo ${{ matrix.packages }}
       # Ubuntu's AppArmor keeps unprivileged processes from using user
@@ -108,6 +114,8 @@ jobs:
       # namespaces: the service that the package starts is not needed.
       - name: Install the toolchain and what the suite needs
         run: |
+          echo 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";' |
+            sudo tee /etc/apt/apt.conf.d/80-lightbox-ci > /dev/null
           sudo apt-get update
           sudo apt-get install -y ninja-build gcc-14 busybox-static iproute2 iptables nftables util-linux strace squid skopeo
           sudo systemctl disable --now squid || true
@@ -182,6 +190,8 @@ jobs:
           submodules: recursive
       - name: Install the toolchain
         run: |
+          echo 'Acquire::Retries "3"; Acquire::http::Timeout "30"; Acquire::https::Timeout "30";' |
+            sudo tee /etc/apt/apt.conf.d/80-lightbox-ci > /dev/null
           sudo apt-get update
           sudo apt-get install -y ninja-build gcc-aarch64-linux-gnu
       - name: Build

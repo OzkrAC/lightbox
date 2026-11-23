@@ -4006,8 +4006,12 @@ untar_others_case() {
         # bsdtar writes a socket's name where GNU tar leaves it out, and no
         # program has a kind of entry for one: the trees it is given have none
         python3 -I -c "import os; os.unlink(\"tree/sub/socket\")"
+        # its own choice is pax where an entry needs it and ustar where not,
+        # and ustar has a time in whole seconds, which same_tree compares:
+        # to the nanosecond the times are the tree's with --format=pax alone
+        # (found by CI's first run of this case, on 2026-11-23)
         bsdtar -cf bsd.tar -C tree . 2>/dev/null
-        unpacks "bsdtar, its own choice" bsd.tar tree "attributes times"
+        unpacks "bsdtar, its own choice" bsd.tar tree "attributes"
         bsdtar --format=pax -cf bsd-pax.tar -C tree . 2>/dev/null
         unpacks "bsdtar, pax" bsd-pax.tar tree "attributes times"
         bsdtar --format=gnutar -cf bsd-gnu.tar -C tree . 2>/dev/null

@@ -58,6 +58,14 @@ sandbox() {
 
 lb() { HOME="$W/home" LIGHTBOX_CONFIG="$CONF" "$LB" "$@"; }
 
+# skopeo with nothing of the caller's environment but PATH: what it keeps and
+# what it looks for, a registry's password among it, is under the case's own
+# directory, whatever HOME and XDG_CONFIG_HOME say where the suite runs.
+skopeo_here() {
+    mkdir -p "$W/home/run" &&
+        env -i PATH="$PATH" HOME="$W/home" XDG_RUNTIME_DIR="$W/home/run" XDG_CONFIG_HOME="$W/home/.config" skopeo "$@"
+}
+
 # Succeeds when the command fails. Output is kept for the report.
 refused() { ! "$@"; }
 
@@ -2415,13 +2423,13 @@ t_export_image() {
     # when it is told to leave a layer that is not compressed as it is
     if command -v skopeo >/dev/null 2>&1; then
         out=$(python3 -I "$IMAGE_CHECK" "$W/image") || return 1
-        HOME="$W/home" skopeo inspect "oci:$W/image" > "$W/skopeo.out" 2>&1 || { cat "$W/skopeo.out"; echo "skopeo does not read the image"; return 1; }
+        skopeo_here inspect "oci:$W/image" > "$W/skopeo.out" 2>&1 || { cat "$W/skopeo.out"; echo "skopeo does not read the image"; return 1; }
         cat "$W/skopeo.out"
         grep -q "\"$layer\"" "$W/skopeo.out" || { echo "skopeo does not find the layer"; return 1; }
         grep -q "\"Digest\": \"$(printf '%s\n' "$out" | sed -n 's/^manifest //p')\"" "$W/skopeo.out" ||
             { echo "skopeo reads another manifest than export named"; return 1; }
         if skopeo copy --help 2>&1 | grep -q -- --dest-oci-accept-uncompressed-layers; then
-            HOME="$W/home" skopeo --insecure-policy copy --dest-oci-accept-uncompressed-layers "oci:$W/image" "oci:$W/copied" \
+            skopeo_here --insecure-policy copy --dest-oci-accept-uncompressed-layers "oci:$W/image" "oci:$W/copied" \
                 > "$W/skopeo.out" 2>&1 || { cat "$W/skopeo.out"; echo "skopeo does not copy the image"; return 1; }
             diff -r "$W/image/blobs" "$W/copied/blobs" || { echo "skopeo's copy of the image has other blobs"; return 1; }
         else
@@ -2835,8 +2843,9 @@ t_registry() {
     while [ ! -s "$W/port" ] && [ $n -lt 50 ]; do sleep 0.1; n=$((n + 1)); done
     port=$(cat "$W/port" 2>/dev/null)
     carried() {
-        [ -n "$port" ] || { cat "$W/registry.out"; echo "the registry did not start"; return 1; }
-        copy() { HOME="$W/home" timeout 120 skopeo --insecure-policy copy --dest-tls-verify=false --src-tls-verify=false "$@" 2>&1; }
+        [ -n "$port" ] && mkdir -p "$W/home/run" || { cat "$W/registry.out"; echo "the registry did not start"; return 1; }
+        copy() { timeout 120 env -i PATH="$PATH" HOME="$W/home" XDG_RUNTIME_DIR="$W/home/run" XDG_CONFIG_HOME="$W/home/.config" \
+                     skopeo --insecure-policy copy --dest-tls-verify=false --src-tls-verify=false "$@" 2>&1; }
         copy "oci:$W/one" "docker://127.0.0.1:$port/boxes/one:latest" || { echo "skopeo did not copy the image to the registry"; return 1; }
         sent=$(grep -c '^PATCH ' "$W/registry.log")
         copy "oci:$W/two" "docker://127.0.0.1:$port/boxes/two:latest" || { echo "skopeo did not copy the second image"; return 1; }

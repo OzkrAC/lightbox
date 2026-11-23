@@ -3646,8 +3646,9 @@ t_import() {
     }
     OVERLAY=1
     up imp --mem 200M --ttl 2h || return 1
+    # no mode with the setgid bit: a container's seccomp filter refuses one
     sh_in imp 'mkdir -p /work/sub && echo mine > /work/file && ln -s file /work/link && ln /work/file /work/sub/second &&
-        chown 1000:1001 /work/sub && chmod 2750 /work/sub && echo more >> /etc/passwd && rm /etc/group &&
+        chown 1000:1001 /work/sub && chmod 750 /work/sub && echo more >> /etc/passwd && rm /etc/group &&
         rm -r /lbt && mkdir /lbt && echo again > /lbt/again && chown 12:34 /lbt/again && touch -d "2020-02-02 02:02:02" /work/file' || return 1
     first=$(shown_in imp) && [ -n "$first" ] || return 1
     printf '%s\n' "$first"
@@ -3732,8 +3733,12 @@ t_registry() {
         [ -n "$port" ] || { cat "$T/carry/registry.out"; echo "the registry did not start"; return 1; }
         python3 -I -c 'import socket, sys; socket.create_connection(("127.0.0.1", int(sys.argv[1])), 3)' "$port" 2>/dev/null ||
             { echo "the loopback reaches no listener in the suite's namespace"; return 77; }
+        # with nothing of the caller's environment: an XDG_CONFIG_HOME in it, as
+        # CI's runners have one, names a directory of another user's, which
+        # skopeo looks in for a registry's password and ends when it may not
         copy() {
-            setpriv --reuid=4711 --regid=4711 --clear-groups env HOME="$T/carry/home" XDG_RUNTIME_DIR="$T/carry/run" TMPDIR="$T/carry/tmp" \
+            setpriv --reuid=4711 --regid=4711 --clear-groups env -i PATH="$PATH" HOME="$T/carry/home" \
+                XDG_RUNTIME_DIR="$T/carry/run" XDG_CONFIG_HOME="$T/carry/home/.config" TMPDIR="$T/carry/tmp" \
                 timeout 120 skopeo --insecure-policy copy --dest-tls-verify=false --src-tls-verify=false "$@" </dev/null
         }
         copy "oci:$T/carry/image" "docker://127.0.0.1:$port/boxes/reg:latest" || { echo "skopeo did not copy the image to the registry"; return 1; }
