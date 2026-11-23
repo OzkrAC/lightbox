@@ -244,6 +244,25 @@ The other commands that end or change a container are built from these parts:
 | `update` | Takes the lock, writes the new limits into `.conf` first, and then, if the container runs, into `memory.max`, `pids.max` and `cpu.max` of its cgroup. A limit that the running container does not take is said, and holds from its next start |
 | `add-vol`, `rm-vol` | Take the lock and rewrite `.conf`. A container that runs has the change from its next start |
 
+## export and import {#images}
+
+Neither starts anything, and neither runs a tool of the host's but the one named below.
+
+**`export`** holds the container's lock to its end, so that no `start` comes between its files and their image, and refuses one that runs. It writes each layer by walking the tree by descriptors, never by a path it put together, with the entries of a directory in the order of their names' bytes, into a file of a name of its own in `blobs/sha256/`, hashing what it writes; when the layer is whole and on the disk the file is given its digest's name. The configuration and the manifest follow, then `oci-layout`, and `index.json` last: a directory without it is no image. A failure takes away what this export wrote. Into the directory of an export before, the image there is read first as `import` reads one, the snapshot's layer is left where it is, and `index.json` is put in place by a rename, after which the blobs only the old image named are taken away.
+
+**`import`** and **`base import`** read the image as an ordinary user may: the index, the manifest and the configuration through lightbox's JSON reader, every blob held to its size and SHA-256, every layer's blob kept open from then on. Then root is asked for, the store's lock taken, and the snapshot is found by the digests its layers are named by, or made: in `.<id>.new`, renamed when it is whole. `import` goes on as `create` does, with the image in the place of a base. Each layer is unpacked by two processes, or one:
+
+```text
+ lightbox import                     the command, as root
+   ├─ gzip -dc                       for a compressed layer: nobody, no capability, a network of its own,
+   │    stdin: the blob              its own seccomp filter; it writes to a pipe
+   │    stdout: a pipe ─┐
+   └─ lightbox ◀────────┘            the process that unpacks: its root the directory it fills,
+        answers on a pipe            three descriptors, the filter of the reader's calls
+```
+
+The process that unpacks is a fork of the command. It changes its root to the directory it fills, takes its pages, closes every descriptor but the source's, its root's and the pipe it answers on, sets `no_new_privs` and installs `LB_SECCOMP_UNPACK`, which ends it at a call that is not there. Then it reads the archive to its end, hashing every byte, makes each entry in place of what is at its name, and sends back what it made, what it left out, the digest, or what ended it and at which entry. The command holds that digest to the one the configuration names, and holds nothing that came back on trust: a process that ended in another way is a failure. A compressed layer whose snapshot is here is still read through `gzip` and hashed, with nothing written.
+
 ## States {#states}
 
 `ls` and `inspect` show a state for each container. It is what is on record, corrected by what they see: whether the process on record as its init is there, with that PID, that start time and a PID namespace of its own.
@@ -368,12 +387,13 @@ lightbox runs a handful of host tools and no others. Each is looked for at fixed
 | `nft` | The same commands, with `firewall_backend = nftables` | The same, in lightbox's two tables: one `nft list chains` to look, one `nft -f -` to change |
 | `cp` | `create`, `base add` | A snapshot of a base, or a container's copy of it: `cp -a --reflink=auto`, then `cp -a` |
 | `rm` | `rm`, `reset`, `base rm`, and `create` | `rm -rf` of a container's directory, of its layers, of a snapshot, of the four directories of `create`'s trial, and of what a `create` that failed had made |
+| `gzip` | `import` and `base import`, of an image with a compressed layer | `gzip -dc`, with the blob as its standard input and a pipe as its output, as nobody, with no capability, in a network of its own and under a seccomp filter of its own calls, which lets it `execve` that one path ([Security](security.html#import)) |
 
-Whether a tool could be executed at all is learned through a close-on-exec pipe: a successful `execve` closes it, and a failed one is followed by its errno. Everything else is system calls of lightbox's own: namespaces, mounts, cgroups, the bridge and the interfaces over rtnetlink, the user namespace maps, the seccomp and device programs, signals and terminals. Since 0.7 it runs neither `ip` nor `nsenter`. Nothing from an image is run before its `/init.sh`.
+Whether a tool could be executed at all is learned through a close-on-exec pipe: a successful `execve` closes it, and a failed one is followed by its errno. Everything else is system calls of lightbox's own: namespaces, mounts, cgroups, the bridge and the interfaces over rtnetlink, the user namespace maps, the seccomp and device programs, signals and terminals. Since 0.7 it runs neither `ip` nor `nsenter`. Nothing from an image is run before its `/init.sh`, and a tar archive is read and written by lightbox's own code, never by a `tar` of the host's.
 
 ### Private system calls {#syscalls}
 
-lightc wraps the system calls a freestanding program usually needs. lightbox makes some that it does not wrap yet, and `lightbox_sys.h` is the only place in lightbox that may hold a raw system call number: `fcntl`, `flock`, `fsync`, `fchdir`, `chroot`, `getuid`, `geteuid`, `capget`, `capset`, `statfs`, `statx`, `faccessat`, `renameat`, `ppoll`, `getrandom`, `memfd_create`, `execveat`, `bpf`, `pidfd_open`, `pidfd_send_signal`, `open_tree`, `move_mount`, `mount_setattr`, `openat2` and `close_range`, each with its number for x86_64 and for aarch64, beside the kernel constants and structure layouts they take.
+lightc wraps the system calls a freestanding program usually needs. lightbox makes some that it does not wrap yet, and `lightbox_sys.h` is the only place in lightbox that may hold a raw system call number: `fcntl`, `flock`, `fsync`, `fchdir`, `chroot`, `getuid`, `geteuid`, `capget`, `capset`, `statfs`, `statx`, `faccessat`, `renameat`, `ppoll`, `getrandom`, `memfd_create`, `execveat`, `bpf`, `pidfd_open`, `pidfd_send_signal`, `open_tree`, `move_mount`, `mount_setattr`, `openat2`, `close_range`, and for images `fchmod`, `fgetxattr`, `flistxattr`, `fsetxattr`, `linkat`, `umask` and `utimensat`, each with its number for x86_64 and for aarch64, beside the kernel constants and structure layouts they take.
 
 A wrong number does not fail to build; it calls another system call. So `make check-sys` compiles `tests/sys_check.c` and `tests/sys_check_net.c`, which compare every number, constant and layout of `lightbox_sys.h`, every number in the seccomp tables and every constant of the device program with the kernel's own headers, with the native compiler and with each cross compiler that is installed. Nothing is linked or run: a value that differs is a compile error. An entry is deleted when lightc ships the wrapper for it.
 
@@ -387,14 +407,18 @@ A wrong number does not fail to build; it calls another system call. So `make ch
 | `lightbox_container.c` | A container's `.conf`: its one reader and its one writer, and the rules for what a limit, a volume and a `--net` may be, which options, settings and the file are all held to |
 | `lightbox_config.c` | `lightbox.conf`: where it is read from, its settings and their built-in values |
 | `lightbox_state.c` | Where a container's files are, the runtime records, the probe that says whether its init is there, the locks and the listing of containers |
-| `lightbox_base.c` | Base snapshots and the `base` command |
+| `lightbox_base.c` | Base snapshots and the `base` command, and the look through an upper directory for what an overlay left |
+| `lightbox_image.c` | `export`, the reading of an image for `import` and `base import`, the unpacking of its layers, and generations |
+| `lightbox_tar.c` | The tar writer, which writes one tree one way, and the reader, which unpacks in a process of its own that is held to what unpacking needs |
+| `lightbox_json.c` | A strict JSON reader for manifests, indexes and configurations, which refuses a name that is there twice |
+| `lightbox_sha256.c` | SHA-256, as FIPS 180-4 writes it, taking its input in pieces |
 | `lightbox_net.c` | Addresses, the firewall with either backend, `setup`, `reload`, the teardown, and what a start puts in for a container |
 | `lightbox_netlink.c` | rtnetlink: the bridge, the interface pair, addresses and routes, one request at a time |
 | `lightbox_userns.c` | Ranges of ids from `/etc/subuid` and `/etc/subgid`, the maps of a user namespace, and idmapped mounts |
 | `lightbox_audit.c` | The audit log: its lines, as JSON in ASCII, and the filter of `logs --audit` |
 | `lightbox_meta.c` | `ls`, `inspect`, `logs` and `doctor` |
 | `lightbox_util.c` | Text that must arrive whole, numbers and durations, files written in one step, running a tool, `mount`, and the loading of the device program |
-| `lightbox_seccomp.h` | The two seccomp profiles as tables, and the functions that turn them into the program for an architecture |
+| `lightbox_seccomp.h` | The two seccomp profiles as tables, and the functions that turn them into the program for an architecture; and the filters of the process that unpacks a layer and of the host's `gzip` |
 | `lightbox_devices.h` | The devices of a container's `/dev` as one table, and the cgroup device program made from it |
 | `lightbox_sys.h` | The private system call numbers, constants and wrappers |
 | `lightbox.conf.example` | Every setting with its built-in value, which `make install` puts in `/etc/lightbox` |
@@ -457,6 +481,7 @@ The suite does not use the host, and leaves nothing on it. It runs itself again 
 | Option | What it does |
 |---|---|
 | `LIGHTBOX_TEST_ROOTFS=<dir>` | Makes the containers from a copy of that root filesystem and not from the suite's own busybox image. `sudo tests/fetch_image.sh alpine <dir>`, or `debian <dir>`, fetches one of the two images the allow-list is fitted to, pinned by its SHA-256, and unpacks it there |
+| `LIGHTBOX_TEST_IMAGE=<dir>` | An image of a registry's, in the OCI image layout, for the case that makes one a base and runs its own tools. `tests/fetch_image.sh --oci alpine <dir>`, or `debian <dir>`, copies one with `skopeo` by the digest of its manifest, which is pinned. Without it that case is skipped |
 | `LIGHTBOX_TEST_USERNS=overlay` | Makes every container with `--userns` |
 | `LIGHTBOX_TEST_USERNS=copy` | The same with `--copy`, but in the cases about overlays |
 | `LIGHTBOX_TEST_SECCOMP=deny` | Makes every container with `--seccomp deny`, but where a case chooses the profile; alone, or with either of the two above |
@@ -476,7 +501,7 @@ The suite does not use the host, and leaves nothing on it. It runs itself again 
 | Checks (x86_64) | `ubuntu-24.04`, GCC 14, with the aarch64 cross compiler installed | `make`, then `make check`, so `check-sys` covers both architectures |
 | Checks (x86_64 with GCC 13) | `ubuntu-24.04`, the GCC that Ubuntu installs | `make`, then `make check-sys test`: an analyzer's findings change from release to release, so the gate is not run with this one |
 | Checks (aarch64) | `ubuntu-24.04-arm`, GCC 14 | `make`, then `make check`, natively: an emulator would refuse to install a seccomp filter |
-| Lifecycle suite, six times on each of x86_64 and aarch64 | `ubuntu-24.04` and `ubuntu-24.04-arm` | `sudo make test-lifecycle` on the suite's own image as it is; with `LIGHTBOX_TEST_USERNS=overlay`; with `=copy`; with `LIGHTBOX_TEST_SECCOMP=deny`; and on the Alpine and the Debian image that `tests/fetch_image.sh` fetches. The job on the suite's own image runs `sudo make bench` afterwards |
+| Lifecycle suite, six times on each of x86_64 and aarch64 | `ubuntu-24.04` and `ubuntu-24.04-arm` | `sudo make test-lifecycle` on the suite's own image as it is; with `LIGHTBOX_TEST_USERNS=overlay`; with `=copy`; with `LIGHTBOX_TEST_SECCOMP=deny`; and on the Alpine and the Debian image that `tests/fetch_image.sh` fetches, as a root filesystem and, with `--oci`, as its registry has it. The job on the suite's own image runs `sudo make bench` afterwards. `skopeo` is installed for the cases that carry an image to a registry of the suite's own, `tests/registry.py`, and back |
 | Cross-build for aarch64 | `ubuntu-24.04` | `make CC=aarch64-linux-gnu-gcc`, and a look that the result is a static aarch64 executable |
 | `.deb`, on each of x86_64 and aarch64 | `ubuntu-24.04` and `ubuntu-24.04-arm` | `packaging/build-deb.sh`; lintian, of which an error or a warning without an answer fails the job; an install with `apt` on the runner and in containers of Debian 12 and 13; the lifecycle suite with `/usr/bin/lightbox` of the package; a removal and a purge |
 | `.xbps`, on each of x86_64 and aarch64 | Void Linux's container image, on the same two runners | `packaging/build-xbps.sh`, an install with `xbps-install` from the directory the packages are in, a look at what was installed, and a removal |
@@ -487,4 +512,4 @@ The three kinds of package job are `.github/workflows/packages.yml`, which `ci.y
 Under GitHub Actions the runner writes annotations, which a run's summary page lists without opening a log: each suite's totals as a notice that names every case it skipped, each failed case as an error with the first and the last lines of its output, and for expected failures the last line each printed, so that a reader can see that it fails for the reason its name gives. The timing is a notice of its own. A job that fails prints the end of the kernel log.
 
 {.source}
-Source: `lightbox.c` for the commands and init; `lightbox_state.c` for records, states and locks; `lightbox_base.c`, `lightbox_container.c`, `lightbox_util.c`, `lightbox_net.c` and `lightbox_userns.c` for what they call; `lightbox_sys.h`; the `Makefile`; `tests/lib.sh` and the heads of the suites; `.github/workflows/ci.yml`, `packages.yml` and `release.yml`; `packaging/README.md`.
+Source: `lightbox.c` for the commands and init; `lightbox_state.c` for records, states and locks; `lightbox_image.c`, `lightbox_tar.c` and `lightbox_json.c` for images; `lightbox_base.c`, `lightbox_container.c`, `lightbox_util.c`, `lightbox_net.c` and `lightbox_userns.c` for what they call; `lightbox_sys.h`; the `Makefile`; `tests/lib.sh` and the heads of the suites; `.github/workflows/ci.yml`, `packages.yml` and `release.yml`; `packaging/README.md`.

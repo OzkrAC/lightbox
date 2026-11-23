@@ -805,6 +805,69 @@ static void apply_sandbox(bool allow_list) {
     apply_seccomp(allow_list);
 }
 
+/*
+ * What a host tool runs under that is given bytes from somewhere else to
+ * read, as gzip is a layer of an image (ROADMAP I.6): a fault in it that
+ * such bytes reach is then a fault in a process that can do little.
+ *
+ *   - a network and an IPC namespace of its own, with nothing in them;
+ *   - nobody's uid and gid and no supplementary group, so that no file of
+ *     root's is its own;
+ *   - no capability, in any set, and none to be had: the bounding set is
+ *     emptied and no_new_privs is set;
+ *   - a seccomp filter of gzip's calls (ROADMAP I.12), with execve of
+ *     program alone, which is then run, and every other call answered
+ *     ENOSYS: tighter than the allow-list a container has, which this was
+ *     before.
+ *
+ * In a user namespace that maps no id for nobody, as one that an ordinary
+ * user made for a test has none, the ids stay: its root is that user, and
+ * the rest is done all the same. Any step that fails ends the process.
+ */
+#define NOBODY_ID 65534u
+
+void sandbox_host_tool(const char *program) {
+    if (lc_kernel_unshare(CLONE_NEWNET | CLONE_NEWIPC) < 0)
+        die("Error: cannot give a host tool a network of its own, with nothing in it");
+    for (int cap = 0; cap < 64; cap++) {
+        lc_sysret held = lc_kernel_prctl(LB_PR_CAPBSET_READ, (uint64_t)cap, 0, 0, 0);
+        if (held < 0)
+            break;
+        if (held == 1 && lc_kernel_prctl(LB_PR_CAPBSET_DROP, (uint64_t)cap, 0, 0, 0) < 0)
+            die("Error: failed to drop a capability from a host tool's bounding set");
+    }
+    /* setgroups is refused in a user namespace that an ordinary user made;
+     * the groups there are that user's own */
+    lc_sysret rc = lc_kernel_setgroups(0, NULL);
+    if (rc < 0 && rc != -LB_EPERM)
+        die("Error: failed to drop a host tool's groups");
+    rc = lc_kernel_setgid(NOBODY_ID);
+    if (rc < 0 && rc != -LB_EINVAL)
+        die("Error: failed to make a host tool's group nobody's");
+    rc = lc_kernel_setuid(NOBODY_ID);
+    if (rc < 0 && rc != -LB_EINVAL)
+        die("Error: failed to make a host tool's user nobody");
+
+    struct lb_cap_header hdr = { LB_CAPABILITY_VERSION_3, 0 };
+    struct lb_cap_data sets[LB_CAPABILITY_WORDS] = { 0 };
+    if (lb_sys_capset(&hdr, sets) < 0)
+        die("Error: failed to empty a host tool's capability sets");
+    if (lc_kernel_prctl(LB_PR_CAP_AMBIENT, LB_PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) < 0)
+        die("Error: failed to clear a host tool's ambient capability set");
+    if (lc_kernel_prctl(LB_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
+        die("Error: failed to enable no_new_privs for a host tool");
+    /* the calls of gzip, and of no other program: tighter than the allow-list
+     * a container has, which was this filter before I.12 */
+    static struct lb_sock_filter filter[LB_SECCOMP_GZIP_PROG_LEN];
+    struct lb_sock_fprog prog = {
+        .len = (uint16_t)lb_seccomp_build_gzip(filter, (uint64_t)(uintptr_t)program),
+        .filter = filter,
+    };
+    if (prog.len != LB_SECCOMP_GZIP_PROG_LEN ||
+        lc_kernel_prctl(LB_PR_SET_SECCOMP, LB_SECCOMP_MODE_FILTER, (uint64_t)&prog, 0, 0) < 0)
+        die("Error: failed to install the seccomp filter of a host tool");
+}
+
 /* ─── Security: /proc masking ───────────────────────────────────────────── */
 
 /* Cover a path: a directory with an empty read-only tmpfs, anything else
@@ -986,7 +1049,45 @@ static bool limit_option(int argc, char **argv, int *i, container_config *cfg) {
  * of etc or of any of the three files, cannot put them anywhere else. NULL,
  * or what failed.
  */
-static const char *write_etc_files(const char *root, const char *name, const char *ip, const char *resolv) {
+/* A hosts file's text without the lines create wrote for a container of one
+ * of two names, "<address>\t<name>": its new length. */
+static size_t without_own_lines(char *text, size_t len, const char *name, const char *former) {
+    size_t kept = 0;
+    for (size_t at = 0; at < len; ) {
+        size_t end = at;
+        while (end < len && text[end] != '\n')
+            end++;
+        size_t next = end < len ? end + 1 : end;
+        /* the line as two fields with one tab between them */
+        char address[IPV4_TEXT_MAX], who[NAME_MAX_LEN + 1];
+        size_t tab = at;
+        while (tab < end && text[tab] != '\t')
+            tab++;
+        uint32_t parsed;
+        bool own = false;
+        if (tab < end && tab - at < sizeof(address) && end - tab - 1 < sizeof(who)) {
+            lc_bytes_copy(address, text + at, tab - at);
+            address[tab - at] = '\0';
+            lc_bytes_copy(who, text + tab + 1, end - tab - 1);
+            who[end - tab - 1] = '\0';
+            own = parse_ipv4(address, &parsed) && (streq(who, name) || (former[0] && streq(who, former)));
+        }
+        if (!own) {
+            lc_bytes_move(text + kept, text + at, next - at);
+            kept += next - at;
+        }
+        at = next;
+    }
+    text[kept] = '\0';
+    return kept;
+}
+
+/* former: with import, what the container was called where its image was
+ * made, or "" for an image that does not say; the lines create wrote there
+ * for that name and for this one are not kept beside the new one. NULL:
+ * the hosts file is the base's, and is added to as it is. */
+static const char *write_etc_files(const char *root, const char *name, const char *ip, const char *resolv,
+                                   const char *former) {
     char text[4096];
     bool cut = false;
     /* inside the container's own filesystem, so readable by its users */
@@ -1004,7 +1105,9 @@ static const char *write_etc_files(const char *root, const char *name, const cha
         return NULL;
     }
     pos = (size_t)had;
-    if (had == 0)
+    if (former)
+        pos = without_own_lines(text, pos, name, former);
+    if (pos == 0)
         pos = str_append(text, pos, "127.0.0.1\tlocalhost\n", sizeof(text), &cut);
     else if (text[pos - 1] != '\n')
         pos = str_append(text, pos, "\n", sizeof(text), &cut);
@@ -1040,6 +1143,7 @@ struct overlay_job {
     const char *lower;                  /* the layer to idmap; NULL: none */
     uint32_t    uid_start, gid_start;
     const char *name, *ip, *resolv;
+    const char *former;                 /* as write_etc_files takes it */
 };
 
 /* In a child, with a mount namespace of its own. 0, OVERLAY_CANNOT_MOUNT as
@@ -1124,7 +1228,7 @@ static int in_overlay(const struct overlay_job *job) {
             print_str(STDERR, "Error: cannot write the container's files as its root\n");
             lc_kernel_exit(failure_status);
         }
-        const char *wrong = job->name ? write_etc_files(".", job->name, job->ip, job->resolv) : NULL;
+        const char *wrong = job->name ? write_etc_files(".", job->name, job->ip, job->resolv, job->former) : NULL;
         if (wrong) {
             print_str(STDERR, "Error: ");
             print_str(STDERR, wrong);
@@ -1157,7 +1261,8 @@ static bool overlay_mounts_here(const char *name, const container_config *userns
     pos = str_append(options, pos, ",upperdir=", sizeof(options), &cut);
     pos = str_append(options, pos, upper, sizeof(options), &cut);
     pos = str_append(options, pos, ",workdir=", sizeof(options), &cut);
-    str_append(options, pos, work, sizeof(options), &cut);
+    pos = str_append(options, pos, work, sizeof(options), &cut);
+    str_append(options, pos, "," OVERLAY_WHOLE_OPTIONS, sizeof(options), &cut);
     struct overlay_job job = {
         .merged = merged, .options = options,
         .lower = userns ? lower : NULL,
@@ -1179,13 +1284,16 @@ static bool overlay_mounts_here(const char *name, const container_config *userns
  * where no overlay can be mounted here, as said; anything else when the
  * files could not be written, as said.
  */
-static int overlay_etc(const char *name, const container_config *cfg, const char *ip, const char *resolv) {
+static int overlay_etc(const char *name, const container_config *cfg, const char *ip, const char *resolv,
+                       const char *former) {
     const char *base = cfg->base;
     char upper[MAX_PATH], work[MAX_PATH], merged[MAX_PATH], options[3 * MAX_PATH + 48], lower[MAX_PATH];
     container_root(upper, name);
     if (!overlay_dirs(name, work, merged) || !base_rootfs_path(lower, base))
         return 1;
-    if (lc_kernel_mkdirat(AT_FDCWD, upper, 0755) < 0 || lc_kernel_mkdirat(AT_FDCWD, work, MODE_PRIVATE_DIR) < 0 ||
+    /* the upper layer is there already when import unpacked a layer into it */
+    lc_sysret made = lc_kernel_mkdirat(AT_FDCWD, upper, 0755);
+    if ((made < 0 && !(former && made == -LB_EEXIST)) || lc_kernel_mkdirat(AT_FDCWD, work, MODE_PRIVATE_DIR) < 0 ||
         lc_kernel_mkdirat(AT_FDCWD, merged, MODE_PRIVATE_DIR) < 0)
         return 1;
     /* the root of the merged tree is the upper layer's: the container's root's */
@@ -1199,7 +1307,7 @@ static int overlay_etc(const char *name, const container_config *cfg, const char
     struct overlay_job job = {
         .merged = merged, .options = options,
         .lower = cfg->userns ? lower : NULL, .uid_start = cfg->uid_start, .gid_start = cfg->gid_start,
-        .name = name, .ip = ip, .resolv = resolv,
+        .name = name, .ip = ip, .resolv = resolv, .former = former,
     };
     int code = in_overlay(&job);
     if (code == OVERLAY_CANNOT_MOUNT) {
@@ -1269,7 +1377,7 @@ static const char *make_resolv(container_config *cfg, char dns[MAX_DNS][16], int
  * cmd_create's loop: validation gives run every option create --help names.
  */
 static const char *const create_value_options[] = {
-    "--mem", "--swap", "--pids", "--cpu", "--io-max", "--vol", "--rootfs", "--seccomp", "--net",
+    "--mem", "--swap", "--pids", "--cpu", "--io-max", "--vol", "--rootfs", "--base", "--seccomp", "--net",
     "--oom-score", "--ttl", "--link", "--dns", "--profile", "--workspace",
 };
 static const char *const create_flag_options[] = { "--userns", "--read-only", "--copy", "--privileged" };
@@ -1352,10 +1460,140 @@ static void add_workspace(container_config *cfg, const char *dir) {
  * so that no box of run is ever without it once it can be started. */
 static char create_runner[48];
 
+/* "<before><count><after>" on standard output */
+static void say_count(const char *before, uint64_t count, const char *after) {
+    char digits[24];
+    int at = (int)sizeof(digits);
+    digits[--at] = '\0';
+    do { digits[--at] = (char)('0' + count % 10); count /= 10; } while (count);
+    print_str(STDOUT, before);
+    print_str(STDOUT, digits + at);
+    print_str(STDOUT, after);
+}
+
+/* What an import made a container of, and what of the image it left out. */
+static void say_imported(const image *img, const container_config *cfg, const image_unpacked *unpacked, const char *taken_base) {
+    print_str(STDOUT, "Image sha256:");
+    print_str(STDOUT, img->manifest);
+    say_count(": ", (uint64_t)img->nlayers, img->nlayers == 1 ? " layer" : " layers");
+    if (cfg->base[0]) {
+        print_str(STDOUT, taken_base[0] ? ", on the new base snapshot " : ", on the base snapshot ");
+        print_str(STDOUT, cfg->base);
+        print_str(STDOUT, taken_base[0] ? "\n" : ", which was here\n");
+    } else {
+        print_str(STDOUT, ", as a copy\n");
+    }
+    const struct { const char *key, *value, *given; } limits[] = {
+        { "mem", img->mem, cfg->mem }, { "swap", img->swap, cfg->swap }, { "pids", img->pids, cfg->pids },
+        { "cpu", img->cpu, cfg->cpu }, { "ttl", img->ttl, cfg->ttl },
+    };
+    bool any = false;
+    for (size_t i = 0; i < sizeof(limits) / sizeof(limits[0]); i++) {
+        if (!limits[i].value[0] || !streq(limits[i].value, limits[i].given))
+            continue;
+        print_str(STDOUT, any ? " " : "Limits of the image's: ");
+        print_str(STDOUT, limits[i].key);
+        print_str(STDOUT, "=");
+        print_str(STDOUT, limits[i].value);
+        any = true;
+    }
+    if (any)
+        lc_print_char(STDOUT, '\n');
+    image_notes(img, unpacked);
+}
+
+/*
+ * Set by import (ROADMAP I.6): the image create makes the container of, in
+ * the place of a base. Everything else is create's: the name, the address,
+ * the options and what they may be, the store's lock, the mark while the
+ * container is half made, and what is taken away when it cannot be made.
+ */
+static const image *create_image;
+
+/* .overlay-whole: that a container's own files are all there (ROADMAP I.14), see require_upper_whole */
+static int upper_whole_keep(const char *name);
+
+/* How much of a thing a limit lets a container have: bytes of memory or of
+ * swap, processes, or microseconds of CPU in each period. False for a text
+ * that is no such limit. */
+enum { LIMIT_MEM, LIMIT_SWAP, LIMIT_PIDS, LIMIT_CPU };
+
+static bool limit_amount(int kind, const char *text, uint64_t *amount) {
+    int64_t count;
+    int quota;
+    switch (kind) {
+    case LIMIT_MEM:
+    case LIMIT_SWAP:
+        return (kind == LIMIT_SWAP ? swap_limit_ok(text) : mem_limit_ok(text)) && limit_bytes(text, amount);
+    case LIMIT_PIDS:
+        if (streq(text, "max")) {
+            *amount = UINT64_MAX;
+            return true;
+        }
+        if (!pids_limit_ok(text) || !parse_number(text, 1, PIDS_LIMIT_MAX, &count))
+            return false;
+        *amount = (uint64_t)count;
+        return true;
+    default:
+        if (!parse_cpu_limit(text, &quota))
+            return false;
+        *amount = (uint64_t)quota;
+        return true;
+    }
+}
+
+/*
+ * The limits no option gave, and no profile, are the image's, where it
+ * carries them and where they give the container no more than lightbox.conf
+ * gives a new one: its default_mem, default_pids and default_cpu, and no
+ * swap. An image is somebody else's word; what a container may use up of
+ * this host is said here. One that asks for more is told, and the option
+ * gives it. A lifetime only takes away, and is the image's.
+ */
+static void take_image_limits(const image *img, container_config *cfg) {
+    struct { int kind; const char *name; char *field; size_t size; const char *images, *hosts; } limits[] = {
+        { LIMIT_MEM,  "mem",  cfg->mem,  sizeof(cfg->mem),  img->mem,  cfg_global.default_mem },
+        { LIMIT_SWAP, "swap", cfg->swap, sizeof(cfg->swap), img->swap, "0" },
+        { LIMIT_PIDS, "pids", cfg->pids, sizeof(cfg->pids), img->pids, cfg_global.default_pids },
+        { LIMIT_CPU,  "cpu",  cfg->cpu,  sizeof(cfg->cpu),  img->cpu,  cfg_global.default_cpu },
+    };
+    for (size_t i = 0; i < sizeof(limits) / sizeof(limits[0]); i++) {
+        uint64_t asked, given;
+        if (limits[i].field[0] || !limits[i].images[0] || !limit_amount(limits[i].kind, limits[i].images, &asked))
+            continue;
+        /* a setting that cannot be used holds nothing against: the image's is not taken */
+        if (limits[i].hosts[0] && limit_amount(limits[i].kind, limits[i].hosts, &given) && asked <= given) {
+            str_copy_or_die(limits[i].field, limits[i].images, limits[i].size, "a limit of the image's");
+            continue;
+        }
+        print_str(STDOUT, "Note: the image has ");
+        print_str(STDOUT, limits[i].name);
+        print_str(STDOUT, "=");
+        print_str(STDOUT, limits[i].images);
+        if (limits[i].kind == LIMIT_SWAP) {
+            print_str(STDOUT, ", and a new container here has no swap: it has none, and --swap gives it some\n");
+        } else {
+            print_str(STDOUT, ", which is more than lightbox.conf gives a new container");
+            if (limits[i].hosts[0]) {
+                print_str(STDOUT, ", ");
+                print_str(STDOUT, limits[i].hosts);
+            }
+            print_str(STDOUT, ": it is not taken, and --");
+            print_str(STDOUT, limits[i].name);
+            print_str(STDOUT, " gives it more\n");
+        }
+    }
+    if (!cfg->ttl[0] && img->ttl[0] && parse_duration_ms(img->ttl, &cfg->ttl_ms))
+        str_copy_or_die(cfg->ttl, img->ttl, sizeof(cfg->ttl), "the lifetime of the image's");
+}
+
 static void cmd_create(int argc, char **argv) {
     bool full_copy = false;     /* --copy: the container is a copy of its base, not an overlay */
-    require_tool("cp", tool_path_cp());
-    if (argc < 1) die("Usage: lightbox create <name> [<ip>] [options]");
+    if (!create_image)
+        require_tool("cp", tool_path_cp());
+    if (argc < 1)
+        die(create_image ? "Usage: lightbox import <dir> <name> [<ip>] [options]"
+                         : "Usage: lightbox create <name> [<ip>] [options]");
     const char *name = argv[0];
     validate_name(name);
 
@@ -1389,8 +1627,9 @@ static void cmd_create(int argc, char **argv) {
     cfg.net = NET_OUTSIDE;
     char dns[MAX_DNS][16];
     int ndns = 0;
-    bool net_given = false, agent = false;
+    bool net_given = false, agent = false, rootfs_given = false;
     const char *workspace = NULL;
+    const char *base_id = NULL;     /* --base: the snapshot it is made of, and no base directory */
 
     for (int i = address_given ? 2 : 1; i < argc; i++) {
         const char *opt = argv[i];
@@ -1434,7 +1673,19 @@ static void cmd_create(int argc, char **argv) {
                 die("Error: --workspace is given once: a box has one workspace");
             workspace = value;
         } else if (streq(opt, "--rootfs")) {
+            if (create_image)
+                die("Error: import makes a container of an image, which is all the base it has: no --rootfs");
             str_copy_or_die(cfg_global.rootfs, option_value(argc, argv, &i), MAX_PATH, "--rootfs");
+            rootfs_given = true;
+        } else if (streq(opt, "--base")) {
+            const char *value = option_value(argc, argv, &i);
+            if (create_image)
+                die("Error: import makes a container of an image, which is all the base it has: no --base");
+            if (base_id)
+                die("Error: --base is given once: a container has one base");
+            if (!base_id_ok(value))
+                die2("Error: --base takes the id of a base snapshot, as base ls shows it, not: ", value);
+            base_id = value;
         } else if (streq(opt, "--copy")) {
             full_copy = true;
         } else if (streq(opt, "--read-only")) {
@@ -1470,10 +1721,14 @@ static void cmd_create(int argc, char **argv) {
         }
     }
 
+    if (base_id && rootfs_given)
+        die("Error: --rootfs names a base and --base a snapshot of one: a container is made of one of the two");
     if (agent)
         agent_profile(&cfg, net_given, full_copy);
     if (workspace)
         add_workspace(&cfg, workspace);
+    if (create_image)
+        take_image_limits(create_image, &cfg);
 
     /* what no option gave comes from lightbox.conf */
     {
@@ -1518,8 +1773,13 @@ static void cmd_create(int argc, char **argv) {
 
     /* The base must be a directory with something in it. A link to one is
      * followed. Checked before anything is created, so a refusal leaves
-     * nothing behind. */
-    {
+     * nothing behind. An image has been read whole by now. */
+    if (base_id) {
+        /* the snapshot's files are the base, for a copy too; it is looked at
+         * once more with the store locked, when no base rm can come between */
+        if (!base_rootfs_path(cfg_global.rootfs, base_id) || !path_is_directory(cfg_global.rootfs))
+            die2("Error: there is no base snapshot ", base_id);
+    } else if (!create_image) {
         struct lb_statx stx;
         if (lb_sys_statx(AT_FDCWD, cfg_global.rootfs, 0, LB_STATX_TYPE, &stx) < 0)
             die2("Error: base rootfs does not exist: ", cfg_global.rootfs);
@@ -1530,11 +1790,20 @@ static void cmd_create(int argc, char **argv) {
             die2("Error: base rootfs cannot be read: ", cfg_global.rootfs);
         if (empty)
             die2("Error: base rootfs is empty: ", cfg_global.rootfs);
+        if (image_layout_at(cfg_global.rootfs)) {
+            print_str(STDERR, "Error: the base is an image and no root filesystem: ");
+            print_str(STDERR, cfg_global.rootfs);
+            print_str(STDERR, "\nlightbox import <dir> <name> makes a container of one, and lightbox base import <dir> a\n"
+                              "base that create --base <id> takes\n");
+            lc_kernel_exit(failure_status);
+        }
     }
 
     /* One create at a time: what one decides about names and addresses holds
      * until it is done. */
     store_lock();
+    if (base_id && !path_is_directory(cfg_global.rootfs))
+        die2("Error: there is no base snapshot ", base_id);
     /* A link to a container of --net proxy would be a way out of it. The
      * firewall drops what the bridge would switch to or from one, whatever
      * links name it; one that is there already is refused here. */
@@ -1560,12 +1829,23 @@ static void cmd_create(int argc, char **argv) {
         }
     }
 
-    print_str(STDOUT,"Creating container '");
+    print_str(STDOUT, create_image ? "Importing container '" : "Creating container '");
     print_str(STDOUT,name);
-    print_str(STDOUT,"'...\n");
+    if (create_image) {
+        print_str(STDOUT, "' from ");
+        print_str(STDOUT, create_image->dir);
+        print_str(STDOUT, "...\n");
+    } else {
+        print_str(STDOUT,"'...\n");
+    }
 
     const char *create_err = NULL;
     bool created_dir = false;
+    /* with import: what the image's layers were unpacked to, and the
+     * snapshot this command took for them, if it took one */
+    image_unpacked unpacked = { 0 };
+    char taken_base[BASE_ID_TEXT] = "";
+    const char *former = create_image ? create_image->name : NULL;
 
     /* create container directory and copy rootfs into it */
     if (lc_kernel_mkdirat(AT_FDCWD, cdir, MODE_PRIVATE_DIR) < 0) {
@@ -1609,13 +1889,53 @@ static void cmd_create(int argc, char **argv) {
     bool overlay_here = !full_copy && overlay_mounts_here(name, cfg.userns ? &cfg : NULL);
     if (!full_copy && cfg.userns && !overlay_here)
         goto fail_create;           /* said: nothing falls back to a copy */
-    if (overlay_here) {
+    if (overlay_here && create_image) {
+        /*
+         * An image of two layers is a container as export writes one: the
+         * first is its snapshot, and the second its own files, with the
+         * marks of what it took out of the first. Any other image is all
+         * snapshot. The snapshot is one that is here already, where one is
+         * those layers; otherwise the layers are unpacked into a new one,
+         * which is put in place when it is whole.
+         */
+        int own = create_image->lightbox && create_image->nlayers == 2 ? 1 : 0;
+        int under = create_image->nlayers - own;
         bool took = false;
-        if (base_snapshot_for(cfg_global.rootfs, cfg.base, &took) != 0) {
+        if (image_base(create_image, under, cfg.base, &took, &unpacked) != 0) {
+            create_err = "the image's base was not unpacked, and no snapshot of it is kept";
+            goto fail_create;
+        }
+        if (took)
+            lc_bytes_copy(taken_base, cfg.base, sizeof(taken_base));
+        /* its own files are its root's on the host, as the overlay has them */
+        if (own && (lc_kernel_mkdirat(AT_FDCWD, root, 0755) < 0 ||
+                    (cfg.userns && lc_kernel_fchownat(AT_FDCWD, root, cfg.uid_start, cfg.gid_start, 0) < 0) ||
+                    image_unpack(create_image, under, own, root, TAR_INTO_UPPER, cfg.userns ? cfg.uid_start : 0,
+                                 cfg.userns ? cfg.gid_start : 0, &unpacked) != 0)) {
+            create_err = "the container's own files were not unpacked";
+            goto fail_create;
+        }
+        int written = overlay_etc(name, &cfg, ip, resolv, former);
+        if (written == OVERLAY_CANNOT_MOUNT) {
+            /* a copy after all, as said: of the image, with no snapshot */
+            cfg.base[0] = '\0';
+            unpacked = (image_unpacked){ 0 };
+            if (taken_base[0])
+                base_discard(taken_base);
+            taken_base[0] = '\0';
+        } else if (written != 0) {
+            create_err = "failed to write the container's files in /etc";
+            goto fail_create;
+        }
+    } else if (overlay_here) {
+        bool took = false;
+        if (base_id) {
+            lc_bytes_copy(cfg.base, base_id, BASE_ID_TEXT);
+        } else if (base_snapshot_for(cfg_global.rootfs, cfg.base, &took) != 0) {
             create_err = "failed to take a snapshot of the base";
             goto fail_create;
         }
-        int written = overlay_etc(name, &cfg, ip, resolv);
+        int written = overlay_etc(name, &cfg, ip, resolv, NULL);
         if (written == OVERLAY_CANNOT_MOUNT) {
             cfg.base[0] = '\0';
         } else if (written != 0) {
@@ -1650,7 +1970,16 @@ static void cmd_create(int argc, char **argv) {
         }
         const char *reflink[] = { "cp", "-a", "--reflink=auto", base_contents, root, NULL };
         const char *plain[] = { "cp", "-a", base_contents, root, NULL };
-        if (run_cmd_quiet(tool_path_cp(), reflink) != 0) {
+        if (create_image) {
+            /* every layer into one tree, one over the other: a mark takes
+             * out what it names. The ids are the image's, from 0, as a copy
+             * of a base has them. */
+            if (lc_kernel_mkdirat(AT_FDCWD, root, 0755) < 0 ||
+                image_unpack(create_image, 0, create_image->nlayers, root, TAR_INTO_TREE, 0, 0, &unpacked) != 0) {
+                create_err = "the image was not unpacked";
+                goto fail_create;
+            }
+        } else if (run_cmd_quiet(tool_path_cp(), reflink) != 0) {
             if (path_exists(root))
                 require_rm_rf(root);
             if (run_cmd(tool_path_cp(), plain) != 0) {
@@ -1658,7 +1987,7 @@ static void cmd_create(int argc, char **argv) {
                 goto fail_create;
             }
         }
-        create_err = write_etc_files(root, name, ip, resolv);
+        create_err = write_etc_files(root, name, ip, resolv, former);
         if (create_err)
             goto fail_create;
     }
@@ -1687,6 +2016,18 @@ static void cmd_create(int argc, char **argv) {
     create_err = container_config_save(name, &cfg);
     if (create_err)
         goto fail_create;
+    /* the generation the image is, of its line, is the container's: an image
+     * that continues it may be put in its place (ROADMAP I.10) */
+    if (create_image && create_image->gen.lineage[0] && generation_keep(name, &create_image->gen) != 0) {
+        create_err = "failed to keep which generation of its line the container is";
+        goto fail_create;
+    }
+
+    /* a new upper directory, which lightbox's overlay alone ever wrote into */
+    if (cfg.base[0] && upper_whole_keep(name) != 0) {
+        create_err = "failed to record that the container's own files are whole";
+        goto fail_create;
+    }
 
     /* made: and with no runtime record, stopped */
     if (remove_file_durably(creating) != 0) {
@@ -1695,13 +2036,16 @@ static void cmd_create(int argc, char **argv) {
     }
     print_str(STDOUT,"Container '");
     print_str(STDOUT,name);
+    print_str(STDOUT, create_image ? "' imported" : "' created");
     if (ip[0]) {
-        print_str(STDOUT, "' created (ip=");
+        print_str(STDOUT, " (ip=");
         print_str(STDOUT, ip);
         print_str(STDOUT, ")\n");
     } else {
-        print_str(STDOUT, "' created (no network)\n");
+        print_str(STDOUT, " (no network)\n");
     }
+    if (create_image)
+        say_imported(create_image, &cfg, &unpacked, taken_base);
     return;
 
 fail_create:
@@ -1712,7 +2056,57 @@ fail_create:
     }
     if (created_dir)
         require_rm_rf(cdir);
+    /* a snapshot this import took is nobody's: no container was made on it */
+    if (taken_base[0])
+        base_discard(taken_base);
     lc_kernel_exit(failure_status);
+}
+
+/*
+ * import <dir> <name> [<ip>] [options] (ROADMAP I.6): a container made of an
+ * image, as create makes one of a base, with create's options. The image is
+ * read first, all of it, and held to the digests it names itself by: what is
+ * no image ends the command before anything is made, and before it asks for
+ * root, so that anyone can ask whether a directory is one. Unpacking is
+ * root's: the process that does it makes the directory it fills its root.
+ */
+static void import_replace(const image *img, const char *name, bool force);
+
+static void cmd_import(int argc, char **argv) {
+    static image img;
+    if (argc < 2 || argv[0][0] == '-')
+        die(argc > 0 && argv[0][0] == '-' ? "Error: import takes the image's directory first, and then the name"
+                                          : "Usage: lightbox import <dir> <name> [<ip>] [options] | import <dir> <name> --replace [--force]");
+    validate_name(argv[1]);
+    /* --replace: the image in the place of a container that is there, which
+     * keeps its address and its settings, so that no other option goes with it */
+    bool replace = false, force = false;
+    for (int i = 2; i < argc; i++) {
+        if (streq(argv[i], "--replace"))
+            replace = true;
+        else if (streq(argv[i], "--force"))
+            force = true;
+    }
+    if (force && !replace)
+        die("Error: --force goes with --replace: import <dir> <name> --replace --force");
+    if (replace)
+        for (int i = 2; i < argc; i++)
+            if (!streq(argv[i], "--replace") && !streq(argv[i], "--force"))
+                die2("Error: import --replace puts the image in the place of a container, which keeps its address\n"
+                     "and its settings; nothing goes with it but --force, and this does not: ", argv[i]);
+    image_open(argv[0], &img);
+    require_root("import");
+    for (int i = 0; i < img.nlayers; i++)
+        if (img.layers[i].gzip) {
+            require_tool("gzip", tool_path_gzip());
+            break;
+        }
+    if (replace) {
+        import_replace(&img, argv[1], force);
+        return;
+    }
+    create_image = &img;
+    cmd_create(argc - 1, argv + 1);
 }
 
 /* ─── Starting: what the command and init say to each other ─────────────── */
@@ -4216,6 +4610,51 @@ typedef void (*per_container)(const char *name, int seconds);
     lc_kernel_exit(first);
 }
 
+/*
+ * A container that overlays a snapshot is mounted with OVERLAY_WHOLE_OPTIONS
+ * since 0.10 (ROADMAP I.14). One made before, on a host whose overlays
+ * moved a directory of the snapshot by a mark in the upper directory, or
+ * kept a file's bytes there, would show such a directory empty and such a
+ * file as holes. Its rootfs/ is looked through once, at its first start, and
+ * a container in which an entry is so is not started; one that is whole is
+ * on record as such in .overlay-whole, as is every container that create,
+ * import and reset make the upper directory of.
+ */
+static bool upper_whole_path(char out[MAX_PATH], const char *name) {
+    char cdir[MAX_PATH];
+    container_dir_path(cdir, name);
+    return path_join(out, MAX_PATH, cdir, ".overlay-whole");
+}
+
+static int upper_whole_keep(const char *name) {
+    char path[MAX_PATH];
+    return upper_whole_path(path, name) ? write_file_atomic(path, "", MODE_PRIVATE_FILE) : -1;
+}
+
+static void require_upper_whole(const char *name, const char *root) {
+    char path[MAX_PATH], found[MAX_PATH];
+    if (!upper_whole_path(path, name))
+        die2("Error: the path of the container's directory is too long: ", name);
+    if (path_exists(path))
+        return;
+    int whole = overlay_upper_whole(root, found, sizeof(found));
+    if (whole < 0)
+        die2("Error: cannot read through the container's own files, to see that they are all there: ", name);
+    if (whole == 0) {
+        print_str(STDERR, "Error: container '");
+        print_str(STDERR, name);
+        print_str(STDERR, "' has in its own files what an overlay leaves when it moves a directory of the\n"
+                          "snapshot by a mark or keeps a file's bytes there, which lightbox's overlays no longer do:\n  ");
+        print_str(STDERR, has_control_chars(found) ? "(a name with control characters)" : found);
+        print_str(STDERR, "\nMounted as lightbox mounts it now, that would be empty or holes, so it is not started.\n"
+                          "It was made by a lightbox before 0.10 on a host with redirect_dir or metacopy on; copy\n"
+                          "out what it has with a lightbox of that version, or create it again.\n");
+        lc_kernel_exit(failure_status);
+    }
+    if (upper_whole_keep(name) != 0)
+        print_str(STDERR, "Warning: could not record that the container's own files are whole; the next start looks again\n");
+}
+
 static void start_one(const char *name, int hook_wait) {
     require_root("start");
 
@@ -4298,6 +4737,7 @@ static void start_one(const char *name, int hook_wait) {
         if (!overlay_dirs(name, work, merged) || !overlay_options(overlay, sizeof(overlay), config.base, root, work))
             die2("Error: the paths of the container's overlay cannot go into its options: ", name);
         start_root = merged;
+        require_upper_whole(name, root);
     }
 
     /* A container without links gets an isolated port on the bridge: it
@@ -4439,6 +4879,14 @@ static void start_one(const char *name, int hook_wait) {
         if (start_err)
             goto fail_start;
         nuserns_volumes = config.nvols;
+    }
+
+    /* A container of a line, one that was exported or imported, is on
+     * record as started from here on: an image is not put in the place of
+     * what it does from now (ROADMAP I.10). */
+    if (generation_started(name) != 0) {
+        start_err = "failed to record that the container is started since its generation was written";
+        goto fail_start;
     }
 
     /* clone init; it waits for its first byte */
@@ -4830,6 +5278,24 @@ static void cmd_restart(int argc, char **argv) {
  * not finished: a reset cut short leaves it half made, not started by start,
  * and a reset again makes it whole, or rm removes it.
  */
+/* What a container's resolv.conf said when it was made, which create kept;
+ * for one made before create kept it, what create would write now, with the
+ * name servers of --net outside as they are on record. */
+static void kept_resolv(const char *name, const container_config *cfg, char resolv[RESOLV_TEXT_MAX]) {
+    char resolv_path[MAX_PATH];
+    container_resolv_path(resolv_path, name);
+    if (read_file(resolv_path, resolv, RESOLV_TEXT_MAX) > 0)
+        return;
+    static container_config again;
+    again = *cfg;
+    char dns[MAX_DNS][16];
+    const char *failed = make_resolv(&again, dns, 0, resolv);
+    if (failed)
+        die2("Error: ", failed);
+    print_str(STDERR, "Note: the container was made before lightbox kept its resolv.conf: it gets the one\n"
+                      "create would write now\n");
+}
+
 static void reset_one(const char *name, int seconds) {
     require_root("reset");
     static container_config cfg;
@@ -4858,20 +5324,7 @@ static void reset_one(const char *name, int seconds) {
     if (cfg.net != NET_NONE && read_container_ip(name, ip, sizeof(ip)) < 0)
         die2("Error: the container's address is not on record: ", name);
     static char resolv[RESOLV_TEXT_MAX];
-    char resolv_path[MAX_PATH];
-    container_resolv_path(resolv_path, name);
-    if (read_file(resolv_path, resolv, sizeof(resolv)) <= 0) {
-        /* made before create kept it: what create would write now, with
-         * the name servers of --net outside as they are on record */
-        static container_config again;
-        again = cfg;
-        char dns[MAX_DNS][16];
-        const char *failed = make_resolv(&again, dns, 0, resolv);
-        if (failed)
-            die2("Error: ", failed);
-        print_str(STDERR, "Note: the container was made before lightbox kept its resolv.conf: it gets the one\n"
-                          "create would write now\n");
-    }
+    kept_resolv(name, &cfg, resolv);
 
     char creating[MAX_PATH], root[MAX_PATH], work[MAX_PATH], merged[MAX_PATH];
     container_creating_path(creating, name);
@@ -4887,15 +5340,229 @@ static void reset_one(const char *name, int seconds) {
     for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++)
         if (path_exists(dirs[i]))
             require_rm_rf(dirs[i]);
-    if (overlay_etc(name, &cfg, ip, resolv) != 0)
+    if (overlay_etc(name, &cfg, ip, resolv, NULL) != 0)
         die2("Error: failed to write the container's files in /etc; it is left half made, and reset\n"
              "makes it whole: ", name);
     container_forget_run(name);
+    if (upper_whole_keep(name) != 0)
+        print_str(STDERR, "Warning: could not record that the container's own files are whole; the next start looks again\n");
+    /* it is not what its generation was written of any more (ROADMAP I.10) */
+    if (generation_started(name) != 0)
+        print_str(STDERR, "Warning: could not record that the container was reset since its generation was written\n");
     if (remove_file_durably(creating) != 0)
         die("Error: failed to mark the container as reset");
     print_str(STDOUT, "Container '");
     print_str(STDOUT, name);
     print_str(STDOUT, "' reset: its root filesystem is its base's again\n");
+}
+
+/* "<number>" of a generation, for a message */
+static const char *generation_said(char out[24], uint32_t number) {
+    int at = 23;
+    out[at] = '\0';
+    do { out[--at] = (char)('0' + number % 10); number /= 10; } while (number);
+    return out + at;
+}
+
+/* A replace that failed after the container's files were taken out of their
+ * place: said, with where they are, and the end. */
+[[noreturn]] static void replace_failed(const char *what, const char *name) {
+    print_str(STDERR, "Error: ");
+    print_str(STDERR, what);
+    print_str(STDERR, "; the container is left half made, with the files it had in .rootfs.old in\nits directory: ");
+    print_str(STDERR, name);
+    lc_print_char(STDERR, '\n');
+    lc_kernel_exit(failure_status);
+}
+
+/*
+ * import <dir> <name> --replace [--force] (ROADMAP I.10): the image in the
+ * place of a container that is there and not running. A container that goes
+ * back and forth between two machines is two copies, and the image of the
+ * one may only take the place of the other where nothing is lost by it:
+ * where the image continues the generation the container is, and the
+ * container was not started since that was written. Otherwise what the two
+ * are to each other is said, and both are left; --force replaces all the
+ * same. The container keeps its name, its address, its id, its limits and
+ * every setting: what it may do on this host was said here, and the image
+ * brings files. The files are unpacked beside the container's own first, and
+ * put in their place when they are whole.
+ */
+static void import_replace(const image *img, const char *name, bool force) {
+    store_lock();
+    container_lock(name);
+    char creating[MAX_PATH], cdir[MAX_PATH], root[MAX_PATH], fresh[MAX_PATH], old[MAX_PATH], work[MAX_PATH], merged[MAX_PATH];
+    container_creating_path(creating, name);
+    container_dir_path(cdir, name);
+    container_root(root, name);
+    if (path_exists(creating))
+        die2("Error: the container was not created completely, and no image is put in its place; remove it with rm: ", name);
+    if (is_running(name))
+        die2("Error: container is running (stop it first): ", name);
+    (void)reconcile(name);
+    static container_config cfg;
+    container_config_load_or_die(name, &cfg);
+    if (!path_is_directory(root))
+        die2("Error: the container has no root filesystem to put an image in the place of: ", name);
+
+    /* what the two are to each other */
+    static generation here;
+    bool of_a_line = generation_read(name, &here), changed = generation_changed(name);
+    const generation *there = &img->gen;
+    char ours[24], theirs[24];
+    const char *mine = generation_said(ours, here.number), *its = generation_said(theirs, there->number);
+    generation_relation relation = of_a_line && there->lineage[0] ? generation_compare(&here, there) : GENERATION_OF_ANOTHER_LINE;
+    if (!force) {
+        const char *why[6] = { NULL };
+        if (!there->lineage[0]) {
+            why[0] = "the image names no generation of a container's, so that nothing says it continues this one";
+        } else if (!of_a_line) {
+            why[0] = "the container was never exported or imported, so that nothing says the image continues it";
+        } else if (relation == GENERATION_OF_ANOTHER_LINE) {
+            why[0] = "the image is generation ", why[1] = its, why[2] = " of another container's line than this one is of";
+        } else if (relation == GENERATION_THE_SAME && !changed) {
+            print_str(STDOUT, "Container '");
+            print_str(STDOUT, name);
+            print_str(STDOUT, "' is generation ");
+            print_str(STDOUT, mine);
+            print_str(STDOUT, " of its line already, as the image is, and was not started since: nothing was replaced\n");
+            return;
+        } else if (relation == GENERATION_THE_SAME) {
+            why[0] = "the container was started since generation ", why[1] = mine,
+            why[2] = ", which the image is: the container is the newer, and the image would take away what it did since";
+        } else if (relation == GENERATION_CONTINUED && changed) {
+            why[0] = "the container was started since generation ", why[1] = mine, why[2] = ", and the image is generation ",
+            why[3] = its, why[4] = ", which continues generation ", why[5] = mine;
+        } else if (relation == GENERATION_CONTINUES) {
+            why[0] = "the container is generation ", why[1] = mine, why[2] = ", which continues generation ", why[3] = its,
+            why[4] = ", the image's: the container is the newer";
+        } else if (relation == GENERATION_APART) {
+            why[0] = "the container is generation ", why[1] = mine, why[2] = " and the image generation ", why[3] = its,
+            why[4] = " of one line, and neither continues the other: each has what the other has not";
+        }
+        if (why[0]) {
+            print_str(STDERR, "Error: container '");
+            print_str(STDERR, name);
+            print_str(STDERR, "' is not replaced: ");
+            for (size_t i = 0; i < sizeof(why) / sizeof(why[0]) && why[i]; i++)
+                print_str(STDERR, why[i]);
+            if (relation == GENERATION_CONTINUED)
+                print_str(STDERR, " too: each has what the other has not");
+            print_str(STDERR, "\nBoth are left as they are. --force puts the image in its place all the same; lightbox export ");
+            print_str(STDERR, name);
+            print_str(STDERR, " <dir>\nkeeps the container first.\n");
+            lc_kernel_exit(failure_status);
+        }
+    }
+
+    /* what create kept, which the new files are written with */
+    char ip[IPV4_TEXT_MAX] = "";
+    if (cfg.net != NET_NONE && read_container_ip(name, ip, sizeof(ip)) < 0)
+        die2("Error: the container's address is not on record: ", name);
+    static char resolv[RESOLV_TEXT_MAX];
+    kept_resolv(name, &cfg, resolv);
+    bool overlay = cfg.base[0] != '\0';
+    /* nothing is taken away before an overlay is known to mount */
+    if (overlay && !overlay_mounts_here(name, cfg.userns ? &cfg : NULL))
+        die2("Error: no overlay can be mounted here, and the container is left as it was: ", name);
+    if (!overlay_dirs(name, work, merged) || !path_join(fresh, sizeof(fresh), cdir, ".rootfs.new") ||
+        !path_join(old, sizeof(old), cdir, ".rootfs.old"))
+        die2("Error: the paths of the container are too long: ", name);
+    /* what a replace that was killed left: files that were no container's yet, or no longer */
+    if (path_exists(fresh))
+        require_rm_rf(fresh);
+    if (path_exists(old))
+        require_rm_rf(old);
+
+    print_str(STDOUT, "Replacing container '");
+    print_str(STDOUT, name);
+    print_str(STDOUT, "' with the image in ");
+    print_str(STDOUT, img->dir);
+    print_str(STDOUT, "...\n");
+
+    /* The image's files, beside the container's: as import unpacks them for
+     * a container of this kind, an overlay of a snapshot or a copy. */
+    image_unpacked unpacked = { 0 };
+    char base[BASE_ID_TEXT] = "", taken_base[BASE_ID_TEXT] = "";
+    bool unpacked_whole = lc_kernel_mkdirat(AT_FDCWD, fresh, 0755) == 0;
+    if (unpacked_whole && overlay) {
+        int own = img->lightbox && img->nlayers == 2 ? 1 : 0;
+        int under = img->nlayers - own;
+        bool took = false;
+        unpacked_whole = image_base(img, under, base, &took, &unpacked) == 0;
+        if (unpacked_whole && took)
+            lc_bytes_copy(taken_base, base, sizeof(taken_base));
+        unpacked_whole = unpacked_whole &&
+            (!cfg.userns || lc_kernel_fchownat(AT_FDCWD, fresh, cfg.uid_start, cfg.gid_start, 0) == 0) &&
+            (!own || image_unpack(img, under, own, fresh, TAR_INTO_UPPER, cfg.userns ? cfg.uid_start : 0,
+                                  cfg.userns ? cfg.gid_start : 0, &unpacked) == 0);
+    } else if (unpacked_whole) {
+        unpacked_whole = image_unpack(img, 0, img->nlayers, fresh, TAR_INTO_TREE, 0, 0, &unpacked) == 0;
+    }
+    if (!unpacked_whole) {
+        if (path_exists(fresh))
+            require_rm_rf(fresh);
+        if (taken_base[0])
+            base_discard(taken_base);
+        die2("Error: the image was not unpacked, and the container is as it was: ", name);
+    }
+
+    /* and in their place: from here to the end the container is half made */
+    if (write_file_atomic(creating, "", MODE_PRIVATE_FILE) != 0) {
+        require_rm_rf(fresh);
+        if (taken_base[0])
+            base_discard(taken_base);
+        die("Error: failed to mark the container as being replaced; it is as it was");
+    }
+    const char *dirs[] = { work, merged };
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++)
+        if (path_exists(dirs[i]))
+            require_rm_rf(dirs[i]);
+    if (lb_sys_renameat(AT_FDCWD, root, AT_FDCWD, old) < 0 || lb_sys_renameat(AT_FDCWD, fresh, AT_FDCWD, root) < 0)
+        replace_failed("failed to put the image's files in the place of the container's", name);
+    if (overlay && !streq(cfg.base, base)) {
+        lc_bytes_copy(cfg.base, base, sizeof(cfg.base));
+        const char *wrong = container_config_save(name, &cfg);
+        if (wrong)
+            replace_failed("failed to write which snapshot the container overlays", name);
+    }
+    if (overlay ? overlay_etc(name, &cfg, ip, resolv, img->name) != 0
+                : write_etc_files(root, name, ip, resolv, img->name) != NULL)
+        replace_failed("failed to write the container's files in /etc", name);
+    if (there->lineage[0] ? generation_keep(name, there) != 0 : (generation_forget(name), false))
+        replace_failed("failed to keep which generation of its line the container is now", name);
+    generation_unchanged(name);
+    container_forget_run(name);
+    if (overlay && upper_whole_keep(name) != 0)
+        replace_failed("failed to record that the container's own files are whole", name);
+    if (remove_file_durably(creating) != 0)
+        die("Error: failed to mark the container as replaced");
+    require_rm_rf(old);
+
+    print_str(STDOUT, "Container '");
+    print_str(STDOUT, name);
+    print_str(STDOUT, "' replaced");
+    if (there->lineage[0]) {
+        print_str(STDOUT, ": generation ");
+        print_str(STDOUT, its);
+        if (of_a_line && relation != GENERATION_OF_ANOTHER_LINE) {
+            print_str(STDOUT, " in the place of generation ");
+            print_str(STDOUT, mine);
+            print_str(STDOUT, changed ? ", which was started since" : "");
+        }
+    }
+    print_str(STDOUT, "\nImage sha256:");
+    print_str(STDOUT, img->manifest);
+    say_count(": ", (uint64_t)img->nlayers, img->nlayers == 1 ? " layer" : " layers");
+    if (overlay) {
+        print_str(STDOUT, taken_base[0] ? ", on the new base snapshot " : ", on the base snapshot ");
+        print_str(STDOUT, cfg.base);
+        print_str(STDOUT, taken_base[0] ? "\n" : ", which was here\n");
+    } else {
+        print_str(STDOUT, ", as a copy\n");
+    }
+    print_str(STDOUT, "Its address, its limits and its settings are as they were\n");
+    image_notes(img, &unpacked);
 }
 
 static void cmd_reset(int argc, char **argv) {
@@ -5650,6 +6317,8 @@ static const struct { const char *name; const char *text; } command_help[] = {
         "                                riops or wiops (default: none)\n"
         "         --vol  <src:dst[:ro]>  Bind mount (repeatable)\n"
         "         --rootfs <path>        The base it is made from (default: $LIGHTBOX_ROOTFS or lightbox.conf)\n"
+        "         --base <id>            The snapshot it is made from, as base ls shows it, in the place\n"
+        "                                of a base: the one base import unpacked an image into\n"
         "         --userns               A user namespace of its own: its root is an unprivileged uid\n"
         "                                on the host, from the range of /etc/subuid; as root\n"
         "         --read-only            Read-only root filesystem\n"
@@ -5719,9 +6388,26 @@ static const struct { const char *name; const char *text; } command_help[] = {
         "                                that profile needs too\n" },
     { "ls",
         "  ls [--json]                   List all containers\n" },
+    { "export",
+        "  export <name> <dir>           Write a container that is not running as an image in <dir>,\n"
+        "                                which is made, or holds the image of its export before: an OCI\n"
+        "                                image layout, as skopeo and oras carry one to a registry\n" },
+    { "import",
+        "  import <dir> <name> --replace [--force]\n"
+        "                                Put the image in the place of a container that is there and not\n"
+        "                                running, which keeps its address and settings: where the image\n"
+        "                                continues the generation the container was exported or imported\n"
+        "                                as, and it was not started since. --force: whatever they are\n"
+        "  import <dir> <name> [<ip>] [options]\n"
+        "                                Make a container of the image in <dir>, an OCI image layout, with\n"
+        "                                the options of create but --rootfs and --base. Every blob is held to the\n"
+        "                                digest it is named by first. The limits no option gives are the\n"
+        "                                image's, where they are no more than lightbox.conf's; as root\n" },
     { "base",
         "  base ls                       List the snapshots of bases that containers overlay\n"
         "  base add <dir>                Take a new snapshot of a base, for the containers made after it\n"
+        "  base import <dir>             Unpack the image in <dir>, an OCI image layout as skopeo copies\n"
+        "                                one from a registry, into a snapshot, for create --base; as root\n"
         "  base rm <id>...               Remove snapshots that no container uses\n" },
     { "setup",
         "  setup                         Setup host networking\n"
@@ -5877,6 +6563,8 @@ int main(int argc, char **argv, char **envp) {
     else if (streq(cmd, "inspect")) cmd_inspect(sub_argc, sub_argv);
     else if (streq(cmd, "doctor")) cmd_doctor(sub_argc, sub_argv);
     else if (streq(cmd, "ls"))     cmd_ls(sub_argc, sub_argv);
+    else if (streq(cmd, "export")) cmd_export(sub_argc, sub_argv);
+    else if (streq(cmd, "import")) cmd_import(sub_argc, sub_argv);
     else if (streq(cmd, "base"))   cmd_base(sub_argc, sub_argv);
     else if (streq(cmd, "reload")) cmd_reload(sub_argc, sub_argv);
     else {

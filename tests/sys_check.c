@@ -23,6 +23,7 @@
 
 #include <asm/errno.h>
 #include <asm/ioctls.h>
+#include <asm/mman.h>
 #include <asm/poll.h>
 #include <asm/siginfo.h>
 #include <asm/signal.h>
@@ -86,6 +87,13 @@ SAME_NR(mount_setattr);
 SAME_NR(move_mount);
 SAME_NR(pidfd_send_signal);
 SAME_NR(statx);
+SAME_NR(fgetxattr);
+SAME_NR(flistxattr);
+SAME_NR(fsetxattr);
+SAME_NR(linkat);
+SAME_NR(utimensat);
+SAME_NR(fchmod);
+SAME_NR(umask);
 SAME_NR(faccessat);
 SAME_NR(bpf);
 
@@ -102,9 +110,26 @@ SAME_VALUE(LB_ENOMEM, ENOMEM);
 SAME_VALUE(LB_EEXIST, EEXIST);
 SAME_VALUE(LB_EACCES, EACCES);
 SAME_VALUE(LB_ENOTDIR, ENOTDIR);
+SAME_VALUE(LB_EISDIR, EISDIR);
+SAME_VALUE(LB_ENOTEMPTY, ENOTEMPTY);
+SAME_VALUE(LB_ELOOP, ELOOP);
 SAME_VALUE(LB_S_IFREG, S_IFREG);
+SAME_VALUE(LB_S_IFMT, S_IFMT);
+SAME_VALUE(LB_S_IFDIR, S_IFDIR);
+SAME_VALUE(LB_S_IFLNK, S_IFLNK);
+SAME_VALUE(LB_S_IFCHR, S_IFCHR);
+SAME_VALUE(LB_S_IFBLK, S_IFBLK);
+SAME_VALUE(LB_S_IFIFO, S_IFIFO);
+SAME_VALUE(LB_S_IFSOCK, S_IFSOCK);
+SAME_VALUE(LB_STATX_NLINK, STATX_NLINK);
+SAME_VALUE(LB_STATX_MTIME, STATX_MTIME);
+SAME_VALUE(LB_STATX_SIZE, STATX_SIZE);
+SAME_VALUE(LB_ERANGE, ERANGE);
+SAME_VALUE(LB_ENODATA, ENODATA);
+SAME_VALUE(LB_EOPNOTSUPP, EOPNOTSUPP);
 SAME_VALUE(LB_AT_EMPTY_PATH, AT_EMPTY_PATH);
 SAME_VALUE(LB_O_EXCL, O_EXCL);
+SAME_VALUE(LB_O_PATH, O_PATH);
 SAME_VALUE(LB_LOCK_SH, LOCK_SH);
 SAME_VALUE(LB_LOCK_EX, LOCK_EX);
 SAME_VALUE(LB_LOCK_NB, LOCK_NB);
@@ -133,6 +158,7 @@ SAME_VALUE(LB_SIGPIPE, SIGPIPE);
 SAME_VALUE(LB_SIGCONT, SIGCONT);
 SAME_VALUE(LB_SIGTTOU, SIGTTOU);
 SAME_VALUE(LB_SIGWINCH, SIGWINCH);
+SAME_VALUE(LB_SIGSYS, SIGSYS);
 SAME_VALUE(LB_EAGAIN, EAGAIN);
 SAME_VALUE(LB_POLLOUT, POLLOUT);
 SAME_VALUE(LB_TCGETS, TCGETS);
@@ -240,6 +266,17 @@ SAME_FIELD(lb_statx, statx, stx_attributes_mask);
 SAME_FIELD(lb_statx, statx, stx_dev_major);
 SAME_FIELD(lb_statx, statx, stx_dev_minor);
 SAME_FIELD(lb_statx, statx, stx_mnt_id);
+SAME_FIELD(lb_statx, statx, stx_nlink);
+SAME_FIELD(lb_statx, statx, stx_ino);
+SAME_FIELD(lb_statx, statx, stx_size);
+SAME_FIELD(lb_statx, statx, stx_rdev_major);
+SAME_FIELD(lb_statx, statx, stx_rdev_minor);
+/* stx_mtime is a struct of the kernel's, which lightbox has as its two numbers */
+_Static_assert(offsetof(struct lb_statx, stx_mtime_sec) == offsetof(struct statx, stx_mtime.tv_sec) &&
+               offsetof(struct lb_statx, stx_mtime_nsec) == offsetof(struct statx, stx_mtime.tv_nsec) &&
+               sizeof(((struct lb_statx *)0)->stx_mtime_sec) == sizeof(((struct statx *)0)->stx_mtime.tv_sec) &&
+               sizeof(((struct lb_statx *)0)->stx_mtime_nsec) == sizeof(((struct statx *)0)->stx_mtime.tv_nsec),
+               "struct lb_statx's mtime does not match the kernel's struct statx");
 
 /* siginfo_t is a typedef, and its fields past the first three are macros
  * into a union: compared one by one. */
@@ -416,6 +453,25 @@ LB_SECCOMP_MODE_X86_64(CHECK_MODE_ROW_X86_64)
 LB_SECCOMP_ALLOW(CHECK_ALLOW_ROW)
 #define CHECK_ALLOW_ROW_X86_64(name, nr) CHECK_ROW_X86_64(name, nr, 0)
 LB_SECCOMP_ALLOW_X86_64(CHECK_ALLOW_ROW_X86_64)
+/* the tables of the process that unpacks and of the host's gzip, as the allow table */
+LB_SECCOMP_UNPACK(CHECK_ALLOW_ROW)
+LB_SECCOMP_GZIP(CHECK_ALLOW_ROW)
+LB_SECCOMP_GZIP_X86_64(CHECK_ALLOW_ROW_X86_64)
+#if defined(__x86_64__)
+SAME_VALUE(LB_SECCOMP_NR_MMAP, LB_SECCOMP_NR_MMAP_X86_64);
+SAME_VALUE(LB_SECCOMP_NR_EXECVE, LB_SECCOMP_NR_EXECVE_X86_64);
+SAME_VALUE(LB_SECCOMP_NR_IOCTL, LB_SECCOMP_NR_IOCTL_X86_64);
+#else
+SAME_VALUE(LB_SECCOMP_NR_MMAP, LB_SECCOMP_NR_MMAP_AARCH64);
+SAME_VALUE(LB_SECCOMP_NR_EXECVE, LB_SECCOMP_NR_EXECVE_AARCH64);
+SAME_VALUE(LB_SECCOMP_NR_IOCTL, LB_SECCOMP_NR_IOCTL_AARCH64);
+#endif
+SAME_VALUE(LB_SECCOMP_NR_MMAP, __NR_mmap);
+SAME_VALUE(LB_SECCOMP_NR_EXECVE, __NR_execve);
+SAME_VALUE(LB_SECCOMP_NR_IOCTL, __NR_ioctl);
+SAME_VALUE(LB_SECCOMP_PROT_EXEC, PROT_EXEC);
+SAME_VALUE(LB_SECCOMP_TCGETS, TCGETS);
+SAME_VALUE(LB_SC_ENOTTY, ENOTTY);
 #if defined(__x86_64__)
 SAME_VALUE(LB_SECCOMP_NR_SOCKET, LB_SECCOMP_NR_SOCKET_X86_64);
 SAME_VALUE(LB_SECCOMP_NR_SOCKETPAIR, LB_SECCOMP_NR_SOCKETPAIR_X86_64);

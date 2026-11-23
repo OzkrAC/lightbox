@@ -194,7 +194,7 @@ The address of the bridge, which is the gateway of every container: an address o
 
 ### Limits of new containers {#settings-limits}
 
-What `create` and `run` give a container that no option gives a limit. Each takes what its option takes. `create` writes the limit into the container's own `.conf`, so a change here holds for the containers made after it and changes none that is there.
+What `create` and `run` give a container that no option gives a limit. Each takes what its option takes. `create` writes the limit into the container's own `.conf`, so a change here holds for the containers made after it and changes none that is there. They are also the most that an image's limits may be: `import` takes an image's memory, process and CPU limits only where they are no more than these, and says so of one that is more ([Commands](commands.html#import)).
 
 :::member{#conf-default_mem}
 ```ini
@@ -369,7 +369,9 @@ Nothing of the environment reaches a container. What a command in one gets is a 
 3. `rootfs` in `lightbox.conf`.
 4. `<lightbox_dir>/rootfs`, which is `/var/lib/lightbox/rootfs` on a host that sets neither.
 
-The base has to be a directory with something in it; a link to one is followed. `create` looks before it makes anything, so a refusal leaves nothing behind:
+`--base <id>` names a snapshot in the place of all four, as `base import` makes one of an image ([Storage](storage.html#image-base)).
+
+The base has to be a directory with something in it; a link to one is followed. A directory that holds an image is no base, and is refused with the commands that take one. `create` looks before it makes anything, so a refusal leaves nothing behind:
 
 ```text
 Error: base rootfs does not exist: /opt/rootfs/alpine

@@ -18,7 +18,7 @@ A minimal, secure container runtime for Linux: one static binary with no libc an
 ::toc
 
 :::div{.facts cols="1 1 1 1"}
-**240 KB**
+**330 KB**
 one static binary, no libc
 +++
 **0**
@@ -33,7 +33,7 @@ to start a container[^start]
 
 ## Overview {#overview}
 
-lightbox turns a directory that holds a Linux root filesystem into containers. `create` makes a container from that base, `start` gives it namespaces, a cgroup with limits, an address on a bridge and a sandbox, `exec` runs commands in it, and `stop` and `rm` take it away again. There is no image format, no registry and no daemon: a container is a directory and a few processes, and every command is one run of the same binary.
+lightbox turns a directory that holds a Linux root filesystem into containers. `create` makes a container from that base, `start` gives it namespaces, a cgroup with limits, an address on a bridge and a sandbox, `exec` runs commands in it, and `stop` and `rm` take it away again. There is no daemon: a container is a directory and a few processes, and every command is one run of the same binary. A container that is not running goes to another machine as an image in the OCI layout, which `export` writes and `import` reads, and a tool such as `skopeo` carries to a registry and back; an image of a registry's is a base.
 
 Three things hold throughout:
 

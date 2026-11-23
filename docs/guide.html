@@ -176,6 +176,21 @@ What a base has to contain:
 
 A container does not copy its base. The first `create` from a base takes a snapshot of it, and every container of that base is an overlay of the snapshot, so changing the directory afterwards changes no container ([Storage](storage.html#bases)).
 
+### Or a registry's image {#rootfs-registry}
+
+An image that a registry keeps, such as Docker's official ones, is a base too, once a tool has copied it into a directory. lightbox speaks to no registry; `skopeo` does, and is a package of most distributions:
+
+```console
+# skopeo copy docker://docker.io/library/alpine:3.24 oci:/srv/images/alpine
+# lightbox base import /srv/images/alpine
+Base 82c36559d2d2 unpacked from the image sha256:0f49f331d9212aff11b932863be4eb01cdf962969aa86dab7d1ee21ac6f5f52b, 1 layer
+Note: the image names a command to start, which lightbox does not read: a container starts its /init.sh, where it has one
+A container of it: lightbox create <name> --base 82c36559d2d2
+# lightbox create web --base 82c36559d2d2
+```
+
+`base import` holds every layer to the SHA-256 the image names it by before it unpacks anything, and makes one snapshot of them, which `create --base` makes containers of. A name with a digest, `docker://docker.io/library/alpine@sha256:<digest>`, pins one image. An image's command is not run: a container starts its `/init.sh` ([below](#init)).
+
 :::warning[A base is trusted as it is]
 `create` takes a base as the files it is. What it contains runs in the sandbox, as the container's root. Take bases from where you would take software for the host, and check what you download.
 :::
@@ -355,6 +370,7 @@ What happens afterwards:
 
 ## Where to go next {#next}
 
+- **Taking a container to another machine:** `lightbox export web <dir>` there, `skopeo copy` to a registry or `rsync -a` of the directory, and `lightbox import <dir> web` on the other machine ([Commands](commands.html#images), [Storage](storage.html#images)).
 - **Running an AI agent, or any code you do not trust,** in a container: [Agent boxes](agents.html) has the profile that turns on everything lightbox has for it, and says where a container stops being enough.
 - **What the sandbox is made of,** and what it does not keep out: [Security](security.html).
 - **A firewall of the host's own,** Docker beside lightbox, or nftables: [Networking](networking.html#firewall).

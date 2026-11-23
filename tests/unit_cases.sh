@@ -206,6 +206,10 @@ in_namespace_with_ids() { # script
         UNIT=$1; D=$2
         '"$1" _ "$UNIT" "$dir"
     rc=$?
+    # as that namespace's root once more: a directory of another of its ids,
+    # with something in it, is not this user's to empty
+    unshare --map-root-user --map-users="1:$uids:65536" --map-groups="1:$gids:65536" -- \
+        find "$dir" -mindepth 1 -delete 2>/dev/null
     rm -rf -- "$dir"
     return $rc
 }
@@ -3543,5 +3547,1298 @@ check 'a file is removed for good, or said not to be'             t_remove_durab
 check 'init says how it ends, and nothing it starts can look into it' t_init_reports_its_end
 check 'a container that ended without a stop is cleared away, and how it ended recorded' t_reconcile
 check 'the device program lets a container open its own devices and nothing else' t_device_program
+
+# ─── Images (ROADMAP Track I) ───────────────────────────────────────────────
+
+# I.1: a blob of an image is named by its SHA-256. The harness gives a file to
+# sha256_update in pieces of a given length, as a layer is hashed while it is
+# written.
+t_sha256() {
+    D=$(mktemp -d "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    bad=0
+    expect() { # digest, file, [piece]
+        got=$("$UNIT" sha256 "$2" ${3:+"$3"})
+        [ "$got" = "$1" ] || { echo "${2##*/}${3:+ in pieces of $3}: $got, not $1"; bad=1; }
+    }
+
+    # the messages FIPS 180-4's examples use: none, one block, two blocks,
+    # and a million times the letter a
+    : > "$D/empty"
+    printf abc > "$D/abc"
+    printf abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq > "$D/two-blocks"
+    head -c 1000000 /dev/zero | tr '\0' a > "$D/million"
+    expect e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 "$D/empty"
+    expect ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad "$D/abc"
+    expect 248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1 "$D/two-blocks"
+    expect cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0 "$D/million"
+    expect cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0 "$D/million" 7
+
+    # Every length around a block's 64 bytes, where the padding ends in the
+    # same block or takes one more, and around a megabyte; each in one piece
+    # and in pieces that cut a block anywhere. sha256sum says what it is.
+    if command -v sha256sum >/dev/null; then
+        head -c 1048700 /dev/urandom > "$D/random"
+        for len in $(seq 0 130) 1048575 1048576 1048577 1048700; do
+            head -c "$len" "$D/random" > "$D/part"
+            want=$(sha256sum < "$D/part")
+            want=${want%% *}
+            pieces="65536 1 3 63 64 65"
+            [ "$len" -gt 130 ] && pieces="65536 63 64 65 4097"
+            for piece in $pieces; do
+                expect "$want" "$D/part" "$piece"
+            done
+        done
+    else
+        echo "no sha256sum here: only the standard's messages were compared"
+    fi
+
+    # a digest as text is 64 lowercase hex digits, and nothing else is one
+    zeros=$(printf '%063d' 0)
+    for name in '' abc "${zeros}" "${zeros}00" "${zeros}A" "${zeros}g" "${zeros} " "sha256:${zeros#??????}"; do
+        [ "$("$UNIT" sha256-name "$name")" = refused ] || { echo "taken for a digest: '$name'"; bad=1; }
+    done
+    for name in "${zeros}0" e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855; do
+        [ "$("$UNIT" sha256-name "$name")" = ok ] || { echo "a digest was refused: $name"; bad=1; }
+    done
+
+    rm -rf -- "$D"
+    return $bad
+}
+check 'SHA-256 is the standard'"'"'s and sha256sum'"'"'s, in whatever pieces the input comes' t_sha256
+
+# I.2: a tree as a tar archive, the way a layer of an image is one. The cases
+# run as the root of a user namespace that has 65536 more ids, so that files
+# have several owners and a file of mode 000 is read, as root reads one. Each
+# is a function that in_namespace_with_ids runs there, with $UNIT and $D.
+
+# what a tree is, a line for each entry but sockets: name, kind, mode, owner,
+# seconds of its time, a link's target, the number of its names, a file's size
+tar_helpers() {
+    listing() {
+        (cd "$1" && find . -mindepth 1 ! -type s -printf "%P|%y|%m|%U:%G|%Ts|%l|%n|" \
+            \( -type f -printf "%s" -o -true \) -printf "\n" | LC_ALL=C sort)
+    }
+    # the user attributes of every file and directory of a tree
+    attributes() {
+        python3 -I -c "
+import os, sys
+for d, dirs, files in sorted(os.walk(sys.argv[1])):
+    for n in sorted(dirs + files):
+        p = os.path.join(d, n)
+        if os.path.islink(p) or not (os.path.isfile(p) or os.path.isdir(p)): continue
+        for a in sorted(os.listxattr(p)):
+            print(os.path.relpath(p, sys.argv[1]), a, os.getxattr(p, a))
+" "$1"
+    }
+    field() { printf "%s\n" "$2" | sed -n "s/^$1 //p"; }
+    long=$(printf "n%.0s" $(seq 1 120))
+    # A tree with every kind of entry an archive has, 19 of them and a
+    # socket: names of 120 and 255 bytes, a link to a name of 362, several
+    # owners, a file no mode lets anyone read, a second name of a file.
+    # $attrs says whether the filesystem took the user attributes.
+    make_tree() {
+        mkdir -p "$1/sub/deep" "$1/empty-dir" || return 1
+        (
+            cd "$1" || exit 1
+            printf "hello\n" > file
+            : > empty
+            head -c 512 /dev/urandom > block
+            head -c 513 /dev/urandom > block-and-one
+            head -c 200000 /dev/urandom > sub/big
+            ln file sub/second-name
+            ln -s ../file sub/symlink
+            ln -s /nowhere/at/all dangling
+            mkfifo sub/fifo
+            chmod 4755 block
+            chmod 000 empty
+            printf "long\n" > "sub/$long"
+            mkdir -p "sub/deep/$long/$long"
+            printf "deeper\n" > "sub/deep/$long/$long/file"
+            ln -s "$long/$long/$long" sub/long-link
+            printf "spaces\n" > "a name with spaces"
+            printf "utf8\n" > "ünïcödé"
+            chown 1000:2000 block-and-one
+            chown 65536:65536 sub/big
+            chown -h 7:8 sub/symlink
+            chown 33:33 empty-dir
+            touch -d "2001-02-03 04:05:06 UTC" file sub/deep
+            python3 -I -c "import socket; s = socket.socket(socket.AF_UNIX); s.bind(\"sub/socket\")"
+        ) || return 1
+        attrs=yes
+        python3 -I -c "
+import os, sys
+os.setxattr(sys.argv[1] + \"/file\", \"user.note\", b\"kept\")
+os.setxattr(sys.argv[1] + \"/sub\", \"user.b\", b\"2\")
+os.setxattr(sys.argv[1] + \"/sub\", \"user.a\", bytes(range(256)))" "$1" 2>/dev/null || attrs=no
+    }
+    # Two trees are one: names, kinds, modes, owners, times, links, the names
+    # of one file, sizes, bytes and, where there are any, attributes.
+    same_tree() {
+        listing "$1" > one.list
+        listing "$2" > other.list
+        diff one.list other.list || { echo "$2 is another tree than $1"; return 1; }
+        diff -r --no-dereference "$1" "$2" 2>&1 | grep -v "socket\|fifo" | grep . &&
+            { echo "a file of $2 is another than in $1"; return 1; }
+        [ $attrs = yes ] || return 0
+        attributes "$1" > one.attrs
+        attributes "$2" > other.attrs
+        diff one.attrs other.attrs || { echo "the attributes of $2 are others than those of $1"; return 1; }
+    }
+}
+
+tar_tree_case() {
+    cd "$D" || exit 1
+    mkdir out
+    make_tree tree || { echo "the tree could not be made"; exit 1; }
+
+    said=$("$UNIT" tar tree a.tar) || { echo "$said"; exit 1; }
+    echo "$said"
+    bad=0
+    [ "$(field entries "$said")" = 19 ] || { echo "not 19 entries"; bad=1; }
+    [ "$(field sockets "$said")" = 1 ] || { echo "the socket was not left out and counted"; bad=1; }
+    [ "$(field attributes-left "$said")" = 0 ] || { echo "attributes were left out"; bad=1; }
+    size=$(stat -c %s a.tar)
+    [ "$(field bytes "$said")" = "$size" ] && [ $((size % 512)) = 0 ] || { echo "the archive is $size bytes"; bad=1; }
+    sum=$(sha256sum < a.tar)
+    [ "$(field sha256 "$said")" = "${sum%% *}" ] || { echo "the digest is not the file's"; bad=1; }
+
+    # one tree, one archive
+    "$UNIT" tar tree b.tar >/dev/null && cmp a.tar b.tar || { echo "a second archive of the tree differs"; bad=1; }
+
+    # GNU tar reads it as the tree it is: names, kinds, modes, owners, times,
+    # links, the two names of one file, sizes, bytes, attributes
+    tar --version | grep -q GNU || { echo "tar here is not GNU tar: nothing else was compared"; exit $bad; }
+    tar -xpf a.tar -C out --same-owner --xattrs --xattrs-include="user.*" || { echo "GNU tar could not unpack it"; exit 1; }
+    listing tree > tree.list
+    listing out > out.list
+    diff tree.list out.list || { echo "unpacked, the tree is another"; bad=1; }
+    [ "$(wc -l < tree.list)" = 19 ] || { echo "the tree does not have 19 entries"; bad=1; }
+    diff -r --no-dereference tree out 2>&1 | grep -v "socket\|fifo" | grep . && { echo "unpacked, a file is another"; bad=1; }
+    if [ $attrs = yes ]; then
+        attributes tree > tree.attrs
+        attributes out > out.attrs
+        # three attributes, one of them seen under both names of its file
+        diff tree.attrs out.attrs && [ "$(wc -l < tree.attrs)" = 4 ] || { echo "the attributes did not arrive"; bad=1; }
+    else
+        echo "no user attributes on this filesystem: none were written"
+    fi
+
+    # and that tree, made by another program in another order and with other
+    # inodes, gives the archive again, byte for byte
+    "$UNIT" tar out c.tar >/dev/null && cmp a.tar c.tar || { echo "the unpacked tree gives another archive"; bad=1; }
+
+    if command -v bsdtar >/dev/null; then
+        [ "$(bsdtar -tf a.tar | LC_ALL=C sort)" = "$(tar -tf a.tar | LC_ALL=C sort)" ] ||
+            { echo "bsdtar lists other names than GNU tar"; bad=1; }
+    else
+        echo "no bsdtar here: GNU tar alone read the archive"
+    fi
+    exit $bad
+}
+t_tar_tree() { in_namespace_with_ids "$(declare -f tar_helpers tar_tree_case); tar_helpers; tar_tree_case"; }
+
+tar_overlay_case() {
+    cd "$D" || exit 1
+    mkdir -p upper/kept upper/opaque
+    printf "new\n" > upper/kept/file
+    printf "its own\n" > upper/opaque/file
+    mknod upper/gone c 0 0 || { echo "this kernel lets no one but root make a whiteout"; exit 77; }
+    mknod upper/kept/gone-too c 0 0
+    python3 -I -c "import os; os.setxattr(\"upper/opaque\", \"user.overlay.opaque\", b\"y\")" 2>/dev/null ||
+        { echo "no user attributes on this filesystem"; exit 77; }
+    bad=0
+
+    # as an overlay's upper directory: each mark the image's way, in the
+    # place of the name it stands for
+    said=$("$UNIT" tar upper o.tar overlay) || { echo "$said"; exit 1; }
+    got=$(tar -tvf o.tar --numeric-owner | awk "{ print substr(\$1, 1, 1), \$3, \$NF }")
+    want="- 0 .wh.gone
+d 0 kept/
+- 4 kept/file
+- 0 kept/.wh.gone-too
+d 0 opaque/
+- 0 opaque/.wh..wh..opq
+- 8 opaque/file"
+    [ "$got" = "$want" ] || { echo "as an overlay:"; echo "$got"; bad=1; }
+    [ "$(field attributes-left "$said")" = 0 ] || { echo "the overlay's own attribute was counted as left out"; bad=1; }
+
+    # as a tree of its own: a device is a device, and nothing is a mark
+    said=$("$UNIT" tar upper p.tar) || { echo "$said"; exit 1; }
+    got=$(tar -tvf p.tar --numeric-owner | awk "{ print substr(\$1, 1, 1), \$NF }")
+    want="c gone
+d kept/
+- kept/file
+c kept/gone-too
+d opaque/
+- opaque/file"
+    [ "$got" = "$want" ] || { echo "as a tree:"; echo "$got"; bad=1; }
+
+    # The kernel makes the device as whoever mounted the overlay, which is
+    # host root and nobody of a container's range: its mark is written all
+    # the same, as root's. Outside an overlay such a device is of no
+    # container of that range.
+    chown -R 1000:1000 upper && chown 0:0 upper/gone upper/kept/gone-too || exit 1
+    said=$("$UNIT" tar upper r.tar overlay 1000 1000) || { echo "with a range of ids: $said"; bad=1; }
+    got=$(tar -tvf r.tar --numeric-owner | awk "{ print \$2, \$NF }" | paste -sd" " -)
+    [ "$got" = "0/0 .wh.gone 0/0 kept/ 0/0 kept/file 0/0 kept/.wh.gone-too 0/0 opaque/ 0/0 opaque/.wh..wh..opq 0/0 opaque/file" ] ||
+        { echo "with a range of ids, the owners are: $got"; bad=1; }
+    said=$("$UNIT" tar upper s.tar 1000 1000)
+    [ $? = 1 ] && [ "$said" = "failed: gone: belongs to an id outside the container's range" ] ||
+        { echo "a device of host root's in a tree of a range: $said"; bad=1; }
+    chown -R 0:0 upper
+
+    # What an overlay keeps in part in its base, a directory it moved with
+    # redirect_dir, a file whose bytes metacopy left there, and a whiteout
+    # that is an attribute, is no layer by the upper directory alone: each
+    # ends the writing with the entry named. In a tree of its own they say
+    # nothing.
+    unread="is as an overlay with redirect_dir, metacopy or whiteouts in attributes leaves it, which is not written as a layer"
+    for pair in moved:redirect:/kept meta:metacopy: white:whiteout:y opaque:opaque:x; do
+        name=${pair%%:*} rest=${pair#*:}
+        [ -e "upper/$name" ] || { if [ "$name" = moved ]; then mkdir upper/moved; else : > "upper/$name"; fi; }
+        python3 -I -c "import os, sys; os.setxattr(sys.argv[1], \"user.overlay.\" + sys.argv[2], sys.argv[3].encode())" \
+            "upper/$name" "${rest%%:*}" "${rest#*:}" || exit 1
+        said=$("$UNIT" tar upper t.tar overlay)
+        [ $? = 1 ] && [ "$said" = "failed: $name: $unread" ] || { echo "user.overlay.${rest%%:*} on $name: $said"; bad=1; }
+        "$UNIT" tar upper u.tar > /dev/null || { echo "user.overlay.${rest%%:*} in a tree of its own ended the writing"; bad=1; }
+        python3 -I -c "import os, sys; os.removexattr(sys.argv[1], \"user.overlay.\" + sys.argv[2])" "upper/$name" "${rest%%:*}"
+    done
+    exit $bad
+}
+t_tar_overlay() { in_namespace_with_ids "$(declare -f tar_helpers tar_overlay_case); tar_helpers; tar_overlay_case"; }
+
+tar_ids_case() {
+    cd "$D" || exit 1
+    mkdir tree
+    : > tree/root-of-the-range
+    : > tree/another
+    chown 1000:1000 tree/root-of-the-range
+    chown 1500:1700 tree/another
+    bad=0
+    said=$("$UNIT" tar tree a.tar 1000 1000) || { echo "$said"; exit 1; }
+    got=$(tar -tvf a.tar --numeric-owner | awk "{ print \$2, \$NF }")
+    [ "$got" = "500/700 another
+0/0 root-of-the-range" ] || { echo "less 1000:1000, the owners are:"; echo "$got"; bad=1; }
+
+    # an id below the range is of no container of that range
+    : > tree/host-roots
+    said=$("$UNIT" tar tree b.tar 1000 1000)
+    [ $? = 1 ] && [ "$said" = "failed: host-roots: belongs to an id outside the container's range" ] ||
+        { echo "a file of an id below the range: $said"; bad=1; }
+    exit $bad
+}
+t_tar_ids() { in_namespace_with_ids "$(declare -f tar_helpers tar_ids_case); tar_helpers; tar_ids_case"; }
+
+tar_refusals_case() {
+    cd "$D" || exit 1
+    bad=0
+    refused() { # what was said, what it has to be
+        [ "$1" = "$2" ] || { echo "said: $1"; echo "not:  $2"; bad=1; }
+    }
+    # a name an image would take for a mark
+    mkdir -p marks/dir
+    : > marks/dir/.wh.file
+    refused "$("$UNIT" tar marks m.tar)" \
+        "failed: dir/.wh.file: has a name that begins with .wh., which in an image marks what a layer removes"
+
+    # a name longer than a path may be: 18 directories of 240 letters
+    mkdir deep
+    (
+        cd deep || exit 1
+        part=$(printf "d%.0s" $(seq 1 240))
+        for i in $(seq 1 18); do mkdir "$part" && cd "$part" || exit 1; done
+    ) || { echo "the deep tree could not be made"; exit 1; }
+    said=$("$UNIT" tar deep d.tar)
+    case $said in
+        "failed: d"*": has an entry whose name is too long for an archive"|"failed: d"*": has a name too long for an archive") ;;
+        *) echo "a name too long: $(printf "%s" "$said" | cut -c1-60)...$(printf "%s" "$said" | tail -c 70)"; bad=1 ;;
+    esac
+
+    # nowhere to write
+    mkdir one
+    : > one/file
+    refused "$("$UNIT" tar one /dev/full)" "failed: file: the archive could not be written"
+    exit $bad
+}
+t_tar_refusals() { in_namespace_with_ids "$(declare -f tar_helpers tar_refusals_case); tar_helpers; tar_refusals_case"; }
+
+check 'a tree is one archive, which GNU tar unpacks to a tree that gives it again' t_tar_tree
+check "an overlay's marks are written the way an image has them" t_tar_overlay
+check "ids are written less the start of a container's range, and none from outside it" t_tar_ids
+check 'what an archive cannot hold ends the writing, with the entry named' t_tar_refusals
+
+# I.3: an archive unpacked into a directory, by a process whose root that
+# directory is. The cases run as the root of a user namespace, as I.2's do:
+# only a root makes a directory its root and gives files to other ids.
+# tests/tar_archives.py writes the archives no tar program does.
+
+untar_helpers() {
+    # the names in a tree, on one line
+    names() { (cd "$1" && find . -mindepth 1 -printf "%P\n" | LC_ALL=C sort | paste -sd" "); }
+    # what was got and what it has to be
+    is() { # what it is about, got, wanted
+        [ "$2" = "$3" ] || { echo "$1: $2"; echo "$1, not: $3"; bad=1; }
+    }
+}
+
+untar_tree_case() {
+    cd "$D" || exit 1
+    mkdir out pieces
+    make_tree tree || { echo "the tree could not be made"; exit 1; }
+    wrote=$("$UNIT" tar tree a.tar) || { echo "$wrote"; exit 1; }
+    said=$("$UNIT" untar a.tar out) || { echo "$said"; exit 1; }
+    echo "$said"
+    bad=0
+    is "entries, devices, attributes left" \
+        "$(field entries "$said") $(field devices "$said") $(field attributes-left "$said")" "19 0 0"
+    is "the bytes read and their digest" "$(field bytes "$said") $(field sha256 "$said")" \
+        "$(stat -c %s a.tar) $(field sha256 "$wrote")"
+    same_tree tree out || bad=1
+    "$UNIT" tar out b.tar >/dev/null && cmp a.tar b.tar || { echo "the unpacked tree gives another archive"; bad=1; }
+
+    # the archive as a pipe may give it, a few bytes at a time
+    "$UNIT" untar a.tar pieces tree 0 0 7 >/dev/null && same_tree tree pieces ||
+        { echo "read in pieces of 7 bytes, it is another tree"; bad=1; }
+
+    # over a tree that is there: every entry takes the place of what is at its name
+    printf "changed\n" > out/file
+    : > out/sub/symlink.new && mv -f out/sub/symlink.new out/sub/symlink
+    "$UNIT" untar a.tar out >/dev/null && same_tree tree out || { echo "unpacked over itself, it is another tree"; bad=1; }
+    exit $bad
+}
+t_untar_tree() {
+    in_namespace_with_ids "$(declare -f tar_helpers untar_helpers untar_tree_case); tar_helpers; untar_helpers; untar_tree_case"
+}
+
+untar_ids_case() {
+    cd "$D" || exit 1
+    mkdir tree shifted archives made range none
+    (
+        cd tree || exit 1
+        : > roots
+        : > others
+        mkdir dir
+        ln -s roots link
+        mkfifo pipe
+        chown 500:700 others
+        chown 65535:65535 dir
+        chown -h 5:6 link
+        chown 9:10 pipe
+    ) || { echo "the tree could not be made"; exit 1; }
+    bad=0
+    "$UNIT" tar tree a.tar >/dev/null || exit 1
+    said=$("$UNIT" untar a.tar shifted tree 1 1) || { echo "$said"; exit 1; }
+    is "with a start of 1:1" "$(cd shifted && stat -c "%n %u:%g" * | paste -sd" ")" \
+        "dir 65536:65536 link 6:7 others 501:701 pipe 10:11 roots 1:1"
+    # and written less the start again, it is the archive that was unpacked
+    "$UNIT" tar shifted b.tar 1 1 >/dev/null && cmp a.tar b.tar || { echo "written less 1:1, it is another archive"; bad=1; }
+
+    python3 -I "$HERE/tar_archives.py" archives "$D" || exit 1
+    # the directories an archive has no entry for belong to the root of the range
+    "$UNIT" untar archives/missing-directories.tar made tree 1 1 >/dev/null
+    is "directories without an entry" "$(stat -c %u:%g made/p made/p/q/r made/s/t | paste -sd" ")" "1:1 1:1 1:1"
+
+    # an id that is not one of a range's 65536, and the one that is no id
+    said=$("$UNIT" untar archives/id-outside-range.tar range tree 1 1)
+    is "an id of 65536 in a range" "$said" "failed: out: belongs to an id that does not fit the container's range"
+    is "and what is in the tree after it" "$(names range) $(stat -c %u:%g range/in)" "in 65536:65536"
+    said=$("$UNIT" untar archives/id-no-id.tar none)
+    is "the id 4294967295" "$said" "failed: file: belongs to an id that does not fit the container's range"
+    exit $bad
+}
+t_untar_ids() {
+    in_namespace_with_ids "HERE=$(printf %q "$HERE"); $(declare -f tar_helpers untar_helpers untar_ids_case)
+        tar_helpers; untar_helpers; untar_ids_case"
+}
+
+untar_others_case() {
+    cd "$D" || exit 1
+    make_tree tree || { echo "the tree could not be made"; exit 1; }
+    # a smaller tree for the formats without a place for a long name: its
+    # longest is 126 bytes, which ustar keeps in two of a header's fields
+    p=$(printf "p%.0s" $(seq 1 60))
+    q=$(printf "q%.0s" $(seq 1 60))
+    mkdir -p small/dir "small/$p/$q" || exit 1
+    printf "small\n" > small/dir/file
+    printf "split\n" > "small/$p/$q/file"
+    ln -s dir/file small/link
+    ln small/dir/file small/second-name
+    chown 12:34 small/dir/file
+    # and one for the oldest format, whose names end at 99 bytes
+    mkdir -p seventh/dir || exit 1
+    printf "seventh\n" > seventh/dir/file
+    ln -s dir/file seventh/link
+    ln seventh/dir/file seventh/second-name
+    chown 12:34 seventh/link
+    bad=0
+    n=0
+    # the program and the format in words, the archive, the tree it is of,
+    # and "attributes" or "times" where the format keeps those too
+    unpacks() {
+        n=$((n + 1))
+        mkdir "out.$n"
+        [ -s "$2" ] || { echo "$1: no archive was written"; bad=1; return; }
+        said=$("$UNIT" untar "$2" "out.$n") || { echo "$1: $said"; bad=1; return; }
+        held=$attrs
+        case " ${4:-} " in *" attributes "*) ;; *) attrs=no ;; esac
+        same_tree "$3" "out.$n" || { echo "$1: unpacked, it is not the tree"; bad=1; }
+        attrs=$held
+        case " ${4:-} " in *" times "*)
+            (cd "$3" && find . -mindepth 1 ! -type s -printf "%P %T@\n" | LC_ALL=C sort) > one.times
+            (cd "out.$n" && find . -mindepth 1 -printf "%P %T@\n" | LC_ALL=C sort) > other.times
+            diff one.times other.times || { echo "$1: the times are not the tree's to the nanosecond"; bad=1; } ;;
+        esac
+    }
+
+    if tar --version 2>/dev/null | grep -q GNU; then
+        tar --format=gnu -cf gnu.tar -C tree . 2>/dev/null
+        unpacks "GNU tar, its own format" gnu.tar tree
+        tar --format=pax --xattrs --xattrs-include="user.*" -cf gnu-pax.tar -C tree . 2>/dev/null
+        unpacks "GNU tar, pax" gnu-pax.tar tree "attributes times"
+        tar --format=ustar -cf gnu-ustar.tar -C small . 2>/dev/null
+        unpacks "GNU tar, ustar" gnu-ustar.tar small
+        tar --format=v7 -cf gnu-v7.tar -C seventh . 2>/dev/null
+        unpacks "GNU tar, the format of Seventh Edition Unix" gnu-v7.tar seventh
+    else
+        echo "tar here is not GNU tar: none of its archives was unpacked"
+    fi
+    if command -v bsdtar >/dev/null; then
+        # bsdtar writes a socket's name where GNU tar leaves it out, and no
+        # program has a kind of entry for one: the trees it is given have none
+        python3 -I -c "import os; os.unlink(\"tree/sub/socket\")"
+        # its own choice is pax where an entry needs it and ustar where not,
+        # and ustar has a time in whole seconds, which same_tree compares:
+        # to the nanosecond the times are the tree's with --format=pax alone
+        # (found by CI's first run of this case, on 2026-11-23)
+        bsdtar -cf bsd.tar -C tree . 2>/dev/null
+        unpacks "bsdtar, its own choice" bsd.tar tree "attributes"
+        bsdtar --format=pax -cf bsd-pax.tar -C tree . 2>/dev/null
+        unpacks "bsdtar, pax" bsd-pax.tar tree "attributes times"
+        bsdtar --format=gnutar -cf bsd-gnu.tar -C tree . 2>/dev/null
+        unpacks "bsdtar, GNU tar's format" bsd-gnu.tar tree
+        bsdtar --format=ustar -cf bsd-ustar.tar -C small . 2>/dev/null
+        unpacks "bsdtar, ustar" bsd-ustar.tar small
+    else
+        echo "no bsdtar here: none of its archives was unpacked"
+    fi
+    [ $n -gt 0 ] || exit 77
+    exit $bad
+}
+t_untar_others() {
+    in_namespace_with_ids "$(declare -f tar_helpers untar_helpers untar_others_case); tar_helpers; untar_helpers; untar_others_case"
+}
+
+untar_taken_case() {
+    cd "$D" || exit 1
+    mkdir archives
+    python3 -I "$HERE/tar_archives.py" archives "$D" || exit 1
+    bad=0
+    unpack() { # an archive, into a directory of its name: sets $said
+        mkdir "$1"
+        said=$("$UNIT" untar "archives/$1.tar" "$1") || { echo "$1: $said"; bad=1; return 1; }
+    }
+    part=$(printf "n%.0s" $(seq 1 200))
+    long=$part/$part/$part/file
+    link=$(printf "t%.0s" $(seq 1 300))
+
+    # pax: what its records say of a name, a link, a size, the ids and a
+    # time is taken before what the header says, and its attributes are set
+    if unpack pax-all; then
+        is "pax: size, ids and time of the file with a long name" "$(stat -c "%s %u:%g %.9Y" "pax-all/$long")" \
+            "5 1234:4321 1234567890.123456789"
+        is "pax: its content" "$(cat "pax-all/$long")" 12345
+        is "pax: a link to a long name" "$(readlink pax-all/long-link)" "$link"
+        is "pax: a time before 1970, of a link" "$(stat -c %.9Y pax-all/long-link)" "-1.250000000"
+        is "pax: a record that says nothing" "$(cat pax-all/empty-record)" e
+        is "pax: entries" "$(field entries "$said")" 4
+        # one attribute is carried; SELinux's and an overlay's are left
+        case $(field attributes-left "$said") in
+            2) is "pax: the attributes" \
+                   "$(python3 -I -c "import os, sys; print([(a, os.getxattr(sys.argv[1], a)) for a in os.listxattr(sys.argv[1])])" "pax-all/$long")" \
+                   "[('user.note', b'with\\x00every\\nbyte')]" ;;
+            3) echo "no user attributes on this filesystem: the one of the archive was left" ;;
+            *) echo "pax: attributes left: $(field attributes-left "$said")"; bad=1 ;;
+        esac
+    fi
+    if unpack gnu; then
+        is "GNU: a long name" "$(cat "gnu/$long")" gnu
+        is "GNU: a link to a long name" "$(readlink gnu/long-link)" "$link"
+        is "GNU: numbers in base 256" "$(stat -c "%s %u:%g %Y" gnu/numbers)" "3 1234:4321 -86400"
+    fi
+    if unpack ustar-prefix; then
+        p=$(printf "p%.0s" $(seq 1 60))
+        q=$(printf "q%.0s" $(seq 1 60))
+        x=$(printf "x%.0s" $(seq 1 100))
+        y=$(printf "y%.0s" $(seq 1 155))
+        is "ustar: a name in two fields" "$(names ustar-prefix)" "$p $p/$q $p/$q/file $y $y/$x"
+    fi
+    if unpack old; then
+        is "the kinds from before ustar" "$(cd old && stat -c "%n %F %a" olddir olddir/file contiguous | paste -sd" ")" \
+            "olddir directory 750 olddir/file regular file 644 contiguous regular file 644"
+    fi
+    if unpack names; then
+        is "names with . and // in them, and the root's own" "$(names names)" "a a/b a/b/c a/b/d a/b/d/e"
+    fi
+    if unpack global-records; then
+        is "records for a whole archive" "$(names global-records)" file
+    fi
+    if unpack missing-directories; then
+        is "directories without an entry" "$(cd missing-directories && stat -c "%n %a" p p/q/r s/t | paste -sd" ")" \
+            "p 755 p/q/r 755 s/t 755"
+        is "a second name in one of them" "$(stat -c "%h %s" missing-directories/s/t/second)" "2 4"
+    fi
+    if unpack replaced; then
+        is "what is at a name is replaced" "$(cd replaced && stat -c "%n %F" x y y/in kept kept/first | paste -sd" ")" \
+            "x regular file y directory y/in regular file kept directory kept/first regular file"
+        is "a directory stays for a directory, with the later mode and time" "$(stat -c "%a %Y" replaced/kept)" \
+            "750 1111111111"
+    fi
+    if unpack tape-record; then
+        is "zeros after the end, to a tape's record" "$(field bytes "$said") $(names tape-record)" "10240 only"
+    fi
+    if unpack devices; then
+        is "devices are counted and not made" "$(field devices "$said") $(field entries "$said") $(names devices)" "2 1 beside"
+    fi
+    exit $bad
+}
+t_untar_taken() {
+    in_namespace_with_ids "HERE=$(printf %q "$HERE"); $(declare -f tar_helpers untar_helpers untar_taken_case)
+        tar_helpers; untar_helpers; untar_taken_case"
+}
+
+untar_marks_case() {
+    cd "$D" || exit 1
+    mkdir -p upper/kept upper/opaque archives again roots
+    printf "new\n" > upper/kept/file
+    printf "its own\n" > upper/opaque/file
+    mknod upper/gone c 0 0 || { echo "this kernel lets no one but root make a whiteout"; exit 77; }
+    mknod upper/kept/gone-too c 0 0
+    chown 5:6 upper/gone
+    python3 -I -c "import os; os.setxattr(\"upper/opaque\", \"user.overlay.opaque\", b\"y\")" 2>/dev/null ||
+        { echo "no user attributes on this filesystem"; exit 77; }
+    bad=0
+    "$UNIT" tar upper o.tar overlay >/dev/null || exit 1
+
+    # Into an overlay's upper directory each mark is the overlay's own again,
+    # and the directory gives the archive it was unpacked from. Whose the
+    # device was is not written: the kernel makes it as whoever mounted the
+    # overlay, and its mark is root's.
+    said=$("$UNIT" untar o.tar again upper-user) || { echo "$said"; exit 1; }
+    is "the marks of names" "$(stat -c "%n %F %t:%T %u:%g" again/gone again/kept/gone-too | paste -sd" ")" \
+        "again/gone character special file 0:0 0:0 again/kept/gone-too character special file 0:0 0:0"
+    is "the mark of a directory" \
+        "$(python3 -I -c "import os; print(os.getxattr(\"again/opaque\", \"user.overlay.opaque\"))")" "b'y'"
+    is "the names" "$(names again)" "gone kept kept/file kept/gone-too opaque opaque/file"
+    is "entries" "$(field entries "$said")" 7
+    "$UNIT" tar again o2.tar overlay >/dev/null && cmp o.tar o2.tar || { echo "the upper directory gives another archive"; bad=1; }
+
+    # As root mounts an overlay, a directory's mark is an attribute that
+    # only the root of the machine sets.
+    said=$("$UNIT" untar o.tar roots upper)
+    is "as root's overlay, in a user namespace" "$said" \
+        "failed: opaque: could not mark its directory as one that hides its base's"
+
+    # Into one tree, over what a layer under it left there: what a mark
+    # names is taken out, and all that is in a directory with one.
+    mkdir -p flat/kept flat/opaque/deep/er
+    : > flat/gone
+    : > flat/kept/gone-too
+    : > flat/kept/stays
+    : > flat/opaque/deep/er/low
+    "$UNIT" untar o.tar flat >/dev/null || { echo "the upper directory's archive was not unpacked into a tree"; bad=1; }
+    is "an upper directory's archive over a tree" "$(names flat)" "kept kept/file kept/stays opaque opaque/file"
+
+    # A mark is about the layers under its own, wherever in its archive it
+    # comes: what the archive itself has under the name stays.
+    python3 -I "$HERE/tar_archives.py" archives "$D" || exit 1
+    for order in first last; do
+        mkdir "tree-$order"
+        "$UNIT" untar archives/layer-under.tar "tree-$order" >/dev/null &&
+            said=$("$UNIT" untar "archives/layer-marks-$order.tar" "tree-$order") ||
+            { echo "with the marks $order: $said"; bad=1; continue; }
+        is "with the marks $order" "$(names "tree-$order")" "d d/own d/sub d/sub/own stays x x/new"
+        is "with the marks $order, entries" "$(field entries "$said")" 12
+    done
+    # and one at the top is about the whole tree, which an overlay's upper
+    # directory has no way to say: its base is always under it
+    mkdir tree-new upper-new
+    "$UNIT" untar archives/layer-under.tar tree-new >/dev/null && "$UNIT" untar archives/layer-all-new.tar tree-new >/dev/null
+    is "with a mark at the top" "$(names tree-new)" alone
+    said=$("$UNIT" untar archives/layer-all-new.tar upper-new upper-user)
+    is "a mark at the top of an upper directory" "$said" \
+        "failed: : could not mark its directory as one that hides its base's"
+    exit $bad
+}
+t_untar_marks() {
+    in_namespace_with_ids "HERE=$(printf %q "$HERE"); $(declare -f tar_helpers untar_helpers untar_marks_case)
+        tar_helpers; untar_helpers; untar_marks_case"
+}
+
+untar_refusals_case() {
+    cd "$D" || exit 1
+    chmod 755 .
+    mkdir archives jail plain
+    printf "outside\n" > jail/secret
+    python3 -I "$HERE/tar_archives.py" archives "$D/jail" || exit 1
+    bad=0
+    # an archive, what is said of it, and what its root has afterwards
+    refused() {
+        mkdir "jail/$1"
+        said=$("$UNIT" untar "archives/$1.tar" "jail/$1")
+        [ $? = 1 ] || { echo "$1: it was not refused"; bad=1; }
+        is "$1" "$said" "failed: $2"
+        is "$1: its root" "$(names "jail/$1")" "${3:-}"
+    }
+
+    # names that lead out of the root, or would if they were followed
+    refused dotdot              "../outside: has .. in its name"
+    refused dotdot-inside       "a/b/../../../outside: has .. in its name" a
+    refused dotdot-pax          "a/../../outside: has .. in its name"
+    refused dotdot-long         "a/../../outside: has .. in its name"
+    refused absolute            "/outside: has a name that begins at the root"
+    refused absolute-outside    "$(printf "%s" "$D/jail/made" | cut -c1-100): has a name that begins at the root"
+    refused no-name             ": has no name"
+    refused unprintable         "a?[2Jb??/../c: has .. in its name"
+    refused pax-name-too-long   "short: has a name too long for a path"
+    refused long-name-too-long  ": what follows has a name too long for a path"
+    refused link-out            "out/through: could not be made" out
+    refused second-name-dotdot  "h: is a second name of a file named with .."
+    refused second-name-absolute "h: is a second name of a file named from the root"
+    refused second-name-through "h: is a second name of a file that is not in the tree" up
+    refused second-name-of-directory "h: is a second name of a file that is not in the tree" d
+
+    # archives that end before they say so, and ones that say what is not so
+    refused cut-in-content      "big: the archive ends before it says so" "big first"
+    refused cut-in-header       "first: the archive ends before it says so" first
+    refused cut-before-end      "only: the archive ends before it says so" only
+    refused cut-in-end          "only: the archive ends before it says so" only
+    refused cut-in-records      "first: the archive ends before it says so" first
+    refused size-too-large      "liar: the archive ends before it says so" liar
+    refused size-too-small      "liar: what follows is no header of an archive" liar
+    refused empty               ": the archive ends before it says so"
+    refused not-an-archive      ": what follows is no header of an archive"
+    refused bad-checksum        ": what follows is no header of an archive"
+    refused zeros-then-entry    "first: what follows is no header of an archive" first
+    refused more-after-end      "only: the archive has more after its end" only
+    refused bad-number          "file: has a number that is no number"
+    refused blank-number        "file: has a number that is no number"
+    refused negative-size       "file: has a number that is no number"
+    refused kind                "strange: is of a kind this reader does not know"
+    refused kind-volume         "label: is of a kind this reader does not know"
+    refused pax-broken          "after: has pax records that cannot be read"
+    refused pax-length-lies     "after: has pax records that cannot be read"
+    refused pax-no-equals       "after: has pax records that cannot be read"
+    refused pax-name-with-nul   "after: has pax records that cannot be read"
+    refused pax-number          "after: has a number that is no number"
+    refused pax-sparse          "holes: is a file with holes written GNU's way, which is not read"
+    refused pax-too-many-records ": what follows has more pax records than are read for one entry"
+
+    # names with .wh. in them that are no marks of a layer
+    refused mark-of-nothing     ".wh.: has a name with .wh. in it that is no mark of a layer"
+    refused mark-of-dot         ".wh..: has a name with .wh. in it that is no mark of a layer"
+    refused mark-aufs           ".wh..wh.plnk: has a name with .wh. in it that is no mark of a layer"
+    refused mark-on-the-way     "a/.wh.b/c: has a name with .wh. in it that is no mark of a layer"
+    refused mark-directory      ".wh.dir: has a name with .wh. in it that is no mark of a layer"
+    refused mark-link           "d/.wh..wh..opq: has a name with .wh. in it that is no mark of a layer"
+    refused mark-of-dotdot      "d/.wh...: has a name with .wh. in it that is no mark of a layer" d
+
+    # What is unpacked: a link is replaced by the entry of its name and
+    # never written through, and what a link names is looked up under the root.
+    for a in link-up link-replaced second-name-of-link; do
+        mkdir "jail/$a"
+        "$UNIT" untar "archives/$a.tar" "jail/$a" >/dev/null || { echo "$a was refused"; bad=1; }
+    done
+    is "a file through a link to .." "$(names jail/link-up) $(cat jail/link-up/through)" "through up inside"
+    is "a file at the name of a link" \
+        "$(cd jail/link-replaced && stat -c "%n %F" s t target | paste -sd" ") $(cat jail/link-replaced/target)" \
+        "s regular file t regular file target regular file original"
+    is "a second name of a link" "$(stat -c "%F %h" jail/second-name-of-link/h)" "symbolic link 2"
+
+    # beside the roots nothing was made, and what was there is as it was
+    is "the directory the roots are in" \
+        "$(find jail -mindepth 1 -maxdepth 1 ! -type d | paste -sd" ") $(cat jail/secret) $(stat -c %h jail/secret) $(ls | paste -sd" ")" \
+        "jail/secret outside 1 archives jail plain"
+
+    # and who may not make a directory its root unpacks nothing
+    said=$(setpriv --reuid=1000 --regid=1000 --clear-groups "$UNIT" untar archives/names.tar plain 2>&1)
+    is "as a user who is no root" "$said" "failed: : the directory could not be made the root of the process that unpacks"
+    is "and its directory" "$(names plain)" ""
+    exit $bad
+}
+t_untar_refusals() {
+    in_namespace_with_ids "HERE=$(printf %q "$HERE"); $(declare -f tar_helpers untar_helpers untar_refusals_case)
+        tar_helpers; untar_helpers; untar_refusals_case"
+}
+
+check 'what the writer wrote is unpacked to the same tree, which gives the same bytes' t_untar_tree
+check "ids are made the start of a container's range more, and none that does not fit it" t_untar_ids
+check 'archives of GNU tar and of bsdtar are unpacked to the trees they are of' t_untar_others
+check 'what tar programs write in ways of their own is read' t_untar_taken
+check "a layer's marks become an overlay's own, or take out what they name" t_untar_marks
+check 'what is no archive of a tree is refused, and nothing is made outside the root' t_untar_refusals
+
+# I.4: the JSON an image's index, its manifest and its configuration are
+# written in. tests/json has the three of Alpine 3.22 for amd64 as Docker
+# Hub served them on 2026-11-22, byte for byte: each is named by its SHA-256
+# in the one before it, which the first case holds them to.
+json_helpers() {
+    bad=0
+    # the value at a path of a file: file, path, what is said of it
+    says() {
+        said=$("$UNIT" json-read "$1" "$2" 2>&1)
+        [ "$said" = "ok
+$3" ] || { echo "${1##*/} at '$2': '$said', not '$3'"; bad=1; }
+    }
+    # a text, given as printf writes it, and what is said of it
+    text_says() { # what the text is, the text, what is said
+        printf -- "$2" > "$D/text"
+        said=$("$UNIT" json-read "$D/text" 2>&1)
+        [ "$said" = "$3" ] || { echo "$1: '$said', not '$3'"; bad=1; }
+    }
+    taken() { text_says "$1" "$2" ok; }
+    refused() { text_says "$1" "$2" "refused: $3"; }
+}
+
+t_json_image() {
+    local dir=$HERE/json digest size
+    json_helpers
+    index=$dir/alpine-index.json manifest=$dir/alpine-manifest.json config=$dir/alpine-config.json
+
+    says "$index" /schemaVersion 'number 2 whole'
+    says "$index" /mediaType 'string application/vnd.oci.image.index.v1+json'
+    [ "$("$UNIT" json-read "$index" /manifests | sed -n 2p)" = 'array 16' ] || { echo "the index has not 16 manifests"; bad=1; }
+    says "$index" /manifests/0/mediaType 'string application/vnd.oci.image.manifest.v1+json'
+    says "$index" /manifests/0/platform 'object 2
+  architecture: string
+  os: string'
+    says "$index" /manifests/0/platform/architecture 'string amd64'
+    says "$index" /manifests/0/platform/os 'string linux'
+    says "$index" /manifests/2/platform/variant 'string v6'
+    says "$index" /manifests/16 none
+    # a name with dots in it, and a text whose every / is written \/
+    says "$index" /manifests/0/annotations/org.opencontainers.image.url 'string https://hub.docker.com/_/alpine'
+    # the manifest is the blob the index names, by its digest and its size
+    digest=$("$UNIT" sha256 "$manifest")
+    size=$(($(wc -c < "$manifest")))
+    says "$index" /manifests/0/digest "string sha256:$digest"
+    says "$index" /manifests/0/digest 'string sha256:9db2934886712d877c932e07249c75a59e6ca27adfbccc05261987a17bef2d63'
+    says "$index" /manifests/0/size "number $size whole"
+
+    says "$manifest" '' 'object 5
+  schemaVersion: number
+  mediaType: string
+  config: object
+  layers: array
+  annotations: object'
+    says "$manifest" /mediaType 'string application/vnd.oci.image.manifest.v1+json'
+    says "$manifest" /config/mediaType 'string application/vnd.oci.image.config.v1+json'
+    says "$manifest" /layers 'array 1
+  object'
+    says "$manifest" /layers/0/mediaType 'string application/vnd.oci.image.layer.v1.tar+gzip'
+    says "$manifest" /layers/0/digest 'string sha256:710f3da1112f360bed5d2908205aeee86b9d04ecd471354cf7049a2f0bdb5c72'
+    says "$manifest" /layers/0/size 'number 3794375 whole'
+    says "$manifest" /layers/1 none
+    says "$manifest" /annotations 'object 7
+  com.docker.official-images.bashbrew.arch: string
+  org.opencontainers.image.base.name: string
+  org.opencontainers.image.created: string
+  org.opencontainers.image.revision: string
+  org.opencontainers.image.source: string
+  org.opencontainers.image.url: string
+  org.opencontainers.image.version: string'
+    says "$manifest" /annotations/org.opencontainers.image.version 'string 3.22.8'
+    # and the configuration the blob the manifest names
+    digest=$("$UNIT" sha256 "$config")
+    size=$(($(wc -c < "$config")))
+    says "$manifest" /config/digest "string sha256:$digest"
+    says "$manifest" /config/size "number $size whole"
+
+    says "$config" /architecture 'string amd64'
+    says "$config" /os 'string linux'
+    says "$config" /rootfs/type 'string layers'
+    says "$config" /rootfs/diff_ids 'array 1
+  string'
+    says "$config" /rootfs/diff_ids/0 'string sha256:fdc5834cb53a4bde074c41b5baf85f9d5cece29df379fecafea8c396ba8c29d9'
+    says "$config" /config/Env/0 'string PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+    says "$config" /history/1/created_by 'string CMD ["/bin/sh"]'
+    says "$config" /history/1/empty_layer true
+    says "$config" /history/0/empty_layer none
+    # a name in other letters' case is not taken for the name, and not passed over
+    says "$manifest" /Layers 'other case'
+    says "$config" /config/env 'other case'
+    says "$config" /Config/Env 'other case'
+
+    [ "$("$UNIT" json-is "$manifest" /layers/0/mediaType application/vnd.oci.image.layer.v1.tar+gzip)" = same ] ||
+        { echo "the layer's media type is not what it is"; bad=1; }
+    [ "$("$UNIT" json-is "$manifest" /layers/0/mediaType application/vnd.oci.image.layer.v1.tar)" = other ] ||
+        { echo "the layer's media type is one it only begins with"; bad=1; }
+    return $bad
+}
+check "the values of a registry's index, manifest and configuration are read" t_json_image
+
+t_json_values() {
+    D=$(mktemp -d "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    json_helpers
+    hex_at() { "$UNIT" json-read "$D/text" "$1" | sed 1d | od -An -tx1 | tr -d ' \n'; }
+    hex_of() { printf "$1" | od -An -tx1 | tr -d ' \n'; }
+    same_hex() { # what, path, the bytes as printf writes them
+        [ "$(hex_at "$2")" = "$(hex_of "string $3\n")" ] || { echo "$1: $(hex_at "$2"), not $(hex_of "string $3\n")"; bad=1; }
+    }
+
+    # a string's escapes, each resolved: the eight of two characters, and
+    # \uXXXX to UTF-8 of one byte to four, the last from a surrogate pair
+    printf '%s' '{"two":"\"\\\/\b\f\n\r\t","u":"\u0041\u007f\u00e9\u20AC\uffff\ud83d\uDE00","raw":"' > "$D/text"
+    printf 'A\177\303\251\342\202\254\360\237\230\200","mixed":"a\\u0062c"}' >> "$D/text"
+    same_hex "the escapes of two characters" /two '"\\/\b\f\n\r\t'
+    same_hex "the escapes of four digits" /u 'A\177\303\251\342\202\254\357\277\277\360\237\230\200'
+    same_hex "UTF-8 as it is written" /raw 'A\177\303\251\342\202\254\360\237\230\200'
+    # into no fewer bytes than it has and one for its NUL, and never a part of it
+    says "$D/text" /mixed 'string abc'
+    for pair in '4:3 abc' '65536:3 abc' '3:none' '1:none' '0:none'; do
+        said=$("$UNIT" json-text "$D/text" /mixed "${pair%%:*}")
+        [ "$said" = "${pair#*:}" ] || { echo "abc into ${pair%%:*} bytes: '$said', not '${pair#*:}'"; bad=1; }
+    done
+    printf '["","\\u00e9x"]' > "$D/text"
+    for pair in '0 1:0 ' '1 4:3 éx' '1 3:none' '1 2:none'; do
+        want=${pair#*:} args=${pair%%:*}
+        said=$("$UNIT" json-text "$D/text" "/${args% *}" "${args#* }")
+        [ "$said" = "$want" ] || { echo "element ${args% *} into ${args#* } bytes: '$said', not '$want'"; bad=1; }
+    done
+    # a text is another text or the same, by what it says and not by how it is written
+    printf '{"s":"a\\u0062c","n":12,"e":""}' > "$D/text"
+    for pair in '/s abc:same' '/s ABC:other' '/s ab:other' '/s abcd:other' '/s :other' '/n 12:other' '/e :same' '/x abc:none'; do
+        args=${pair%%:*}
+        said=$("$UNIT" json-is "$D/text" "${args% *}" "${args#* }")
+        [ "$said" = "${pair#*:}" ] || { echo "'${args#* }' against ${args% *}: $said, not ${pair#*:}"; bad=1; }
+    done
+
+    # a number is given as it is written, and is a whole one when digits are all of it
+    printf '[0,7,18446744073709551615,18446744073709551616,-1,-0,1.0,1e3,10,123456789012345678901234567890,0.5E-3]' > "$D/text"
+    n=0
+    for want in '0 whole' '7 whole' '18446744073709551615 whole' 18446744073709551616 -1 -0 1.0 1e3 '10 whole' \
+                123456789012345678901234567890 0.5E-3; do
+        says "$D/text" "/$n" "number $want"
+        n=$((n + 1))
+    done
+
+    # a path is RFC 6901's: ~1 for /, ~0 for ~, a name that is empty, digits
+    # that are a name in an object and an index in an array
+    printf '{"a/b":1,"m~n":2,"":{"":3},"0":4,"~1":5,"list":[10,[20,21],{"x":30}],"deep":{"a":{"b":[null,true,false]}}}' > "$D/text"
+    says "$D/text" /a~1b 'number 1 whole'
+    says "$D/text" /m~0n 'number 2 whole'
+    says "$D/text" / 'object 1
+  : number'
+    says "$D/text" // 'number 3 whole'
+    says "$D/text" /0 'number 4 whole'
+    says "$D/text" /~01 'number 5 whole'
+    says "$D/text" /list 'array 3
+  number
+  array
+  object'
+    says "$D/text" /list/0 'number 10 whole'
+    says "$D/text" /list/1/1 'number 21 whole'
+    says "$D/text" /list/2/x 'number 30 whole'
+    says "$D/text" /deep/a/b/0 null
+    says "$D/text" /deep/a/b/1 true
+    says "$D/text" /deep/a/b/2 false
+    for path in /list/3 /list/01 /list/00 /list/- /list/+1 /list/1.0 /list/x /list/ /list/18446744073709551616 \
+                /list/0/0 /list/2/y /a/b /m~n/x /nothing a list /deep/a/b/3 /deep/a/b/0/x; do
+        says "$D/text" "$path" none
+    done
+
+    # A member whose name is the path's but for the case of its letters, with
+    # the long s and the Kelvin sign that fold to s and k: the lookup says so,
+    # whether or not the path's own name is there too.
+    printf '{"layers":[1],"Layers":[2],"digest":"d","size":{"Size":1},"layer\\u017f2":0,"\\u212aey":0,"\303\211":0,"x":0}' > "$D/text"
+    for path in /layers /Layers /LAYERS /Digest /DIGEST /size/size /layers2 /Layers2 /key /Key; do
+        says "$D/text" "$path" 'other case'
+    done
+    says "$D/text" /digest 'string d'
+    says "$D/text" /size/Size 'number 1 whole'
+    says "$D/text" /x 'number 0 whole'
+    says "$D/text" "$(printf '/\303\211')" 'number 0 whole'
+    # letters beyond ASCII are another name in another case, as they are to Go
+    says "$D/text" "$(printf '/\303\251')" none
+    says "$D/text" /X 'other case'
+
+    rm -rf -- "$D"
+    return $bad
+}
+check "a string's escapes are resolved, a number is whole or is not, and a path is RFC 6901's" t_json_values
+
+t_json_strict() {
+    D=$(mktemp -d "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    json_helpers
+    local no_value='what is here is no value' ends='the text ends before its value does'
+    local no_number='a number that is not written the way JSON has them' more='there is more after the value'
+    local no_name="a member's name has to be a string" no_colon="there is no colon after a member's name"
+    local in_object='there is no comma and no closing brace after a member'
+    local in_array='there is no comma and no closing bracket after an element'
+    local open='a string that does not end' control='a control character in a string, where only an escape may say one'
+    local escape='an escape that JSON does not have' utf8='bytes that are no UTF-8' half='half of a surrogate pair'
+    local nul='the character U+0000, which is not read' twice='a name that is there twice in one object'
+    local deep='arrays and objects are deeper inside one another than is read'
+
+    # what is JSON, and stays so
+    taken "an object with nothing in it" '{}'
+    taken "an array with nothing in it" ' [ ] '
+    taken "a string alone" '"a"'
+    taken "a number alone" '\n-0.5e+10\n'
+    taken "a word alone" 'null'
+    taken "blanks of every kind" ' \t\r\n{ "a" :\t[ 1 ,\r\n2 ] , "b" : { } } \n'
+    taken "numbers in every form" '[0,-0,1,10,1.5,-1.5,1e5,1E5,1e+5,1e-5,0.0,0e0,123456789012345678901234567890]'
+    taken "one name in two objects" '{"a":{"a":1},"b":{"a":2},"c":[{"a":3},{"a":4}]}'
+    taken "two names that differ in their case" '{"a":1,"A":2}'
+    taken "DEL, which is no control character to JSON" '"\177"'
+
+    # no value, or more than one
+    refused "no text" '' "1:1: there is no value"
+    refused "blanks alone" ' \n\t ' "2:3: there is no value"
+    refused "a byte order mark" '\357\273\277{}' "1:1: $no_value"
+    refused "a comment" '// c\n{}' "1:1: $no_value"
+    refused "two values" '1 2' "1:3: $more"
+    refused "two objects" '{}{}' "1:3: $more"
+    refused "a letter after the value" '{}\n x' "2:2: $more"
+    refused "a NUL after the value" '{}\000' "1:3: $more"
+    refused "a word that is none" 'nul' "1:1: $no_value"
+    refused "a word in capitals" 'True' "1:1: $no_value"
+    refused "NaN" 'NaN' "1:1: $no_value"
+    refused "Infinity" '[Infinity]' "1:2: $no_value"
+    refused "a string in single quotes" "'a'" "1:1: $no_value"
+    refused "a form feed for a blank" '[\f1]' "1:2: $no_value"
+
+    # numbers
+    refused "a number that begins with 0" '01' "1:1: $no_number"
+    refused "a sign alone" '[-]' "1:2: $no_number"
+    refused "minus Infinity" '-Infinity' "1:1: $no_number"
+    refused "a point with nothing after it" '[1.]' "1:2: $no_number"
+    refused "an exponent with nothing after it" '1e' "1:1: $no_number"
+    refused "an exponent with a sign alone" '[1e+]' "1:2: $no_number"
+    refused "a point with nothing before it" '.5' "1:1: $no_value"
+    refused "a plus sign" '+1' "1:1: $no_value"
+    refused "a number in hex" '0x10' "1:2: $more"
+
+    # arrays and objects
+    refused "an object that does not end" '{' "1:2: $ends"
+    refused "an array that does not end" '[1,' "1:4: $ends"
+    refused "a member without its value" '{"a":' "1:6: $ends"
+    refused "a comma before an array's end" '[1,]' "1:4: $no_value"
+    refused "a comma before an object's end" '{"a":1,}' "1:8: $no_name"
+    refused "a name without quotes" '{a:1}' "1:2: $no_name"
+    refused "a number for a name" '{1:1}' "1:2: $no_name"
+    refused "no colon" '{"a" 1}' "1:6: $no_colon"
+    refused "no comma in an object" '{"a":1 "b":2}' "1:8: $in_object"
+    refused "no comma in an array" '[1 2]' "1:4: $in_array"
+    refused "an array closed as an object" '[1}' "1:3: $in_array"
+    refused "an object closed as an array" '{"a":1]' "1:7: $in_object"
+    refused "a closing bracket alone" ']' "1:1: $no_value"
+
+    # strings
+    refused "a string that does not end" '"abc' "1:1: $open"
+    refused "a string that ends in a backslash" '"abc\\' "1:5: $open"
+    refused "an escape there is none of" '"a\\qb"' "1:3: $escape"
+    refused "an escape of three digits" '"\\u12g4"' "1:2: $escape"
+    refused "the first half of a pair alone" '"\\ud800"' "1:2: $half"
+    refused "the first half and a letter" '"\\ud800\\u0041"' "1:2: $half"
+    refused "the second half alone" '"a\\udc00"' "1:3: $half"
+    refused "the two halves the wrong way round" '"\\udc00\\ud800"' "1:2: $half"
+    refused "U+0000 as an escape" '{"a":"x\\u0000y"}' "1:8: $nul"
+    refused "U+0000 in a name" '{"\\u0000":1}' "1:3: $nul"
+    refused "a tab in a string" '"a\tb"' "1:3: $control"
+    refused "a line's end in a string" '["a\nb"]' "1:4: $control"
+    refused "a NUL in a string" '"a\000b"' "1:3: $control"
+    refused "a byte that is no UTF-8" '"\377"' "1:2: $utf8"
+    refused "a byte of a longer character alone" '"a\200"' "1:3: $utf8"
+    refused "a form longer than the shortest" '"\300\200"' "1:2: $utf8"
+    refused "another, of three bytes" '"\340\200\200"' "1:2: $utf8"
+    refused "a surrogate written as UTF-8" '"\355\240\200"' "1:2: $utf8"
+    refused "a character above U+10FFFF" '"\364\220\200\200"' "1:2: $utf8"
+    refused "a character cut short" '"\342\202"' "1:2: $utf8"
+    refused "a character cut short in a name" '{"\303":1}' "1:3: $utf8"
+
+    # a name twice in one object, however it is written, and where the second is
+    refused "a name twice" '{"a":1,"a":2}' "1:8: $twice"
+    refused "a name twice, once as an escape" '{"a":1,"b":2,"\\u0061":3}' "1:14: $twice"
+    refused "a name twice in an object inside" '{"b":{"x":1,"y":2,"x":3},"c":0}' "1:19: $twice"
+    refused "a name twice, lines apart" '{"a":1,\n "b":2,\n "a":3}' "3:2: $twice"
+    refused "a name three times" '{"k":1,"a":0,"k":2,"k":3}' "1:14: $twice"
+    refused "two names twice" '{"p":1,"q":2,"q":3,"p":4}' "1:14: $twice"
+    refused "a name twice, once as a surrogate pair" '{"\\ud83d\\ude00":1,"\360\237\230\200":2}' "1:19: $twice"
+    refused "the empty name twice" '[{"":1,"":2}]' "1:8: $twice"
+
+    # 32 arrays and objects inside one another are read, and no more
+    nested() { # how many, what opens one, what the innermost has in it, what closes one
+        local i text=$3
+        for i in $(seq 1 "$1"); do text="$2$text$4"; done
+        printf '%s' "$text" > "$D/text"
+        "$UNIT" json-read "$D/text"
+    }
+    for depth in 1 31 32; do
+        [ "$(nested $depth '[' '' ']')" = ok ] || { echo "$depth arrays inside one another are not read"; bad=1; }
+        [ "$(nested $depth '{"a":' 0 '}')" = ok ] || { echo "$depth objects inside one another are not read"; bad=1; }
+    done
+    [ "$(nested 32 '[' '"a"' ']')" = ok ] || { echo "a string in 32 arrays is not read"; bad=1; }
+    said=$(nested 33 '[' '' ']')
+    [ "$said" = "refused: 1:33: $deep" ] || { echo "33 arrays inside one another: '$said'"; bad=1; }
+    said=$(nested 33 '{"a":' 0 '}')
+    [ "$said" = "refused: 1:161: $deep" ] || { echo "33 objects inside one another: '$said'"; bad=1; }
+    said=$(nested 32 '[' '{}' ']')
+    [ "$said" = "refused: 1:33: $deep" ] || { echo "an object in 32 arrays: '$said'"; bad=1; }
+
+    # 1048576 bytes are read, and not one more
+    { printf '"'; head -c 1048574 /dev/zero | tr '\0' a; printf '"'; } > "$D/text"
+    said=$("$UNIT" json-read "$D/text" | head -c 40)
+    [ "$said" = ok ] || { echo "a text of 1048576 bytes: '$said'"; bad=1; }
+    printf ' ' >> "$D/text"
+    said=$("$UNIT" json-read "$D/text")
+    [ "$said" = "refused: 1:1048577: the text is longer than is read" ] || { echo "a text of 1048577 bytes: '$said'"; bad=1; }
+
+    # An object of 100000 members is checked for a name twice in no more
+    # time than its names take to sort; the last of them, there before, is
+    # found where it is.
+    seq 1 100000 | awk 'BEGIN { printf "{" } { printf "%s\"%d\":0", (NR > 1 ? "," : ""), ($1 * 7919) % 100000 } END { printf "}" }' > "$D/text"
+    said=$("$UNIT" json-read "$D/text" /7919 /99999)
+    [ "$said" = "ok
+number 0 whole
+number 0 whole" ] || { echo "an object of 100000 members: '$said'"; bad=1; }
+    size=$(($(wc -c < "$D/text")))
+    { head -c $((size - 1)) "$D/text"; printf ',"75\\u0030":1}'; } > "$D/again"
+    said=$("$UNIT" json-read "$D/again")
+    [ "$said" = "refused: 1:$((size + 1)): $twice" ] || { echo "and with one of them twice: '$said', not at 1:$((size + 1))"; bad=1; }
+
+    rm -rf -- "$D"
+    return $bad
+}
+check 'a text that is no JSON, or says one thing twice, is refused with where' t_json_strict
+
+# What Python's reader takes, held as strictly as this one, this one takes,
+# and every value at every path is the same: texts that are JSON, texts of
+# one with bytes changed, and texts of pieces put together.
+t_json_python() {
+    command -v python3 >/dev/null || { echo "no python3 to compare with"; return 77; }
+    D=$(mktemp -d "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    local bad=0
+    python3 -I "$HERE/json_texts.py" "$UNIT" "$D" 3000 1 > "$D/said" 2>&1 || { cat "$D/said"; bad=1; }
+    rm -rf -- "$D"
+    return $bad
+}
+check "what Python's reader takes of 3000 texts, and gives, is what this one does" t_json_python
+
+# I.6: a layer that is compressed is unpacked by the host's gzip, which reads
+# what somebody else wrote. What it runs under: nobody's ids and no group
+# besides, no capability in any set, no new privilege, a seccomp filter, and
+# a network of its own with nothing in it but its loopback. Since I.12 the
+# filter is gzip's own, which leaves it its calls and no other program: what
+# it runs under is seen through gzip itself, which with -dcf gives a file
+# that is not compressed as it is, here those of /proc of its own process. A
+# shell does not get as far as a second program.
+tool_sandbox_case() {
+    status() { "$UNIT" tool-sandbox "$GZIP" -dcf /proc/self/status 2>&1 | tr -s "\t" " "; }
+    out=$(status | grep -E "^(Uid|Gid|Groups|Cap(Inh|Prm|Eff|Bnd|Amb)|NoNewPrivs|Seccomp):")
+    printf "%s\n" "$out"
+    [ "$out" = "Uid: 65534 65534 65534 65534
+Gid: 65534 65534 65534 65534
+Groups: 
+CapInh: 0000000000000000
+CapPrm: 0000000000000000
+CapEff: 0000000000000000
+CapBnd: 0000000000000000
+CapAmb: 0000000000000000
+NoNewPrivs: 1
+Seccomp: 2" ] || { echo "a host tool is not held to that"; exit 1; }
+    links=$("$UNIT" tool-sandbox "$GZIP" -dcf /proc/self/net/dev 2>&1 | sed -n "s/^ *\([^ :]*\):.*/\1/p" | paste -sd" " -)
+    [ "$links" = lo ] || { echo "a host tool has more of a network than a loopback: $links"; exit 1; }
+    # what is no root of its own may not read what root may
+    echo secret > "$D/roots" && chmod 600 "$D/roots"
+    out=$("$UNIT" tool-sandbox "$GZIP" -dcf "$D/roots" 2>&1) && { echo "a host tool read a file of root's: $out"; exit 1; }
+    case $out in *secret*) echo "a host tool read a file of root's"; exit 1 ;; esac
+    # it unpacks what it is there for, from its standard input to its standard output
+    printf "layer\n%.0s" $(seq 1 3000) | gzip -c > "$D/layer.gz" && chmod 644 "$D/layer.gz" && chmod 755 "$D"
+    [ "$("$UNIT" tool-sandbox "$GZIP" -dc < "$D/layer.gz" | wc -l)" = 3000 ] || { echo "gzip does not unpack under its filter"; exit 1; }
+    # and no second program is started: the path it was given is the one execve takes
+    out=$("$UNIT" tool-sandbox "$SH" -c "exec \"$SH\" -c \"echo second\"" 2>&1)
+    printf "%s\n" "$out" | tail -n 1
+    case $out in *second*) echo "a second program was started under the filter of a host tool"; exit 1 ;; esac
+    exit 0
+}
+t_tool_sandbox() {
+    command -v gzip >/dev/null || { echo "no gzip here"; return 77; }
+    in_namespace_with_ids "SH=$(printf %q "$SH") GZIP=$(printf %q "$(command -v gzip)"); $(declare -f tool_sandbox_case); tool_sandbox_case"
+}
+# Where nobody has no id, in a user namespace that an ordinary user made of
+# one id, the ids stay, and the rest holds all the same. Without the right to
+# a network of its own, which an ordinary user has not, nothing is run.
+t_tool_sandbox_without_ids() {
+    unshare -r --mount true 2>/dev/null || { echo "user namespaces with capabilities are not available to this user"; return 77; }
+    command -v gzip >/dev/null || { echo "no gzip here"; return 77; }
+    out=$(unshare -r "$UNIT" tool-sandbox "$(command -v gzip)" -dcf /proc/self/status 2>&1 | tr -s '\t' ' ' |
+          grep -E "^(Uid|Cap(Prm|Eff|Bnd)|NoNewPrivs|Seccomp):")
+    printf '%s\n' "$out"
+    [ "$out" = 'Uid: 0 0 0 0
+CapPrm: 0000000000000000
+CapEff: 0000000000000000
+CapBnd: 0000000000000000
+NoNewPrivs: 1
+Seccomp: 2' ] || return 1
+    [ "$(id -u)" != 0 ] || return 0
+    out=$("$UNIT" tool-sandbox "$SH" -c 'echo the program ran' 2>&1)
+    rc=$?
+    echo "as an ordinary user, exit $rc: $out"
+    [ $rc -ne 0 ] && case $out in *'the program ran'*) false ;; *'Error: cannot give a host tool a network of its own'*) true ;; *) false ;; esac
+}
+# I.6: the snapshot an import makes of an image's layers, where the container
+# is an overlay. tests/image_make.py puts tar archives the writer wrote into
+# an image; the snapshot is the layers unpacked one over the other, kept with
+# the layers it was unpacked from, by which a second import finds it and
+# unpacks nothing. A snapshot that an export wrote as that layer is found by
+# what export keeps of it. A layer that is compressed gives the same
+# snapshot, and one that cannot be unpacked leaves none.
+image_base_case() {
+    cd "$D" || exit 1
+    attrs=no
+    arch=amd64
+    [ "$(uname -m)" = aarch64 ] && arch=arm64
+    mkdir -p one/bin one/lib two/lib two/srv three/added merged store other exported/bases/0123456789ab/rootfs gz bad archives
+    echo tool > one/bin/tool && ln -s tool one/bin/link && echo gone > one/lib/gone && echo keep > one/lib/keep &&
+        chown 12:34 one/lib/keep && echo new > two/srv/new && echo third > three/added/file || exit 1
+    mknod two/lib/gone c 0 0 || { echo "this kernel lets no one but root make a whiteout"; exit 77; }
+    "$UNIT" tar one one.tar > /dev/null && "$UNIT" tar two two.tar overlay > /dev/null && "$UNIT" tar three three.tar > /dev/null &&
+        python3 -I "$HERE/image_make.py" image "$arch" one.tar two.tar three.tar || exit 1
+    digest=$(sha256sum < one.tar)
+    digest=${digest%% *}
+    bad=0
+
+    # the first layer, a snapshot
+    said=$("$UNIT" image-base "$D/store" "$D/image" 1) || { echo "$said"; exit 1; }
+    id=$(printf "%s\n" "$said" | sed -n "s/^took //p")
+    [ -n "$id" ] && [ "$(field entries "$said")" = 6 ] || { echo "the first layer: $said"; exit 1; }
+    same_tree one "store/bases/$id/rootfs" || { echo "the snapshot is not the layer unpacked"; bad=1; }
+    is "its source" "$(cat "store/bases/$id/source")" "sha256:$digest"
+    is "the layers it keeps" "$(cat "store/bases/$id/image")" "sha256:$digest"
+    is "the snapshots" "$(ls -A store/bases)" "$id"
+    # a second time it is found, and nothing is unpacked
+    is "a second time" "$("$UNIT" image-base "$D/store" "$D/image" 1 | paste -sd" " -)" "found $id entries 0 devices 0"
+    is "the snapshots still" "$(ls -A store/bases)" "$id"
+
+    # all three, one over the other, are another snapshot: a mark took out what it names
+    said=$("$UNIT" image-base "$D/store" "$D/image" 3) || { echo "$said"; exit 1; }
+    all=$(printf "%s\n" "$said" | sed -n "s/^took //p")
+    [ -n "$all" ] && [ "$all" != "$id" ] || { echo "three layers: $said"; exit 1; }
+    cp -a one/. merged/ && rm merged/lib/gone && cp -a two/srv merged/ && cp -a three/added merged/ || exit 1
+    is "three layers" "$(names "store/bases/$all/rootfs")" "$(names merged)"
+    is "what three layers took out" "$(ls "store/bases/$all/rootfs/lib")" keep
+    is "their source" "$(cat "store/bases/$all/source")" "sha256:$digest and the layers over it"
+    is "how many layers it keeps" "$(wc -l < "store/bases/$all/image")" 3
+    is "three layers a second time" "$("$UNIT" image-base "$D/store" "$D/image" 3 | sed -n 1p)" "found $all"
+    # and no snapshot of a base directory, whatever is asked for under its source's text
+    is "the first of two is not the three" "$("$UNIT" image-base "$D/store" "$D/image" 2 | sed -n 1p | cut -d" " -f1)" took
+
+    # a snapshot that an export here wrote as that layer is the layer unpacked
+    printf "sha256:%s %s\n" "$digest" "$(($(wc -c < one.tar)))" > exported/bases/0123456789ab/layer
+    is "a snapshot that was exported as the layer" "$("$UNIT" image-base "$D/exported" "$D/image" 1 | sed -n 1p)" "found 0123456789ab"
+    is "and no other" "$("$UNIT" image-base "$D/exported" "$D/image" 3 | sed -n 1p | cut -d" " -f1)" took
+
+    # a compressed layer is the same snapshot
+    if command -v gzip >/dev/null; then
+        cp -r image compressed && python3 -I "$HERE/image_edit.py" compressed gzip || exit 1
+        said=$("$UNIT" image-base "$D/gz" "$D/compressed" 1) || { echo "a compressed layer: $said"; exit 1; }
+        same_tree one "gz/bases/$(printf "%s\n" "$said" | sed -n "s/^took //p")/rootfs" || { echo "a compressed layer is another snapshot"; bad=1; }
+        # and found by the layer as it is unpacked, however it was packed
+        is "the layer, compressed, where it is a snapshot already" "$("$UNIT" image-base "$D/store" "$D/compressed" 1 | sed -n 1p)" "found $id"
+    else
+        echo "no gzip here: no compressed layer was unpacked"
+    fi
+
+    # a layer that is no archive of a tree leaves no snapshot, and no half of one
+    python3 -I "$HERE/tar_archives.py" archives "$D/other" && python3 -I "$HERE/image_make.py" hostile "$arch" one.tar archives/dotdot.tar || exit 1
+    said=$("$UNIT" image-base "$D/bad" "$D/hostile" 2 2>&1)
+    [ $? = 1 ] || { echo "a hostile layer was unpacked: $said"; bad=1; }
+    case $said in *"Error: layer 2 of the image cannot be unpacked: "*"has .. in its name"*) ;; *) echo "a hostile layer: $said"; bad=1 ;; esac
+    is "what a hostile layer left" "$(ls -A bad/bases 2>/dev/null)" ""
+    is "outside the snapshot" "$(ls -A other)" ""
+    exit $bad
+}
+t_image_base() {
+    in_namespace_with_ids "HERE=$(printf %q "$HERE"); $(declare -f tar_helpers untar_helpers image_base_case)
+        tar_helpers; untar_helpers; image_base_case"
+}
+check "an image's layers are unpacked into a snapshot once, which is found by them after" t_image_base
+
+# I.12: the process that unpacks is held to what unpacking needs before it
+# reads a byte of the archive. Every archive of I.3's cases gives what it
+# gave, which those cases show, as each is unpacked by such a process now.
+# Here: of the first 1024 descriptors it has three, the archive's, the
+# root's and the pipe it answers on, however many the command had open; and
+# a call the reader never makes ends it, which the command says as a failure
+# of the unpacking, with nothing more made.
+untar_held_case() {
+    cd "$D" || exit 1
+    mkdir -p tree/sub out.1 out.2 out.3 && echo x > tree/sub/file || exit 1
+    "$UNIT" tar tree a.tar > /dev/null || exit 1
+    bad=0
+    exec 5< a.tar 6< a.tar 9< /dev/null
+    said=$("$UNIT" untar-held descriptors a.tar out.1) || { echo "with more descriptors open: $said"; bad=1; }
+    [ "$(cat out.1/sub/file 2>/dev/null)" = x ] || { echo "it was not unpacked"; bad=1; }
+    exec 5<&- 6<&- 9<&-
+    said=$("$UNIT" untar-held call a.tar out.2)
+    rc=$?
+    echo "$said"
+    [ $rc -ne 0 ] && [ "$said" = "failed: : the process that unpacks made a system call that unpacking does not make, and was ended" ] ||
+        { echo "a call the reader does not make: status $rc"; bad=1; }
+    [ -z "$(ls -A out.2)" ] || { echo "it made something before the call"; bad=1; }
+    # and the same archive as the reader has it
+    "$UNIT" untar a.tar out.3 > /dev/null && [ "$(cat out.3/sub/file)" = x ] || { echo "the archive is not unpacked as it was"; bad=1; }
+    exit $bad
+}
+t_untar_held() {
+    in_namespace_with_ids "$(declare -f untar_held_case); untar_held_case"
+}
+check 'the process that unpacks has three descriptors, and a call the reader never makes ends it' t_untar_held
+
+# An overlay of a container is mounted with redirect_dir and metacopy off
+# (ROADMAP I.14), whatever the host's settings are, and an upper directory
+# from before is looked through for what either left: a directory with a
+# redirect, a file with a metacopy, under either name an overlay keeps them
+# by, found where it is and named by its path. An opaque directory and a
+# whiteout are what an overlay without the two leaves too, and are whole.
+t_overlay_whole() {
+    local said bad=0 d
+    d=$(mktemp -d "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    said=$("$UNIT" overlay-options "$d" 0123456789ab /up /work)
+    echo "$said"
+    [ "$said" = "lowerdir=$d/bases/0123456789ab/rootfs,upperdir=/up,workdir=/work,redirect_dir=off,metacopy=off" ] ||
+        { echo "the options are not the three directories and the two off"; bad=1; }
+    mkdir -p "$d/up/etc" "$d/up/opt/deep/er" "$d/up/srv" && echo x > "$d/up/opt/deep/er/file" && echo y > "$d/up/srv/file" &&
+        ln -s nowhere "$d/up/link" && mkfifo "$d/up/fifo" || { rm -rf -- "$d"; return 1; }
+    attr() { python3 -I -c 'import os, sys; os.setxattr(sys.argv[1], sys.argv[2], sys.argv[3].encode())' "$@"; }
+    unattr() { python3 -I -c 'import os, sys; os.removexattr(sys.argv[1], sys.argv[2])' "$@"; }
+    if ! command -v python3 >/dev/null || ! attr "$d/up/srv" user.overlay.opaque y 2>/dev/null; then
+        echo "no python3, or no user.* attribute can be set here"; rm -rf -- "$d"; return 77
+    fi
+    is() { # what it is about, what is said, the status that goes with it
+        said=$("$UNIT" overlay-whole "$d/up")
+        local rc=$?
+        [ "$said" = "$2" ] && [ $rc -eq "$3" ] || { echo "$1: $said, status $rc"; bad=1; }
+    }
+    is "a tree with an opaque directory, a link and a pipe" "whole" 0
+    attr "$d/up/opt/deep" user.overlay.redirect /elsewhere
+    is "a directory with a redirect" "not whole: opt/deep" 1
+    unattr "$d/up/opt/deep" user.overlay.redirect
+    attr "$d/up/opt/deep/er/file" user.overlay.metacopy ""
+    is "a file with a metacopy" "not whole: opt/deep/er/file" 1
+    unattr "$d/up/opt/deep/er/file" user.overlay.metacopy
+    attr "$d/up" user.overlay.redirect /x
+    is "the top with a redirect" "not whole: ." 1
+    unattr "$d/up" user.overlay.redirect
+    is "the same tree again" "whole" 0
+    chmod 000 "$d/up/opt"
+    if [ "$(id -u)" != 0 ]; then is "a directory that cannot be read" "cannot read" 2; fi
+    chmod 755 "$d/up/opt"
+    rm -rf -- "$d"
+    return $bad
+}
+check 'an overlay is mounted with redirect_dir and metacopy off, and an upper directory is looked through for either' t_overlay_whole
+check 'a host tool that reads an image runs as nobody, with no capability and no network' t_tool_sandbox
+check 'where nobody has no id the tool keeps its own, and where it cannot be confined it is not run' t_tool_sandbox_without_ids
 
 summary unit

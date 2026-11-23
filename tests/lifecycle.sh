@@ -28,6 +28,9 @@
 # loses meanwhile is reported and does not count.
 #
 #   LIGHTBOX_TEST_ROOTFS=/path  use a copy of this root filesystem (Alpine, Debian ...)
+#   LIGHTBOX_TEST_IMAGE=/path   an image of a registry's, as an OCI image layout that
+#                               tests/fetch_image.sh --oci fetched: one case makes it a
+#                               base (ROADMAP I.9), and is skipped without it
 #   LIGHTBOX_TEST_USERNS=overlay
 #                               make every container with --userns: every case is
 #                               then one of a container whose root is an
@@ -157,6 +160,18 @@ box() { # name [create options] : create a container on the next free address
     ip=$(next_ip) || return 1
     # shellcheck disable=SC2046  # options of one word each
     lb create "$name" "$ip" "$@" $(mode_options "$@") >"$OUT/$name.create" 2>&1 || { cat "$OUT/$name.create"; return 1; }
+    port_of "$name" >/dev/null
+}
+
+# The same with import: a container of an image, on the next free address,
+# which $ip then is, with what import said in $OUT/<name>.import.
+imported() { # image, name, [options]
+    local image=$1 name=$2
+    shift 2
+    ip=$(next_ip) || return 1
+    # shellcheck disable=SC2046  # options of one word each
+    lb import "$image" "$name" "$ip" "$@" $(mode_options "$@") >"$OUT/$name.import" 2>&1 </dev/null || { cat "$OUT/$name.import"; return 1; }
+    cat "$OUT/$name.import"
     port_of "$name" >/dev/null
 }
 
@@ -3535,6 +3550,410 @@ t_base_commands() {
     refused lb base rm 000000000000 && refused lb base rm not-an-id
 }
 
+# ─── Cases: images (ROADMAP Track I) ────────────────────────────────────────
+
+# export (ROADMAP I.5) of a container that ran. One that overlays a snapshot
+# is two layers: the snapshot, whose digest and size the snapshot keeps, and
+# the container's own files, with a file it removed and a directory it made
+# anew marked as an image marks them. What its root made is uid 0 in the
+# image, whatever range of the host's the container has; the device the
+# kernel left for the removed file is host root's, and its mark is written
+# all the same. Two containers of one snapshot have one first layer. A
+# container that runs is refused and nothing is left of an image; after its
+# export it starts as before. A copy is one layer.
+# tests/image_check.py holds each image to the digests and sizes it names.
+t_export() {
+    command -v python3 >/dev/null 2>&1 || { echo "no python3 to read the image with"; return 77; }
+    local said out id two
+    OVERLAY=1
+    up exp --mem 300M --ttl 2h || return 1
+    sh_in exp 'echo mine > /made-here && rm /etc/group && rm -r /lbt && mkdir /lbt && echo again > /lbt/again' || return 1
+    said=$(lb export exp "$T/image-running" 2>&1 </dev/null) && { echo "a running container was exported"; return 1; }
+    printf '%s\n' "$said"
+    [ "$said" = 'Error: container is running (stop it first): exp' ] && [ ! -e "$T/image-running" ] ||
+        { echo "a running container was not refused as one, or left a directory"; return 1; }
+    lb stop exp >/dev/null || return 1
+    # a directory that is there and another user's is not written into
+    mkdir "$T/image-of-another" && chown 4711:4711 "$T/image-of-another" || return 1
+    said=$(lb export exp "$T/image-of-another" 2>&1 </dev/null) && { echo "an image was written into another user's directory"; return 1; }
+    case $said in *"and this is another user's"*) ;; *) printf '%s\n' "$said"; return 1 ;; esac
+    [ -z "$(ls -A "$T/image-of-another")" ] || { echo "a refused export left files"; return 1; }
+    echo "in rootfs/: $(cd "$C/exp/rootfs" && find . -mindepth 1 \( -name group -o -name lbt -o -name made-here \) -printf '%p %y %U:%G; ')"
+
+    said=$(lb export exp "$T/image" 2>&1 </dev/null) || { printf '%s\n' "$said"; return 1; }
+    printf '%s\n' "$said"
+    out=$(python3 -I "$HERE/image_check.py" "$T/image") || { printf '%s\n' "$out"; return 1; }
+    printf '%s\n' "$out" | grep -v '^entry 1 '
+    printf '%s\n' "$said" | grep -q "^Container 'exp' exported: 2 layers, " && printf '%s\n' "$out" | grep -qx 'layers 2' ||
+        { echo "an overlay is not two layers"; return 1; }
+    printf '%s\n' "$out" | grep -qx 'annotation ac.ozkr.lightbox.mem=300M' &&
+        printf '%s\n' "$out" | grep -qx 'annotation ac.ozkr.lightbox.ttl=2h' &&
+        printf '%s\n' "$out" | grep -qx 'annotation ac.ozkr.lightbox.name=exp' || { echo "the limits are not in the image"; return 1; }
+
+    # the snapshot, with what the container took out still in it
+    id=$(base_of exp)
+    [ "$(cat "$T/lb/bases/$id/layer")" = "$(printf '%s\n' "$out" | sed -n 's/^layer 1 //p')" ] ||
+        { echo "the snapshot does not keep its layer's digest and size: $(cat "$T/lb/bases/$id/layer" 2>&1)"; return 1; }
+    printf '%s\n' "$out" | grep -qE "^entry 1 (file|hardlink) .* ${KIT#/}( -> .*)?\$" &&
+        printf '%s\n' "$out" | grep -qE '^entry 1 file [0-7]{4} [0-9]+:[0-9]+ [0-9]+ etc/group$' &&
+        ! printf '%s\n' "$out" | grep -qE '^entry 1 .* made-here$' || { echo "the first layer is not the snapshot"; return 1; }
+    # its own files, root's as uid 0, and the marks
+    two=$(printf '%s\n' "$out" | sed -n 's/^entry 2 //p')
+    printf '%s\n' "$two" | grep -qE '^file [0-7]{4} 0:0 5 made-here$' || { echo "what the container's root made is not uid 0 in the image"; return 1; }
+    printf '%s\n' "$two" | grep -qE '^file [0-7]{4} 0:0 0 etc/\.wh\.group$' || { echo "the file it removed is not marked"; return 1; }
+    printf '%s\n' "$two" | grep -qE '^file [0-7]{4} 0:0 0 lbt/\.wh\.\.wh\.\.opq$' &&
+        printf '%s\n' "$two" | grep -qE '^file [0-7]{4} 0:0 6 lbt/again$' &&
+        ! printf '%s\n' "$two" | grep -q " ${KIT#/}\$" || { echo "the directory it made anew does not hide its base's"; return 1; }
+    printf '%s\n' "$two" | grep -qE '^file [0-7]{4} 0:0 4 etc/hostname$' || { echo "the files create wrote are not in the second layer"; return 1; }
+    ! printf '%s\n' "$two" | grep -qE '^(char|block) ' || { echo "a device is in the second layer"; return 1; }
+
+    # a second container of the same base has the same first layer
+    box exp2 && lb export exp2 "$T/image2" >/dev/null 2>&1 </dev/null || return 1
+    [ "$(python3 -I "$HERE/image_check.py" "$T/image2" | sed -n 's/^layer 1 //p')" = "$(printf '%s\n' "$out" | sed -n 's/^layer 1 //p')" ] ||
+        { echo "two containers of one snapshot have two first layers"; return 1; }
+
+    # the container is as it was
+    start exp && [ "$(sh_in exp 'cat /made-here /lbt/again; test -e /etc/group || echo no-group')" = 'mine
+again
+no-group' ] || { echo "after its export the container is not what it was"; return 1; }
+
+    # a copy of its base is one layer, with its files as they are in it
+    OVERLAY=
+    box expc --copy && lb export expc "$T/image-copy" >/dev/null 2>&1 </dev/null || return 1
+    out=$(python3 -I "$HERE/image_check.py" "$T/image-copy") || { printf '%s\n' "$out"; return 1; }
+    printf '%s\n' "$out" | grep -qx 'layers 1' && printf '%s\n' "$out" | grep -qE '^entry 1 file [0-7]{4} 0:0 5 etc/hostname$' &&
+        printf '%s\n' "$out" | grep -qE "^entry 1 (file|hardlink) .* ${KIT#/}( -> .*)?\$" || { echo "a copy is not one layer of its files"; return 1; }
+}
+
+# import (ROADMAP I.6): a container that ran, with files added, changed and
+# removed, links, a second name and owners of several ids, is exported and
+# made a container again under another name. What it shows inside is what
+# the first showed, with its own name and address in /etc; its limits are
+# the first one's, which are within lightbox.conf's; it overlays the snapshot the first overlays, which is
+# found by the layer export wrote it as, so that nothing of it is unpacked.
+# Its own files are its root's on this host, whatever range it has, and the
+# marks of the image are the overlay's own: a device for the file that was
+# removed, the attribute for the directory that was made anew. The same
+# image with its layers compressed is the same container. A copy, exported,
+# is an image of one layer, which import unpacks into a snapshot once: a
+# second import of it finds that one.
+t_import() {
+    command -v python3 >/dev/null 2>&1 || { echo "no python3 to read the image with"; return 77; }
+    local said ip first second owner before
+    # what a container shows of the two directories the case made in it
+    shown_in() {
+        sh_in "$1" 'cd / && { find work lbt -type f -exec stat -c "%n file %a %u:%g %s %Y %h" {} + ; find work lbt ! -type f -exec stat -c "%N %F %a %u:%g %Y" {} + ; } | sort'
+    }
+    OVERLAY=1
+    up imp --mem 200M --ttl 2h || return 1
+    # no mode with the setgid bit: a container's seccomp filter refuses one
+    sh_in imp 'mkdir -p /work/sub && echo mine > /work/file && ln -s file /work/link && ln /work/file /work/sub/second &&
+        chown 1000:1001 /work/sub && chmod 750 /work/sub && echo more >> /etc/passwd && rm /etc/group &&
+        rm -r /lbt && mkdir /lbt && echo again > /lbt/again && chown 12:34 /lbt/again && touch -d "2020-02-02 02:02:02" /work/file' || return 1
+    first=$(shown_in imp) && [ -n "$first" ] || return 1
+    printf '%s\n' "$first"
+    lb stop imp >/dev/null && lb export imp "$T/imp-image" </dev/null || return 1
+
+    imported "$T/imp-image" imp2 || return 1
+    grep -qx "Container 'imp2' imported (ip=$ip)" "$OUT/imp2.import" || { echo "import does not say what it made"; return 1; }
+    [ -n "$(base_of imp)" ] && [ "$(base_of imp2)" = "$(base_of imp)" ] &&
+        grep -q ", on the base snapshot $(base_of imp), which was here\$" "$OUT/imp2.import" ||
+        { echo "the import does not overlay the snapshot the container overlays"; return 1; }
+    [ "$(conf_value imp2 mem)" = 200M ] && [ "$(conf_value imp2 ttl)" = 2h ] && grep -q "^Limits of the image's: mem=200M " "$OUT/imp2.import" ||
+        { echo "the limits are not the image's"; return 1; }
+    # its own files: its root's on this host, and the overlay's marks
+    owner=0:0
+    [ "$(conf_value imp2 userns)" = 1 ] && owner="$(conf_value imp2 uid_start):$(conf_value imp2 gid_start)"
+    [ "$(stat -c %u:%g "$C/imp2/rootfs/work/file")" = "$owner" ] && [ "$(stat -c %u:%g "$C/imp2/rootfs")" = "$owner" ] ||
+        { echo "its own files are not its root's on the host: $(stat -c %u:%g "$C/imp2/rootfs" "$C/imp2/rootfs/work/file" | paste -sd' '), not $owner"; return 1; }
+    [ "$(stat -c '%F %t:%T' "$C/imp2/rootfs/etc/group")" = 'character special file 0:0' ] || { echo "the file that was removed is not marked as the overlay marks it"; return 1; }
+    [ "$(python3 -I -c 'import os, sys; print(os.getxattr(sys.argv[1], "trusted.overlay.opaque").decode())' "$C/imp2/rootfs/lbt")" = y ] ||
+        { echo "the directory that was made anew is not marked as one that hides its base's"; return 1; }
+
+    start imp2 || return 1
+    second=$(shown_in imp2)
+    [ "$second" = "$first" ] || { echo "the import shows another tree:"; printf '%s\n' "$second"; return 1; }
+    said=$(sh_in imp2 'cat /etc/hostname /work/file; tail -n 1 /etc/passwd; test -e /etc/group || echo no-group; test -e /lbt/busybox || echo no-busybox')
+    [ "$said" = 'imp2
+mine
+more
+no-group
+no-busybox' ] || { echo "in the import: $said"; return 1; }
+    sh_in imp2 "grep -q '^$ip	imp2\$' /etc/hosts && ! grep -q '	imp\$' /etc/hosts" || { echo "its hosts file is not its own: $(sh_in imp2 'cat /etc/hosts' | paste -sd'|')"; return 1; }
+    lb stop imp2 >/dev/null || return 1
+
+    # its layers compressed: the same container, on the same snapshot
+    cp -r "$T/imp-image" "$T/imp-gz" && python3 -I "$HERE/image_edit.py" "$T/imp-gz" gzip || return 1
+    imported "$T/imp-gz" imp3 && [ "$(base_of imp3)" = "$(base_of imp)" ] && start imp3 || return 1
+    [ "$(shown_in imp3)" = "$first" ] || { echo "the image with its layers compressed is another tree"; return 1; }
+    lb stop imp3 >/dev/null || return 1
+    # and one that is not what it is named by makes nothing
+    cp -r "$T/imp-image" "$T/imp-bad" && python3 -I "$HERE/image_edit.py" "$T/imp-bad" byte layer || return 1
+    refused lb import "$T/imp-bad" imp-bad </dev/null && [ ! -e "$C/imp-bad" ] || { echo "an image with a byte changed was imported, or left a container"; return 1; }
+
+    # a copy is one layer, and import makes a snapshot of it, once
+    OVERLAY=
+    up impc --copy && sh_in impc 'echo copied > /made-here' && lb stop impc >/dev/null && lb export impc "$T/impc-image" >/dev/null </dev/null || return 1
+    OVERLAY=1
+    before=$(ls "$T/lb/bases" | wc -l)
+    imported "$T/impc-image" imp4 || return 1
+    grep -q ", on the new base snapshot $(base_of imp4)\$" "$OUT/imp4.import" && [ "$(ls "$T/lb/bases" | wc -l)" = $((before + 1)) ] &&
+        [ "$(cat "$T/lb/bases/$(base_of imp4)/rootfs/made-here")" = copied ] || { echo "a copy's image was not unpacked into a new snapshot"; return 1; }
+    lb base ls | grep -E "^$(base_of imp4)  .*  sha256:[0-9a-f]{64}  imp4\$" || { lb base ls; echo "base ls does not show the snapshot of an image"; return 1; }
+    imported "$T/impc-image" imp5 || return 1
+    [ "$(base_of imp5)" = "$(base_of imp4)" ] && [ "$(ls "$T/lb/bases" | wc -l)" = $((before + 1)) ] &&
+        grep -q ", which was here\$" "$OUT/imp5.import" || { echo "a second import took a second snapshot"; return 1; }
+    start imp4 && [ "$(sh_in imp4 'cat /made-here /etc/hostname' | paste -sd' ')" = 'copied imp4' ] || { echo "the import of a copy does not start as itself"; return 1; }
+    # a container made of a base after it does not take the image's snapshot for its base's
+    box impn && [ "$(base_of impn)" != "$(base_of imp4)" ] || { echo "a snapshot of an image was taken for one of the base"; return 1; }
+}
+
+# To a registry and back (ROADMAP I.8), with a container that ran: it is
+# exported, skopeo copies the image to tests/registry.py, a registry of this
+# case's own on the loopback, and back into an empty directory, and import
+# makes of that a container that starts and has the first one's files, on the
+# snapshot the first one overlays. skopeo runs as another user than root,
+# with its home, its runtime directory and its temporary files in the work
+# directory: it keeps a record of what it copied, and root's would be the
+# host's.
+t_registry() {
+    command -v python3 >/dev/null 2>&1 && command -v skopeo >/dev/null 2>&1 && command -v setpriv >/dev/null 2>&1 ||
+        { echo "no python3, skopeo or setpriv to carry an image to a registry with"; return 77; }
+    local pid port n=0 rc said ip
+    OVERLAY=1
+    up reg --mem 200M || return 1
+    sh_in reg 'echo there > /made-here && rm /etc/group' || return 1
+    lb stop reg >/dev/null && lb export reg "$T/reg-image" >/dev/null </dev/null || return 1
+    mkdir -p "$T/carry/home" "$T/carry/run" "$T/carry/tmp" && cp -r "$T/reg-image" "$T/carry/image" && chown -R 4711:4711 "$T/carry" || return 1
+    python3 -I "$HERE/registry.py" "$T/carry/registry" "$T/carry/port" "$T/carry/log" > "$T/carry/registry.out" 2>&1 &
+    pid=$!
+    while [ ! -s "$T/carry/port" ] && [ $n -lt 50 ]; do sleep 0.1; n=$((n + 1)); done
+    port=$(cat "$T/carry/port" 2>/dev/null)
+    carried() {
+        [ -n "$port" ] || { cat "$T/carry/registry.out"; echo "the registry did not start"; return 1; }
+        python3 -I -c 'import socket, sys; socket.create_connection(("127.0.0.1", int(sys.argv[1])), 3)' "$port" 2>/dev/null ||
+            { echo "the loopback reaches no listener in the suite's namespace"; return 77; }
+        # with nothing of the caller's environment: an XDG_CONFIG_HOME in it, as
+        # CI's runners have one, names a directory of another user's, which
+        # skopeo looks in for a registry's password and ends when it may not
+        copy() {
+            setpriv --reuid=4711 --regid=4711 --clear-groups env -i PATH="$PATH" HOME="$T/carry/home" \
+                XDG_RUNTIME_DIR="$T/carry/run" XDG_CONFIG_HOME="$T/carry/home/.config" TMPDIR="$T/carry/tmp" \
+                timeout 120 skopeo --insecure-policy copy --dest-tls-verify=false --src-tls-verify=false "$@" </dev/null
+        }
+        copy "oci:$T/carry/image" "docker://127.0.0.1:$port/boxes/reg:latest" || { echo "skopeo did not copy the image to the registry"; return 1; }
+        copy "docker://127.0.0.1:$port/boxes/reg:latest" "oci:$T/carry/back" || { echo "skopeo did not copy the image back"; return 1; }
+    }
+    carried
+    rc=$?
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    cat "$T/carry/log" 2>/dev/null
+    [ $rc -ne 77 ] || return 77
+    [ $rc -eq 0 ] || return 1
+    imported "$T/carry/back" reg2 || return 1
+    [ "$(base_of reg2)" = "$(base_of reg)" ] || { echo "what came back does not overlay the snapshot it was exported from"; return 1; }
+    start reg2 || return 1
+    said=$(sh_in reg2 'cat /made-here /etc/hostname; test -e /etc/group || echo no-group')
+    [ "$said" = 'there
+reg2
+no-group' ] || { echo "what came back from the registry: $said"; return 1; }
+}
+
+# A registry's image as a base (ROADMAP I.9), with one made here as somebody
+# else builds one: the export of a copy, with nothing of lightbox's said in
+# it, a command to start, and a second layer over the first that adds a file
+# and takes one out. base import unpacks both layers into one snapshot, and
+# create --base makes a container that overlays it, starts, and shows the
+# image's files with its own name in /etc; its snapshot is not removed under
+# it. A reset gives it the whole image again, as both layers are its base.
+# import of the same image is a container on that snapshot with nothing of
+# its own: only an image that export wrote has its second layer as the
+# container's own files, which a reset takes away. --copy is a copy of the
+# snapshot.
+t_base_import() {
+    command -v python3 >/dev/null 2>&1 || { echo "no python3 to make the image with"; return 77; }
+    local said id
+    box bisrc --copy && lb export bisrc "$T/bi-export" >/dev/null </dev/null || return 1
+    python3 -I -c '
+import io, sys, tarfile
+with tarfile.open(sys.argv[1], "w", format=tarfile.PAX_FORMAT) as t:
+    d = tarfile.TarInfo("added"); d.type = tarfile.DIRTYPE; d.mode = 0o755; t.addfile(d)
+    f = tarfile.TarInfo("added/file"); f.size = 7; f.mode = 0o644; f.uid, f.gid = 12, 34; t.addfile(f, io.BytesIO(b"second\n"))
+    w = tarfile.TarInfo("etc/.wh.group"); t.addfile(w)
+' "$T/bi-second.tar" && cp -r "$T/bi-export" "$T/bi-image" && python3 -I "$HERE/image_edit.py" "$T/bi-image" no-annotations &&
+        python3 -I "$HERE/image_edit.py" "$T/bi-image" command && python3 -I "$HERE/image_edit.py" "$T/bi-image" add-layer "$T/bi-second.tar" ||
+        { echo "no image to import"; return 1; }
+
+    said=$(lb base import "$T/bi-image" 2>&1 </dev/null) || { printf '%s\n' "$said"; return 1; }
+    printf '%s\n' "$said"
+    id=$(printf '%s\n' "$said" | sed -n 's/^Base \([0-9a-f]\{12\}\) unpacked from the image sha256:[0-9a-f]\{64\}, 2 layers$/\1/p')
+    [ -n "$id" ] || { echo "base import does not say what it made"; return 1; }
+    printf '%s\n' "$said" | grep -q '^Note: the image names a command to start, which lightbox does not read' ||
+        { echo "the image's command, which is not read, is not said"; return 1; }
+    [ "$(cat "$T/lb/bases/$id/rootfs/added/file")" = second ] && [ "$(stat -c %u:%g "$T/lb/bases/$id/rootfs/added/file")" = 12:34 ] &&
+        [ ! -e "$T/lb/bases/$id/rootfs/etc/group" ] && [ -e "$T/lb/bases/$id/rootfs$KIT" ] ||
+        { echo "the snapshot is not the two layers, one over the other"; return 1; }
+    said=$(lb base import "$T/bi-image" 2>&1 </dev/null) && printf '%s\n' "$said" | grep -q "^Base $id is the image sha256:[0-9a-f]\{64\} already, 2 layers: nothing was unpacked\$" ||
+        { printf '%s\n' "$said"; echo "a second base import took a second snapshot"; return 1; }
+
+    OVERLAY=1
+    up bi1 --base "$id" || return 1
+    [ "$(base_of bi1)" = "$id" ] || { echo "the container does not overlay the snapshot it was given: $(base_of bi1)"; return 1; }
+    said=$(sh_in bi1 'cat /added/file /etc/hostname; stat -c %u:%g /added/file; test -e /etc/group || echo no-group')
+    [ "$said" = 'second
+bi1
+12:34
+no-group' ] || { echo "in the container of the image: $said"; return 1; }
+    lb base ls | grep -E "^$id  .*  bi1\$" || { lb base ls; echo "base ls does not show the container on its snapshot"; return 1; }
+    refused lb base rm "$id" || { echo "a snapshot was removed under its container"; return 1; }
+    # its base is the whole image: a reset gives back both layers
+    sh_in bi1 'echo mine > /added/mine && rm /added/file' && lb reset bi1 >/dev/null 2>&1 </dev/null && start bi1 || return 1
+    [ "$(sh_in bi1 'cat /added/file; test -e /added/mine || echo gone')" = 'second
+gone' ] || { echo "after a reset the container is not the image again"; return 1; }
+
+    # import of that image: all of it is the snapshot, and its own files are what create writes
+    imported "$T/bi-image" bi2 || return 1
+    [ "$(base_of bi2)" = "$id" ] && grep -q ", on the base snapshot $id, which was here\$" "$OUT/bi2.import" ||
+        { echo "an image that export did not write is not all snapshot"; return 1; }
+    [ -z "$(cd "$C/bi2/rootfs" && find . -type f ! -path './etc/hostname' ! -path './etc/hosts' ! -path './etc/resolv.conf')" ] ||
+        { echo "its own files are more than create writes: $(cd "$C/bi2/rootfs" && find . -type f | paste -sd' ')"; return 1; }
+    start bi2 && lb reset bi2 >/dev/null 2>&1 </dev/null && start bi2 && [ "$(sh_in bi2 'cat /added/file /etc/hostname' | paste -sd' ')" = 'second bi2' ] ||
+        { echo "the import of the image is not the image after a reset"; return 1; }
+
+    # and a copy of the snapshot
+    OVERLAY=
+    up bi3 --base "$id" --copy || return 1
+    [ -z "$(base_of bi3)" ] && [ "$(sh_in bi3 'cat /added/file /etc/hostname' | paste -sd' ')" = 'second bi3' ] ||
+        { echo "create --base --copy is no copy of the snapshot"; return 1; }
+    refused lb create bi4 --base 000000000000 </dev/null && [ ! -e "$C/bi4" ] || { echo "a snapshot that is not there was taken, or left a container"; return 1; }
+}
+
+# Alpine's or Debian's image as its registry has it (ROADMAP I.9): the
+# directory LIGHTBOX_TEST_IMAGE names, which tests/fetch_image.sh --oci
+# filled with skopeo, by the digest of the manifest that is pinned there.
+# Its layers are compressed, and written by another program than lightbox's
+# tests. base import makes a snapshot of it, a container of that starts with
+# no /init.sh of its own and runs the image's own shell and package tool, and
+# a file of another group than root's is that group's inside. import of the
+# directory is a container on the same snapshot.
+t_registry_image() {
+    [ -n "${LIGHTBOX_TEST_IMAGE:-}" ] ||
+        { echo "LIGHTBOX_TEST_IMAGE names no image of a registry's; tests/fetch_image.sh --oci alpine|debian <dir> fetches one"; return 77; }
+    local said id os tool
+    said=$(lb base import "$LIGHTBOX_TEST_IMAGE" 2>&1 </dev/null) || { printf '%s\n' "$said"; return 1; }
+    printf '%s\n' "$said"
+    id=$(printf '%s\n' "$said" | sed -n 's/^Base \([0-9a-f]\{12\}\) unpacked from the image sha256:[0-9a-f]\{64\}, [0-9]* layers\{0,1\}$/\1/p')
+    [ -n "$id" ] || { echo "base import does not say what it made"; return 1; }
+    echo "in the snapshot: $(find "$T/lb/bases/$id/rootfs" | wc -l) entries, $(du -sh "$T/lb/bases/$id/rootfs" | cut -f1)"
+    OVERLAY=1
+    up rimg --base "$id" || return 1
+    os=$(sh_in rimg '. /etc/os-release && echo "$ID"')
+    case $os in
+        alpine) tool='apk --version' ;;
+        debian) tool='dpkg --version' ;;
+        *)      echo "the image says it is neither Alpine nor Debian: $os"; return 1 ;;
+    esac
+    said=$(sh_in rimg "$tool" 2>&1) && [ -n "$said" ] || { echo "the image's own $tool did not run: $said"; return 1; }
+    printf '%s\n' "$said" | head -n 1
+    said=$(sh_in rimg 'cat /etc/hostname; stat -c %u:%g /etc/shadow; test -e /init.sh || echo no-hook')
+    [ "$said" = 'rimg
+0:42
+no-hook' ] || { echo "in the container of the image: $said"; return 1; }
+    imported "$LIGHTBOX_TEST_IMAGE" rimg2 || return 1
+    [ "$(base_of rimg2)" = "$id" ] && grep -q ", on the base snapshot $id, which was here\$" "$OUT/rimg2.import" ||
+        { echo "import of the image took another snapshot than base import made"; return 1; }
+    start rimg2 && sh_in rimg2 "$tool" >/dev/null || { echo "the import of the image does not start, or run $tool"; return 1; }
+}
+
+# An import takes no work away (ROADMAP I.10), with containers that run. One
+# is exported, and its image imported: both are generation 1 of one line. The
+# second works and is exported, generation 2, and that image takes the place
+# of the first, which was not started since its export: it has the second's
+# files, and its own name, address and limits, and starts. Started, it is on
+# record as changed, and the same exchange the other way is refused with both
+# generations named, as each has what the other has not; --force does it all
+# the same. A reset is a change too.
+t_import_replace() {
+    command -v python3 >/dev/null 2>&1 || { echo "no python3 for the case's listener"; return 77; }
+    local said line
+    OVERLAY=1
+    up gena --mem 200M || return 1
+    sh_in gena 'echo one > /work.txt' && lb stop gena >/dev/null && lb export gena "$T/gen-1" > "$OUT/gen-1.export" 2>&1 </dev/null || { cat "$OUT/gen-1.export"; return 1; }
+    grep -qx "Generation 1, the first of the container's line" "$OUT/gen-1.export" || { cat "$OUT/gen-1.export"; echo "the first export is not generation 1"; return 1; }
+    line=$(cut -d' ' -f1 "$C/gena/.generation")
+    imported "$T/gen-1" genb --mem 100M >/dev/null || return 1
+    [ "$(cat "$C/genb/.generation")" = "$(cat "$C/gena/.generation")" ] && [ ! -e "$C/genb/.changed" ] || { echo "the import is not the generation its image is"; return 1; }
+
+    # the second one works: started, it is on record as changed, and its export is generation 2
+    start genb && [ -e "$C/genb/.changed" ] || { echo "a start left no record that the container changed"; return 1; }
+    sh_in genb 'echo two >> /work.txt && rm /etc/group' && lb stop genb >/dev/null && lb export genb "$T/gen-2" > "$OUT/gen-2.export" 2>&1 </dev/null || { cat "$OUT/gen-2.export"; return 1; }
+    grep -qx 'Generation 2: the container was started since the one before' "$OUT/gen-2.export" && [ ! -e "$C/genb/.changed" ] &&
+        grep -qxE "$line 2 [0-9a-f]{8},[0-9a-f]{8}" "$C/genb/.generation" || { cat "$OUT/gen-2.export"; echo "the export of a container that was started is not generation 2"; return 1; }
+
+    # and takes the place of the first, which was not started since its export
+    said=$(lb import "$T/gen-2" gena --replace 2>&1 </dev/null) || { printf '%s\n' "$said"; return 1; }
+    printf '%s\n' "$said"
+    printf '%s\n' "$said" | grep -qx "Container 'gena' replaced: generation 2 in the place of generation 1" || { echo "replace does not say what it did"; return 1; }
+    [ "$(cat "$C/gena/.generation")" = "$(cat "$C/genb/.generation")" ] && [ "$(conf_value gena mem)" = 200M ] &&
+        [ "$(base_of gena)" = "$(base_of genb)" ] || { echo "the container is not the image's generation with its own limits, on the snapshot"; return 1; }
+    start gena || return 1
+    said=$(sh_in gena 'cat /work.txt /etc/hostname; test -e /etc/group || echo no-group' | paste -sd' ')
+    [ "$said" = 'one two gena no-group' ] || { echo "in the container that was replaced: $said"; return 1; }
+    sh_in gena "grep -q '	gena\$' /etc/hosts && ! grep -q '	genb\$' /etc/hosts" || { echo "its hosts file is not its own"; return 1; }
+
+    # it was started: the exchange the other way is refused, with both generations
+    sh_in gena 'echo three >> /work.txt' && lb stop gena >/dev/null || return 1
+    start genb && sh_in genb 'echo other >> /work.txt' && lb stop genb >/dev/null && lb export genb "$T/gen-3" >/dev/null 2>&1 </dev/null || return 1
+    said=$(lb import "$T/gen-3" gena --replace 2>&1 </dev/null) && { echo "an image took the place of a container that was started since"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *"the container was started since generation 2, and the image is generation 3, which continues generation 2 too: each has what the other has not"*) ;;
+        *) echo "the refusal does not name both generations"; return 1 ;; esac
+    start gena && [ "$(sh_in gena 'cat /work.txt' | paste -sd' ')" = 'one two three' ] && lb stop gena >/dev/null ||
+        { echo "a refused replace changed the container"; return 1; }
+    # --force does it all the same
+    lb import "$T/gen-3" gena --replace --force > "$OUT/gena.force" 2>&1 </dev/null || { cat "$OUT/gena.force"; return 1; }
+    start gena && [ "$(sh_in gena 'cat /work.txt' | paste -sd' ')" = 'one two other' ] || { echo "--force did not put the image in its place"; return 1; }
+    # a reset is a change too
+    lb reset genb >/dev/null 2>&1 </dev/null && [ -e "$C/genb/.changed" ] || { echo "a reset left no record that the container changed"; return 1; }
+}
+
+# A container's files are all in its rootfs/ (ROADMAP I.14). Its overlay is
+# mounted with redirect_dir and metacopy off, which the mount shows where
+# the host's own setting is the other; a directory of the snapshot that the
+# container moves is copied, and its export is whole. create puts on record
+# that its upper directory is whole. One from before whose rootfs/ has a
+# redirect, as an overlay with redirect_dir on leaves one, is looked
+# through at its start and refused, with the entry named; without it, it
+# starts and is on record as whole.
+t_overlay_whole() {
+    command -v python3 >/dev/null 2>&1 || { echo "no python3 to set an attribute with"; return 77; }
+    local pid opts said out
+    OVERLAY=1
+    up whole || return 1
+    [ -n "$(base_of whole)" ] && [ -e "$C/whole/.overlay-whole" ] || { echo "create did not put on record that the upper directory is whole"; return 1; }
+    pid=$(pid_of whole)
+    opts=$(awk '$5 == "/" { for (i = 7; i <= NF; i++) if ($i == "-") { print $(i + 3); exit } }' "/proc/$pid/mountinfo")
+    echo "the container's root: $opts; the host's: redirect_dir=$(cat /sys/module/overlay/parameters/redirect_dir 2>/dev/null) metacopy=$(cat /sys/module/overlay/parameters/metacopy 2>/dev/null)"
+    case ",$opts," in *,redirect_dir=on,*|*,metacopy=on,*) echo "the overlay is mounted with redirect_dir or metacopy on"; return 1 ;; esac
+    case ",$opts," in *,upperdir=*) ;; *) echo "the container's root is no overlay: $opts"; return 1 ;; esac
+    sh_in whole 'mv /lbt /lbt-moved && test -x /lbt-moved/busybox && ! test -e /lbt' || { echo "a directory of the snapshot could not be moved"; return 1; }
+    lb stop whole >/dev/null && lb export whole "$T/whole-image" >/dev/null 2>&1 </dev/null || { echo "the container that moved a directory is not exported"; return 1; }
+    out=$(python3 -I "$HERE/image_check.py" "$T/whole-image") || { printf '%s\n' "$out"; return 1; }
+    printf '%s\n' "$out" | grep -qE "^entry 2 (file|hardlink) .* lbt-moved/busybox( -> .*)?\$" &&
+        printf '%s\n' "$out" | grep -qE '^entry 2 file [0-7]{4} 0:0 0 \.wh\.lbt$' || { echo "the moved directory is not whole in the container's own layer"; return 1; }
+
+    # one from before, with a redirect in its own files
+    setfattr_py() { python3 -I -c 'import os, sys; os.setxattr(sys.argv[1], "trusted.overlay.redirect", b"/lbt")' "$1"; }
+    rm "$C/whole/.overlay-whole" && setfattr_py "$C/whole/rootfs/lbt-moved" || return 1
+    said=$(lb start whole 2>&1 </dev/null) && { echo "a container with a redirect in its own files was started"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *"has in its own files what an overlay leaves"*"  lbt-moved"*"so it is not started"*) ;; *) echo "the refusal does not name the entry"; return 1 ;; esac
+    [ ! -e "$C/whole/.overlay-whole" ] && [ "$(state_of whole)" = stopped ] || { echo "a refused start left a record"; return 1; }
+    python3 -I -c 'import os, sys; os.removexattr(sys.argv[1], "trusted.overlay.redirect")' "$C/whole/rootfs/lbt-moved" || return 1
+    start whole && [ -e "$C/whole/.overlay-whole" ] || { echo "a container that is whole was not started, or not put on record"; return 1; }
+}
+
 # ─── Cases: where the settings are ──────────────────────────────────────────
 
 # Named by neither --config nor LIGHTBOX_CONFIG, the settings are those of
@@ -4466,6 +4885,13 @@ if [ "$MODE" = inside ]; then
     check '--copy makes a container a copy of its base'                   t_copy_root
     check "reset makes a container's root its base's again, and keeps its volume" t_reset
     check 'base ls, base rm and base add manage the snapshots'            t_base_commands
+    check 'export writes a container that ran as an image: its snapshot, and its own files and marks' t_export
+    check 'import makes a container of an image that shows what the exported one showed' t_import
+    check 'an image goes to a registry and back with skopeo, and is the container again' t_registry
+    check "base import makes a snapshot of an image's layers, and create --base a container that starts" t_base_import
+    check "a registry's own image is a base, and a container of it runs the image's tools" t_registry_image
+    check 'import --replace puts an image in the place of the container it continues, and of none that was started since' t_import_replace
+    check "an overlay is mounted with redirect_dir and metacopy off, and a container's own files are whole" t_overlay_whole
     check 'no case ran ip or nsenter, which were masked in every one'     t_no_ip_or_nsenter_ran
 
     # last: it may leave a kernel setting changed for the rest of this suite's life

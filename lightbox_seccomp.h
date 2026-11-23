@@ -12,6 +12,13 @@
  * lb_seccomp_build() and lb_seccomp_build_allow() turn the rows for the
  * target architecture into the program lightbox installs.
  *
+ * Two more are for what lightbox runs on bytes from elsewhere (ROADMAP
+ * I.12): the process that unpacks an archive, which may make the calls of
+ * LB_SECCOMP_UNPACK and nothing else, and the host's gzip that unpacks a
+ * compressed layer, which may make those of LB_SECCOMP_GZIP and is answered
+ * ENOSYS for any other. lb_seccomp_build_unpack() and lb_seccomp_build_gzip()
+ * write them.
+ *
  * Nothing here is taken on trust:
  *   tests/sys_check.c       compares every number and constant below with the
  *                           kernel's headers, for both architectures
@@ -88,7 +95,17 @@ _Static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
 #define LB_SECCOMP_NR_CLONE_AARCH64  220
 
 #define LB_SC_EPERM                  1
+#define LB_SC_ENOTTY                 25
 #define LB_SC_ENOSYS                 38
+
+#define LB_SECCOMP_PROT_EXEC         4U
+#define LB_SECCOMP_TCGETS            0x5401U
+#define LB_SECCOMP_NR_MMAP_X86_64    9
+#define LB_SECCOMP_NR_MMAP_AARCH64   222
+#define LB_SECCOMP_NR_EXECVE_X86_64  59
+#define LB_SECCOMP_NR_EXECVE_AARCH64 221
+#define LB_SECCOMP_NR_IOCTL_X86_64   16
+#define LB_SECCOMP_NR_IOCTL_AARCH64  29
 #define LB_SC_EAFNOSUPPORT           97
 
 #define LB_SECCOMP_NR_SOCKET_X86_64       41
@@ -540,6 +557,109 @@ struct lb_sock_fprog {
     X(vfork,                    58)
 
 /*
+ * The process that unpacks an archive (ROADMAP I.12), once its root is the
+ * directory it fills and it has closed every descriptor but the archive's,
+ * the root's and the pipe it answers on: the calls the reader makes, read
+ * from lightbox_tar.c and seen by tracing it over every archive of the unit
+ * cases, and nothing else. A call that is not here ends the process, which
+ * the command says as a failure of the unpacking. mmap, which a buffer that
+ * grows takes its pages with, is allowed without PROT_EXEC, and mprotect not
+ * at all, so that no page of it is ever code. No chroot, mount, execve,
+ * ptrace, socket, kill or setuid is among them.
+ *
+ *   X(name, number on x86_64, number on aarch64)
+ */
+#define LB_SECCOMP_UNPACK(X) \
+    X(chdir,                    80,   49) \
+    X(close,                     3,   57) \
+    X(exit,                     60,   93) \
+    X(exit_group,              231,   94) \
+    X(fchdir,                   81,   50) \
+    X(fchmod,                   91,   52) \
+    X(fchownat,                260,   54) \
+    X(fsetxattr,               190,    7) \
+    X(getdents64,              217,   61) \
+    X(linkat,                  265,   37) \
+    X(mkdirat,                 258,   34) \
+    X(mknodat,                 259,   33) \
+    X(munmap,                   11,  215) \
+    X(openat,                  257,   56) \
+    X(read,                      0,   63) \
+    X(rt_sigreturn,             15,  139) \
+    X(statx,                   332,  291) \
+    X(symlinkat,               266,   36) \
+    X(unlinkat,                263,   35) \
+    X(utimensat,               280,   88) \
+    X(write,                     1,   64)
+
+/*
+ * The host's gzip that unpacks a compressed layer (ROADMAP I.12), as nobody,
+ * with no capability and a network of its own: what a program of a C
+ * library's needs to start, to read its standard input and to write its
+ * standard output, seen by tracing GNU gzip 1.14 with glibc, and a little
+ * room for other libraries' ways. Every other call is answered ENOSYS, as a
+ * kernel without it would. Beside these: execve only of the path lightbox
+ * gave it, by the address of that path in lightbox's own memory, so that
+ * once gzip runs no second program can be started; and ioctl only to ask
+ * whether a descriptor is a terminal, which keeps the command's terminal,
+ * its standard error, from being written into with TIOCSTI.
+ *
+ *   X(name, number on x86_64, number on aarch64)
+ */
+#define LB_SECCOMP_GZIP(X) \
+    X(brk,                      12,  214) \
+    X(clock_gettime,           228,  113) \
+    X(close,                     3,   57) \
+    X(exit,                     60,   93) \
+    X(exit_group,              231,   94) \
+    X(faccessat,               269,   48) \
+    X(faccessat2,              439,  439) \
+    X(fadvise64,               221,  223) \
+    X(fcntl,                    72,   25) \
+    X(fstat,                     5,   80) \
+    X(futex,                   202,   98) \
+    X(getegid,                 108,  177) \
+    X(geteuid,                 107,  175) \
+    X(getgid,                  104,  176) \
+    X(getpid,                   39,  172) \
+    X(getrandom,               318,  278) \
+    X(gettid,                  186,  178) \
+    X(getuid,                  102,  174) \
+    X(lseek,                     8,   62) \
+    X(madvise,                  28,  233) \
+    X(mmap,                      9,  222) \
+    X(mprotect,                 10,  226) \
+    X(mremap,                   25,  216) \
+    X(munmap,                   11,  215) \
+    X(newfstatat,              262,   79) \
+    X(openat,                  257,   56) \
+    X(pread64,                  17,   67) \
+    X(prlimit64,               302,  261) \
+    X(read,                      0,   63) \
+    X(readlinkat,              267,   78) \
+    X(readv,                    19,   65) \
+    X(rseq,                    334,  293) \
+    X(rt_sigaction,             13,  134) \
+    X(rt_sigprocmask,           14,  135) \
+    X(rt_sigreturn,             15,  139) \
+    X(set_robust_list,         273,   99) \
+    X(set_tid_address,         218,   96) \
+    X(sigaltstack,             131,  132) \
+    X(statx,                   332,  291) \
+    X(uname,                    63,  160) \
+    X(write,                     1,   64) \
+    X(writev,                   20,   66)
+
+/* and those of x86_64 alone:  X(name, number on x86_64) */
+#define LB_SECCOMP_GZIP_X86_64(X) \
+    X(access,                   21) \
+    X(arch_prctl,              158) \
+    X(lstat,                     6) \
+    X(open,                      2) \
+    X(readlink,                 89) \
+    X(stat,                      4)
+
+/*
  * In both profiles, socket and socketpair are allowed for the families agents
  * use, and answer any other with EAFNOSUPPORT, as a kernel without that family
  * would. AF_UNIX, AF_INET, AF_INET6 and AF_NETLINK, which C libraries use to
@@ -571,6 +691,9 @@ struct lb_seccomp_mode {
 
 #if defined(LB_SECCOMP_TARGET_X86_64)
 #  define LB_SECCOMP_AUDIT_ARCH   LB_AUDIT_ARCH_X86_64
+#  define LB_SECCOMP_NR_MMAP      LB_SECCOMP_NR_MMAP_X86_64
+#  define LB_SECCOMP_NR_EXECVE    LB_SECCOMP_NR_EXECVE_X86_64
+#  define LB_SECCOMP_NR_IOCTL     LB_SECCOMP_NR_IOCTL_X86_64
 #  define LB_SECCOMP_NR_CLONE     LB_SECCOMP_NR_CLONE_X86_64
 #  define LB_SECCOMP_NR_SOCKET    LB_SECCOMP_NR_SOCKET_X86_64
 #  define LB_SECCOMP_NR_SOCKETPAIR LB_SECCOMP_NR_SOCKETPAIR_X86_64
@@ -585,6 +708,9 @@ struct lb_seccomp_mode {
 #  define LB_SC_ALLOW_ROW_X86_64(name, nr)                    nr,
 #else
 #  define LB_SECCOMP_AUDIT_ARCH   LB_AUDIT_ARCH_AARCH64
+#  define LB_SECCOMP_NR_MMAP      LB_SECCOMP_NR_MMAP_AARCH64
+#  define LB_SECCOMP_NR_EXECVE    LB_SECCOMP_NR_EXECVE_AARCH64
+#  define LB_SECCOMP_NR_IOCTL     LB_SECCOMP_NR_IOCTL_AARCH64
 #  define LB_SECCOMP_NR_CLONE     LB_SECCOMP_NR_CLONE_AARCH64
 #  define LB_SECCOMP_NR_SOCKET    LB_SECCOMP_NR_SOCKET_AARCH64
 #  define LB_SECCOMP_NR_SOCKETPAIR LB_SECCOMP_NR_SOCKETPAIR_AARCH64
@@ -616,6 +742,15 @@ static const uint32_t LB_SECCOMP_ALLOW_TABLE[] = {
     LB_SECCOMP_ALLOW_X86_64(LB_SC_ALLOW_ROW_X86_64)
 };
 
+static const uint32_t LB_SECCOMP_UNPACK_TABLE[] = {
+    LB_SECCOMP_UNPACK(LB_SC_ALLOW_ROW)
+};
+
+static const uint32_t LB_SECCOMP_GZIP_TABLE[] = {
+    LB_SECCOMP_GZIP(LB_SC_ALLOW_ROW)
+    LB_SECCOMP_GZIP_X86_64(LB_SC_ALLOW_ROW_X86_64)
+};
+
 #define LB_SC_FAMILY(af) af,
 static const uint32_t LB_SECCOMP_SOCKET_FAMILY_TABLE[] = { LB_SECCOMP_SOCKET_FAMILIES(LB_SC_FAMILY) };
 static const uint32_t LB_SECCOMP_SOCKETPAIR_FAMILY_TABLE[] = { LB_SECCOMP_SOCKETPAIR_FAMILIES(LB_SC_FAMILY) };
@@ -631,6 +766,8 @@ static const uint32_t LB_SECCOMP_SOCKETPAIR_FAMILY_TABLE[] = { LB_SECCOMP_SOCKET
 #define LB_SECCOMP_TABLE_LEN (sizeof(LB_SECCOMP_TABLE) / sizeof(LB_SECCOMP_TABLE[0]))
 #define LB_SECCOMP_MODE_TABLE_LEN (sizeof(LB_SECCOMP_MODE_TABLE) / sizeof(LB_SECCOMP_MODE_TABLE[0]))
 #define LB_SECCOMP_ALLOW_TABLE_LEN (sizeof(LB_SECCOMP_ALLOW_TABLE) / sizeof(LB_SECCOMP_ALLOW_TABLE[0]))
+#define LB_SECCOMP_UNPACK_TABLE_LEN (sizeof(LB_SECCOMP_UNPACK_TABLE) / sizeof(LB_SECCOMP_UNPACK_TABLE[0]))
+#define LB_SECCOMP_GZIP_TABLE_LEN (sizeof(LB_SECCOMP_GZIP_TABLE) / sizeof(LB_SECCOMP_GZIP_TABLE[0]))
 #define LB_SECCOMP_SOCKET_FAMILY_LEN \
     (sizeof(LB_SECCOMP_SOCKET_FAMILY_TABLE) / sizeof(LB_SECCOMP_SOCKET_FAMILY_TABLE[0]))
 #define LB_SECCOMP_SOCKETPAIR_FAMILY_LEN \
@@ -656,6 +793,12 @@ static const uint32_t LB_SECCOMP_SOCKETPAIR_FAMILY_TABLE[] = { LB_SECCOMP_SOCKET
 /* room for either */
 #define LB_SECCOMP_PROG_MAX \
     (LB_SECCOMP_ALLOW_PROG_LEN > LB_SECCOMP_PROG_LEN ? LB_SECCOMP_ALLOW_PROG_LEN : LB_SECCOMP_PROG_LEN)
+
+/* The one of the process that unpacks: the head, two per call, five for mmap
+ * and the final kill. That of gzip: the head, two per call, seven for execve,
+ * five for ioctl and the final ENOSYS. */
+#define LB_SECCOMP_UNPACK_PROG_LEN (LB_SECCOMP_PROG_HEAD + 2 * LB_SECCOMP_UNPACK_TABLE_LEN + 5 + 1)
+#define LB_SECCOMP_GZIP_PROG_LEN   (LB_SECCOMP_PROG_HEAD + 2 * LB_SECCOMP_GZIP_TABLE_LEN + 7 + 5 + 1)
 
 _Static_assert(LB_SECCOMP_PROG_LEN <= 4096, "the kernel accepts at most 4096 BPF instructions");
 _Static_assert(LB_SECCOMP_ALLOW_PROG_LEN <= 4096, "the kernel accepts at most 4096 BPF instructions");
@@ -769,6 +912,69 @@ static inline size_t lb_seccomp_build(struct lb_sock_filter *prog) {
 /* The allow-list into prog, which holds LB_SECCOMP_ALLOW_PROG_LEN instructions. */
 static inline size_t lb_seccomp_build_allow(struct lb_sock_filter *prog) {
     return lb_seccomp_program(prog, 1);
+}
+
+/*
+ * The head both programs below begin with: a call of another ABI of this
+ * machine, and on x86_64 an x32 call, ends the process; then the number is
+ * in A.
+ */
+static inline size_t lb_seccomp_head(struct lb_sock_filter *prog) {
+    size_t n = 0;
+    prog[n++] = (struct lb_sock_filter){ LB_BPF_LD_W_ABS, 0, 0, LB_SECCOMP_DATA_ARCH };
+    prog[n++] = (struct lb_sock_filter){ LB_BPF_JEQ_K, 1, 0, LB_SECCOMP_AUDIT_ARCH };
+    prog[n++] = (struct lb_sock_filter){ LB_BPF_RET_K, 0, 0, LB_SECCOMP_RET_KILL_PROCESS };
+    prog[n++] = (struct lb_sock_filter){ LB_BPF_LD_W_ABS, 0, 0, LB_SECCOMP_DATA_NR };
+#if defined(LB_SECCOMP_TARGET_X86_64)
+    prog[n++] = (struct lb_sock_filter){ LB_BPF_JGE_K, 0, 1, LB_X32_SYSCALL_BIT };
+    prog[n++] = (struct lb_sock_filter){ LB_BPF_RET_K, 0, 0, LB_SECCOMP_RET_KILL_PROCESS };
+#endif
+    return n;
+}
+
+/* The program of the process that unpacks, into prog, which holds
+ * LB_SECCOMP_UNPACK_PROG_LEN instructions. */
+static inline size_t lb_seccomp_build_unpack(struct lb_sock_filter *prog) {
+    size_t n = lb_seccomp_head(prog);
+    for (size_t i = 0; i < LB_SECCOMP_UNPACK_TABLE_LEN; i++) {
+        prog[n++] = (struct lb_sock_filter){ LB_BPF_JEQ_K, 0, 1, LB_SECCOMP_UNPACK_TABLE[i] };
+        prog[n++] = (struct lb_sock_filter){ LB_BPF_RET_K, 0, 0, LB_SECCOMP_RET_ALLOW };
+    }
+    /* mmap of pages that are no code: its prot is the third argument */
+    prog[n++] = (struct lb_sock_filter){ LB_BPF_JEQ_K, 0, 4, LB_SECCOMP_NR_MMAP };
+    prog[n++] = (struct lb_sock_filter){ LB_BPF_LD_W_ABS, 0, 0, LB_SECCOMP_DATA_ARG_LO(2) };
+    prog[n++] = (struct lb_sock_filter){ LB_BPF_JSET_K, 0, 1, LB_SECCOMP_PROT_EXEC };
+    prog[n++] = (struct lb_sock_filter){ LB_BPF_RET_K, 0, 0, LB_SECCOMP_RET_KILL_PROCESS };
+    prog[n++] = (struct lb_sock_filter){ LB_BPF_RET_K, 0, 0, LB_SECCOMP_RET_ALLOW };
+    prog[n++] = (struct lb_sock_filter){ LB_BPF_RET_K, 0, 0, LB_SECCOMP_RET_KILL_PROCESS };
+    return n;
+}
+
+/* The program of the host's gzip, into prog, which holds
+ * LB_SECCOMP_GZIP_PROG_LEN instructions: path is the address of the path
+ * execve is to be given, which is the one execve it may make. */
+static inline size_t lb_seccomp_build_gzip(struct lb_sock_filter *prog, uint64_t path) {
+    size_t n = lb_seccomp_head(prog);
+    for (size_t i = 0; i < LB_SECCOMP_GZIP_TABLE_LEN; i++) {
+        prog[n++] = (struct lb_sock_filter){ LB_BPF_JEQ_K, 0, 1, LB_SECCOMP_GZIP_TABLE[i] };
+        prog[n++] = (struct lb_sock_filter){ LB_BPF_RET_K, 0, 0, LB_SECCOMP_RET_ALLOW };
+    }
+    /* execve of that path, both halves of its address, or EPERM */
+    prog[n++] = (struct lb_sock_filter){ LB_BPF_JEQ_K, 0, 6, LB_SECCOMP_NR_EXECVE };
+    prog[n++] = (struct lb_sock_filter){ LB_BPF_LD_W_ABS, 0, 0, LB_SECCOMP_DATA_ARG_LO(0) };
+    prog[n++] = (struct lb_sock_filter){ LB_BPF_JEQ_K, 0, 3, (uint32_t)path };
+    prog[n++] = (struct lb_sock_filter){ LB_BPF_LD_W_ABS, 0, 0, LB_SECCOMP_DATA_ARG_LO(0) + 4 };
+    prog[n++] = (struct lb_sock_filter){ LB_BPF_JEQ_K, 0, 1, (uint32_t)(path >> 32) };
+    prog[n++] = (struct lb_sock_filter){ LB_BPF_RET_K, 0, 0, LB_SECCOMP_RET_ALLOW };
+    prog[n++] = (struct lb_sock_filter){ LB_BPF_RET_K, 0, 0, LB_SECCOMP_RET_ERRNO | LB_SC_EPERM };
+    /* ioctl to ask whether it is a terminal, which its request says, or ENOTTY */
+    prog[n++] = (struct lb_sock_filter){ LB_BPF_JEQ_K, 0, 4, LB_SECCOMP_NR_IOCTL };
+    prog[n++] = (struct lb_sock_filter){ LB_BPF_LD_W_ABS, 0, 0, LB_SECCOMP_DATA_ARG_LO(1) };
+    prog[n++] = (struct lb_sock_filter){ LB_BPF_JEQ_K, 0, 1, LB_SECCOMP_TCGETS };
+    prog[n++] = (struct lb_sock_filter){ LB_BPF_RET_K, 0, 0, LB_SECCOMP_RET_ALLOW };
+    prog[n++] = (struct lb_sock_filter){ LB_BPF_RET_K, 0, 0, LB_SECCOMP_RET_ERRNO | LB_SC_ENOTTY };
+    prog[n++] = (struct lb_sock_filter){ LB_BPF_RET_K, 0, 0, LB_SECCOMP_RET_ERRNO | LB_SC_ENOSYS };
+    return n;
 }
 
 #endif /* LIGHTBOX_SECCOMP_H */

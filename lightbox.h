@@ -18,7 +18,7 @@
 
 /* What --version says: the release, set when it is tagged, and "-dev" after
  * it on the way to the next one. */
-#define LIGHTBOX_VERSION "0.9.0"
+#define LIGHTBOX_VERSION "0.10.0"
 
 #define MAX_PATH         512
 #define NAME_MAX_LEN     30
@@ -180,6 +180,8 @@ typedef struct {
 /* Is this a limit as an option, a setting and the file may give it? */
 [[nodiscard]] bool mem_limit_ok(const char *text);      /* <number>[K|M|G|T] or max */
 [[nodiscard]] bool swap_limit_ok(const char *text);     /* the same, or 0 */
+/* The bytes such a limit is: all there are for max, none for a swap of 0 */
+[[nodiscard]] bool limit_bytes(const char *text, uint64_t *bytes);
 /* A line for io.max: <major>:<minor> and one or more of rbps, wbps, riops and
  * wiops, each =<number> or =max, with a space before each */
 [[nodiscard]] bool io_limit_ok(const char *text);
@@ -401,6 +403,7 @@ const char *tool_path_iptables_restore(void);
 const char *tool_path_nft(void);
 const char *tool_path_cp(void);
 const char *tool_path_rm(void);
+const char *tool_path_gzip(void);
 bool tool_available(const char *path);
 void require_tool(const char *label, const char *path);
 /* a macro's value as a string literal */
@@ -484,6 +487,182 @@ void id_map_line(char out[ID_MAP_LINE_MAX], const id_map *map);
 [[nodiscard]] int idmapped_tree(const char *path, int userns_fd, bool privileged, const char **step);
 [[nodiscard]] int attach_tree(int tree, const char *target);
 
+/* ─── SHA-256 (lightbox_sha256.c, ROADMAP I.1) ──────────────────────────── */
+
+/*
+ * What a blob of an image is named by. The input is taken in pieces of any
+ * length, so that a layer is hashed while it is written or read:
+ *
+ *   sha256_init, sha256_update for each piece, sha256_final
+ */
+#define SHA256_BYTES 32
+#define SHA256_HEX   64         /* a digest's digits, without their NUL */
+#define SHA256_BLOCK 64         /* the bytes the hash takes at a time */
+typedef struct {
+    uint32_t state[8];
+    uint64_t length;                /* the bytes taken so far */
+    uint8_t  block[SHA256_BLOCK];   /* those of them that do not fill a block yet */
+} sha256_ctx;
+void sha256_init(sha256_ctx *ctx);
+void sha256_update(sha256_ctx *ctx, const void *data, size_t len);
+/* The digest of all that was taken. The context is spent and wiped: it takes
+ * a sha256_init before it is used again. */
+void sha256_final(sha256_ctx *ctx, uint8_t digest[SHA256_BYTES]);
+/* A digest as 64 lowercase hex digits and their NUL, and whether a text is
+ * one: the way a blob's name and a descriptor have it. */
+void sha256_hex(const uint8_t digest[SHA256_BYTES], char out[SHA256_HEX + 1]);
+[[nodiscard]] bool sha256_hex_ok(const char *text);
+
+/* ─── tar (lightbox_tar.c, ROADMAP I.2 and I.3) ─────────────────────────── */
+
+/* The longest name an archive's entry may have from its root, a link's
+ * target too, with the NUL: the kernel's own limit for a path. */
+#define TAR_PATH_MAX 4096
+
+/* Where an archive's bytes go, all of them and in order: 0, or anything else
+ * to end the writing. */
+typedef int (*tar_sink)(void *to, const void *data, size_t len);
+
+/*
+ * A tree written as a tar archive, the way a layer of an image is one. The
+ * same tree gives the same bytes every time. The caller sets the first five
+ * members; the others say afterwards what was written and what was not.
+ */
+typedef struct {
+    tar_sink    sink;
+    void       *to;
+    /* Ids are written less these, and one that is not in the 65536 from a
+     * start that is not 0 ends the writing: a container's with --userns has
+     * its files under its own range, and an image has them from 0. */
+    uint32_t    uid_start;
+    uint32_t    gid_start;
+    /* The tree is an overlay's upper directory: what it marks as taken out
+     * of its base is written as an image marks it. */
+    bool        overlay;
+
+    uint64_t    entries;            /* written */
+    uint64_t    sockets;            /* left out: a socket is of a process that is gone */
+    uint64_t    attributes_left;    /* extended attributes an archive does not carry */
+    const char *failure;            /* NULL, or what ended the writing */
+    char        failed_at[TAR_PATH_MAX];    /* and the entry it was at, from the tree's root */
+} tar_writer;
+
+/* The tree under a directory, which is not an entry itself, and the
+ * archive's end: 0, or -1 with failure and failed_at set. */
+[[nodiscard]] int tar_write_tree(tar_writer *w, int32_t dirfd);
+
+/* Where an archive's bytes come from, in order: how many were put at data,
+ * at most len, 0 at the archive's end, or less than 0 to end the reading.
+ * It is called in the process that unpacks, not in the caller's. */
+typedef int64_t (*tar_source)(void *from, void *data, size_t len);
+
+/* What the directory an archive is unpacked into is. An image marks what a
+ * layer takes out of the ones under it with names that begin with .wh. */
+typedef enum {
+    TAR_INTO_TREE,              /* one tree for all layers: a mark takes out what it names */
+    TAR_INTO_UPPER,             /* an overlay's upper directory: a mark becomes the overlay's own */
+    TAR_INTO_UPPER_USERXATTR,   /* the same, for an overlay mounted with userxattr */
+} tar_into;
+
+/*
+ * An archive unpacked into a directory, by a process of its own whose root is
+ * that directory: no name and no link of the archive leads out of it. The
+ * caller, which has to be root there, sets the first five members; the others
+ * say afterwards what was made and what was not.
+ */
+typedef struct {
+    tar_source  source;
+    void       *from;
+    /* The one descriptor the source reads: the process that unpacks keeps
+     * it, the root's and the pipe it answers on, and closes every other one
+     * before it reads a byte (ROADMAP I.12). */
+    int32_t     source_fd;
+    /* Ids are made these more, and with a start that is not 0 one that is
+     * not in the 65536 from it ends the unpacking. */
+    uint32_t    uid_start;
+    uint32_t    gid_start;
+    tar_into    into;
+
+    uint64_t    entries;            /* made, or taken out by a mark */
+    uint64_t    devices;            /* not made: a container's devices are lightbox's to give */
+    uint64_t    attributes_left;    /* extended attributes that were not set */
+    uint64_t    bytes;              /* read from the source, to its end */
+    uint8_t     digest[SHA256_BYTES];   /* and their SHA-256, when the unpacking did not fail */
+    const char *failure;            /* NULL, or what ended the unpacking */
+    /* and the entry it was at, as the archive names it, with a ? for each
+     * byte that is not printable: empty before the first */
+    char        failed_at[TAR_PATH_MAX];
+} tar_reader;
+
+/* The archive's entries under a directory, to the source's end: 0, or -1
+ * with failure and failed_at set. What was made before a failure stays. */
+[[nodiscard]] int tar_read_tree(tar_reader *r, int32_t dirfd);
+
+/* ─── JSON, read (lightbox_json.c, ROADMAP I.4) ─────────────────────────── */
+
+/*
+ * What an image's index, manifest and configuration are written in. A text
+ * is checked whole and strictly, json_check, and then its values are looked
+ * up in it; nothing is built from it, and a value is its bytes in the text,
+ * which has to stay where it is for as long as one is used.
+ */
+#define JSON_TEXT_MAX  ((size_t)1 << 20)    /* the longest text that is read */
+#define JSON_DEPTH_MAX 32                   /* arrays and objects inside one another */
+
+typedef enum { JSON_NULL, JSON_FALSE, JSON_TRUE, JSON_NUMBER, JSON_STRING, JSON_ARRAY, JSON_OBJECT } json_kind;
+
+typedef struct {
+    const char *text;
+    size_t      len;
+} json_value;
+
+/* Why a text is not read, and where: the bytes before the place, its line
+ * from 1, and its column in the line, in bytes and from 1. */
+typedef struct {
+    const char *why;
+    size_t      offset;
+    size_t      line;
+    size_t      column;
+} json_refusal;
+
+/* A text as RFC 8259 has one, and nothing that readers take differently: a
+ * name twice in one object, bytes that are no UTF-8, half a surrogate pair,
+ * \u0000, anything but blanks around the value. 0 and the value the text is,
+ * or -1 and why not. */
+[[nodiscard]] int json_check(const char *text, size_t len, json_value *root, json_refusal *why);
+
+json_kind json_kind_of(json_value v);
+
+/* An array's elements or an object's members, in the order they are written:
+ *   for (bool more = json_first(v, &item); more; more = json_next(&item)) */
+typedef struct {
+    json_value name;    /* of a member, a string; of an element, nothing */
+    json_value value;
+    json_value rest;    /* what follows it in its array or object */
+    bool       named;
+} json_item;
+[[nodiscard]] bool json_first(json_value in, json_item *item);
+[[nodiscard]] bool json_next(json_item *item);
+size_t json_count(json_value v);
+
+/*
+ * The value at a path from v, written as RFC 6901 has a path: "" is v,
+ * "/layers/0/digest" the member digest of the first element of the member
+ * layers; in a name, ~1 stands for / and ~0 for ~. 1 with the value, 0 when
+ * nothing is there, and -1 when an object on the way has a member whose name
+ * is the path's but for the case of its letters: Go's reader of JSON takes
+ * that member for the field, so that the text says two things.
+ */
+[[nodiscard]] int json_at(json_value v, const char *path, json_value *out);
+
+/* What a string says, its escapes resolved, with a NUL: its length, or -1
+ * and an empty text for what is no string or does not fit. */
+[[nodiscard]] int64_t json_text(json_value v, char *out, size_t size);
+[[nodiscard]] bool json_text_is(json_value v, const char *text);
+/* A number written with digits alone, 0 to 2^64 - 1: no sign, no fraction
+ * and no exponent, which is how a size and a version are written. */
+[[nodiscard]] bool json_whole(json_value v, uint64_t *number);
+
 /* ─── Base snapshots (lightbox_base.c) ──────────────────────────────────── */
 
 #define BASE_ID_LEN  12
@@ -494,14 +673,170 @@ void bases_dir_path(char out[MAX_PATH]);
 bool base_rootfs_path(char out[MAX_PATH], const char *id);
 /* A snapshot of a base directory taken now: 0, or -1 once said. */
 int base_take(const char *source, char id[BASE_ID_TEXT]);
+/* The two halves of that, for a snapshot that is filled another way: its id
+ * drawn and <bases>/.<id>.new made, with its source line and its time on
+ * record and nothing else in it; and that directory put in place under the
+ * id. Each 0, or -1 once said, with the directory taken away. */
+int base_begin(const char *source, char id[BASE_ID_TEXT], char fresh[MAX_PATH]);
+int base_commit(const char *id, const char *fresh);
+/* A snapshot that was put in place and that nothing came to use, taken away */
+void base_discard(const char *id);
 /* The newest snapshot of a base directory, or one taken now, which took
  * says: 0, or -1 once said. */
 int base_snapshot_for(const char *source, char id[BASE_ID_TEXT], bool *took);
 int list_bases(char ids[][NAME_MAX_LEN + 1], int max);
+/* <bases>/<id>/layer: the digest and the size of the snapshot written as a
+ * layer of an image, which an export keeps (ROADMAP I.5). False when none
+ * is kept, or what is there is no such record. */
+[[nodiscard]] bool base_layer_read(const char *id, char digest[SHA256_HEX + 1], uint64_t *size);
+[[nodiscard]] int base_layer_keep(const char *id, const char *digest, uint64_t size);
+/* The layers of an image that a snapshot was unpacked from, one over the
+ * other: "sha256:<digest>" and a newline for each, the digest of the layer
+ * as it is unpacked. Kept in a snapshot that is being made, in the directory
+ * base_begin gave; and the snapshot that is those layers, if there is one. */
+#define IMAGE_LAYERS_MAX    128
+#define BASE_IMAGE_TEXT_MAX (IMAGE_LAYERS_MAX * (SHA256_HEX + 8) + 1)
+[[nodiscard]] int base_image_keep(const char *fresh, const char *layers);
+[[nodiscard]] bool base_of_layers(const char *layers, char id[BASE_ID_TEXT]);
 /* The mount options of an overlay of a snapshot with this upper and work
  * directory, or false where a path cannot go into them. */
 bool overlay_options(char *out, size_t max, const char *id, const char *upper, const char *work);
+/* What every overlay of a container is mounted with beside its directories
+ * (ROADMAP I.14): no directory stands for one of the snapshot, and no file
+ * keeps its bytes there, so that a container's files are all in its rootfs/
+ * on every host, whatever the host's own settings for overlays are. */
+#define OVERLAY_WHOLE_OPTIONS "redirect_dir=off,metacopy=off"
+/* Whether an upper directory is all of what it stands for: 1 yes; 0 no, with
+ * the path of the first entry that is not, a directory moved from the
+ * snapshot or a file whose bytes are there, as an overlay mounted without
+ * those options leaves them; -1 when it cannot be read through. */
+int overlay_upper_whole(const char *upper, char *found, size_t max);
 void cmd_base(int argc, char **argv);
+
+/* ─── Images (lightbox_image.c, ROADMAP Track I) ────────────────────────── */
+
+/* export <name> <dir>: a container that is not running as an OCI image
+ * layout in a directory of its own */
+void cmd_export(int argc, char **argv);
+
+/*
+ * Generations (ROADMAP I.10). A container that is exported is of a line,
+ * which the first export names with 16 hex digits drawn then, and at a
+ * generation of it: the first export is 1, and each export of a container
+ * that was started since the one before is one more. A generation has a
+ * token of its own, 8 hex digits drawn when it is made, and a container and
+ * an image keep those of the generations they come from, the newest last:
+ * by them one is known to continue the other, or not to.
+ *
+ *   <container>/.generation   "<line> <number> <token>,<token>,...\n"
+ *   <container>/.changed      there when the container was started, or
+ *                             reset, since its generation was written
+ */
+#define LINEAGE_HEX            16
+#define GENERATION_HEX         8
+#define GENERATIONS_KEPT       32
+#define GENERATION_HISTORY_MAX (GENERATIONS_KEPT * (GENERATION_HEX + 1) + 1)
+
+typedef struct {
+    char     lineage[LINEAGE_HEX + 1];      /* empty: of no line */
+    uint32_t number;                        /* of the newest generation: 1 and up */
+    int      count;                         /* how many tokens are kept: at least 1 */
+    char     tokens[GENERATIONS_KEPT][GENERATION_HEX + 1];
+} generation;
+
+/* what one generation is to another of its line, or that it is of none */
+typedef enum {
+    GENERATION_OF_ANOTHER_LINE,
+    GENERATION_THE_SAME,
+    GENERATION_CONTINUED,                   /* the second continues the first */
+    GENERATION_CONTINUES,                   /* the first continues the second */
+    GENERATION_APART,                       /* of one line, and neither continues the other */
+} generation_relation;
+
+/* A container's generation on record: false where it has none, or what is
+ * there is none. */
+[[nodiscard]] bool generation_read(const char *name, generation *g);
+[[nodiscard]] int generation_keep(const char *name, const generation *g);
+/* Of no line any more: what is on record is taken away */
+void generation_forget(const char *name);
+/* Whether the container was started, or reset, since its generation was written */
+[[nodiscard]] bool generation_changed(const char *name);
+/* On record that it was: 0, also for a container of no line, which keeps no
+ * such record; -1 when it could not be written. And that record taken away. */
+[[nodiscard]] int generation_started(const char *name);
+void generation_unchanged(const char *name);
+/* The tokens as an image carries them, "<token>,<token>,...", and taken from that */
+void generation_history_text(const generation *g, char out[GENERATION_HISTORY_MAX]);
+[[nodiscard]] bool generation_history_take(const char *text, generation *g);
+generation_relation generation_compare(const generation *first, const generation *second);
+
+/*
+ * An image that import read (ROADMAP I.6): every blob of it was held to the
+ * size and the SHA-256 it is named by, and its layers are open. The limits
+ * are those its manifest carries, each empty where it carries none.
+ */
+typedef struct {
+    char     digest[SHA256_HEX + 1];    /* of the blob */
+    char     diff_id[SHA256_HEX + 1];   /* of the layer as it is unpacked, which the configuration names */
+    uint64_t size;
+    bool     gzip;                      /* the blob is the layer compressed */
+    int32_t  fd;
+} image_layer;
+
+typedef struct {
+    char        dir[MAX_PATH];
+    char        manifest[SHA256_HEX + 1];
+    int         nlayers;
+    image_layer layers[IMAGE_LAYERS_MAX];
+    char        name[NAME_MAX_LEN + 1];     /* what the container was called where it was exported */
+    char        mem[MEM_TEXT_MAX];
+    char        swap[MEM_TEXT_MAX];
+    char        pids[PIDS_TEXT_MAX];
+    char        cpu[CPU_TEXT_MAX];
+    char        ttl[DURATION_TEXT_MAX];
+    bool        lightbox;                   /* export wrote it: its annotations are lightbox's, of the version read here */
+    generation  gen;                        /* the generation it is, of its container's line; of none where it names none */
+    bool        command;                    /* its configuration names a command to start, which lightbox does not read */
+} image;
+
+/* The image in a directory, read and held to its digests. What is no image
+ * that import takes ends the process, said; what an image says of its
+ * container and import does not take is said too, as a note. */
+void image_open(const char *dir, image *img);
+/* The first count layers as base_image_keep and base_of_layers take them */
+void image_layers_text(const image *img, int count, char out[BASE_IMAGE_TEXT_MAX]);
+
+typedef struct {
+    uint64_t entries, devices, attributes_left, bytes;
+} image_unpacked;
+/* count layers from the one at first, unpacked into a directory one over the
+ * other, each held to the digest the configuration names for it as it is
+ * unpacked; a compressed one through the host's gzip. 0, or -1 once said,
+ * with what was unpacked until then left for the caller to take away. */
+[[nodiscard]] int image_unpack(const image *img, int first, int count, const char *dir, tar_into into,
+                               uint32_t uid_start, uint32_t gid_start, image_unpacked *total);
+
+/*
+ * The snapshot that is the first count layers of an image, one unpacked over
+ * the other: one that is here already, by the record it keeps of the layers
+ * it was unpacked from, or of the layer an export wrote it as; or one made
+ * now, in a directory that is put in place when it is whole. 0, with its id
+ * and whether it was made now; -1 once said, with nothing kept.
+ */
+[[nodiscard]] int image_base(const image *img, int count, char id[BASE_ID_TEXT], bool *took, image_unpacked *total);
+/* What of an image was left out when it was unpacked, and what of it lightbox
+ * does not read, each as a note on standard output */
+void image_notes(const image *img, const image_unpacked *unpacked);
+/* Whether a directory is laid out as an image, and so is no root filesystem:
+ * what create and base add are told is a base, by mistake */
+bool image_layout_at(const char *dir);
+
+/* What the host's gzip runs under, which reads bytes somebody else wrote: no
+ * network of the host's, nobody's ids, no capability, no new privilege, and
+ * a filter of the calls gzip makes, with execve of program alone, at this
+ * address, which is what the caller then runs (ROADMAP I.12). Ends the
+ * process where it cannot. */
+void sandbox_host_tool(const char *program);
 
 /*
  * What a container is made of is in <container_dir>/<name>/ and is written

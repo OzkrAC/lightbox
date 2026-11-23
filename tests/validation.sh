@@ -58,6 +58,14 @@ sandbox() {
 
 lb() { HOME="$W/home" LIGHTBOX_CONFIG="$CONF" "$LB" "$@"; }
 
+# skopeo with nothing of the caller's environment but PATH: what it keeps and
+# what it looks for, a registry's password among it, is under the case's own
+# directory, whatever HOME and XDG_CONFIG_HOME say where the suite runs.
+skopeo_here() {
+    mkdir -p "$W/home/run" &&
+        env -i PATH="$PATH" HOME="$W/home" XDG_RUNTIME_DIR="$W/home/run" XDG_CONFIG_HOME="$W/home/.config" skopeo "$@"
+}
+
 # Succeeds when the command fails. Output is kept for the report.
 refused() { ! "$@"; }
 
@@ -1270,6 +1278,7 @@ t_records_from_before_are_read() {
     lb ls
     report=$(lb inspect web)
     kill "$holder"
+    wait "$holder" 2>/dev/null      # gone, and not only told to go: ls looked before it was, once, on 2026-11-23
     lb ls | grep -Eq "^web +10\.0\.0\.2 +exited" || { echo "the container is not seen to have been running"; return 1; }
     printf '%s\n' "$report" | grep -qx 'running: yes' && printf '%s\n' "$report" | grep -qx "pid: $holder" &&
     printf '%s\n' "$report" | grep -qx 'state: running' || { echo "inspect did not see it running"; return 1; }
@@ -2349,5 +2358,910 @@ check 'update writes the limits into a stopped container'"'"'s .conf'       t_up
 check 'create --userns is root'"'"'s, and inspect and doctor show the ranges' t_userns_as_a_user_sees_it
 check 'base add, ls and rm manage the snapshots of bases'              t_base_snapshots
 check 'start without root is a clean error'                   t_start_without_root_is_a_clean_error
+
+# ─── Images (ROADMAP Track I) ───────────────────────────────────────────────
+
+# tests/image_check.py holds an image to what it says of itself, every blob
+# to its digest and its size, and prints what is in it.
+IMAGE_CHECK=$(cd "$(dirname "$0")" && pwd)/image_check.py
+need_python() { command -v python3 >/dev/null 2>&1 || { echo "no python3 to read the image with"; return 77; }; }
+annotations_of() { printf '%s\n' "$1" | sed -n 's/^annotation //p' | paste -sd' ' -; }
+
+# export (ROADMAP I.5), as an ordinary user has it, of a container that is a
+# copy of its base: the directory is an image whose every blob is what its
+# descriptor says, with one layer that has the container's files, links and
+# second names, and the container's limits as annotations. What a container
+# may do on a host is not in it. The same container gives the same bytes, and
+# nothing lightbox keeps is changed but the record of the generation the
+# first export is, of the line it begins (ROADMAP I.10); a second changes
+# nothing.
+t_export_image() {
+    need_python || return 77
+    local me said out before layer config line token
+    # everything lightbox keeps but that record, and the time of the directory it is made in
+    kept_but_generation() { find "$W/data" "$R" ! -path "$C/web" ! -name .generation -printf '%p %y %s %T@\n' | LC_ALL=C sort; }
+    me="$(id -u):$(id -g)"
+    ln -s placeholder "$BASE/bin/link" && ln "$BASE/bin/placeholder" "$BASE/bin/second-name" || return 1
+    lb create web 10.0.0.2 --mem 1G --swap 512M --pids 64 --cpu 0.5 --ttl 8h --privileged --read-only \
+        --seccomp deny --net nat --vol "$W/vol:/data" --dns 9.9.9.9 --oom-score 100 >/dev/null || return 1
+    printf 'work\n' > "$C/web/rootfs/work.txt" && chmod 640 "$C/web/rootfs/work.txt" || return 1
+    before=$(kept_but_generation)
+    said=$(lb export web "$W/image") || { printf '%s\n' "$said"; return 1; }
+    printf '%s\n' "$said"
+    [ "$before" = "$(kept_but_generation)" ] || { echo "export changed what lightbox keeps, beyond the record of the generation"; return 1; }
+    grep -qxE '[0-9a-f]{16} 1 [0-9a-f]{8}' "$C/web/.generation" && [ "$(mode_of "$C/web/.generation")" = 600 ] &&
+        printf '%s\n' "$said" | grep -qx "Generation 1, the first of the container's line" ||
+        { echo "the first export is not on record as generation 1 of a line: $(cat "$C/web/.generation" 2>&1)"; return 1; }
+    line=$(cut -d' ' -f1 "$C/web/.generation") token=$(cut -d' ' -f3 "$C/web/.generation")
+    out=$(python3 -I "$IMAGE_CHECK" "$W/image") || { printf '%s\n' "$out"; return 1; }
+    printf '%s\n' "$out"
+    printf '%s\n' "$said" | grep -q "^Container 'web' exported: 1 layer, " &&
+        printf '%s\n' "$said" | grep -qx "Image $(printf '%s\n' "$out" | sed -n 's/^manifest //p')" ||
+        { echo "export does not say what it wrote"; return 1; }
+    [ "$(mode_of "$W/image")" = 700 ] && [ "$(mode_of "$W/image/index.json")" = 600 ] &&
+        [ -z "$(find "$W/image/blobs" -type f ! -perm 600)" ] || { echo "the image is not its owner's alone"; return 1; }
+
+    # the limits, and nothing else of the container's configuration
+    [ "$(annotations_of "$out")" = "ac.ozkr.lightbox.cpu=0.5 ac.ozkr.lightbox.generation=1 ac.ozkr.lightbox.history=$token ac.ozkr.lightbox.lineage=$line ac.ozkr.lightbox.mem=1G ac.ozkr.lightbox.name=web ac.ozkr.lightbox.pids=64 ac.ozkr.lightbox.swap=512M ac.ozkr.lightbox.ttl=8h ac.ozkr.lightbox.version=1" ] ||
+        { echo "the annotations are not the container's limits and its generation: $(annotations_of "$out")"; return 1; }
+    layer=$(printf '%s\n' "$out" | sed -n 's/^layer 1 \(sha256:[0-9a-f]*\) .*/\1/p')
+    config=$(printf '%s\n' "$out" | sed -n 's/^config sha256://p')
+    [ "$(cat "$W/image/blobs/sha256/$config")" = \
+      "{\"architecture\":\"$(printf '%s\n' "$out" | sed -n 's/^architecture //p')\",\"os\":\"linux\",\"rootfs\":{\"type\":\"layers\",\"diff_ids\":[\"$layer\"]}}" ] ||
+        { echo "the configuration says more than what the image is for and its layer: $(cat "$W/image/blobs/sha256/$config")"; return 1; }
+
+    # the container's files, as they are
+    has() { printf '%s\n' "$out" | grep -qE -- "^entry 1 $1\$" || { echo "the layer has no: $1"; return 1; }; }
+    has "file 0640 $me 5 work.txt" && has "file 0[0-7]{3} $me 30 etc/passwd" && has "file 0[0-7]{3} $me 4 etc/hostname" &&
+        has "dir 0[0-7]{3} $me 0 etc" && has "link 0777 $me 0 bin/link -> placeholder" &&
+        has "file 0[0-7]{3} $me 12 bin/placeholder" && has "hardlink 0[0-7]{3} $me 0 bin/second-name -> bin/placeholder" || return 1
+
+    # the same container is the same image, in a directory that was there and empty too
+    before=$(kept_sum)
+    mkdir -m 777 "$W/empty" && lb export web "$W/again" > "$W/again.out" && lb export web "$W/empty" >/dev/null || return 1
+    diff -r "$W/image" "$W/again" && diff -r "$W/image" "$W/empty" || { echo "a second export wrote another image"; return 1; }
+    [ "$before" = "$(kept_sum)" ] && grep -qx 'Generation 1, as the export before: the container was not started since' "$W/again.out" ||
+        { echo "a second export of a container that was not started is another generation, or changed what lightbox keeps"; return 1; }
+    [ "$(mode_of "$W/empty")" = 700 ] || { echo "a directory that was there is not its owner's alone: $(mode_of "$W/empty")"; return 1; }
+
+    # a container that no option gave a swap or a lifetime says nothing of them
+    lb create plain 10.0.0.3 >/dev/null && lb export plain "$W/plain" >/dev/null || return 1
+    out=$(python3 -I "$IMAGE_CHECK" "$W/plain") || { printf '%s\n' "$out"; return 1; }
+    [ "$(annotations_of "$out" | sed 's/ ac\.ozkr\.lightbox\.\(generation\|history\|lineage\)=[0-9a-f]*//g')" = 'ac.ozkr.lightbox.cpu=1 ac.ozkr.lightbox.mem=256M ac.ozkr.lightbox.name=plain ac.ozkr.lightbox.pids=128 ac.ozkr.lightbox.version=1' ] ||
+        { echo "the annotations of a container with the defaults: $(annotations_of "$out")"; return 1; }
+
+    # skopeo, where the host has it, reads the image as the one export named,
+    # and copies it, which holds every blob to its digest, to the same blobs
+    # when it is told to leave a layer that is not compressed as it is
+    if command -v skopeo >/dev/null 2>&1; then
+        out=$(python3 -I "$IMAGE_CHECK" "$W/image") || return 1
+        skopeo_here inspect "oci:$W/image" > "$W/skopeo.out" 2>&1 || { cat "$W/skopeo.out"; echo "skopeo does not read the image"; return 1; }
+        cat "$W/skopeo.out"
+        grep -q "\"$layer\"" "$W/skopeo.out" || { echo "skopeo does not find the layer"; return 1; }
+        grep -q "\"Digest\": \"$(printf '%s\n' "$out" | sed -n 's/^manifest //p')\"" "$W/skopeo.out" ||
+            { echo "skopeo reads another manifest than export named"; return 1; }
+        if skopeo copy --help 2>&1 | grep -q -- --dest-oci-accept-uncompressed-layers; then
+            skopeo_here --insecure-policy copy --dest-oci-accept-uncompressed-layers "oci:$W/image" "oci:$W/copied" \
+                > "$W/skopeo.out" 2>&1 || { cat "$W/skopeo.out"; echo "skopeo does not copy the image"; return 1; }
+            diff -r "$W/image/blobs" "$W/copied/blobs" || { echo "skopeo's copy of the image has other blobs"; return 1; }
+        else
+            echo "this skopeo cannot be told to leave a layer as it is: the image was not copied"
+        fi
+    else
+        echo "no skopeo here: the image was read by image_check.py alone"
+    fi
+}
+
+# What is no export: a directory that is not the image's own, a container
+# that is not there, is half made or runs, and a tree that is no layer. Each
+# is said, and nothing of an image is left where one was to be.
+t_export_refusals() {
+    local bad=0 before said
+    # What lightbox keeps, with every time to the nanosecond: a refused export
+    # that made a directory among it and took it away again left the directory
+    # above with the time of now, which a look in whole seconds saw only when
+    # a second had ended in between (CI run 45177356327, on 2026-11-23).
+    kept_sum() { find "$W/data" "$R" -printf '%p %y %s %T@\n' | LC_ALL=C sort; }
+    lb create web 10.0.0.2 >/dev/null || return 1
+    mkdir "$W/full" "$W/there" "$W/data/bases" && : > "$W/full/file" && : > "$W/afile" && ln -s "$C" "$W/link" &&
+        ln -s there "$W/link-to-there" && chmod 755 "$W/full" || return 1
+    before=$(kept_sum)
+    no() { # what it says, the command
+        local want=$1
+        shift
+        said=$(lb "$@" 2>&1) && { echo "lightbox $*: succeeded"; bad=1; return; }
+        case $said in *"$want"*) ;; *) echo "lightbox $*: $said"; bad=1 ;; esac
+    }
+    no 'Usage: lightbox export <name> <dir>' export
+    no 'Usage: lightbox export <name> <dir>' export web
+    no 'Error: unexpected argument: more' export web "$W/x" more
+    no 'Error: unknown option: --force' export --force web "$W/x"
+    no 'Error: unknown option: --compress' export web "$W/x" --compress
+    no 'Error: container does not exist: nosuch' export nosuch "$W/x"
+    no 'Error: container name must only contain' export a/b "$W/x"
+    no 'a directory of its own, and this one is not empty' export web "$W/full"
+    no 'into a directory, and this is none' export web "$W/afile"
+    no 'into a directory, and this is a link' export web "$W/link-to-there"
+    no 'which has to be in one that is there' export web "$W/no/such/x"
+    no "among lightbox's own files" export web "$C/image"
+    no "among lightbox's own files" export web "$C/web/rootfs/image"
+    no "among lightbox's own files" export web "$W/data/bases/image"
+    no "among lightbox's own files" export web "$W/link/web/rootfs/image"
+    [ "$before" = "$(kept_sum)" ] || { echo "a refused export changed what lightbox keeps"; bad=1; }
+    # A tree that cannot be a layer ends it, with the entry named. What is
+    # kept is looked at with the file in it, as making it is a change.
+    : > "$C/web/rootfs/.wh.x"
+    before=$(kept_sum)
+    no ': .wh.x: has a name that begins with .wh.' export web "$W/x"
+    no ': .wh.x: has a name that begins with .wh.' export web "$W/there"
+    [ "$before" = "$(kept_sum)" ] || { echo "a refused export of a tree that is no layer changed what lightbox keeps"; bad=1; }
+    rm "$C/web/rootfs/.wh.x"
+    [ ! -e "$W/x" ] && [ ! -e "$C/image" ] && [ ! -e "$C/web/rootfs/image" ] && [ ! -e "$W/data/bases/image" ] ||
+        { echo "a refused export left a directory"; bad=1; }
+    [ "$(ls -A "$W/full")" = file ] && [ "$(mode_of "$W/full")" = 755 ] && [ -d "$W/there" ] && [ -z "$(ls -A "$W/there")" ] ||
+        { echo "a refused export changed a directory that was there"; bad=1; }
+    # one that create did not finish, and one that runs
+    : > "$C/web/.creating"
+    no 'was not created completely, and is not exported' export web "$W/x"
+    rm "$C/web/.creating"
+    record web $$ "$(awk '{ printf "%s", $22 }' /proc/$$/stat)" running
+    no 'Error: container is running (stop it first): web' export web "$W/x"
+    [ ! -e "$W/x" ] || { echo "a refused export left a directory"; bad=1; }
+    return $bad
+}
+
+# A container that overlays a snapshot is two layers: the snapshot, and its
+# own files with what it took out of its base marked as an image marks it.
+# Two containers of one base have the same first layer, whose digest the
+# snapshot keeps. No overlay is mounted for this: the container is one by its
+# .conf, and its rootfs/ is made here as an overlay would leave it, in a user
+# namespace, where the device 0:0 that marks a file as taken out can be made.
+t_export_overlay() {
+    need_python || return 77
+    local rc out id first names
+    mkdir -p "$BASE/lib" "$BASE/opt/old" && echo gone > "$BASE/lib/gone" && echo keep > "$BASE/lib/keep" &&
+        echo x > "$BASE/opt/old/x" || return 1
+    # shellcheck disable=SC2016     # the script is for the shell in the namespace
+    HOME="$W/home" LIGHTBOX_CONFIG="$CONF" unshare -r --mount -- bash -c '
+        W=$1 LB=$2 C=$1/data/containers
+        # copies, which the lines below make overlays by their .conf: where an
+        # overlay mounts in such a namespace, as on CI, create would make one
+        "$LB" create one 10.0.0.2 --copy >/dev/null && "$LB" create two 10.0.0.3 --copy >/dev/null || exit 1
+        id=$("$LB" base add "$W/base" | sed -n "s/^Base \([0-9a-f]\{12\}\) taken of .*/\1/p")
+        [ -n "$id" ] || exit 1
+        for name in one two; do
+            echo "base=$id" >> "$C/$name/.conf"
+            mv "$C/$name/rootfs" "$C/$name/copy" && mkdir -p "$C/$name/rootfs/etc" &&
+                cp "$C/$name/copy/etc/hostname" "$C/$name/rootfs/etc/hostname" || exit 1
+        done
+        U=$C/one/rootfs
+        mkdir -p "$U/lib" "$U/opt/old" "$U/srv" && echo new > "$U/srv/new" && echo y > "$U/opt/old/y" || exit 1
+        mknod "$U/lib/gone" c 0 0 2>/dev/null || exit 77
+        python3 -I -c "import os, sys; os.setxattr(sys.argv[1], \"user.overlay.opaque\", b\"y\")" "$U/opt/old" 2>/dev/null || exit 77
+        "$LB" export one "$W/one" && "$LB" export two "$W/two" || exit 1
+        echo "kept: $(cat "$W/data/bases/$id/layer")"
+        echo changed > "$W/data/bases/$id/rootfs/lib/keep"
+        "$LB" export two "$W/changed" 2>&1 | grep "^Warning"
+    ' _ "$W" "$LB" > "$W/ns.out" 2>&1
+    rc=$?
+    cat "$W/ns.out"
+    [ $rc -ne 77 ] || { echo "no device 0:0 or no user.* attribute can be made in a user namespace here"; return 77; }
+    [ $rc -eq 0 ] || return 1
+    out=$(python3 -I "$IMAGE_CHECK" "$W/one") || { printf '%s\n' "$out"; return 1; }
+    printf '%s\n' "$out"
+    grep -q "^Container 'one' exported: 2 layers, " "$W/ns.out" && printf '%s\n' "$out" | grep -qx 'layers 2' ||
+        { echo "an overlay is not two layers"; return 1; }
+    # its own files alone, and the two marks, each an empty file
+    names=$(printf '%s\n' "$out" | sed -n 's/^entry 2 [a-z]* [0-7]* [0-9:]* [0-9]* //p' | paste -sd' ' -)
+    [ "$names" = 'etc etc/hostname lib lib/.wh.gone opt opt/old opt/old/.wh..wh..opq opt/old/y srv srv/new' ] ||
+        { echo "the second layer is not the container's own files and its marks: $names"; return 1; }
+    printf '%s\n' "$out" | grep -qE '^entry 2 file 0[0-7]{3} 0:0 0 lib/\.wh\.gone$' &&
+        printf '%s\n' "$out" | grep -qE '^entry 2 file 0[0-7]{3} 0:0 0 opt/old/\.wh\.\.wh\.\.opq$' ||
+        { echo "a mark is not an empty file"; return 1; }
+    # the first is the snapshot, with what the container took out still in it
+    printf '%s\n' "$out" | grep -qE '^entry 1 file 0[0-7]{3} 0:0 5 lib/gone$' &&
+        printf '%s\n' "$out" | grep -qE '^entry 1 file 0[0-7]{3} 0:0 2 opt/old/x$' &&
+        ! printf '%s\n' "$out" | grep -q '^entry 1 .* srv/new$' || { echo "the first layer is not the snapshot"; return 1; }
+    # which is one layer for every container on it, and kept by the snapshot
+    first=$(printf '%s\n' "$out" | sed -n 's/^layer 1 //p')
+    out=$(python3 -I "$IMAGE_CHECK" "$W/two") || { printf '%s\n' "$out"; return 1; }
+    [ -n "$first" ] && [ "$(printf '%s\n' "$out" | sed -n 's/^layer 1 //p')" = "$first" ] ||
+        { echo "two containers of one snapshot have two first layers"; return 1; }
+    grep -qx "kept: $first" "$W/ns.out" || { echo "the snapshot does not keep its layer's digest and size: $first"; return 1; }
+    # a snapshot that was changed under its containers is said to be another layer
+    grep -q '^Warning: the base snapshot [0-9a-f]\{12\} is another layer than it was' "$W/ns.out" ||
+        { echo "a changed snapshot was not said to be one"; return 1; }
+    python3 -I "$IMAGE_CHECK" "$W/changed" >/dev/null || return 1
+}
+
+# import (ROADMAP I.6) reads an image whole before it makes anything, and
+# before it asks for root: every blob held to the size and the SHA-256 it is
+# named by, the layers to what the configuration says of them, the image to
+# this machine's architecture. tests/image_edit.py changes an image that
+# export wrote into one that is another, or none; each is refused with what
+# is wrong, and nothing lightbox keeps is changed. What an image says of its
+# container beyond its limits is said, and not taken.
+IMAGE_EDIT=$(cd "$(dirname "$0")" && pwd)/image_edit.py
+t_import_refusals() {
+    need_python || return 77
+    local bad=0 before said n=0 other
+    lb create web 10.0.0.2 --mem 1G >/dev/null && lb export web "$W/image" >/dev/null && mkdir "$W/empty" || return 1
+    before=$(kept_sum)
+    changed() { # what import says then, the change
+        local want=$1
+        shift
+        n=$((n + 1))
+        cp -r "$W/image" "$W/changed.$n" && python3 -I "$IMAGE_EDIT" "$W/changed.$n" "$@" ||
+            { echo "image_edit $*: failed"; bad=1; return; }
+        said=$(lb import "$W/changed.$n" new 2>&1) && { echo "import after $*: succeeded"; bad=1; return; }
+        case $said in *"$want"*) ;; *) echo "import after $*: $said"; bad=1 ;; esac
+    }
+    changed 'the manifest is not what it is named by: its bytes have another SHA-256' byte manifest
+    changed 'the configuration is not what it is named by: its bytes have another SHA-256' byte config
+    changed 'a layer is not what it is named by: its bytes have another SHA-256' byte layer
+    changed 'a layer has another size than it is named with' longer layer
+    changed 'the configuration has another size than it is named with' longer config
+    changed 'the manifest is not among its blobs' gone manifest
+    changed 'the configuration is not among its blobs' gone config
+    changed 'a layer is not among its blobs' gone layer
+    changed 'a layer is not among its blobs' link layer
+    other=arm64
+    [ "$(uname -m)" = aarch64 ] && other=amd64
+    changed "is an image for linux on $other, and this lightbox runs linux on" architecture "$other"
+    changed 'is an image for windows on' os windows
+    changed 'a layer of a type that is not read: application/vnd.oci.image.layer.v1.tar+zstd' \
+        layer-type application/vnd.oci.image.layer.v1.tar+zstd
+    changed 'the manifest is of a type that is not read: application/vnd.docker.distribution.manifest.v2+json' \
+        manifest-type application/vnd.docker.distribution.manifest.v2+json
+    changed 'the configuration is of a type that is not read: application/x' config-type application/x
+    changed 'the manifest is no image manifest of schema 2' schema 1
+    changed 'oci-layout does not say that it is an image layout of version 1.0.0' layout '{}'
+    changed 'oci-layout is no JSON, at 1:1: what is here is no value' layout nonsense
+    changed "the configuration does not name the manifest's layers as they are unpacked" one-layer-more
+    changed 'the configuration names another layer than the manifest, for one that is not compressed' other-layer
+    changed 'index.json names more than one image, and import takes a directory with one' two-manifests
+    changed 'index.json names no image' no-manifests
+    changed 'index.json names an index of images and no image' index-of-indexes
+    changed 'a name that is there twice in one object' name-twice
+    changed 'the manifest has a name on the way to /layers in letters of another case' name-in-capitals
+    changed 'the manifest is no JSON, at 1:' no-json
+    # a text of the image's that a terminal would obey is not passed on to it
+    changed 'a layer of a type that is not read: (a text with control characters)' layer-type "$(printf 'x\033[31m')"
+    case $said in *"$(printf '\033')"*) echo "import printed the image's control characters"; bad=1 ;; esac
+
+    no() { # what it says, the command
+        local want=$1
+        shift
+        said=$(lb "$@" 2>&1) && { echo "lightbox $*: succeeded"; bad=1; return; }
+        case $said in *"$want"*) ;; *) echo "lightbox $*: $said"; bad=1 ;; esac
+    }
+    no 'Usage: lightbox import <dir> <name> [<ip>] [options]' import
+    no 'Usage: lightbox import <dir> <name> [<ip>] [options]' import "$W/image"
+    no "import takes the image's directory first, and then the name" import --copy "$W/image" new
+    no 'Error: container name must only contain' import "$W/image" a/b
+    no 'Error: there is no directory with an image at' import "$W/none" new
+    no 'it has no oci-layout' import "$W/empty" new
+    no 'it has no oci-layout' import "$C/web" new
+
+    # What an image says of its container and import does not take is said,
+    # before anything is asked of the caller; a whole image is root's to unpack.
+    if [ "$(id -u)" != 0 ]; then
+        notes() { # what is said, the annotation
+            n=$((n + 1))
+            cp -r "$W/image" "$W/changed.$n" && python3 -I "$IMAGE_EDIT" "$W/changed.$n" annotation "$2" || { bad=1; return; }
+            said=$(lb import "$W/changed.$n" new 2>&1) && { echo "an ordinary user imported an image"; bad=1; return; }
+            case $said in *"$1"*'Error: lightbox import must be run as root') ;; *) echo "with the annotation $2: $said"; bad=1 ;; esac
+        }
+        notes 'Note: the image says ac.ozkr.lightbox.privileged, which import does not take' ac.ozkr.lightbox.privileged=1
+        notes 'Note: the image says ac.ozkr.lightbox.vol, which import does not take' ac.ozkr.lightbox.vol=/:/host
+        notes 'Note: the image says ac.ozkr.lightbox.mem with what is no such value, which is not taken' ac.ozkr.lightbox.mem=lots
+        notes "Note: the image's annotations are of the version 2, and this lightbox reads 1: none of them is taken" ac.ozkr.lightbox.version=2
+        said=$(lb import "$W/image" new 2>&1)
+        [ "$said" = 'Error: lightbox import must be run as root' ] || { echo "a whole image, as an ordinary user: $said"; bad=1; }
+    fi
+    [ "$before" = "$(kept_sum)" ] && [ ! -e "$C/new" ] || { echo "a refused import changed what lightbox keeps"; bad=1; }
+    return $bad
+}
+
+# An image is made a container again, in a user namespace, where this user
+# is root and unpacking is allowed: the tree is the exported one but for the
+# files create writes in /etc, which are the new container's, with the line
+# of the old one gone from its hosts file. The limits no option gives are
+# the image's, where they are no more than lightbox.conf gives a new
+# container; what is more is said and not taken, and an option or the
+# settings give it. An image whose layer was compressed, as skopeo compresses one,
+# gives the same tree; one that unpacks to another layer than its
+# configuration names, or whose gzip stream is cut or has more after its end,
+# is refused, and nothing of a container or a snapshot is left. Layers of an
+# image become one tree with --copy: a mark takes out what it names, and a
+# device is not made. Where an overlay mounts in such a namespace the layer
+# is a snapshot, and a second import takes no second one.
+t_import_round_trip() {
+    need_python || return 77
+    local rc
+    mkdir -p "$BASE/lib" "$BASE/opt/old" && ln -s placeholder "$BASE/bin/link" && ln "$BASE/bin/placeholder" "$BASE/bin/second-name" &&
+        echo gone > "$BASE/lib/gone" && echo keep > "$BASE/lib/keep" && echo x > "$BASE/opt/old/x" || return 1
+    # shellcheck disable=SC2016     # the script is for the shell in the namespace
+    HOME="$W/home" LIGHTBOX_CONFIG="$CONF" unshare -r --mount -- bash -c '
+        W=$1 LB=$2 EDIT=$3 C=$1/data/containers
+        fail() { echo "FAILED: $*"; exit 1; }
+        # a tree but for what create writes in /etc: names, kinds, modes, owners, sizes, links and times
+        listing() {
+            (cd "$1" && find . -mindepth 1 ! -path ./etc ! -path ./etc/hostname ! -path ./etc/hosts ! -path ./etc/resolv.conf \
+                -printf "%P %y %m %U:%G %l %n %Ts " \( -type f -printf "%s" -o -true \) -printf "\n" | LC_ALL=C sort)
+        }
+        # where a container has the files of its image: its rootfs/, or the snapshot under it
+        tree_of() {
+            base=$(sed -n "s/^base=//p" "$C/$1/.conf")
+            if [ -n "$base" ]; then echo "$W/data/bases/$base/rootfs"; else echo "$C/$1/rootfs"; fi
+        }
+        snapshots() { ls "$W/data/bases" 2>/dev/null | wc -l; }
+        conf() { grep -qx -- "$2" "$C/$1/.conf" || fail "$1 has no $2 in its .conf: $(paste -sd" " "$C/$1/.conf")"; }
+
+        "$LB" create web 10.0.0.2 --mem 128M --pids 64 --cpu 0.5 --ttl 8h --copy > /dev/null || fail "create"
+        echo work > "$C/web/rootfs/work.txt" && chmod 640 "$C/web/rootfs/work.txt" &&
+            touch -d "2020-02-02 02:02:02 UTC" "$C/web/rootfs/work.txt" "$C/web/rootfs/bin" || fail "the container could not be changed"
+        "$LB" export web "$W/image" > "$W/export.out" || fail "export"
+        listing "$C/web/rootfs" > "$W/web.list"
+
+        echo "--- the image, a container again"
+        "$LB" import "$W/image" back 10.0.0.9 > "$W/import.out" 2>&1 || { cat "$W/import.out"; fail "import"; }
+        cat "$W/import.out"
+        grep -qx "Container .back. imported (ip=10.0.0.9)" "$W/import.out" || fail "import does not say what it made"
+        grep -q "^$(grep "^Image sha256:" "$W/export.out")" "$W/import.out" || fail "import names another image than export wrote"
+        grep -qx "Limits of the image.s: mem=128M pids=64 cpu=0.5 ttl=8h" "$W/import.out" || fail "the limits it took are not said"
+        for line in mem=128M pids=64 cpu=0.5 ttl=8h; do conf back "$line"; done
+        listing "$(tree_of back)" > "$W/back.list"
+        diff "$W/web.list" "$W/back.list" || fail "the tree is not the exported one"
+        [ "$(cat "$C/back/rootfs/etc/hostname")" = back ] || fail "its hostname is not its own"
+        grep -qx "10.0.0.9	back" "$C/back/rootfs/etc/hosts" || fail "its hosts file has no line for it"
+        ! grep -q "	web\$" "$C/back/rootfs/etc/hosts" || fail "its hosts file still has the line of the container it was"
+        had=$(snapshots)
+        if [ -n "$(sed -n "s/^base=//p" "$C/back/.conf")" ]; then
+            echo "an overlay mounts here: the layer is a snapshot"
+            [ "$(cd "$C/back/rootfs" && find . -type f | LC_ALL=C sort | paste -sd" ")" = "./etc/hostname ./etc/hosts ./etc/resolv.conf" ] ||
+                fail "its own files are more than create writes"
+            "$LB" import "$W/image" again > "$W/again.out" 2>&1 || { cat "$W/again.out"; fail "a second import"; }
+            grep -q ", on the base snapshot [0-9a-f]\{12\}, which was here\$" "$W/again.out" && [ "$(snapshots)" = "$had" ] ||
+                fail "a second import took a second snapshot"
+        fi
+
+        echo "--- an option is before the image, and the image before lightbox.conf"
+        "$LB" import "$W/image" opt --mem 2G --ttl 1h > "$W/opt.out" 2>&1 || { cat "$W/opt.out"; fail "import with options"; }
+        for line in mem=2G pids=64 cpu=0.5 ttl=1h; do conf opt "$line"; done
+        grep -qx "Limits of the image.s: pids=64 cpu=0.5" "$W/opt.out" || fail "the limits it took, beside the options: $(cat "$W/opt.out")"
+        said=$("$LB" import "$W/image" other --rootfs "$W/base" 2>&1) && fail "import took --rootfs"
+        case $said in *"no --rootfs"*) ;; *) fail "--rootfs: $said" ;; esac
+        said=$("$LB" import "$W/image" web 2>&1) && fail "import over a container that is there"
+        case $said in *"container already exists: web"*) ;; *) fail "an existing name: $said" ;; esac
+        [ ! -e "$C/other" ] || fail "a refused import left a container"
+
+        echo "--- an image gives its container no more than lightbox.conf gives a new one"
+        cp -r "$W/image" "$W/more" || fail "cp"
+        for pair in mem=4G swap=1G pids=max cpu=8; do
+            python3 -I "$EDIT" "$W/more" annotation "ac.ozkr.lightbox.$pair" || fail "image_edit"
+        done
+        "$LB" import "$W/more" capped > "$W/capped.out" 2>&1 || { cat "$W/capped.out"; fail "import of an image that has more"; }
+        cat "$W/capped.out"
+        grep -qx "Note: the image has mem=4G, which is more than lightbox.conf gives a new container, 256M: it is not taken, and --mem gives it more" "$W/capped.out" &&
+            grep -qx "Note: the image has pids=max, which is more than lightbox.conf gives a new container, 128: it is not taken, and --pids gives it more" "$W/capped.out" &&
+            grep -qx "Note: the image has cpu=8, which is more than lightbox.conf gives a new container, 1: it is not taken, and --cpu gives it more" "$W/capped.out" &&
+            grep -qx "Note: the image has swap=1G, and a new container here has no swap: it has none, and --swap gives it some" "$W/capped.out" ||
+            fail "what the image has more of is not said"
+        for line in mem=256M pids=128 cpu=1 ttl=8h; do conf capped "$line"; done
+        ! grep -q "^swap=" "$C/capped/.conf" || fail "the image gave its container swap"
+        grep -qx "Limits of the image.s: ttl=8h" "$W/capped.out" || fail "a lifetime, which only takes away, is not the image.s: $(grep "^Limits" "$W/capped.out")"
+        # the option gives it, and then nothing is said of it
+        "$LB" import "$W/more" given --mem 4G --swap 1G --pids max --cpu 8 > "$W/given.out" 2>&1 || { cat "$W/given.out"; fail "import with what the image has, as options"; }
+        for line in mem=4G swap=1G pids=max cpu=8; do conf given "$line"; done
+        ! grep -q "^Note: the image has " "$W/given.out" || fail "a limit an option gave is held against the image.s"
+        # and so does a lightbox.conf that gives a new container as much
+        printf "default_mem = 4G\ndefault_pids = max\ndefault_cpu = 8\n" >> "$LIGHTBOX_CONFIG"
+        "$LB" import "$W/more" roomy > "$W/roomy.out" 2>&1 || { cat "$W/roomy.out"; fail "import where lightbox.conf gives as much"; }
+        for line in mem=4G pids=max cpu=8; do conf roomy "$line"; done
+        grep -qx "Limits of the image.s: mem=4G pids=max cpu=8 ttl=8h" "$W/roomy.out" && ! grep -q "^swap=" "$C/roomy/.conf" ||
+            fail "what lightbox.conf gives as much of is not the image.s: $(grep "^Limits\|^Note" "$W/roomy.out" | paste -sd"|")"
+        sed -i "/^default_/d" "$LIGHTBOX_CONFIG"
+
+        echo "--- what an image says beyond its limits is said and not taken"
+        cp -r "$W/image" "$W/asking" && python3 -I "$EDIT" "$W/asking" annotation ac.ozkr.lightbox.privileged=1 &&
+            python3 -I "$EDIT" "$W/asking" annotation ac.ozkr.lightbox.net=nat || fail "image_edit"
+        "$LB" import "$W/asking" asked > "$W/asked.out" 2>&1 || { cat "$W/asked.out"; fail "import of an image that asks for more"; }
+        grep -q "^Note: the image says ac.ozkr.lightbox.privileged, which import does not take" "$W/asked.out" &&
+            grep -q "^Note: the image says ac.ozkr.lightbox.net, which import does not take" "$W/asked.out" || fail "what it asks for is not said"
+        ! grep -q "^privileged=1" "$C/asked/.conf" && grep -qx "net=outside" "$C/asked/.conf" || fail "the image had its way: $(paste -sd" " "$C/asked/.conf")"
+
+        echo "--- a layer that is compressed"
+        cp -r "$W/image" "$W/gz" && python3 -I "$EDIT" "$W/gz" gzip || fail "image_edit gzip"
+        "$LB" import "$W/gz" unpacked > "$W/gz.out" 2>&1 || { cat "$W/gz.out"; fail "import of a compressed layer"; }
+        listing "$(tree_of unpacked)" > "$W/gz.list"
+        diff "$W/web.list" "$W/gz.list" || fail "a compressed layer is another tree"
+        # A layer that is not what the configuration names, where it is
+        # unpacked: with --copy every layer is, whatever is here already. The
+        # same through a snapshot is the case of base import.
+        had=$(snapshots)
+        for pair in "gzip-other:is, as it was unpacked, not the layer its configuration names" \
+                    "gzip-cut:of the image" "gzip-more:gzip did not unpack layer 1 of the image to its end"; do
+            change=${pair%%:*}
+            cp -r "$W/image" "$W/$change" && python3 -I "$EDIT" "$W/$change" "$change" || fail "image_edit $change"
+            said=$("$LB" import "$W/$change" broken --copy 2>&1) && fail "$change was imported"
+            case $said in *"${pair#*:}"*) ;; *) fail "$change: $said" ;; esac
+            [ ! -e "$C/broken" ] && [ "$(snapshots)" = "$had" ] && [ -z "$(ls -A "$W/data/bases" 2>/dev/null | grep "^\.")" ] ||
+                fail "$change left a container or a snapshot"
+        done
+        # Where the layer the configuration names is a snapshot here already,
+        # as it is where an overlay mounts, the compressed one is held to
+        # that digest all the same, and refused as it is everywhere else.
+        if [ -n "$(sed -n "s/^base=//p" "$C/unpacked/.conf")" ]; then
+            said=$("$LB" import "$W/gzip-other" named 2>&1) && fail "an image whose layer is another than it says was taken where its snapshot is"
+            case $said in *"is, as it was unpacked, not the layer its configuration names"*) ;; *) fail "gzip-other onto its snapshot: $said" ;; esac
+            [ ! -e "$C/named" ] && [ "$(snapshots)" = "$had" ] || fail "a refused import onto a snapshot left a container or a snapshot"
+        fi
+
+        echo "--- two layers and three, as one tree"
+        "$LB" create over --copy > /dev/null && id=$("$LB" base add "$W/base" | sed -n "s/^Base \([0-9a-f]\{12\}\) taken of .*/\1/p") &&
+            [ -n "$id" ] && echo "base=$id" >> "$C/over/.conf" && mv "$C/over/rootfs" "$C/over/copy" || fail "no container to be an overlay"
+        U=$C/over/rootfs
+        mkdir -p "$U/etc" "$U/lib" "$U/opt/old" "$U/srv" && cp "$C/over/copy/etc/hostname" "$U/etc/hostname" &&
+            echo new > "$U/srv/new" && echo y > "$U/opt/old/y" || fail "no upper directory"
+        mknod "$U/lib/gone" c 0 0 2>/dev/null || { echo "no device 0:0 can be made here"; exit 77; }
+        python3 -I -c "import os, sys; os.setxattr(sys.argv[1], \"user.overlay.opaque\", b\"y\")" "$U/opt/old" 2>/dev/null ||
+            { echo "no user.* attribute can be set here"; exit 77; }
+        "$LB" export over "$W/two" > /dev/null || fail "export of two layers"
+        "$LB" import "$W/two" flat --copy > "$W/flat.out" 2>&1 || { cat "$W/flat.out"; fail "import of two layers"; }
+        cat "$W/flat.out"
+        F=$C/flat/rootfs
+        [ "$(cat "$F/lib/keep" "$F/srv/new" "$F/opt/old/y")" = "keep
+new
+y" ] && [ ! -e "$F/lib/gone" ] && [ ! -e "$F/opt/old/x" ] || fail "the second layer was not put over the first: $(cd "$F" && find lib opt srv | paste -sd" ")"
+        [ -z "$(find "$F" -name ".wh.*" -o -type c)" ] || fail "a mark of a layer is in the tree"
+        grep -q ": 2 layers, as a copy\$" "$W/flat.out" || fail "two layers with --copy are not said to be a copy"
+        python3 -I -c "
+import io, sys, tarfile
+with tarfile.open(sys.argv[1], \"w\", format=tarfile.PAX_FORMAT) as t:
+    d = tarfile.TarInfo(\"added\"); d.type = tarfile.DIRTYPE; d.mode = 0o755; t.addfile(d)
+    f = tarfile.TarInfo(\"added/file\"); f.size = 6; f.mode = 0o600; t.addfile(f, io.BytesIO(b\"third\\n\"))
+    n = tarfile.TarInfo(\"added/null\"); n.type = tarfile.CHRTYPE; n.devmajor, n.devminor = 1, 3; t.addfile(n)
+    w = tarfile.TarInfo(\"srv/.wh.new\"); t.addfile(w)
+" "$W/third.tar" && cp -r "$W/two" "$W/three" && python3 -I "$EDIT" "$W/three" add-layer "$W/third.tar" || fail "no third layer"
+        "$LB" import "$W/three" three --copy > "$W/three.out" 2>&1 || { cat "$W/three.out"; fail "import of three layers"; }
+        cat "$W/three.out"
+        T=$C/three/rootfs
+        [ "$(cat "$T/added/file")" = third ] && [ ! -e "$T/added/null" ] && [ ! -e "$T/srv/new" ] && [ -e "$T/lib/keep" ] ||
+            fail "the third layer was not put over the two"
+        grep -qx "Note: 1 device of the image.s was not made: a container.s devices are lightbox.s to give" "$W/three.out" ||
+            fail "a device that was not made is not said"
+    ' _ "$W" "$LB" "$IMAGE_EDIT" > "$W/ns.out" 2>&1
+    rc=$?
+    cat "$W/ns.out"
+    [ $rc -ne 77 ] || return 77
+    [ $rc -eq 0 ] && ! grep -q '^FAILED: ' "$W/ns.out"
+}
+
+# To a registry and back (ROADMAP I.8). lightbox writes and reads a
+# directory, and skopeo carries it: tests/registry.py is a registry for this
+# case alone, on the loopback. Two containers that overlay one snapshot are
+# exported and copied to it; of the second, the layer that is the snapshot is
+# not sent again, which the registry's own record of what it was sent shows.
+# What is copied back, into empty directories, has its layers compressed, and
+# import makes of it the tree that it makes of the directory export wrote.
+REGISTRY=$(cd "$(dirname "$0")" && pwd)/registry.py
+t_registry() {
+    need_python || return 77
+    command -v skopeo >/dev/null 2>&1 || { echo "no skopeo to carry an image to a registry with"; return 77; }
+    local rc pid port sent n
+    mkdir -p "$BASE/lib" && echo gone > "$BASE/lib/gone" && echo keep > "$BASE/lib/keep" || return 1
+    # shellcheck disable=SC2016     # the script is for the shell in the namespace
+    HOME="$W/home" LIGHTBOX_CONFIG="$CONF" unshare -r --mount -- bash -c '
+        W=$1 LB=$2 C=$1/data/containers
+        "$LB" create one --mem 128M --ttl 8h --copy > /dev/null && "$LB" create two --copy > /dev/null || exit 1
+        id=$("$LB" base add "$W/base" | sed -n "s/^Base \([0-9a-f]\{12\}\) taken of .*/\1/p")
+        [ -n "$id" ] || exit 1
+        for name in one two; do
+            echo "base=$id" >> "$C/$name/.conf"
+            mv "$C/$name/rootfs" "$C/$name/copy" && mkdir -p "$C/$name/rootfs/etc" "$C/$name/rootfs/srv" &&
+                cp "$C/$name/copy/etc/hostname" "$C/$name/rootfs/etc/hostname" && echo "of $name" > "$C/$name/rootfs/srv/own" || exit 1
+        done
+        mkdir "$C/one/rootfs/lib" && mknod "$C/one/rootfs/lib/gone" c 0 0 2>/dev/null || exit 77
+        "$LB" export one "$W/one" > /dev/null && "$LB" export two "$W/two" > /dev/null
+    ' _ "$W" "$LB" > "$W/ns.out" 2>&1
+    rc=$?
+    cat "$W/ns.out"
+    [ $rc -ne 77 ] || { echo "no device 0:0 can be made in a user namespace here"; return 77; }
+    [ $rc -eq 0 ] || return 1
+
+    python3 -I "$REGISTRY" "$W/registry" "$W/port" "$W/registry.log" > "$W/registry.out" 2>&1 &
+    pid=$!
+    n=0
+    while [ ! -s "$W/port" ] && [ $n -lt 50 ]; do sleep 0.1; n=$((n + 1)); done
+    port=$(cat "$W/port" 2>/dev/null)
+    carried() {
+        [ -n "$port" ] && mkdir -p "$W/home/run" || { cat "$W/registry.out"; echo "the registry did not start"; return 1; }
+        copy() { timeout 120 env -i PATH="$PATH" HOME="$W/home" XDG_RUNTIME_DIR="$W/home/run" XDG_CONFIG_HOME="$W/home/.config" \
+                     skopeo --insecure-policy copy --dest-tls-verify=false --src-tls-verify=false "$@" 2>&1; }
+        copy "oci:$W/one" "docker://127.0.0.1:$port/boxes/one:latest" || { echo "skopeo did not copy the image to the registry"; return 1; }
+        sent=$(grep -c '^PATCH ' "$W/registry.log")
+        copy "oci:$W/two" "docker://127.0.0.1:$port/boxes/two:latest" || { echo "skopeo did not copy the second image"; return 1; }
+        sed 's/sha256:\([0-9a-f]\{12\}\)[0-9a-f]*/\1/g; s/sha256%3A\([0-9a-f]\{12\}\)[0-9a-f]*/\1/g' "$W/registry.log"
+        # the first image: two layers and the configuration; the second: its own layer and its configuration
+        [ "$sent" = 3 ] && [ "$(grep -c '^PATCH ' "$W/registry.log")" = 5 ] ||
+            { echo "the registry was sent $sent blobs and then $(($(grep -c '^PATCH ' "$W/registry.log") - sent)), not 3 and then 2"; return 1; }
+        copy "docker://127.0.0.1:$port/boxes/one:latest" "oci:$W/one-back" && copy "docker://127.0.0.1:$port/boxes/two:latest" "oci:$W/two-back" ||
+            { echo "skopeo did not copy the images back"; return 1; }
+        grep -q 'image.layer.v1.tar+gzip' "$W/one-back/blobs/sha256/"* || { echo "what came back has no compressed layer: is this still what a registry gives?"; return 1; }
+    }
+    carried
+    rc=$?
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    [ $rc -eq 0 ] || return 1
+
+    # what came back is the container that was exported
+    # shellcheck disable=SC2016
+    HOME="$W/home" LIGHTBOX_CONFIG="$CONF" unshare -r --mount -- bash -c '
+        W=$1 LB=$2 C=$1/data/containers
+        listing() {
+            (cd "$1" && find . -mindepth 1 ! -path ./etc ! -path ./etc/hostname ! -path ./etc/hosts ! -path ./etc/resolv.conf \
+                -printf "%P %y %m %U:%G %l %n %Ts " \( -type f -printf "%s" -o -true \) -printf "\n" | LC_ALL=C sort)
+        }
+        for name in one two; do
+            "$LB" import "$W/$name" "$name-direct" --copy > "$W/$name-direct.out" 2>&1 || { cat "$W/$name-direct.out"; exit 1; }
+            "$LB" import "$W/$name-back" "$name-carried" --copy > "$W/$name-carried.out" 2>&1 || { cat "$W/$name-carried.out"; exit 1; }
+            listing "$C/$name-direct/rootfs" > "$W/direct.list" && listing "$C/$name-carried/rootfs" > "$W/carried.list" || exit 1
+            diff "$W/direct.list" "$W/carried.list" || { echo "FAILED: $name came back from the registry as another tree"; exit 1; }
+            [ "$(cat "$C/$name-carried/rootfs/srv/own")" = "of $name" ] && [ -e "$C/$name-carried/rootfs/lib/keep" ] ||
+                { echo "FAILED: $name came back without its files"; exit 1; }
+        done
+        [ ! -e "$C/one-carried/rootfs/lib/gone" ] && [ -e "$C/two-carried/rootfs/lib/gone" ] ||
+            { echo "FAILED: what one took out of its base is not what came back as taken out"; exit 1; }
+        grep -qx "Limits of the image.s: mem=128M pids=128 cpu=1 ttl=8h" "$W/one-carried.out" && grep -qx "ttl=8h" "$C/one-carried/.conf" ||
+            { echo "FAILED: the limits did not come back: $(grep "^Limits" "$W/one-carried.out")"; exit 1; }
+    ' _ "$W" "$LB" > "$W/ns2.out" 2>&1
+    rc=$?
+    cat "$W/ns2.out"
+    [ $rc -eq 0 ]
+}
+
+# A registry's image as a base (ROADMAP I.9). An image that somebody else
+# built says nothing of lightbox's and has as many layers as it has; here it
+# is made of an export, with its annotations taken away, a command to start
+# and a second layer that adds a file, takes one out and has a device. base
+# import reads it as import reads one, whole and before root is asked for,
+# and unpacks all its layers into one snapshot, which a second import of
+# those layers, compressed or not, finds. create --base makes a container of
+# the snapshot, by its id, and a copy of it where it is to be one. A layer
+# that unpacks to another than the configuration names, and a blob that is
+# not what it is named by, leave no snapshot. What names a base that is none
+# is refused with what would take it.
+t_base_import() {
+    need_python || return 77
+    local bad=0 before said rc
+    # exported where this user is root, so that the layer's files are root's
+    # shellcheck disable=SC2016
+    HOME="$W/home" LIGHTBOX_CONFIG="$CONF" unshare -r --mount -- bash -c '
+        "$2" create web 10.0.0.2 --copy > /dev/null && "$2" export web "$1/image" > /dev/null' _ "$W" "$LB" || return 1
+    python3 -I -c '
+import io, sys, tarfile
+with tarfile.open(sys.argv[1], "w", format=tarfile.PAX_FORMAT) as t:
+    d = tarfile.TarInfo("added"); d.type = tarfile.DIRTYPE; d.mode = 0o755; t.addfile(d)
+    f = tarfile.TarInfo("added/file"); f.size = 7; f.mode = 0o640; t.addfile(f, io.BytesIO(b"second\n"))
+    n = tarfile.TarInfo("added/null"); n.type = tarfile.CHRTYPE; n.devmajor, n.devminor = 1, 3; t.addfile(n)
+    w = tarfile.TarInfo("bin/.wh.placeholder"); t.addfile(w)
+' "$W/second.tar" && cp -r "$W/image" "$W/foreign" && python3 -I "$IMAGE_EDIT" "$W/foreign" no-annotations &&
+        python3 -I "$IMAGE_EDIT" "$W/foreign" command && python3 -I "$IMAGE_EDIT" "$W/foreign" add-layer "$W/second.tar" &&
+        cp -r "$W/foreign" "$W/bad" && python3 -I "$IMAGE_EDIT" "$W/bad" byte layer || { echo "no image to import"; return 1; }
+
+    # what is refused before anything is made, and before root is asked for
+    before=$(kept_sum)
+    no() { # what it says, the command
+        local want=$1
+        shift
+        said=$(lb "$@" 2>&1) && { echo "lightbox $*: succeeded"; bad=1; return; }
+        case $said in *"$want"*) ;; *) echo "lightbox $*: $said"; bad=1 ;; esac
+    }
+    no 'Usage: lightbox base import <dir>' base import
+    no 'Error: base import takes one directory, with an image in it' base import "$W/foreign" more
+    no 'Error: there is no directory with an image at' base import "$W/none"
+    no 'it has no oci-layout' base import "$BASE"
+    no 'a layer is not what it is named by: its bytes have another SHA-256' base import "$W/bad"
+    no 'Error: --base takes the id of a base snapshot, as base ls shows it, not: latest' create new --base latest
+    no 'Error: --base takes the id of a base snapshot, as base ls shows it, not: ../../etc' create new --base ../../etc
+    no 'Error: there is no base snapshot 000000000000' create new --base 000000000000
+    no 'Error: --base is given once: a container has one base' create new --base 000000000000 --base 000000000000
+    no 'Error: --rootfs names a base and --base a snapshot of one' create new --base 000000000000 --rootfs "$BASE"
+    no 'Error: --rootfs names a base and --base a snapshot of one' create new --rootfs "$BASE" --base 000000000000
+    no 'Error: the base is an image and no root filesystem: ' create new --rootfs "$W/foreign"
+    no 'lightbox base import <dir> a' create new --rootfs "$W/foreign"
+    no 'Error: this is an image and no root filesystem, and base import <dir> makes a base of one: ' base add "$W/foreign"
+    if [ "$(id -u)" != 0 ]; then
+        said=$(lb base import "$W/foreign" 2>&1) && { echo "an ordinary user imported a base"; bad=1; }
+        [ "$said" = 'Error: lightbox base import must be run as root' ] || { echo "a whole image, as an ordinary user: $said"; bad=1; }
+    fi
+    [ "$before" = "$(kept_sum)" ] && [ ! -e "$C/new" ] || { echo "a refused command changed what lightbox keeps"; bad=1; }
+    [ $bad -eq 0 ] || return 1
+
+    # shellcheck disable=SC2016     # the script is for the shell in the namespace
+    HOME="$W/home" LIGHTBOX_CONFIG="$CONF" unshare -r --mount -- bash -c '
+        W=$1 LB=$2 EDIT=$3 C=$1/data/containers
+        fail() { echo "FAILED: $*"; exit 1; }
+        snapshots() { ls -A "$W/data/bases" 2>/dev/null | wc -l; }
+        only_etc() { [ "$(cd "$C/$1/rootfs" && find . -type f | LC_ALL=C sort | paste -sd" ")" = "./etc/hostname ./etc/hosts ./etc/resolv.conf" ]; }
+
+        echo "--- every layer of the image, one snapshot"
+        "$LB" base import "$W/foreign" > "$W/base.out" 2>&1 || { cat "$W/base.out"; fail "base import"; }
+        cat "$W/base.out"
+        id=$(sed -n "s/^Base \([0-9a-f]\{12\}\) unpacked from the image sha256:[0-9a-f]\{64\}, 2 layers\$/\1/p" "$W/base.out")
+        [ -n "$id" ] || fail "base import does not say what it made"
+        grep -qx "Note: 1 device of the image.s was not made: a container.s devices are lightbox.s to give" "$W/base.out" ||
+            fail "a device that was not made is not said"
+        grep -qx "Note: the image names a command to start, which lightbox does not read: a container starts its /init.sh, where it has one" "$W/base.out" ||
+            fail "the command of the image.s, which is not read, is not said"
+        grep -qx "A container of it: lightbox create <name> --base $id" "$W/base.out" || fail "what makes a container of it is not said"
+        S=$W/data/bases/$id/rootfs
+        [ "$(cat "$S/added/file")" = second ] && [ "$(stat -c %a "$S/added/file")" = 640 ] && [ -e "$S/etc/passwd" ] ||
+            fail "the snapshot is not the two layers: $(cd "$S" && find . | paste -sd" ")"
+        [ ! -e "$S/bin/placeholder" ] && [ ! -e "$S/added/null" ] && [ -z "$(find "$S" -name ".wh.*" -o -type c -o -type b)" ] ||
+            fail "a mark or a device of a layer is in the snapshot"
+        [ "$(grep -c "^sha256:[0-9a-f]\{64\}\$" "$W/data/bases/$id/image")" = 2 ] || fail "the snapshot does not keep the layers it is"
+        "$LB" base ls | grep -q "^$id  .*  sha256:[0-9a-f]\{64\} and the layers over it  -\$" || { "$LB" base ls; fail "base ls does not show it"; }
+
+        echo "--- the same layers again, and compressed: that snapshot"
+        had=$(snapshots)
+        "$LB" base import "$W/foreign" > "$W/again.out" 2>&1 || { cat "$W/again.out"; fail "a second base import"; }
+        grep -q "^Base $id is the image sha256:[0-9a-f]\{64\} already, 2 layers: nothing was unpacked\$" "$W/again.out" && [ "$(snapshots)" = "$had" ] ||
+            fail "a second base import took a second snapshot: $(head -n 1 "$W/again.out")"
+        cp -r "$W/foreign" "$W/gz" && python3 -I "$EDIT" "$W/gz" gzip || fail "image_edit gzip"
+        "$LB" base import "$W/gz" > "$W/gz.out" 2>&1 || { cat "$W/gz.out"; fail "base import of compressed layers"; }
+        grep -q "^Base $id is the image sha256:[0-9a-f]\{64\} already, 2 layers: nothing was unpacked\$" "$W/gz.out" && [ "$(snapshots)" = "$had" ] ||
+            fail "the layers compressed are another snapshot: $(head -n 1 "$W/gz.out")"
+
+        echo "--- a container of the snapshot"
+        "$LB" create one --base "$id" > "$W/one.out" 2>&1 || { cat "$W/one.out"; fail "create --base"; }
+        if [ -n "$(sed -n "s/^base=//p" "$C/one/.conf")" ]; then
+            echo "an overlay mounts here"
+            grep -qx "base=$id" "$C/one/.conf" && only_etc one || fail "the container does not overlay the snapshot it was given"
+            "$LB" base ls | grep -q "^$id  .*  one\$" || fail "base ls does not show the container on its snapshot"
+            said=$("$LB" base rm "$id" 2>&1) && fail "a snapshot was removed under its container"
+            case $said in *"is used by: one"*) ;; *) fail "base rm: $said" ;; esac
+            # and an import of that image is a container on it, with nothing of its own but what create writes
+            "$LB" import "$W/foreign" three > "$W/three.out" 2>&1 || { cat "$W/three.out"; fail "import of the image"; }
+            grep -qx "base=$id" "$C/three/.conf" && only_etc three && grep -q ", on the base snapshot $id, which was here\$" "$W/three.out" ||
+                fail "an image that is no export of lightbox.s is not all snapshot: $(cat "$W/three.out")"
+        else
+            echo "no overlay mounts here: a copy of the snapshot"
+            [ "$(cat "$C/one/rootfs/added/file")" = second ] && [ ! -e "$C/one/rootfs/bin/placeholder" ] || fail "the container is no copy of the snapshot"
+        fi
+        "$LB" create two --base "$id" --copy > "$W/two.out" 2>&1 || { cat "$W/two.out"; fail "create --base --copy"; }
+        ! grep -q "^base=" "$C/two/.conf" && [ "$(cat "$C/two/rootfs/added/file")" = second ] && [ "$(cat "$C/two/rootfs/etc/hostname")" = two ] &&
+            [ ! -e "$C/two/rootfs/bin/placeholder" ] || fail "a copy of the snapshot is not its files, with its own in /etc"
+        [ "$(cat "$S/etc/hostname")" = web ] || fail "what create writes for a container went into the snapshot: $(cat "$S/etc/hostname")"
+        said=$("$LB" import "$W/foreign" other --base "$id" 2>&1) && fail "import took --base"
+        case $said in *"no --base"*) ;; *) fail "import --base: $said" ;; esac
+
+        echo "--- a layer that is another than the configuration names"
+        # where the snapshot of those layers is here: held to them all the same
+        cp -r "$W/foreign" "$W/foreign-other" && python3 -I "$EDIT" "$W/foreign-other" gzip-other || fail "image_edit gzip-other"
+        said=$("$LB" base import "$W/foreign-other" 2>&1) && fail "a compressed layer that is another tree was taken for the snapshot that is here"
+        case $said in *"layer 1 of the image is, as it was unpacked, not the layer its configuration names"*) ;; *) fail "foreign-other: $said" ;; esac
+        had=$(snapshots)
+        cp -r "$W/image" "$W/other" && python3 -I "$EDIT" "$W/other" gzip-other || fail "image_edit gzip-other"
+        said=$("$LB" base import "$W/other" 2>&1) && fail "a layer that unpacks to another was made a base"
+        case $said in *"layer 1 of the image is, as it was unpacked, not the layer its configuration names"*"no snapshot of it is kept"*) ;; *) fail "gzip-other: $said" ;; esac
+        [ "$(snapshots)" = "$had" ] || fail "a refused image left a snapshot, or half of one: $(ls -A "$W/data/bases" | paste -sd" ")"
+    ' _ "$W" "$LB" "$IMAGE_EDIT" > "$W/ns.out" 2>&1
+    rc=$?
+    cat "$W/ns.out"
+    [ $rc -eq 0 ] && ! grep -q '^FAILED: ' "$W/ns.out"
+}
+
+# An import takes no work away (ROADMAP I.10). A container that is exported is
+# of a line and at a generation of it, which the image carries and an import
+# keeps; an export of a container that was started since is the next one.
+# import --replace puts an image in the place of a container that is there
+# only where the image continues the generation the container is, and the
+# container was not started since that was written: it then has the image's
+# files and generation, and its own name, address and settings. What the two
+# are to each other otherwise is said, with both generations, and both are
+# left; --force replaces all the same. No start is made here: that a
+# container was started is the record a start leaves, made by hand.
+t_import_replace() {
+    need_python || return 77
+    local rc
+    # shellcheck disable=SC2016     # the script is for the shell in the namespace
+    HOME="$W/home" LIGHTBOX_CONFIG="$CONF" unshare -r --mount -- bash -c '
+        W=$1 LB=$2 EDIT=$3 C=$1/data/containers
+        fail() { echo "FAILED: $*"; exit 1; }
+        started() { : > "$C/$1/.changed"; }
+        gen() { cat "$C/$1/.generation"; }
+        # what a refused replace says, the image, the container; and that it changed nothing
+        no() {
+            before=$(cd "$C/$3" && find . -printf "%p %y %s %T@\n" | LC_ALL=C sort)
+            said=$("$LB" import "$2" "$3" --replace 2>&1) && fail "$3 was replaced by $2: $said"
+            # the first as a pattern of grep, in which a dot stands for the apostrophe this script cannot have
+            printf "%s\n" "$said" | grep -q "$1" || fail "replace of $3 by $2: $said"
+            case $said in *"Both are left as they are. --force puts the image in its place all the same; lightbox export $3 <dir>"*) ;;
+                *) fail "replace of $3 by $2 does not say what else can be done: $said" ;; esac
+            [ "$before" = "$(cd "$C/$3" && find . -printf "%p %y %s %T@\n" | LC_ALL=C sort)" ] || fail "a refused replace changed $3"
+        }
+
+        "$LB" create web 10.0.0.2 --copy --mem 128M --vol "$W/vol:/data" > /dev/null && echo one > "$C/web/rootfs/work.txt" || fail "create"
+        "$LB" export web "$W/g1" > /dev/null || fail "export"
+        line=$(gen web | cut -d" " -f1)
+        echo "--- the next generation is of a container that was started since"
+        started web && echo two >> "$C/web/rootfs/work.txt" && "$LB" export web "$W/g2" > "$W/g2.out" || fail "a second export"
+        grep -qx "Generation 2: the container was started since the one before" "$W/g2.out" && [ ! -e "$C/web/.changed" ] &&
+            gen web | grep -qxE "$line 2 [0-9a-f]{8},[0-9a-f]{8}" || fail "not generation 2 with the first behind it: $(gen web)"
+
+        echo "--- an import is the generation its image is"
+        "$LB" import "$W/g1" there 10.0.0.9 --copy --mem 64M > /dev/null || fail "import"
+        [ "$(gen there)" = "$line 1 $(gen web | cut -d" " -f3 | cut -d, -f1)" ] && [ ! -e "$C/there/.changed" ] || fail "the import is not generation 1 of the line: $(gen there)"
+
+        echo "--- the image that continues it takes its place"
+        conf=$(grep -v "^base=" "$C/there/.conf")
+        "$LB" import "$W/g2" there --replace > "$W/replace.out" 2>&1 || { cat "$W/replace.out"; fail "replace"; }
+        cat "$W/replace.out"
+        grep -qx "Container .there. replaced: generation 2 in the place of generation 1" "$W/replace.out" &&
+            grep -qx "Its address, its limits and its settings are as they were" "$W/replace.out" || fail "replace does not say what it did"
+        [ "$(cat "$C/there/rootfs/work.txt" | paste -sd" ")" = "one two" ] && [ "$(cat "$C/there/rootfs/etc/hostname")" = there ] &&
+            grep -qx "10.0.0.9	there" "$C/there/rootfs/etc/hosts" && ! grep -q "	web\$" "$C/there/rootfs/etc/hosts" || fail "its files are not the image.s, with its own name"
+        [ "$(gen there)" = "$(gen web)" ] && [ "$(cat "$C/there/.ip")" = 10.0.0.9 ] && [ "$conf" = "$(grep -v "^base=" "$C/there/.conf")" ] &&
+            grep -qx "mem=64M" "$C/there/.conf" || fail "its generation is not the image.s, or its address and settings are not its own"
+        [ -z "$(ls -A "$C/there" | grep -v -x -e .conf -e .generation -e .ip -e .resolv -e rootfs)" ] || fail "a replace left: $(ls -A "$C/there" | paste -sd" ")"
+        said=$("$LB" import "$W/g2" there --replace 2>&1) || fail "the same image again: $said"
+        case $said in "Container "*" is generation 2 of its line already, as the image is, and was not started since: nothing was replaced") ;;
+            *) fail "the same image again: $said" ;; esac
+
+        echo "--- what is refused, with both generations"
+        no "the container is generation 2, which continues generation 1, the image.s: the container is the newer" "$W/g1" web
+        started there
+        no "the container was started since generation 2, which the image is: the container is the newer" "$W/g2" there
+        "$LB" export there "$W/g3-there" > /dev/null && started web && "$LB" export web "$W/g3-web" > /dev/null || fail "exports of both"
+        no "the container is generation 3 and the image generation 3 of one line, and neither continues the other: each has what the other has not" "$W/g3-there" web
+        "$LB" import "$W/g2" behind --copy > /dev/null && started behind || fail "import"
+        no "the container was started since generation 2, and the image is generation 3, which continues generation 2 too: each has what the other has not" "$W/g3-web" behind
+        "$LB" create fresh --copy > /dev/null || fail "create"
+        no "the container was never exported or imported, so that nothing says the image continues it" "$W/g2" fresh
+        "$LB" export fresh "$W/fresh" > /dev/null || fail "export"
+        no "the image is generation 1 of another container.s line than this one is of" "$W/fresh" web
+        cp -r "$W/g2" "$W/foreign" && python3 -I "$EDIT" "$W/foreign" no-annotations || fail "image_edit"
+        no "the image names no generation of a container.s, so that nothing says it continues this one" "$W/foreign" web
+        cp -r "$W/g2" "$W/half" && python3 -I "$EDIT" "$W/half" annotation ac.ozkr.lightbox.generation=many || fail "image_edit"
+        no "the image names no generation" "$W/half" web
+        case $said in *"Note: the image says ac.ozkr.lightbox.generation with what is no such value, which is not taken"*) ;; *) fail "a generation that is no number is not said: $said" ;; esac
+
+        echo "--- what goes with --replace, and what it needs"
+        for words in "--force" "--replace --mem 1G" "10.0.0.7 --replace" "--replace --copy"; do
+            # shellcheck disable=SC2086
+            said=$("$LB" import "$W/g3-there" web $words 2>&1) && fail "import web $words was taken"
+            case $said in *"--force goes with --replace"*|*"nothing goes with it but --force, and this does not: "*) ;; *) fail "import web $words: $said" ;; esac
+        done
+        said=$("$LB" import "$W/g2" nosuch --replace 2>&1) && fail "a container that is not there was replaced"
+        case $said in *"container does not exist: nosuch"*) ;; *) fail "no such container: $said" ;; esac
+        : > "$C/fresh/.creating"
+        said=$("$LB" import "$W/g2" fresh --replace --force 2>&1) && fail "a half-made container was replaced"
+        case $said in *"was not created completely, and no image is put in its place"*) ;; *) fail "a half-made container: $said" ;; esac
+        python3 -I -c "import os, sys; os.unlink(sys.argv[1])" "$C/fresh/.creating"
+
+        echo "--- --force replaces all the same"
+        "$LB" import "$W/g3-there" web --replace --force > "$W/force.out" 2>&1 || { cat "$W/force.out"; fail "replace --force"; }
+        grep -qx "Container .web. replaced: generation 3 in the place of generation 3" "$W/force.out" && [ "$(gen web)" = "$(gen there)" ] &&
+            [ "$(cat "$C/web/rootfs/etc/hostname")" = web ] && grep -qx "mem=128M" "$C/web/.conf" && grep -q "^vol=" "$C/web/.conf" ||
+            fail "--force did not put the image in the place of the container, with its settings kept: $(cat "$W/force.out")"
+        "$LB" import "$W/foreign" fresh --replace --force > "$W/foreign.out" 2>&1 || { cat "$W/foreign.out"; fail "replace --force by an image of no line"; }
+        [ ! -e "$C/fresh/.generation" ] && [ "$(cat "$C/fresh/rootfs/work.txt" | paste -sd" ")" = "one two" ] || fail "an image of no line left the container of one"
+
+        echo "--- an image that cannot be unpacked leaves the container as it was"
+        cp -r "$W/g3-web" "$W/broken" && python3 -I "$EDIT" "$W/broken" gzip-other || fail "image_edit"
+        # but for the time of its directory, in which the image.s files were for a while
+        before=$(cd "$C/behind" && find . -mindepth 1 -printf "%p %y %s %T@\n" | LC_ALL=C sort)
+        said=$("$LB" import "$W/broken" behind --replace --force 2>&1) && fail "an image that is not what it says was put in the place of a container"
+        case $said in *"not the layer its configuration names"*"the image was not unpacked, and the container is as it was: behind"*) ;; *) fail "a layer that is another: $said" ;; esac
+        [ "$before" = "$(cd "$C/behind" && find . -mindepth 1 -printf "%p %y %s %T@\n" | LC_ALL=C sort)" ] || fail "a replace that failed changed the container"
+    ' _ "$W" "$LB" "$IMAGE_EDIT" > "$W/ns.out" 2>&1
+    rc=$?
+    cat "$W/ns.out"
+    [ $rc -eq 0 ] && ! grep -q '^FAILED: ' "$W/ns.out"
+}
+
+# An export into the directory of the one before (ROADMAP I.13). The
+# directory holds the image of an export of the container before, and
+# nothing else: the new image takes its place, and is the image a new
+# directory gets. The layer that is the snapshot is in the directory already
+# and is not read again, which a snapshot that was changed since shows: its
+# layer is the one it was, and nothing is said of the change. No blob that
+# only the image before named is left. A directory with a file that is no
+# part of an image, an image with a blob that is not what it is named by, one
+# that export did not write so, the image of another container and a newer
+# one of this container's line are refused and left as they were, to the
+# time of every file; and so is the image before when the export fails.
+t_export_again() {
+    need_python || return 77
+    local rc
+    mkdir -p "$BASE/lib" && echo keep > "$BASE/lib/keep" || return 1
+    # shellcheck disable=SC2016     # the script is for the shell in the namespace
+    HOME="$W/home" LIGHTBOX_CONFIG="$CONF" unshare -r --mount -- bash -c '
+        W=$1 LB=$2 EDIT=$3 CHECK=$4 C=$1/data/containers
+        fail() { echo "FAILED: $*"; exit 1; }
+        listing() { (cd "$1" && find . -printf "%p %y %s %T@\n" | LC_ALL=C sort); }
+        # what a refused export says, as a pattern of grep, the container, the directory, which is left as it was
+        no() {
+            before=$(listing "$3")
+            said=$("$LB" export "$2" "$3" 2>&1) && fail "$2 was exported into $3: $said"
+            printf "%s\n" "$said" | grep -q "$1" || fail "export of $2 into $3: $said"
+            [ "$before" = "$(listing "$3")" ] || fail "an export that was refused with [$1] changed $3"
+        }
+        # a copy, made an overlay of a snapshot by its .conf, as no overlay is mounted for this
+        "$LB" create web 10.0.0.2 --copy > /dev/null && id=$("$LB" base add "$W/base" | sed -n "s/^Base \([0-9a-f]\{12\}\) taken of .*/\1/p") &&
+            [ -n "$id" ] && echo "base=$id" >> "$C/web/.conf" && mv "$C/web/rootfs" "$C/web/copy" && mkdir -p "$C/web/rootfs/etc" &&
+            cp "$C/web/copy/etc/hostname" "$C/web/rootfs/etc/hostname" || fail "no container that overlays a snapshot"
+        "$LB" export web "$W/img" > /dev/null || fail "export"
+        first=$(python3 -I "$CHECK" "$W/img" | sed -n "s/^layer 1 //p")
+
+        echo "--- into the directory of the export before: the image a new directory gets"
+        echo more > "$C/web/rootfs/more.txt" || fail "no file"
+        "$LB" export web "$W/img" > "$W/again.out" 2>&1 || { cat "$W/again.out"; fail "a second export into the directory"; }
+        cat "$W/again.out"
+        grep -q "^In the place of the image of the export before: the layer that is the base snapshot was there, and\$" "$W/again.out" ||
+            fail "the second export does not say that the snapshot was not written again"
+        "$LB" export web "$W/new" > /dev/null && diff -r "$W/img" "$W/new" || fail "it is another image than a new directory gets"
+        [ "$(ls -A "$W/img" | paste -sd" ")" = "blobs index.json oci-layout" ] && [ "$(ls -A "$W/img/blobs/sha256" | wc -l)" = 4 ] ||
+            fail "a blob that the image does not name is left: $(ls -A "$W/img/blobs/sha256" | paste -sd" ")"
+
+        echo "--- the snapshot is not read again"
+        echo changed > "$W/data/bases/$id/rootfs/lib/keep" && echo third > "$C/web/rootfs/third.txt" || fail "no change"
+        "$LB" export web "$W/img" > "$W/third.out" 2>&1 || { cat "$W/third.out"; fail "a third export into the directory"; }
+        ! grep -q "^Warning" "$W/third.out" || fail "the snapshot was read: $(grep "^Warning" "$W/third.out")"
+        out=$(python3 -I "$CHECK" "$W/img") || fail "the directory is no image any more: $out"
+        [ "$(printf "%s\n" "$out" | sed -n "s/^layer 1 //p")" = "$first" ] && printf "%s\n" "$out" | grep -q "^entry 2 file .* third.txt\$" &&
+            [ "$(ls -A "$W/img/blobs/sha256" | wc -l)" = 4 ] || fail "not the layer that was there and, over it, the files of now"
+        "$LB" export web "$W/read" 2>&1 | grep -q "^Warning: the base snapshot $id is another layer than it was" ||
+            fail "a new directory, for which the snapshot is read, does not say that it was changed"
+
+        echo "--- what is refused, and left as it was"
+        : > "$W/img/stray" && no "this one is not empty" web "$W/img" && python3 -I -c "import os, sys; os.unlink(sys.argv[1])" "$W/img/stray" || fail "stray"
+        : > "$W/img/blobs/sha256/stray" && no "holds another image, or more than one" web "$W/img" &&
+            python3 -I -c "import os, sys; os.unlink(sys.argv[1])" "$W/img/blobs/sha256/stray" || fail "stray blob"
+        cp -r "$W/img" "$W/bad" && python3 -I "$EDIT" "$W/bad" byte layer || fail "image_edit"
+        no "a layer is not what it is named by: its bytes have another SHA-256" web "$W/bad"
+        cp -r "$W/img" "$W/gz" && python3 -I "$EDIT" "$W/gz" gzip || fail "image_edit"
+        no "holds another image, or more than one" web "$W/gz"
+        cp -r "$W/img" "$W/foreign" && python3 -I "$EDIT" "$W/foreign" no-annotations || fail "image_edit"
+        no "holds another image, or more than one" web "$W/foreign"
+        "$LB" create other --copy > /dev/null || fail "create"
+        no "the directory holds the image of another container, which export does not write over" other "$W/img"
+        "$LB" import "$W/img" there --copy > /dev/null && : > "$C/there/.changed" && "$LB" export there "$W/newer" > /dev/null || fail "no newer generation"
+        no "an image of this container.s line that the container does not continue" web "$W/newer"
+        # And an export that fails while it writes leaves the image before:
+        # every file of it as it was. The layer it began was in the directory
+        # of the blobs for a while, whose own time is that of now.
+        : > "$C/web/rootfs/.wh.x"
+        files() { (cd "$W/img" && find . -type f -printf "%p %s %T@\n" | LC_ALL=C sort); }
+        before=$(files)
+        said=$("$LB" export web "$W/img" 2>&1) && fail "a tree that is no layer was exported: $said"
+        printf "%s\n" "$said" | grep -q ": .wh.x: has a name that begins with .wh." || fail "a tree that is no layer: $said"
+        [ "$before" = "$(files)" ] && [ "$(ls -A "$W/img/blobs/sha256" | wc -l)" = 4 ] || fail "an export that failed changed the image before, or left a file"
+        python3 -I -c "import os, sys; os.unlink(sys.argv[1])" "$C/web/rootfs/.wh.x"
+        python3 -I "$CHECK" "$W/img" > /dev/null || fail "after an export that failed the directory is no image"
+
+        echo "--- a copy, which is one layer"
+        "$LB" export other "$W/one" > /dev/null && echo more > "$C/other/rootfs/more.txt" && "$LB" export other "$W/one" > "$W/one.out" 2>&1 ||
+            { cat "$W/one.out"; fail "a second export of a copy into the directory"; }
+        grep -qx "In the place of the image of the export before" "$W/one.out" && [ "$(ls -A "$W/one/blobs/sha256" | wc -l)" = 3 ] &&
+            python3 -I "$CHECK" "$W/one" | grep -q "^entry 1 file .* more.txt\$" || fail "a copy was not exported in the place of its image before"
+    ' _ "$W" "$LB" "$IMAGE_EDIT" "$IMAGE_CHECK" > "$W/ns.out" 2>&1
+    rc=$?
+    cat "$W/ns.out"
+    [ $rc -eq 0 ] && ! grep -q '^FAILED: ' "$W/ns.out"
+}
+
+check 'export writes a container as an image whose every blob is what it is named by' t_export_image
+check 'export refuses what would be no image, and leaves nothing of one'  t_export_refusals
+check 'an overlay is exported as its snapshot and, over it, its own files and marks' t_export_overlay
+check 'import refuses what is no image, or another than it is named, before anything is made' t_import_refusals
+check 'import makes of an image the container that was exported, and of a compressed one too' t_import_round_trip
+check 'an image goes to a registry and back with skopeo, its base sent once, and is the same container' t_registry
+check "base import makes one snapshot of an image's layers, and create --base a container of it" t_base_import
+check 'import --replace puts an image in the place of the container it continues, and of no other' t_import_replace
+check 'export into the directory of the export before writes the new image, and no snapshot again' t_export_again
 
 summary validation

@@ -16,6 +16,7 @@
 #include <stdint.h>
 
 #include <linux/if.h>
+#include <sys/stat.h>
 #include <sys/statvfs.h>
 
 #include "../lightbox_sys.h"
@@ -30,6 +31,9 @@ SAME_VALUE(LB_AF_INET, AF_INET);
 SAME_VALUE(LB_ST_NOATIME, ST_NOATIME);
 SAME_VALUE(LB_ST_NODIRATIME, ST_NODIRATIME);
 SAME_VALUE(LB_ST_RELATIME, ST_RELATIME);
+/* utimensat's mark for a time that stays, which the kernel's headers for
+ * programs do not have */
+SAME_VALUE(LB_UTIME_OMIT, UTIME_OMIT);
 SAME_VALUE(LB_SOCK_DGRAM, SOCK_DGRAM);
 SAME_VALUE(LB_AF_NETLINK, AF_NETLINK);
 /* the families the allow-list's socket and socketpair take */

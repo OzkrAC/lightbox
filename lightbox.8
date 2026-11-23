@@ -49,9 +49,11 @@ open, and a network that reaches the internet and nothing of the host.
 .BR restart ,
 .BR reset ,
 .BR update ,
-.B exec
+.BR exec ,
+.BR run ,
+.B import
 and
-.B run
+.B base import
 are run as root, and so is
 .B create
 with
@@ -109,6 +111,15 @@ names, then
 .B rootfs
 in
 .IR lightbox.conf .
+.TP
+.BI \-\-base " id"
+The snapshot to make the container from, by the id that
+.B base ls
+shows, in the place of a base: the one
+.B base import
+unpacked an image into.
+Not with
+.BR \-\-rootfs .
 .TP
 .B \-\-copy
 A full copy of the base, and not an overlay of its snapshot.
@@ -320,11 +331,91 @@ It exits with 1 when a check fails.
 .B \-\-profile agent
 checks what a box of that profile needs too.
 .TP
+.BI export " name dir"
+Write a container that is not running as an image in
+.IR dir ,
+which is made, or taken when it is there, the caller's own, and empty or
+with the image of an export of the container before in it and nothing else,
+whose layer for the base snapshot is then not written again: an OCI
+image layout, as
+.BR skopeo (1)
+and
+.BR oras (1)
+copy one to a registry.
+A container that overlays a snapshot is two layers, the snapshot and its own
+files; a copy is one.
+The manifest carries the container's limits, and nothing of what it may do on
+a host.
+The same container gives the same image, byte for byte.
+.TP
+.BI import " dir name " \-\-replace " \fR[" \-\-force \fR]
+Put the image in
+.I dir
+in the place of a container that is there and not running, which keeps its
+name, address, limits and settings.
+An export gives a container a generation of its line, one more for each
+export of a container that was started since the one before, which the image
+carries and an import keeps.
+The image replaces the container where it continues the generation the
+container is and the container was not started since that was written;
+otherwise both are left, and what they are to each other is said.
+.B \-\-force
+replaces all the same.
+No other option goes with it.
+.TP
+.BI import " dir name \fR[\fIip\fR] [\fIoptions\fR]"
+Make a container of the image in
+.IR dir ,
+an OCI image layout, with the options of
+.B create
+but
+.B \-\-rootfs
+and
+.BR \-\-base .
+The image is read first, and every blob of it held to the size and the
+SHA-256 it is named by; an image that is not what it says, or is of another
+architecture, is refused and nothing is made.
+An image of two layers that
+.B export
+wrote is a container: a snapshot, which is taken only when none here is that
+layer, and the container's own files.
+Any other image is one snapshot.
+A layer compressed with gzip is unpacked through
+.BR gzip (1),
+which runs as nobody, without capabilities or a network, under a seccomp
+filter of its own calls.
+The process that unpacks a layer has its root in the directory it fills, no
+descriptor but the layer's, the root's and the pipe it answers on, and a
+seccomp filter of the calls the reader makes.
+The limits that no option gives are the image's, where they are no more than
+.I lightbox.conf
+gives a new container; what is more is said and not taken, and the option
+gives it.
+Nothing else an image says of its container is taken.
+.TP
 .B base ls
 List the snapshots of bases that containers overlay.
+A container's overlay is mounted with
+.BR redirect_dir=off,metacopy=off ,
+so that its own files are all in its
+.IR rootfs/ .
 .TP
 .BI "base add" " dir"
 Take a new snapshot of a base, for the containers made after it.
+.TP
+.BI "base import" " dir"
+Unpack the image in
+.IR dir ,
+an OCI image layout as
+.BR skopeo (1)
+copies one from a registry, into one snapshot, all its layers one over the
+other, for
+.BR "create \-\-base" .
+The image is read and held to its digests as
+.B import
+reads one, and a snapshot that is those layers already is found.
+An image's command and environment are not read.
+As root.
 .TP
 .BI "base rm" " id\fR..."
 Remove snapshots that no container uses.

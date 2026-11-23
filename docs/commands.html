@@ -24,7 +24,7 @@ lightbox [--config <path>] <command> [args]
 ```
 
 - **`--config <path>`** names the `lightbox.conf` to read, and comes before the command. Without it lightbox reads the file that the environment variable `LIGHTBOX_CONFIG` names, and otherwise `/etc/lightbox/lightbox.conf` ([Configuration](configuration.html#file)).
-- **Root.** `setup`, `reload`, `start`, `stop`, `restart`, `reset`, `update`, `exec` and `run` are run as root, and so is `create` with `--userns` or `--profile`; each says so before it touches anything. The other commands read and write lightbox's directories, which are root's alone on an installed host.
+- **Root.** `setup`, `reload`, `start`, `stop`, `restart`, `reset`, `update`, `exec`, `run`, `import` and `base import` are run as root, and so is `create` with `--userns` or `--profile`; each says so before it touches anything. `import` and `base import` read the whole image first, so that anyone can ask whether a directory is one. The other commands read and write lightbox's directories, which are root's alone on an installed host.
 - **An option that a command does not know** ends it with `Error: unknown option:` and the option, a word it has no use for with `Error: unexpected argument:` and the word, and an option that came without its value with `Error: option --mem requires a value`. In each case the command does nothing.
 - **A value that is not what its option takes** ends the command with the option named and what it takes, as in `Error: --mem takes <number>[K|M|G|T] or max, not: 0100M`. No value is shortened, and none is stored to be found wrong at the next start.
 - **Several names.** `start`, `stop`, `restart`, `reset` and `rm` take several names, as Docker's do, and do one container after the other, each in a process of its own. One that cannot be done ends nothing for the others: the command names those it did not do at the end, as in `Error: not started: api, db`, and its exit status is the first that was not 0.
@@ -105,6 +105,7 @@ A container with `--net none` has no address, and `create` says `created (no net
 | Option | Default | What it does |
 |---|---|---|
 | `--rootfs <path>` | `LIGHTBOX_ROOTFS`, then `rootfs` | The base to make the container from ([the order](configuration.html#rootfs-order)) |
+| `--base <id>` | none | A snapshot to make the container from, by the id that `base ls` and `base import` show, in the place of a base directory: the one [base import](#base) unpacked an image into. Not with `--rootfs` |
 | `--copy` | off | A full copy of the base in the container's directory, and not an overlay of its snapshot ([Storage](storage.html#copy)) |
 | `--mem <limit>` | `256M` | The memory limit: a [size](#sizes), or `max` for none |
 | `--swap <limit>` | `0` | The swap the container may use beyond its memory: `0`, a size, or `max` |
@@ -147,6 +148,8 @@ Each of these ends `create` before anything is made:
 |---|---|
 | The name is taken | `Error: container already exists: web` |
 | The base is not there, is not a directory, is empty or cannot be read | `Error: base rootfs does not exist:`, `is not a directory:`, `is empty:` or `cannot be read:`, and its path |
+| The base is a directory that holds an image | `Error: the base is an image and no root filesystem:`, its path, and the commands that take one: `import`, and `base import` with `create --base` |
+| `--base` names no snapshot, or is given twice or with `--rootfs` | `Error: there is no base snapshot` and the id, `Error: --base is given once: a container has one base`, or `Error: --rootfs names a base and --base a snapshot of one` |
 | The address is not one | `Error: invalid IPv4 address:` and the text |
 | The address cannot be a container's, or no address is free | An error that names the address and why ([Networking](networking.html#addresses)) |
 | `--net none` with an address or a `--link` | `Error: a container with --net none has no address:` or `has no network for --link` |
@@ -232,6 +235,91 @@ Removes containers: the directory with their files, their configuration and thei
 - **`-f`, `--force`** kills a container that runs first, as `stop -t 0` does, and then removes it.
 
 `rm` does not read a container's configuration, so a container whose configuration is damaged can always be removed. Its lines in the audit log stay, and so does the snapshot of its base ([base](#base)).
+
+## Images: a container on another machine {#images}
+
+A container that is not running is written as an image by `export`, and an image made a container by `import`, on this machine or on another of the same architecture. The image is a directory in the OCI image layout, which `skopeo` copies to a registry and back. [Storage](storage.html#images) says what is in an image and how a container maps onto it, and [Security](security.html#import) what an import takes on trust and what it does not.
+
+### export {#export}
+
+```text{.synopsis}
+lightbox export <name> <dir>
+```
+
+Writes a container that is not running as an image in `<dir>`, which `export` makes. A directory that is there is taken when it is the caller's own and empty, and when it holds the image of an earlier export of this container and nothing else; it is made the owner's alone.
+
+```console
+# lightbox export web /srv/images/web
+Exporting container 'web' to /srv/images/web...
+Container 'web' exported: 2 layers, 521 entries, 8719872 bytes
+Image sha256:140347448185c4cb25a1fcede7cc824af79da6eafb3c911db5c15073ff998ec3
+Generation 1, the first of the container's line
+```
+
+- **A container that overlays a snapshot is two layers**, the snapshot and its own files; a copy is one. Layers are tar archives that are not compressed, and the same container gives the same image, byte for byte.
+- **Its limits go with it**: memory, swap, processes, CPUs and `--ttl`, as annotations. What a container may do on a host, `--privileged`, volumes, `--net`, links, `--userns`, the seccomp profile, does not.
+- **A generation.** The first export of a container begins a *line*, at generation 1; an export after the container was started or reset is the next generation, and one with no start between is the same generation and the same image. `import --replace` reads it ([below](#import-replace)).
+- **Into the directory of the export before.** The new image takes the place of the old one, which stays whole until the new index is in place; the layer that is the snapshot is not read or written again, and the blobs that only the old image named are taken away. The image of another container, or a newer one of this container's line, is not written over.
+
+What `export` refuses, before it writes anything: a container that runs (`Error: container is running (stop it first): web`) or was not created completely, a directory that is another user's, not empty, a link or among lightbox's own files, and a tree that cannot be a layer, such as one with a name that begins with `.wh.`, with the entry named. A file it cannot write ends it, and nothing of an image is left.
+
+### import {#import}
+
+```text{.synopsis}
+lightbox import <dir> <name> [<ip>] [options]
+```
+
+Makes a container of the image in `<dir>`, with the options of `create` but `--rootfs` and `--base`. The address, the id and, with `--userns`, the range of ids are drawn on this machine, and `/etc/hostname`, `/etc/hosts` and `/etc/resolv.conf` are the new container's.
+
+```console
+# lightbox import /srv/images/web web
+Importing container 'web' from /srv/images/web...
+Container 'web' imported (ip=10.0.0.2)
+Image sha256:140347448185c4cb25a1fcede7cc824af79da6eafb3c911db5c15073ff998ec3: 2 layers, on the base snapshot 82c36559d2d2, which was here
+Limits of the image's: mem=256M pids=128 cpu=1 ttl=8h
+```
+
+- **The image is read whole first**, before root is asked for: the index, the manifest, the configuration and every layer, each held to the size and the SHA-256 it is named by, and the image to this machine's architecture. What is wrong ends the command, and nothing was made.
+- **An image that `export` wrote, of two layers,** is a snapshot and the container's own files; the snapshot is one that is here when it is that layer. Any other image is one snapshot of all its layers.
+- **A layer compressed with gzip**, as `skopeo` compresses one on its way to a registry, is unpacked through the host's `gzip`, and is held to its digest even where its snapshot is here. zstd is refused.
+- **Limits.** Those that no option gives are the image's, where they are no more than `lightbox.conf` gives a new container; what is more, and any swap, is said and not taken, and the option gives it. A lifetime is the image's.
+- **What else an image says** of its container, under lightbox's annotations or as a command to start, is said and not taken.
+
+{.ref}
+| When | It says |
+|---|---|
+| A blob is not what it is named by | `Error: <dir> is no image that import takes: a layer is not what it is named by: its bytes have another SHA-256`, and the same of the manifest or the configuration |
+| An image of another architecture | `Error: <dir> is an image for linux on arm64, and this lightbox runs linux on amd64: nothing in it would run` |
+| A layer in zstd, a Docker manifest, an index of several images | `Error: <dir> is no image that import takes:` and what it is |
+| A layer that unpacks to another than its configuration names | `Error: layer 1 of the image is, as it was unpacked, not the layer its configuration names` |
+| `--rootfs` or `--base` | `Error: import makes a container of an image, which is all the base it has: no --rootfs` |
+| An image with more than `lightbox.conf` gives | `Note: the image has mem=4G, which is more than lightbox.conf gives a new container, 256M: it is not taken, and --mem gives it more` |
+
+#### Putting an image in the place of a container {#import-replace}
+
+```text{.synopsis}
+lightbox import <dir> <name> --replace [--force]
+```
+
+A container that goes back and forth between two machines is two copies. `--replace` puts the image in the place of the container `<name>`, which is there and not running, only where nothing is lost by it: where the image continues the generation the container is, and the container was not started since that was written. The container keeps its name, its address, its id, its limits and every setting; the image brings its files and its generation. They are unpacked beside the container's own and put in their place when they are whole, so an image that cannot be unpacked leaves the container as it was. No other option goes with `--replace`.
+
+```console
+# lightbox import /srv/images/web web --replace
+Replacing container 'web' with the image in /srv/images/web...
+Container 'web' replaced: generation 2 in the place of generation 1
+Image sha256:e6948360e5ce72c9b7fa3ff57a3e04e15ddbfb5527e119ffb9332142a4f0fd76: 2 layers, on the base snapshot 82c36559d2d2, which was here
+Its address, its limits and its settings are as they were
+```
+
+Otherwise both are left, and what the two are to each other is said, with both generations:
+
+```text
+Error: container 'web' is not replaced: the container is generation 2, which continues generation 1, the image's: the container is the newer
+Both are left as they are. --force puts the image in its place all the same; lightbox export web <dir>
+keeps the container first.
+```
+
+The others: the container was started since the generation the image is, or since the one the image continues; the two went on apart from one generation; the image is of another container's line; the container was never exported or imported; the image names no generation. The same generation again, not started since, replaces nothing, says so, and is no error. `--force` replaces whatever the two are.
 
 ## Starting and stopping {#running}
 
@@ -552,14 +640,23 @@ Run as an ordinary user, `doctor` reports what it can see and says which checks 
 ```text{.synopsis}
 lightbox base ls
 lightbox base add <dir>
+lightbox base import <dir>
 lightbox base rm <id>...
 ```
 
 The snapshots of bases that containers overlay. A snapshot is taken by the first `create` from a base, and shared by every container made from that base afterwards ([Storage](storage.html#bases)).
 
-- **`base ls`** lists them: the id, when it was taken, the base it was taken of, and the containers on it.
-- **`base add <dir>`** takes a new snapshot of a base, for the containers made after it, as after an update of the base. The containers made before keep theirs. It prints the new id: `Base 3f9a1c0b7d2e taken of /var/lib/lightbox/rootfs; new containers of it use this one`.
+- **`base ls`** lists them: the id, when it was taken, the base it was taken of, and the containers on it. A snapshot of an image has the digest of its first layer as its source.
+- **`base add <dir>`** takes a new snapshot of a base, for the containers made after it, as after an update of the base. The containers made before keep theirs. It prints the new id: `Base 3f9a1c0b7d2e taken of /var/lib/lightbox/rootfs; new containers of it use this one`. A directory that holds an image is refused.
+- **`base import <dir>`** makes a snapshot of an image that somebody else built, in a directory in the OCI image layout, as `skopeo copy docker://… oci:<dir>` writes one: all its layers, read and held to their digests as `import` reads them and unpacked one over the other. A snapshot that is those layers already is found, and nothing is unpacked. As root. `create --base <id>` makes containers of it.
 - **`base rm <id>...`** removes snapshots that no container uses. One that is in use is refused, with the names of the containers on it, and the others are still removed.
+
+```console
+# lightbox base import /srv/images/alpine
+Base 82c36559d2d2 unpacked from the image sha256:0f49f331d9212aff11b932863be4eb01cdf962969aa86dab7d1ee21ac6f5f52b, 1 layer
+Note: the image names a command to start, which lightbox does not read: a container starts its /init.sh, where it has one
+A container of it: lightbox create <name> --base 82c36559d2d2
+```
 
 ```console
 # lightbox base ls
@@ -592,7 +689,7 @@ lightbox <command> --help
 lightbox --version
 ```
 
-`help` and `--help` print the usage, or one command's part of it, on standard output. `--version` prints the version of lightbox and of the lightc it was built with, as `lightbox 0.9.0 (lightc 0.1.1)`. Neither reads the configuration, so neither prints its warnings.
+`help` and `--help` print the usage, or one command's part of it, on standard output. `--version` prints the version of lightbox and of the lightc it was built with, as `lightbox 0.10.0 (lightc 0.1.1)`. Neither reads the configuration, so neither prints its warnings.
 
 Where lightbox is installed, by a package or by `make install`, `man lightbox` shows its manual page, `lightbox(8)`: the commands and their options on one page, with a line or two on each.
 
@@ -638,4 +735,4 @@ One object with three members:
 The example is shortened: `doctor` prints every setting and every check.
 
 {.source}
-Source: `lightbox.c` for the commands and their options, `lightbox_meta.c` for `ls`, `inspect`, `logs` and `doctor`, `lightbox_base.c` for `base`, `lightbox_audit.c` for the audit log, and `lightbox_container.c` and `lightbox_util.c` for the values.
+Source: `lightbox.c` for the commands and their options, `lightbox_meta.c` for `ls`, `inspect`, `logs` and `doctor`, `lightbox_base.c` for `base`, `lightbox_image.c` for `export`, `import` and the reading of an image, `lightbox_audit.c` for the audit log, and `lightbox_container.c` and `lightbox_util.c` for the values.

@@ -69,6 +69,7 @@
  *   unit loopback                             loopback_up
  *   unit caps                                 drop_capabilities, then this process's own sets
  *   unit sandbox <program> [args...]          apply_sandbox, then the program in its place
+ *   unit tool-sandbox <program> [args...]     sandbox_host_tool, then the program in its place
  *   unit maskproc                             mask_proc_paths
  *   unit noipv6  <pid>                        netns_disable_ipv6
  *   unit seconds <text>                       parse_seconds
@@ -102,6 +103,51 @@
  *                                             reconcile, as start, stop and rm call it for a
  *                                             container that ended without a stop: "cleared" or
  *                                             "nothing", then "state <what is on record now>"
+ *   unit sha256 <file> [<piece>]              the SHA-256 of a file, given to sha256_update in
+ *                                             pieces of at most that many bytes, 65536 without
+ *                                             one: its 64 hex digits
+ *   unit sha256-name <text>                   sha256_hex_ok: ok or refused
+ *   unit tar <dir> <archive> [overlay] [<uid_start> <gid_start>]
+ *                                             tar_write_tree of what is in <dir> into the file
+ *                                             <archive>, as an overlay's upper directory with
+ *                                             "overlay" and with ids less the two starts: lines
+ *                                             "entries <n>", "sockets <n>", "attributes-left <n>",
+ *                                             "bytes <n>" and "sha256 <digest>" of the archive;
+ *                                             or "failed: <entry>: <why>" and status 1
+ *   unit untar <archive> <dir> [tree|upper|upper-user [<uid_start> <gid_start> [<piece>]]]
+ *                                             tar_read_tree of the file <archive> into <dir>: as
+ *                                             one tree, or as an overlay's upper directory, root's
+ *                                             or one mounted with userxattr; with ids the two
+ *                                             starts more; the archive given in pieces of at most
+ *                                             <piece> bytes. Lines "entries <n>", "devices <n>",
+ *                                             "attributes-left <n>", "bytes <n>" and
+ *                                             "sha256 <digest>" of what was read; or
+ *                                             "failed: <entry>: <why>" and status 1
+ *   unit json-read <file> [<path>...]         json_check of the file's text, of which a byte more
+ *                                             than is read is taken: "ok", or "refused:
+ *                                             <line>:<column>: <why>" and status 1. Then json_at
+ *                                             for each path, written as RFC 6901 has one: "none",
+ *                                             "other case", or the value's kind and what it says:
+ *                                             "string <text>", "number <as written>" with " whole"
+ *                                             after one json_whole takes, "true", "false", "null",
+ *                                             and "array <count>" or "object <count>" with a line
+ *                                             "  <kind>" or "  <name>: <kind>" for each of what
+ *                                             is in it, which json_first and json_next give
+ *   unit json-text <file> <path> <size>       json_text of the value at a path into <size> bytes:
+ *                                             "<length> <text>", or "none"
+ *   unit json-is <file> <path> <text>         json_text_is of it: same or other
+ *   unit image-base <lightbox_dir> <image> <count>
+ *                                             image_open of the image in a directory, and image_base
+ *                                             of its first <count> layers, with lightbox's files in
+ *                                             <lightbox_dir>: "took <id>" or "found <id>", and
+ *                                             "entries <n>", "devices <n>" of what was unpacked; what
+ *                                             is no image, or cannot be unpacked, is said as import
+ *                                             says it, with status 1
+ *   unit overlay-options <lightbox_dir> <id> <upper> <work>
+ *                                             overlay_options of a snapshot: the options, or
+ *                                             "refused" and status 1
+ *   unit overlay-whole <dir>                  overlay_upper_whole: "whole", "not whole: <path>"
+ *                                             with status 1, or "cannot read" with status 2
  *   unit volspec <spec>                       parse_volume_spec: "<src> -> <dst> ro|rw",
  *                                             or "invalid: <what is wrong>"
  *   unit volumes <root> <spec>... [-- <probe>...]
@@ -763,6 +809,135 @@ static void unit_request(int argc, char **argv, struct exec_request *req, struct
     resolve_identity(req, argv[2], argv[3], id);
 }
 
+/* "unit tar": the archive into a file, hashed and counted on its way */
+struct unit_tar_sink {
+    int32_t    fd;
+    sha256_ctx hash;
+    uint64_t   bytes;
+};
+
+static int unit_tar_write(void *to, const void *data, size_t len) {
+    struct unit_tar_sink *sink = to;
+    sha256_update(&sink->hash, data, len);
+    sink->bytes += len;
+    return lc_kernel_write_all(sink->fd, data, len) < 0 ? -1 : 0;
+}
+
+/* "unit untar": the archive from a file, in pieces of no more than a length.
+ * "unit untar-held": the same, and the first read, which is made in the
+ * process that unpacks once it is held to what unpacking needs (ROADMAP
+ * I.12), looks at that: with "descriptors", how many it has open of the
+ * first 1024, which statx, one of its calls, tells, and the archive cannot
+ * be read unless they are three; with "call", a call that the reader never
+ * makes, getpid, which its filter ends it at. */
+struct unit_tar_source {
+    int32_t  fd;
+    uint32_t piece;
+    int      probe;     /* 0, or 1 descriptors, 2 a call */
+    bool     probed;
+};
+
+/* set by "untar-held" for "untar" */
+static struct unit_tar_source *unit_source;
+
+static int64_t unit_tar_read(void *from, void *data, size_t len) {
+    struct unit_tar_source *source = from;
+    if (source->probe && !source->probed) {
+        source->probed = true;
+        if (source->probe == 2)
+            (void)lc_kernel_get_process_id();
+        int open = 0;
+        for (int32_t fd = 0; fd < 1024; fd++) {
+            struct lb_statx st;
+            if (lb_sys_statx(fd, "", LB_AT_EMPTY_PATH, LB_STATX_TYPE, &st) == 0)
+                open++;
+        }
+        if (open != 3)
+            return -1;
+    }
+    return lc_kernel_read_retry(source->fd, data, source->piece && source->piece < len ? source->piece : len);
+}
+
+/* "unit json-read" and the two beside it: a file's text, checked, or the refusal said and status 1 */
+static char unit_json_bytes[JSON_TEXT_MAX + 1];
+static char unit_json_string[65536];
+
+static json_value unit_json_root(const char *path) {
+    lc_sysret fd = lc_kernel_open_file(path, O_RDONLY, 0);
+    if (fd < 0)
+        die2("unit: cannot open ", path);
+    lc_sysret len = lc_kernel_read_all((int32_t)fd, unit_json_bytes, sizeof(unit_json_bytes));
+    if (len < 0)
+        die2("unit: cannot read ", path);
+    json_value root;
+    json_refusal why;
+    if (json_check(unit_json_bytes, (size_t)len, &root, &why) != 0) {
+        char line[16], column[16];
+        fmt_int(line, (int)why.line);
+        fmt_int(column, (int)why.column);
+        put("refused: ");
+        put(line);
+        put(":");
+        put(column);
+        put(": ");
+        put(why.why ? why.why : "(no reason given)");
+        put("\n");
+        lc_kernel_exit(1);
+    }
+    return root;
+}
+
+static const char *unit_json_kind(json_value v) {
+    switch (json_kind_of(v)) {
+    case JSON_NULL:   return "null";
+    case JSON_FALSE:  return "false";
+    case JSON_TRUE:   return "true";
+    case JSON_NUMBER: return "number";
+    case JSON_STRING: return "string";
+    case JSON_ARRAY:  return "array";
+    case JSON_OBJECT: return "object";
+    }
+    return "(no kind)";
+}
+
+static void unit_json_put(json_value v) {
+    json_kind kind = json_kind_of(v);
+    put(unit_json_kind(v));
+    if (kind == JSON_STRING) {
+        put(" ");
+        put(json_text(v, unit_json_string, sizeof(unit_json_string)) < 0 ? "(cannot be given)" : unit_json_string);
+    } else if (kind == JSON_NUMBER) {
+        uint64_t whole;
+        put(" ");
+        (void)lc_kernel_write_all(STDOUT, v.text, v.len);
+        if (json_whole(v, &whole)) {
+            /* and the number it took is the one that is written */
+            char digits[24];
+            int at = (int)sizeof(digits);
+            digits[--at] = '\0';
+            do { digits[--at] = (char)('0' + whole % 10); whole /= 10; } while (whole);
+            size_t len = sizeof(digits) - 1 - (size_t)at;
+            put(len != v.len || lc_bytes_compare(digits + at, v.text, len) != 0 ? " whole, but another number"
+                                                                                : " whole");
+        }
+    } else if (kind == JSON_ARRAY || kind == JSON_OBJECT) {
+        put(" ");
+        put_int64((int64_t)json_count(v));
+        json_item item;
+        for (bool more = json_first(v, &item); more; more = json_next(&item)) {
+            put("  ");
+            if (item.named) {
+                put(json_text(item.name, unit_json_string, sizeof(unit_json_string)) < 0 ? "(cannot be given)"
+                                                                                         : unit_json_string);
+                put(": ");
+            }
+            put_line("", unit_json_kind(item.value));
+        }
+        return;
+    }
+    put("\n");
+}
+
 int main(int argc, char **argv, char **envp) {
     caller_argv = argv;
     caller_env = envp;
@@ -1097,6 +1272,11 @@ int main(int argc, char **argv, char **envp) {
     }
     if (argc >= 3 && streq(argv[1], "sandbox")) {
         apply_sandbox(false);
+        exec_program(argv[2], (const char *const *)(argv + 2), TOOL_ENV);
+        die2("unit: cannot execute ", argv[2]);
+    }
+    if (argc >= 3 && streq(argv[1], "tool-sandbox")) {
+        sandbox_host_tool(argv[2]);
         exec_program(argv[2], (const char *const *)(argv + 2), TOOL_ENV);
         die2("unit: cannot execute ", argv[2]);
     }
@@ -1559,6 +1739,236 @@ int main(int argc, char **argv, char **envp) {
             die("unit: the read-only clone could not be executed");
         }
         unit_report_sealed(argc, argv);
+        return 0;
+    }
+    if ((argc == 3 || argc == 4) && streq(argv[1], "sha256")) {
+        static uint8_t piece[65536];
+        int size = (int)sizeof(piece);
+        if (argc == 4 && !parse_int_in(argv[3], 1, (int)sizeof(piece), &size))
+            die("unit: a piece is 1 to 65536 bytes");
+        lc_sysret fd = lc_kernel_open_file(argv[2], O_RDONLY, 0);
+        if (fd < 0)
+            die2("unit: cannot open ", argv[2]);
+        sha256_ctx ctx;
+        sha256_init(&ctx);
+        for (;;) {
+            lc_sysret n = lc_kernel_read_retry((int32_t)fd, piece, (size_t)size);
+            if (n < 0)
+                die2("unit: cannot read ", argv[2]);
+            if (n == 0)
+                break;
+            sha256_update(&ctx, piece, (size_t)n);
+        }
+        uint8_t digest[SHA256_BYTES];
+        char hex[SHA256_HEX + 1];
+        sha256_final(&ctx, digest);
+        sha256_hex(digest, hex);
+        /* what sha256_hex writes is what sha256_hex_ok takes */
+        if (!sha256_hex_ok(hex))
+            die("unit: sha256_hex wrote what sha256_hex_ok refuses");
+        put(hex);
+        put("\n");
+        return 0;
+    }
+    if (argc >= 4 && argc <= 7 && streq(argv[1], "tar")) {
+        static tar_writer w;
+        static struct unit_tar_sink to;
+        int at = 4;
+        if (at < argc && streq(argv[at], "overlay")) {
+            w.overlay = true;
+            at++;
+        }
+        if (at != argc && (at + 2 != argc || !parse_u32_text(argv[at], &w.uid_start) ||
+                           !parse_u32_text(argv[at + 1], &w.gid_start)))
+            die("usage: unit tar <dir> <archive> [overlay] [<uid_start> <gid_start>]");
+        lc_sysret dirfd = lc_kernel_open_file(argv[2], O_RDONLY | O_DIRECTORY, 0);
+        if (dirfd < 0)
+            die2("unit: cannot open the directory ", argv[2]);
+        lc_sysret out = lc_kernel_open_file(argv[3], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (out < 0)
+            die2("unit: cannot write ", argv[3]);
+        to.fd = (int32_t)out;
+        sha256_init(&to.hash);
+        w.sink = unit_tar_write;
+        w.to = &to;
+        if (tar_write_tree(&w, (int32_t)dirfd) != 0) {
+            put("failed: ");
+            put(w.failed_at);
+            put(": ");
+            put(w.failure ? w.failure : "(no reason given)");
+            put("\n");
+            return 1;
+        }
+        uint8_t digest[SHA256_BYTES];
+        char hex[SHA256_HEX + 1];
+        sha256_final(&to.hash, digest);
+        sha256_hex(digest, hex);
+        put("entries ");
+        put_int64((int64_t)w.entries);
+        put("sockets ");
+        put_int64((int64_t)w.sockets);
+        put("attributes-left ");
+        put_int64((int64_t)w.attributes_left);
+        put("bytes ");
+        put_int64((int64_t)to.bytes);
+        put_line("sha256 ", hex);
+        return 0;
+    }
+    if (argc == 5 && streq(argv[1], "untar-held")) {
+        static struct unit_tar_source from;
+        static char *again[5];
+        if (!streq(argv[2], "descriptors") && !streq(argv[2], "call"))
+            die("usage: unit untar-held descriptors|call <archive> <dir>");
+        from.probe = streq(argv[2], "descriptors") ? 1 : 2;
+        unit_source = &from;
+        again[0] = argv[0], again[1] = "untar", again[2] = argv[3], again[3] = argv[4], again[4] = NULL;
+        argv = again;
+        argc = 4;
+    }
+    if (argc >= 4 && argc <= 8 && streq(argv[1], "untar")) {
+        static tar_reader r;
+        static struct unit_tar_source plain;
+        struct unit_tar_source *source = unit_source ? unit_source : &plain;
+        bool usage = argc == 6;
+        if (argc >= 5) {
+            if (streq(argv[4], "upper"))
+                r.into = TAR_INTO_UPPER;
+            else if (streq(argv[4], "upper-user"))
+                r.into = TAR_INTO_UPPER_USERXATTR;
+            else if (!streq(argv[4], "tree"))
+                usage = true;
+        }
+        if (argc >= 7 && (!parse_u32_text(argv[5], &r.uid_start) || !parse_u32_text(argv[6], &r.gid_start)))
+            usage = true;
+        if (argc == 8 && (!parse_u32_text(argv[7], &source->piece) || !source->piece))
+            usage = true;
+        if (usage)
+            die("usage: unit untar <archive> <dir> [tree|upper|upper-user [<uid_start> <gid_start> [<piece>]]]");
+        lc_sysret in = lc_kernel_open_file(argv[2], O_RDONLY, 0);
+        if (in < 0)
+            die2("unit: cannot read ", argv[2]);
+        lc_sysret dirfd = lc_kernel_open_file(argv[3], O_RDONLY | O_DIRECTORY, 0);
+        if (dirfd < 0)
+            die2("unit: cannot open the directory ", argv[3]);
+        source->fd = (int32_t)in;
+        r.source = unit_tar_read;
+        r.from = source;
+        r.source_fd = (int32_t)in;
+        if (tar_read_tree(&r, (int32_t)dirfd) != 0) {
+            put("failed: ");
+            put(r.failed_at);
+            put(": ");
+            put(r.failure ? r.failure : "(no reason given)");
+            put("\n");
+            return 1;
+        }
+        char hex[SHA256_HEX + 1];
+        sha256_hex(r.digest, hex);
+        put("entries ");
+        put_int64((int64_t)r.entries);
+        put("devices ");
+        put_int64((int64_t)r.devices);
+        put("attributes-left ");
+        put_int64((int64_t)r.attributes_left);
+        put("bytes ");
+        put_int64((int64_t)r.bytes);
+        put_line("sha256 ", hex);
+        return 0;
+    }
+    if (argc >= 3 && streq(argv[1], "json-read")) {
+        json_value root = unit_json_root(argv[2]);
+        put("ok\n");
+        for (int i = 3; i < argc; i++) {
+            json_value v;
+            int there = json_at(root, argv[i], &v);
+            if (there == 1)
+                unit_json_put(v);
+            else
+                put(there == 0 ? "none\n" : "other case\n");
+        }
+        return 0;
+    }
+    if (argc == 5 && streq(argv[1], "json-text")) {
+        json_value root = unit_json_root(argv[2]), v;
+        int size = number_arg(argv[4]);
+        if (size < 0 || size > (int)sizeof(unit_json_string))
+            die("unit: json-text takes 0 to 65536 bytes");
+        if (json_at(root, argv[3], &v) != 1) {
+            put("none\n");
+            return 0;
+        }
+        /* a byte after what it may write into, which has to stay */
+        if (size < (int)sizeof(unit_json_string))
+            unit_json_string[size] = '#';
+        int64_t len = json_text(v, unit_json_string, (size_t)size);
+        if (size < (int)sizeof(unit_json_string) && unit_json_string[size] != '#')
+            die("unit: json_text wrote past its size");
+        if (len < 0) {
+            if (size > 0 && unit_json_string[0] != '\0')
+                die("unit: json_text left a text it refused");
+            put("none\n");
+            return 0;
+        }
+        char digits[16];
+        fmt_int(digits, (int)len);
+        put(digits);
+        put(" ");
+        put_line("", unit_json_string);
+        return 0;
+    }
+    if (argc == 5 && streq(argv[1], "json-is")) {
+        json_value root = unit_json_root(argv[2]), v;
+        if (json_at(root, argv[3], &v) != 1) {
+            put("none\n");
+            return 0;
+        }
+        put(json_text_is(v, argv[4]) ? "same\n" : "other\n");
+        return 0;
+    }
+    if (argc == 5 && streq(argv[1], "image-base")) {
+        static image img;
+        image_unpacked unpacked = { 0 };
+        char id[BASE_ID_TEXT];
+        bool took = false;
+        cfg_global_init();
+        str_copy_or_die(cfg_global.lightbox_dir, argv[2], sizeof(cfg_global.lightbox_dir), "lightbox_dir");
+        image_open(argv[3], &img);
+        if (image_base(&img, number_arg(argv[4]), id, &took, &unpacked) != 0)
+            return 1;
+        put_line(took ? "took " : "found ", id);
+        put("entries ");
+        put_int64((int64_t)unpacked.entries);
+        put("devices ");
+        put_int64((int64_t)unpacked.devices);
+        return 0;
+    }
+    if (argc == 6 && streq(argv[1], "overlay-options")) {
+        static char options[4 * MAX_PATH];
+        cfg_global_init();
+        str_copy_or_die(cfg_global.lightbox_dir, argv[2], sizeof(cfg_global.lightbox_dir), "lightbox_dir");
+        if (!overlay_options(options, sizeof(options), argv[3], argv[4], argv[5])) {
+            put("refused\n");
+            return 1;
+        }
+        put_line(options, "");
+        return 0;
+    }
+    if (argc == 3 && streq(argv[1], "overlay-whole")) {
+        static char found[MAX_PATH];
+        int whole = overlay_upper_whole(argv[2], found, sizeof(found));
+        if (whole < 0) {
+            put("cannot read\n");
+            return 2;
+        }
+        if (whole == 0) {
+            put_line("not whole: ", found);
+            return 1;
+        }
+        put("whole\n");
+        return 0;
+    }
+    if (argc == 3 && streq(argv[1], "sha256-name")) {
+        put(sha256_hex_ok(argv[2]) ? "ok\n" : "refused\n");
         return 0;
     }
     if (argc == 3 && (streq(argv[1], "nameservers") || streq(argv[1], "dnslist"))) {
