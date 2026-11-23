@@ -1278,6 +1278,7 @@ t_records_from_before_are_read() {
     lb ls
     report=$(lb inspect web)
     kill "$holder"
+    wait "$holder" 2>/dev/null      # gone, and not only told to go: ls looked before it was, once, on 2026-11-23
     lb ls | grep -Eq "^web +10\.0\.0\.2 +exited" || { echo "the container is not seen to have been running"; return 1; }
     printf '%s\n' "$report" | grep -qx 'running: yes' && printf '%s\n' "$report" | grep -qx "pid: $holder" &&
     printf '%s\n' "$report" | grep -qx 'state: running' || { echo "inspect did not see it running"; return 1; }
@@ -2504,7 +2505,9 @@ t_export_overlay() {
     # shellcheck disable=SC2016     # the script is for the shell in the namespace
     HOME="$W/home" LIGHTBOX_CONFIG="$CONF" unshare -r --mount -- bash -c '
         W=$1 LB=$2 C=$1/data/containers
-        "$LB" create one 10.0.0.2 >/dev/null && "$LB" create two 10.0.0.3 >/dev/null || exit 1
+        # copies, which the lines below make overlays by their .conf: where an
+        # overlay mounts in such a namespace, as on CI, create would make one
+        "$LB" create one 10.0.0.2 --copy >/dev/null && "$LB" create two 10.0.0.3 --copy >/dev/null || exit 1
         id=$("$LB" base add "$W/base" | sed -n "s/^Base \([0-9a-f]\{12\}\) taken of .*/\1/p")
         [ -n "$id" ] || exit 1
         for name in one two; do
@@ -2754,16 +2757,29 @@ t_import_round_trip() {
         "$LB" import "$W/gz" unpacked > "$W/gz.out" 2>&1 || { cat "$W/gz.out"; fail "import of a compressed layer"; }
         listing "$(tree_of unpacked)" > "$W/gz.list"
         diff "$W/web.list" "$W/gz.list" || fail "a compressed layer is another tree"
+        # A layer that is not what the configuration names, where it is
+        # unpacked: with --copy every layer is, whatever is here already. The
+        # same through a snapshot is the case of base import.
         had=$(snapshots)
         for pair in "gzip-other:is, as it was unpacked, not the layer its configuration names" \
                     "gzip-cut:of the image" "gzip-more:gzip did not unpack layer 1 of the image to its end"; do
             change=${pair%%:*}
             cp -r "$W/image" "$W/$change" && python3 -I "$EDIT" "$W/$change" "$change" || fail "image_edit $change"
-            said=$("$LB" import "$W/$change" broken 2>&1) && fail "$change was imported"
+            said=$("$LB" import "$W/$change" broken --copy 2>&1) && fail "$change was imported"
             case $said in *"${pair#*:}"*) ;; *) fail "$change: $said" ;; esac
             [ ! -e "$C/broken" ] && [ "$(snapshots)" = "$had" ] && [ -z "$(ls -A "$W/data/bases" 2>/dev/null | grep "^\.")" ] ||
                 fail "$change left a container or a snapshot"
         done
+        # Where the layer the configuration names is a snapshot here already,
+        # it is not unpacked again, and the blob is held to its own digest
+        # alone: the container is that layer, whatever the blob unpacks to.
+        if [ -n "$(sed -n "s/^base=//p" "$C/unpacked/.conf")" ]; then
+            "$LB" import "$W/gzip-other" named > "$W/named.out" 2>&1 || { cat "$W/named.out"; fail "import onto the snapshot that is the layer the configuration names"; }
+            [ "$(sed -n "s/^base=//p" "$C/named/.conf")" = "$(sed -n "s/^base=//p" "$C/unpacked/.conf")" ] && [ "$(snapshots)" = "$had" ] &&
+                grep -q ", which was here\$" "$W/named.out" || fail "a layer that is here was unpacked again: $(cat "$W/named.out")"
+            listing "$(tree_of named)" > "$W/named.list"
+            diff "$W/web.list" "$W/named.list" || fail "the container is not the layer its configuration names"
+        fi
 
         echo "--- two layers and three, as one tree"
         "$LB" create over --copy > /dev/null && id=$("$LB" base add "$W/base" | sed -n "s/^Base \([0-9a-f]\{12\}\) taken of .*/\1/p") &&
