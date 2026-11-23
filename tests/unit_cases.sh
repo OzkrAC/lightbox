@@ -4890,6 +4890,38 @@ links: physdev match (xt_physdev, CONFIG_NETFILTER_XT_MATCH_PHYSDEV)" 0
     return $bad
 }
 check 'what the iptables rules need of the kernel is found registered, built in or as a module, or named' t_firewall_kernel
+
+# What start does with a cgroup_root that a reboot emptied (ROADMAP F.5), as
+# root of a user, a mount and a cgroup namespace of the case's own: an empty
+# directory, or none, gets cgroup2 mounted, and is said so; one that has it
+# is left as it is, with no second mount; a directory with something in it is
+# refused, as setup refuses it, and nothing is mounted.
+t_start_cgroup2_root() {
+    unshare -r --mount --cgroup true 2>/dev/null || { echo "user and cgroup namespaces are not available to this user"; return 77; }
+    local dir rc
+    dir=$(mktemp -d "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    mkdir -p "$dir/store" "$dir/empty" "$dir/full" && : > "$dir/full/file" || { rm -rf -- "$dir"; return 1; }
+    unshare -r --mount --cgroup -- bash -c '
+        UNIT=$1; D=$2; bad=0
+        at() { awk -v m="$1" '"'"'$5 == m { n++ } END { print n + 0 }'"'"' /proc/self/mountinfo; }
+        said=$("$UNIT" cgroup2-root "$D/store" "$D/empty" 2>&1); rc=$?; echo "empty: $said"
+        [ $rc -eq 0 ] && [ "$said" = "Mounted cgroup2 at $D/empty
+cgroup2" ] && [ "$(stat -f -c %T "$D/empty")" = cgroup2fs ] || { echo "  not mounted, or not said"; bad=1; }
+        said=$("$UNIT" cgroup2-root "$D/store" "$D/empty" 2>&1); rc=$?; echo "again: $said"
+        [ $rc -eq 0 ] && [ "$said" = cgroup2 ] && [ "$(at "$D/empty")" = 1 ] || { echo "  mounted again"; bad=1; }
+        said=$("$UNIT" cgroup2-root "$D/store" "$D/none" 2>&1); rc=$?; echo "none: $said"
+        [ $rc -eq 0 ] && [ "$(stat -f -c %T "$D/none")" = cgroup2fs ] || { echo "  not made and mounted"; bad=1; }
+        said=$("$UNIT" cgroup2-root "$D/store" "$D/full" 2>&1); rc=$?; echo "full: $said"
+        [ $rc -ne 0 ] && [ "$(at "$D/full")" = 0 ] || { echo "  a directory with a file in it was mounted on"; bad=1; }
+        case $said in *"cgroup_root $D/full is not a cgroup v2 hierarchy (it is a directory that is not empty)"*) ;;
+            *) echo "  not refused as setup refuses it"; bad=1 ;; esac
+        exit $bad
+    ' _ "$UNIT" "$dir"
+    rc=$?
+    rm -rf -- "$dir"
+    return $rc
+}
+check 'start mounts cgroup2 on an empty cgroup_root, once, and refuses one with something in it' t_start_cgroup2_root
 check 'a host tool that reads an image runs as nobody, with no capability and no network' t_tool_sandbox
 check 'where nobody has no id the tool keeps its own, and where it cannot be confined it is not run' t_tool_sandbox_without_ids
 

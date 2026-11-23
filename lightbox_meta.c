@@ -591,7 +591,7 @@ static void check_cgroups(struct doctor *d) {
     struct lb_statfs sfs;
     bool v2 = lb_sys_statfs(root, &sfs) == 0 && sfs.f_type == LB_CGROUP2_SUPER_MAGIC;
     doc_yes_no(d, "cgroup2", v2, root,
-               "boot with cgroup_no_v1=all, or set cgroup_root to an empty directory, which lightbox setup mounts cgroup2 on");
+               "boot with cgroup_no_v1=all, or set cgroup_root to an empty directory, which setup and start mount cgroup2 on");
     if (!v2)
         return;
     char path[MAX_PATH], list[256];

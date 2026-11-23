@@ -2262,6 +2262,47 @@ t_without_io_controller() {
     [ ! -d "$sub/base/limited" ] && no_link "$(port_of limited)"
 }
 
+# A host whose cgroup_root is not the system's /sys/fs/cgroup, after a
+# reboot: the cgroup2 that setup mounted there is gone, and start mounts it
+# again, as setup does, before the container's cgroup is made (ROADMAP F.5).
+# A start that finds it there mounts nothing more; a cgroup_root that is a
+# directory with something in it is refused, as setup refuses it, and leaves
+# nothing of the container. The mount here is of the one hierarchy, so the
+# suite's cgroup is below it as it is below /sys/fs/cgroup.
+t_start_mounts_cgroup2() {
+    local root=$T/cg2 rel=${CG#/sys/fs/cgroup/} said mounts
+    [ "$rel" != "$CG" ] || { echo "the suite's cgroup is not below /sys/fs/cgroup"; return 77; }
+    mkdir -p "$T/cg2conf/home/.config/lightbox" "$root" || return 1
+    sed -e "s#^cgroup_root = .*#cgroup_root = $root#" -e "s#^cgroup_base = .*#cgroup_base = $root/$rel#" \
+        "$HOME/.config/lightbox/lightbox.conf" > "$T/cg2conf/home/.config/lightbox/lightbox.conf"
+    export LIGHTBOX_CONFIG="$T/cg2conf/home/.config/lightbox/lightbox.conf"
+    mount -t cgroup2 none "$root" || return 1          # what setup mounted there before the reboot
+    box cgm || { umount "$root"; return 1; }
+    umount "$root" || return 1
+    said=$(lb start cgm 2>&1 </dev/null) || { printf '%s\n' "$said"; return 1; }
+    printf '%s\n' "$said"
+    printf '%s\n' "$said" | grep -qx "Mounted cgroup2 at $root" || { echo "start did not say that it mounted cgroup2"; return 1; }
+    settled cgm || return 1
+    grep -qx "$(pid_of cgm)" "$CG/cgm/cgroup.procs" || { echo "init is not in the container's cgroup"; return 1; }
+    lb stop cgm >/dev/null || return 1
+    mounts=$(grep -c " $root " /proc/self/mountinfo)
+    said=$(lb start cgm 2>&1 </dev/null) || { printf '%s\n' "$said"; return 1; }
+    printf '%s\n' "$said" | grep -q '^Mounted cgroup2' && { echo "a second start mounted cgroup2 again"; return 1; }
+    [ "$(grep -c " $root " /proc/self/mountinfo)" = "$mounts" ] || { echo "the mounts at $root changed"; return 1; }
+    lb stop cgm >/dev/null && lb rm cgm >/dev/null || return 1
+    umount "$root" || return 1
+    # something in it: refused, as setup refuses it
+    box cgn || return 1
+    : > "$root/not-empty"
+    mounts=$(cat /proc/self/mountinfo)
+    said=$(lb start cgn 2>&1 </dev/null) && { printf '%s\n' "$said"; echo "a start on a cgroup_root with a file in it succeeded"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *"cgroup_root $root is not a cgroup v2 hierarchy (it is a directory that is not empty)"*) ;; *) return 1 ;; esac
+    [ "$mounts" = "$(cat /proc/self/mountinfo)" ] || { echo "the mount table changed"; return 1; }
+    [ ! -d "$CG/cgn" ] && [ "$(state_of cgn)" = stopped ] && no_link "$(port_of cgn)" ||
+        { echo "the refused start left something of the container"; return 1; }
+}
+
 t_cgroup_membership() {
     up member || return 1
     grep -qx "$(pid_of member)" "$CG/member/cgroup.procs" || { echo "init is not in the container's cgroup"; return 1; }
@@ -4845,6 +4886,7 @@ if [ "$MODE" = inside ]; then
     check '--io-max reaches io.max'                                        t_io_limit
     check 'past its memory limit a process is killed, and its container with it' t_past_the_memory_limit
     check 'without io, a container starts and is told once; with an I/O limit, not' t_without_io_controller
+    check 'start mounts cgroup2 at a cgroup_root of its own that a reboot emptied, as setup does' t_start_mounts_cgroup2
     check "init is in the container's cgroup, and a command run by exec in its exec's below it" t_cgroup_membership
 
     check 'the init hook runs with /tmp and /run mounted'                 t_hook_runs

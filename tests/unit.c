@@ -148,6 +148,8 @@
  *                                             "refused" and status 1
  *   unit overlay-whole <dir>                  overlay_upper_whole: "whole", "not whole: <path>"
  *                                             with status 1, or "cannot read" with status 2
+ *   unit cgroup2-root <store> <cgroup_root>   ensure_cgroup2_for_start with the store's lock in
+ *                                             <store>: what it says, then "cgroup2"; or its error
  *   unit firewall-kernel <proc_net> <modules> true|false
  *                                             iptables_kernel_missing with ip_masq as given:
  *                                             "all there", "missing: <what>" with status 1, or
@@ -1956,6 +1958,15 @@ int main(int argc, char **argv, char **envp) {
             return 1;
         }
         put_line(options, "");
+        return 0;
+    }
+    if (argc == 4 && streq(argv[1], "cgroup2-root")) {
+        /* the store's lock in a directory of the case's, and cgroup_root */
+        if (!str_copy(cfg_global.container_dir, argv[2], sizeof(cfg_global.container_dir)) ||
+            !str_copy(cfg_global.cgroup_root, argv[3], sizeof(cfg_global.cgroup_root)))
+            return 2;
+        ensure_cgroup2_for_start();
+        put("cgroup2\n");
         return 0;
     }
     if (argc == 5 && streq(argv[1], "firewall-kernel")) {

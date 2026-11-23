@@ -2292,8 +2292,17 @@ void ensure_host_network(const char *starting) {
         /* what took setup's rules took those of the links too */
         (void)put_back_running_links(starting);     /* each has said why, if it could not */
     }
-    if (lock >= 0)
-        lc_kernel_close_file(lock);
+    store_unlock(lock);
+}
+
+void ensure_cgroup2_for_start(void) {
+    struct lb_statfs sfs;
+    if (lb_sys_statfs(cfg_global.cgroup_root, &sfs) == 0 && sfs.f_type == LB_CGROUP2_SUPER_MAGIC)
+        return;
+    /* as setup, and one at a time: whoever waited finds it mounted */
+    int32_t lock = store_lock();
+    ensure_cgroup2_root();
+    store_unlock(lock);
 }
 
 /* LIGHTBOX-USER is the host's, made by lightbox: taken away with its jump

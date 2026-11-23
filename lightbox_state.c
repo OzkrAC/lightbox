@@ -440,6 +440,13 @@ bool store_lock_held(void) {
     return store_held;
 }
 
+void store_unlock(int32_t fd) {
+    if (fd < 0)
+        return;
+    lc_kernel_close_file(fd);
+    store_held = false;
+}
+
 int32_t container_lock_try(const char *name) {
     char dir[MAX_PATH];
     container_dir_path(dir, name);

@@ -935,6 +935,8 @@ int32_t store_lock(void);
 /* Whether this process holds the store's lock: it does from a store_lock()
  * that found a store until it ends. */
 bool store_lock_held(void);
+/* The store's lock let go, as store_lock gave it; -1 is nothing to let go. */
+void store_unlock(int32_t fd);
 /* A container's lock if no command holds it, without waiting: the
  * descriptor that holds it, or -1. */
 int32_t container_lock_try(const char *name);
@@ -1088,6 +1090,10 @@ bool bridge_traffic_is_filtered(void);
  * start makes it again when it is not all there, as setup makes it.
  */
 void ensure_host_network(const char *starting);
+/* cgroup_root a cgroup v2 hierarchy for a start, mounted there as setup
+ * mounts it where a reboot took the mount (ROADMAP F.5), under the store's
+ * lock; and refused as setup refuses it where that cannot be done. */
+void ensure_cgroup2_for_start(void);
 /* What of it is not there, as "the bridge, the firewall rules", or NULL
  * when all of it is. The firewall is looked at only by root. */
 const char *host_network_missing(void);

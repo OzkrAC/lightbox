@@ -4675,6 +4675,10 @@ static void start_one(const char *name, int hook_wait) {
     if (!path_exists(root)) die2("Error: container does not exist: ", name);
 
     if (is_running(name)) die2("Error: container is already running: ", name);
+    /* cgroup v2 at cgroup_root, which a reboot took where setup mounted it;
+     * a container of any network needs it, and so does what reconcile
+     * clears away */
+    ensure_cgroup2_for_start();
     (void)reconcile(name);          /* an earlier run that ended without a stop */
     container_forget_pid(name);     /* and whatever else one left on record */
 

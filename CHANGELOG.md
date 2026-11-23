@@ -13,6 +13,7 @@ Not tagged yet: what is written of the next release so far.
 
 ### Fixed
 
+- **`start` mounts cgroup2 where a reboot took the mount `setup` made.** On a host whose `cgroup_root` is not the system's own `/sys/fs/cgroup`, `setup` mounts cgroup2 on that empty directory, and a reboot takes the mount away. A start after it made the bridge, the rules and forwarding again, and not that mount, and failed where it made the container's cgroup. `start` now mounts cgroup2 there first, as `setup` does, under the store's lock, for a container of any network; a `cgroup_root` that `setup` would refuse it refuses with the same words, and leaves nothing of the container.
 - **A snapshot that a killed command left unfinished is cleared away.** A `create`, `import`, `base add` or `base import` that was killed while it took a snapshot of a base left `bases/.<id>.new`, with up to the base's size in it, and nothing ever removed it, as no later snapshot has that name. The next command that takes a snapshot takes every such directory away, as `base rm` does, and says so: `Removed an unfinished base snapshot, which a command that was killed left: <path>`. It does that only under the store's lock, which every command that takes a snapshot holds, so that none of them loses one it is making.
 
 ## 0.10.0
