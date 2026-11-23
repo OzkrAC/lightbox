@@ -1420,12 +1420,63 @@ void image_notes(const image *img, const image_unpacked *unpacked) {
              ": a container starts its /init.sh, where it has one");
 }
 
+/*
+ * A compressed layer that is not unpacked, as its snapshot is here: held all
+ * the same to the digest its configuration names, through the host's gzip,
+ * and nothing written (the maintainer's word of 2026-11-23). What a snapshot
+ * has was held to that digest when it was made, so that no byte of a blob
+ * that is another tree could reach a container; but an image that is not what
+ * it says would be taken on a machine that has the layer and refused on one
+ * that has not. 0, or -1 once said.
+ */
+static int layers_held(const image *img, int count) {
+    static uint8_t piece[65536];
+    for (int i = 0; i < count && i < img->nlayers; i++) {
+        const image_layer *layer = &img->layers[i];
+        if (!layer->gzip)
+            continue;   /* its blob is the layer, held to that digest when it was read */
+        char number[24], hex[SHA256_HEX + 1];
+        uint8_t digest[SHA256_BYTES];
+        int32_t out = -1, status = 0;
+        sha256_ctx hash;
+        u64_text(number, (uint64_t)i + 1);
+        lc_sysret gzip = lc_kernel_seek_position(layer->fd, 0, 0) == 0 ? gzip_start(layer->fd, &out) : -1;
+        if (gzip < 0) {
+            print_str(STDERR, "Error: cannot start gzip to hold layer ");
+            print_str(STDERR, number);
+            print_str(STDERR, " to its digest\n");
+            return -1;
+        }
+        sha256_init(&hash);
+        lc_sysret n;
+        while ((n = lc_kernel_read_retry(out, piece, sizeof(piece))) > 0)
+            sha256_update(&hash, piece, (size_t)n);
+        lc_kernel_close_file(out);
+        bool gzip_failed = wait_child((int32_t)gzip, &status) < 0 || exit_code_from_status(status) != 0;
+        sha256_final(&hash, digest);
+        sha256_hex(digest, hex);
+        if (n < 0 || gzip_failed) {
+            print_str(STDERR, "Error: gzip did not unpack layer ");
+            print_str(STDERR, number);
+            print_str(STDERR, " of the image to its end\n");
+            return -1;
+        }
+        if (!streq(hex, layer->diff_id)) {
+            print_str(STDERR, "Error: layer ");
+            print_str(STDERR, number);
+            print_str(STDERR, " of the image is, as it was unpacked, not the layer its configuration names\n");
+            return -1;
+        }
+    }
+    return 0;
+}
+
 int image_base(const image *img, int count, char id[BASE_ID_TEXT], bool *took, image_unpacked *total) {
     static char layers[BASE_IMAGE_TEXT_MAX];
     *took = false;
     image_layers_text(img, count, layers);
     if (base_of_layers(layers, id))
-        return 0;
+        return layers_held(img, count);
 
     /* its source line is no path: what it was unpacked from */
     char source[sizeof(DIGEST_PREFIX) + SHA256_HEX + 32], fresh[MAX_PATH], rootfs[MAX_PATH];

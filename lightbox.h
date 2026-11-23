@@ -697,6 +697,16 @@ int list_bases(char ids[][NAME_MAX_LEN + 1], int max);
 /* The mount options of an overlay of a snapshot with this upper and work
  * directory, or false where a path cannot go into them. */
 bool overlay_options(char *out, size_t max, const char *id, const char *upper, const char *work);
+/* What every overlay of a container is mounted with beside its directories
+ * (ROADMAP I.14): no directory stands for one of the snapshot, and no file
+ * keeps its bytes there, so that a container's files are all in its rootfs/
+ * on every host, whatever the host's own settings for overlays are. */
+#define OVERLAY_WHOLE_OPTIONS "redirect_dir=off,metacopy=off"
+/* Whether an upper directory is all of what it stands for: 1 yes; 0 no, with
+ * the path of the first entry that is not, a directory moved from the
+ * snapshot or a file whose bytes are there, as an overlay mounted without
+ * those options leaves them; -1 when it cannot be read through. */
+int overlay_upper_whole(const char *upper, char *found, size_t max);
 void cmd_base(int argc, char **argv);
 
 /* ─── Images (lightbox_image.c, ROADMAP Track I) ────────────────────────── */

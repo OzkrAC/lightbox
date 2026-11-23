@@ -3918,6 +3918,42 @@ t_import_replace() {
     lb reset genb >/dev/null 2>&1 </dev/null && [ -e "$C/genb/.changed" ] || { echo "a reset left no record that the container changed"; return 1; }
 }
 
+# A container's files are all in its rootfs/ (ROADMAP I.14). Its overlay is
+# mounted with redirect_dir and metacopy off, which the mount shows where
+# the host's own setting is the other; a directory of the snapshot that the
+# container moves is copied, and its export is whole. create puts on record
+# that its upper directory is whole. One from before whose rootfs/ has a
+# redirect, as an overlay with redirect_dir on leaves one, is looked
+# through at its start and refused, with the entry named; without it, it
+# starts and is on record as whole.
+t_overlay_whole() {
+    command -v python3 >/dev/null 2>&1 || { echo "no python3 to set an attribute with"; return 77; }
+    local pid opts said out
+    OVERLAY=1
+    up whole || return 1
+    [ -n "$(base_of whole)" ] && [ -e "$C/whole/.overlay-whole" ] || { echo "create did not put on record that the upper directory is whole"; return 1; }
+    pid=$(pid_of whole)
+    opts=$(awk '$5 == "/" { for (i = 7; i <= NF; i++) if ($i == "-") { print $(i + 3); exit } }' "/proc/$pid/mountinfo")
+    echo "the container's root: $opts; the host's: redirect_dir=$(cat /sys/module/overlay/parameters/redirect_dir 2>/dev/null) metacopy=$(cat /sys/module/overlay/parameters/metacopy 2>/dev/null)"
+    case ",$opts," in *,redirect_dir=on,*|*,metacopy=on,*) echo "the overlay is mounted with redirect_dir or metacopy on"; return 1 ;; esac
+    case ",$opts," in *,upperdir=*) ;; *) echo "the container's root is no overlay: $opts"; return 1 ;; esac
+    sh_in whole 'mv /lbt /lbt-moved && test -x /lbt-moved/busybox && ! test -e /lbt' || { echo "a directory of the snapshot could not be moved"; return 1; }
+    lb stop whole >/dev/null && lb export whole "$T/whole-image" >/dev/null 2>&1 </dev/null || { echo "the container that moved a directory is not exported"; return 1; }
+    out=$(python3 -I "$HERE/image_check.py" "$T/whole-image") || { printf '%s\n' "$out"; return 1; }
+    printf '%s\n' "$out" | grep -qE "^entry 2 (file|hardlink) .* lbt-moved/busybox( -> .*)?\$" &&
+        printf '%s\n' "$out" | grep -qE '^entry 2 file [0-7]{4} 0:0 0 \.wh\.lbt$' || { echo "the moved directory is not whole in the container's own layer"; return 1; }
+
+    # one from before, with a redirect in its own files
+    setfattr_py() { python3 -I -c 'import os, sys; os.setxattr(sys.argv[1], "trusted.overlay.redirect", b"/lbt")' "$1"; }
+    rm "$C/whole/.overlay-whole" && setfattr_py "$C/whole/rootfs/lbt-moved" || return 1
+    said=$(lb start whole 2>&1 </dev/null) && { echo "a container with a redirect in its own files was started"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *"has in its own files what an overlay leaves"*"  lbt-moved"*"so it is not started"*) ;; *) echo "the refusal does not name the entry"; return 1 ;; esac
+    [ ! -e "$C/whole/.overlay-whole" ] && [ "$(state_of whole)" = stopped ] || { echo "a refused start left a record"; return 1; }
+    python3 -I -c 'import os, sys; os.removexattr(sys.argv[1], "trusted.overlay.redirect")' "$C/whole/rootfs/lbt-moved" || return 1
+    start whole && [ -e "$C/whole/.overlay-whole" ] || { echo "a container that is whole was not started, or not put on record"; return 1; }
+}
+
 # ─── Cases: where the settings are ──────────────────────────────────────────
 
 # Named by neither --config nor LIGHTBOX_CONFIG, the settings are those of
@@ -4855,6 +4891,7 @@ if [ "$MODE" = inside ]; then
     check "base import makes a snapshot of an image's layers, and create --base a container that starts" t_base_import
     check "a registry's own image is a base, and a container of it runs the image's tools" t_registry_image
     check 'import --replace puts an image in the place of the container it continues, and of none that was started since' t_import_replace
+    check "an overlay is mounted with redirect_dir and metacopy off, and a container's own files are whole" t_overlay_whole
     check 'no case ran ip or nsenter, which were masked in every one'     t_no_ip_or_nsenter_ran
 
     # last: it may leave a kernel setting changed for the rest of this suite's life

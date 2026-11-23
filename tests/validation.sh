@@ -2790,14 +2790,12 @@ t_import_round_trip() {
                 fail "$change left a container or a snapshot"
         done
         # Where the layer the configuration names is a snapshot here already,
-        # it is not unpacked again, and the blob is held to its own digest
-        # alone: the container is that layer, whatever the blob unpacks to.
+        # as it is where an overlay mounts, the compressed one is held to
+        # that digest all the same, and refused as it is everywhere else.
         if [ -n "$(sed -n "s/^base=//p" "$C/unpacked/.conf")" ]; then
-            "$LB" import "$W/gzip-other" named > "$W/named.out" 2>&1 || { cat "$W/named.out"; fail "import onto the snapshot that is the layer the configuration names"; }
-            [ "$(sed -n "s/^base=//p" "$C/named/.conf")" = "$(sed -n "s/^base=//p" "$C/unpacked/.conf")" ] && [ "$(snapshots)" = "$had" ] &&
-                grep -q ", which was here\$" "$W/named.out" || fail "a layer that is here was unpacked again: $(cat "$W/named.out")"
-            listing "$(tree_of named)" > "$W/named.list"
-            diff "$W/web.list" "$W/named.list" || fail "the container is not the layer its configuration names"
+            said=$("$LB" import "$W/gzip-other" named 2>&1) && fail "an image whose layer is another than it says was taken where its snapshot is"
+            case $said in *"is, as it was unpacked, not the layer its configuration names"*) ;; *) fail "gzip-other onto its snapshot: $said" ;; esac
+            [ ! -e "$C/named" ] && [ "$(snapshots)" = "$had" ] || fail "a refused import onto a snapshot left a container or a snapshot"
         fi
 
         echo "--- two layers and three, as one tree"
@@ -3041,6 +3039,10 @@ with tarfile.open(sys.argv[1], "w", format=tarfile.PAX_FORMAT) as t:
         case $said in *"no --base"*) ;; *) fail "import --base: $said" ;; esac
 
         echo "--- a layer that is another than the configuration names"
+        # where the snapshot of those layers is here: held to them all the same
+        cp -r "$W/foreign" "$W/foreign-other" && python3 -I "$EDIT" "$W/foreign-other" gzip-other || fail "image_edit gzip-other"
+        said=$("$LB" base import "$W/foreign-other" 2>&1) && fail "a compressed layer that is another tree was taken for the snapshot that is here"
+        case $said in *"layer 1 of the image is, as it was unpacked, not the layer its configuration names"*) ;; *) fail "foreign-other: $said" ;; esac
         had=$(snapshots)
         cp -r "$W/image" "$W/other" && python3 -I "$EDIT" "$W/other" gzip-other || fail "image_edit gzip-other"
         said=$("$LB" base import "$W/other" 2>&1) && fail "a layer that unpacks to another was made a base"

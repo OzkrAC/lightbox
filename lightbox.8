@@ -391,6 +391,10 @@ Nothing else an image says of its container is taken.
 .TP
 .B base ls
 List the snapshots of bases that containers overlay.
+A container's overlay is mounted with
+.BR redirect_dir=off,metacopy=off ,
+so that its own files are all in its
+.IR rootfs/ .
 .TP
 .BI "base add" " dir"
 Take a new snapshot of a base, for the containers made after it.

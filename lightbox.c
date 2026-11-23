@@ -1249,7 +1249,8 @@ static bool overlay_mounts_here(const char *name, const container_config *userns
     pos = str_append(options, pos, ",upperdir=", sizeof(options), &cut);
     pos = str_append(options, pos, upper, sizeof(options), &cut);
     pos = str_append(options, pos, ",workdir=", sizeof(options), &cut);
-    str_append(options, pos, work, sizeof(options), &cut);
+    pos = str_append(options, pos, work, sizeof(options), &cut);
+    str_append(options, pos, "," OVERLAY_WHOLE_OPTIONS, sizeof(options), &cut);
     struct overlay_job job = {
         .merged = merged, .options = options,
         .lower = userns ? lower : NULL,
@@ -1496,6 +1497,9 @@ static void say_imported(const image *img, const container_config *cfg, const im
  * container is half made, and what is taken away when it cannot be made.
  */
 static const image *create_image;
+
+/* .overlay-whole: that a container's own files are all there (ROADMAP I.14), see require_upper_whole */
+static int upper_whole_keep(const char *name);
 
 /* How much of a thing a limit lets a container have: bytes of memory or of
  * swap, processes, or microseconds of CPU in each period. False for a text
@@ -2004,6 +2008,12 @@ static void cmd_create(int argc, char **argv) {
      * that continues it may be put in its place (ROADMAP I.10) */
     if (create_image && create_image->gen.lineage[0] && generation_keep(name, &create_image->gen) != 0) {
         create_err = "failed to keep which generation of its line the container is";
+        goto fail_create;
+    }
+
+    /* a new upper directory, which lightbox's overlay alone ever wrote into */
+    if (cfg.base[0] && upper_whole_keep(name) != 0) {
+        create_err = "failed to record that the container's own files are whole";
         goto fail_create;
     }
 
@@ -4588,6 +4598,51 @@ typedef void (*per_container)(const char *name, int seconds);
     lc_kernel_exit(first);
 }
 
+/*
+ * A container that overlays a snapshot is mounted with OVERLAY_WHOLE_OPTIONS
+ * since 0.10 (ROADMAP I.14). One made before, on a host whose overlays
+ * moved a directory of the snapshot by a mark in the upper directory, or
+ * kept a file's bytes there, would show such a directory empty and such a
+ * file as holes. Its rootfs/ is looked through once, at its first start, and
+ * a container in which an entry is so is not started; one that is whole is
+ * on record as such in .overlay-whole, as is every container that create,
+ * import and reset make the upper directory of.
+ */
+static bool upper_whole_path(char out[MAX_PATH], const char *name) {
+    char cdir[MAX_PATH];
+    container_dir_path(cdir, name);
+    return path_join(out, MAX_PATH, cdir, ".overlay-whole");
+}
+
+static int upper_whole_keep(const char *name) {
+    char path[MAX_PATH];
+    return upper_whole_path(path, name) ? write_file_atomic(path, "", MODE_PRIVATE_FILE) : -1;
+}
+
+static void require_upper_whole(const char *name, const char *root) {
+    char path[MAX_PATH], found[MAX_PATH];
+    if (!upper_whole_path(path, name))
+        die2("Error: the path of the container's directory is too long: ", name);
+    if (path_exists(path))
+        return;
+    int whole = overlay_upper_whole(root, found, sizeof(found));
+    if (whole < 0)
+        die2("Error: cannot read through the container's own files, to see that they are all there: ", name);
+    if (whole == 0) {
+        print_str(STDERR, "Error: container '");
+        print_str(STDERR, name);
+        print_str(STDERR, "' has in its own files what an overlay leaves when it moves a directory of the\n"
+                          "snapshot by a mark or keeps a file's bytes there, which lightbox's overlays no longer do:\n  ");
+        print_str(STDERR, has_control_chars(found) ? "(a name with control characters)" : found);
+        print_str(STDERR, "\nMounted as lightbox mounts it now, that would be empty or holes, so it is not started.\n"
+                          "It was made by a lightbox before 0.10 on a host with redirect_dir or metacopy on; copy\n"
+                          "out what it has with a lightbox of that version, or create it again.\n");
+        lc_kernel_exit(failure_status);
+    }
+    if (upper_whole_keep(name) != 0)
+        print_str(STDERR, "Warning: could not record that the container's own files are whole; the next start looks again\n");
+}
+
 static void start_one(const char *name, int hook_wait) {
     require_root("start");
 
@@ -4670,6 +4725,7 @@ static void start_one(const char *name, int hook_wait) {
         if (!overlay_dirs(name, work, merged) || !overlay_options(overlay, sizeof(overlay), config.base, root, work))
             die2("Error: the paths of the container's overlay cannot go into its options: ", name);
         start_root = merged;
+        require_upper_whole(name, root);
     }
 
     /* A container without links gets an isolated port on the bridge: it
@@ -5276,6 +5332,8 @@ static void reset_one(const char *name, int seconds) {
         die2("Error: failed to write the container's files in /etc; it is left half made, and reset\n"
              "makes it whole: ", name);
     container_forget_run(name);
+    if (upper_whole_keep(name) != 0)
+        print_str(STDERR, "Warning: could not record that the container's own files are whole; the next start looks again\n");
     /* it is not what its generation was written of any more (ROADMAP I.10) */
     if (generation_started(name) != 0)
         print_str(STDERR, "Warning: could not record that the container was reset since its generation was written\n");
@@ -5463,6 +5521,8 @@ static void import_replace(const image *img, const char *name, bool force) {
         replace_failed("failed to keep which generation of its line the container is now", name);
     generation_unchanged(name);
     container_forget_run(name);
+    if (overlay && upper_whole_keep(name) != 0)
+        replace_failed("failed to record that the container's own files are whole", name);
     if (remove_file_durably(creating) != 0)
         die("Error: failed to mark the container as replaced");
     require_rm_rf(old);

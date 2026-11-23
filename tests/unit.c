@@ -143,6 +143,11 @@
  *                                             "entries <n>", "devices <n>" of what was unpacked; what
  *                                             is no image, or cannot be unpacked, is said as import
  *                                             says it, with status 1
+ *   unit overlay-options <lightbox_dir> <id> <upper> <work>
+ *                                             overlay_options of a snapshot: the options, or
+ *                                             "refused" and status 1
+ *   unit overlay-whole <dir>                  overlay_upper_whole: "whole", "not whole: <path>"
+ *                                             with status 1, or "cannot read" with status 2
  *   unit volspec <spec>                       parse_volume_spec: "<src> -> <dst> ro|rw",
  *                                             or "invalid: <what is wrong>"
  *   unit volumes <root> <spec>... [-- <probe>...]
@@ -1898,6 +1903,31 @@ int main(int argc, char **argv, char **envp) {
         put_int64((int64_t)unpacked.entries);
         put("devices ");
         put_int64((int64_t)unpacked.devices);
+        return 0;
+    }
+    if (argc == 6 && streq(argv[1], "overlay-options")) {
+        static char options[4 * MAX_PATH];
+        cfg_global_init();
+        str_copy_or_die(cfg_global.lightbox_dir, argv[2], sizeof(cfg_global.lightbox_dir), "lightbox_dir");
+        if (!overlay_options(options, sizeof(options), argv[3], argv[4], argv[5])) {
+            put("refused\n");
+            return 1;
+        }
+        put_line(options, "");
+        return 0;
+    }
+    if (argc == 3 && streq(argv[1], "overlay-whole")) {
+        static char found[MAX_PATH];
+        int whole = overlay_upper_whole(argv[2], found, sizeof(found));
+        if (whole < 0) {
+            put("cannot read\n");
+            return 2;
+        }
+        if (whole == 0) {
+            put_line("not whole: ", found);
+            return 1;
+        }
+        put("whole\n");
         return 0;
     }
     if (argc == 3 && streq(argv[1], "sha256-name")) {

@@ -327,8 +327,89 @@ bool overlay_options(char *out, size_t max, const char *id, const char *upper, c
     pos = str_append(out, pos, ",upperdir=", max, &cut);
     pos = str_append(out, pos, upper, max, &cut);
     pos = str_append(out, pos, ",workdir=", max, &cut);
-    str_append(out, pos, work, max, &cut);
+    pos = str_append(out, pos, work, max, &cut);
+    str_append(out, pos, "," OVERLAY_WHOLE_OPTIONS, max, &cut);
     return !cut;
+}
+
+/* ─── An upper directory that is all of a container's own files (ROADMAP I.14) */
+
+/* A name an overlay keeps of an entry in its upper directory that says the
+ * entry is not all there: the directory or the file is in the snapshot. */
+static bool overlay_left(int32_t fd, const char *const names[], size_t count) {
+    static const char *const prefixes[] = { "trusted.overlay.", "user.overlay." };
+    for (size_t p = 0; p < 2; p++)
+        for (size_t i = 0; i < count; i++) {
+            char name[48];
+            bool cut = false;
+            str_append(name, str_append(name, 0, prefixes[p], sizeof(name), &cut), names[i], sizeof(name), &cut);
+            if (!cut && lb_sys_fgetxattr(fd, name, NULL, 0) >= 0)
+                return true;
+        }
+    return false;
+}
+
+/* Below a directory that is open: 1 whole; 0 with the first entry that is
+ * not, its path from the top in found; -1 for one that cannot be read. */
+static int upper_walk(int32_t dirfd, char *found, size_t max, size_t at, int depth) {
+    static const char *const of_dirs[] = { "redirect" }, *const of_files[] = { "metacopy" };
+    if (depth > 4096)
+        return -1;
+    if (overlay_left(dirfd, of_dirs, 1))
+        return 0;
+    char buf[4096];
+    for (;;) {
+        lc_sysret n = lc_kernel_read_directory(dirfd, buf, sizeof(buf));
+        if (n < 0)
+            return -1;
+        if (n == 0)
+            return 1;
+        for (lc_sysret pos = 0; pos < n; ) {
+            /* struct linux_dirent64: d_reclen at offset 16, d_type at 18, d_name at 19 */
+            uint16_t reclen;
+            lc_bytes_copy(&reclen, buf + pos + 16, sizeof(reclen));
+            if (reclen == 0)
+                return -1;
+            const char *entry = buf + pos + 19;
+            pos += reclen;
+            if (entry[0] == '.' && (entry[1] == '\0' || (entry[1] == '.' && entry[2] == '\0')))
+                continue;
+            struct lb_statx st;
+            if (lb_sys_statx(dirfd, entry, AT_SYMLINK_NOFOLLOW, LB_STATX_TYPE, &st) < 0)
+                return -1;
+            uint32_t kind = st.stx_mode & LB_S_IFMT;
+            if (kind != LB_S_IFDIR && kind != LB_S_IFREG)
+                continue;
+            bool cut = false;
+            size_t here = str_append(found, str_append(found, at, at ? "/" : "", max, &cut), entry, max, &cut);
+            if (cut)
+                return -1;
+            lc_sysret fd = lc_kernel_open_file_at(dirfd, entry, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC |
+                                                  (kind == LB_S_IFDIR ? O_DIRECTORY : 0), 0);
+            if (fd < 0)
+                return -1;
+            int rc = kind == LB_S_IFDIR ? upper_walk((int32_t)fd, found, max, here, depth + 1)
+                                        : overlay_left((int32_t)fd, of_files, 1) ? 0 : 1;
+            lc_kernel_close_file((int32_t)fd);
+            if (rc != 1)
+                return rc;
+            found[at] = '\0';
+        }
+    }
+}
+
+int overlay_upper_whole(const char *upper, char *found, size_t max) {
+    found[0] = '\0';
+    lc_sysret fd = lc_kernel_open_file(upper, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC, 0);
+    if (fd < 0)
+        return -1;
+    int rc = upper_walk((int32_t)fd, found, max, 0, 0);
+    lc_kernel_close_file((int32_t)fd);
+    if (rc == 0 && !found[0] && max > 1) {
+        found[0] = '.';
+        found[1] = '\0';
+    }
+    return rc;
 }
 
 /* ─── lightbox base ls | rm | add ──────────────────────────────────────── */

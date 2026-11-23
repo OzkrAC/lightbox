@@ -4747,6 +4747,50 @@ t_image_base() {
         tar_helpers; untar_helpers; image_base_case"
 }
 check "an image's layers are unpacked into a snapshot once, which is found by them after" t_image_base
+
+# An overlay of a container is mounted with redirect_dir and metacopy off
+# (ROADMAP I.14), whatever the host's settings are, and an upper directory
+# from before is looked through for what either left: a directory with a
+# redirect, a file with a metacopy, under either name an overlay keeps them
+# by, found where it is and named by its path. An opaque directory and a
+# whiteout are what an overlay without the two leaves too, and are whole.
+t_overlay_whole() {
+    local said bad=0 d
+    d=$(mktemp -d "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    said=$("$UNIT" overlay-options "$d" 0123456789ab /up /work)
+    echo "$said"
+    [ "$said" = "lowerdir=$d/bases/0123456789ab/rootfs,upperdir=/up,workdir=/work,redirect_dir=off,metacopy=off" ] ||
+        { echo "the options are not the three directories and the two off"; bad=1; }
+    mkdir -p "$d/up/etc" "$d/up/opt/deep/er" "$d/up/srv" && echo x > "$d/up/opt/deep/er/file" && echo y > "$d/up/srv/file" &&
+        ln -s nowhere "$d/up/link" && mkfifo "$d/up/fifo" || { rm -rf -- "$d"; return 1; }
+    attr() { python3 -I -c 'import os, sys; os.setxattr(sys.argv[1], sys.argv[2], sys.argv[3].encode())' "$@"; }
+    unattr() { python3 -I -c 'import os, sys; os.removexattr(sys.argv[1], sys.argv[2])' "$@"; }
+    if ! command -v python3 >/dev/null || ! attr "$d/up/srv" user.overlay.opaque y 2>/dev/null; then
+        echo "no python3, or no user.* attribute can be set here"; rm -rf -- "$d"; return 77
+    fi
+    is() { # what it is about, what is said, the status that goes with it
+        said=$("$UNIT" overlay-whole "$d/up")
+        local rc=$?
+        [ "$said" = "$2" ] && [ $rc -eq "$3" ] || { echo "$1: $said, status $rc"; bad=1; }
+    }
+    is "a tree with an opaque directory, a link and a pipe" "whole" 0
+    attr "$d/up/opt/deep" user.overlay.redirect /elsewhere
+    is "a directory with a redirect" "not whole: opt/deep" 1
+    unattr "$d/up/opt/deep" user.overlay.redirect
+    attr "$d/up/opt/deep/er/file" user.overlay.metacopy ""
+    is "a file with a metacopy" "not whole: opt/deep/er/file" 1
+    unattr "$d/up/opt/deep/er/file" user.overlay.metacopy
+    attr "$d/up" user.overlay.redirect /x
+    is "the top with a redirect" "not whole: ." 1
+    unattr "$d/up" user.overlay.redirect
+    is "the same tree again" "whole" 0
+    chmod 000 "$d/up/opt"
+    if [ "$(id -u)" != 0 ]; then is "a directory that cannot be read" "cannot read" 2; fi
+    chmod 755 "$d/up/opt"
+    rm -rf -- "$d"
+    return $bad
+}
+check 'an overlay is mounted with redirect_dir and metacopy off, and an upper directory is looked through for either' t_overlay_whole
 check 'a host tool that reads an image runs as nobody, with no capability and no network' t_tool_sandbox
 check 'where nobody has no id the tool keeps its own, and where it cannot be confined it is not run' t_tool_sandbox_without_ids
 
