@@ -1,4 +1,4 @@
-<!doctype html><html lang="en"><meta charset="utf-8"><title>Storage · lightbox</title><meta name="description" content="Every file and directory lightbox keeps, bases and their snapshots, containers as overlays and as copies, reset, volumes and whose their files are, the logs as files, and what takes disk."><script src="https://cdn.luccet.dev/v2.0.0/luccet.js"></script>
+<!doctype html><html lang="en"><meta charset="utf-8"><title>Storage · lightbox</title><meta name="description" content="Every file and directory lightbox keeps, bases and their snapshots, containers as overlays and as copies, reset, images and how a container is one, volumes and whose their files are, the logs as files, and what takes disk."><script src="https://cdn.luccet.dev/v2.0.0/luccet.js"></script>
 
 :::use
 https://cdn.luccet.dev/themes/v1.0.0/classic.css
@@ -13,7 +13,7 @@ docs.css
 # Storage {#top}
 
 {.brief}
-Everything lightbox keeps is a file in one of three directories. This page shows them all, and what a container's root filesystem is made of: a snapshot of its base, which containers share, the container's own files on top of it, and the volumes that bring in directories of the host.
+Everything lightbox keeps is a file in one of three directories. This page shows them all, and what a container's root filesystem is made of: a snapshot of its base, which containers share, the container's own files on top of it, and the volumes that bring in directories of the host. And what an image is, in which a container goes to another machine.
 
 ::toc
 
@@ -28,7 +28,9 @@ Three settings name the directories: [`lightbox_dir`](configuration.html#conf-li
 │   └── 3f3f51180fc8/             a snapshot of a base, by its id
 │       ├── rootfs/               the copy of the base that containers overlay
 │       ├── source                the path of the base it was taken of
-│       └── taken                 when it was taken
+│       ├── taken                 when it was taken
+│       ├── layer                 its digest as a layer, once an export wrote it
+│       └── image                 the layers of an image it was unpacked from
 ├── rootfs/                       the base of the rootfs setting, yours to fill
 └── containers/                   container_dir
     └── web/                      a container
@@ -38,6 +40,9 @@ Three settings name the directories: [`lightbox_dir`](configuration.html#conf-li
         ├── .conf                 its configuration
         ├── .ip                   its address
         ├── .resolv               what create wrote in its resolv.conf
+        ├── .generation           its line and generation, once exported or imported
+        ├── .changed              started or reset since that generation
+        ├── .overlay-whole        its own files are all in rootfs/
         ├── console.log           what its init, its hook and its services print
         ├── .runner               in a box of run: the run it belongs to
         └── .creating             while create or reset has not finished with it
@@ -60,7 +65,9 @@ The three directories and each container's directory are mode 0700, and lightbox
 |---|---|
 | `<lightbox_dir>` | Mode 0700. `setup` makes it, and restricts one that is there to 0700 and says so; `make install` and the packages make it too |
 | `<lightbox_dir>/audit.log` | Mode 0600, made by the first `exec` or `run`. Two lines for every `exec`, appended; never rotated ([the audit log](commands.html#audit-log)) |
-| `<lightbox_dir>/bases/<id>/` | Mode 0700, made by `create` and by `base add`. A snapshot: `rootfs/` with the copy of the base, `source` with the base's path, and `taken` with the time as seconds and nanoseconds since 1970. It is made as `.<id>.new` and renamed when it is whole |
+| `<lightbox_dir>/bases/<id>/` | Mode 0700, made by `create`, `base add`, `import` and `base import`. A snapshot: `rootfs/` with the copy of the base, `source` with the base's path, and `taken` with the time as seconds and nanoseconds since 1970. It is made as `.<id>.new` and renamed when it is whole |
+| `…/bases/<id>/layer` | Mode 0600, written by `export`: `sha256:<digest> <size>` of the snapshot written as a layer, by which `import` and the next `export` know it ([Images](#images)) |
+| `…/bases/<id>/image` | Written by `import` and `base import` into a snapshot they unpacked: a line `sha256:<digest>` for each layer, as it is unpacked, by which a later import finds it. Its `source` is the first layer's digest, and no `create` from a base directory takes it |
 | `<lightbox_dir>/rootfs/` | The default of the `rootfs` setting, which `make install` and the packages make, empty. Nothing of lightbox's writes to a base |
 | `<container_dir>` | Mode 0700, made by `setup`, by `make install` and by the packages. `create` does not make it |
 | `<container_dir>/<name>/` | Mode 0700, made by `create`. `rm` removes it whole |
@@ -68,6 +75,9 @@ The three directories and each container's directory are mode 0700, and lightbox
 | `…/.work/`, `…/.merged/` | Mode 0700, for an overlay only, made by `create` and made anew by `reset`. `.merged/` is empty on the host |
 | `…/.conf` | Mode 0600, written by `create`, `update`, `add-vol` and `rm-vol`. The container's configuration ([Configuration](configuration.html#container-conf)) |
 | `…/.ip`, `…/.resolv` | Mode 0600, written by `create`. The container's address, which one of `--net none` has none of, and the text of its `resolv.conf` |
+| `…/.generation` | Mode 0600, written by `export` and `import`: `<line> <number> <token>,…`, the line the container is of, its generation, and the tokens of the last 32 generations ([Images](#images)) |
+| `…/.changed` | An empty mark that a `start` or a `reset` of a container with `.generation` makes, and the next `export` takes away |
+| `…/.overlay-whole` | An empty mark, of an overlay: its own files are all in `rootfs/` ([below](#overlay)). `create`, `import`, `reset` and `import --replace` make it, and the first `start` of a container made before 0.10 does once it has looked |
 | `…/console.log` | Mode 0600, made by the first `start`. Appended to at every start; never rotated ([logs](#logs)) |
 | `…/.runner` | Mode 0600, in a box that `run` made. The PID and the start time of that `run`, by which the next `run` finds a box whose `run` is gone |
 | `…/.creating` | An empty mark that `create` and `reset` make, and take away when the container is whole. A container that has it is shown as `creating`, and `start` refuses it |
@@ -83,7 +93,7 @@ A few things are not in the list because they are not files of lightbox's:
 - **Cgroups.** A container's cgroup is `<cgroup_base>/<name>` in the kernel's cgroup filesystem, there while the container runs ([How it works](internals.html#cgroups)).
 - **The network.** The bridge, a container's interfaces and the firewall rules are in the kernel only ([Networking](networking.html#overview)).
 
-Two kinds of name are left by a command that was killed at the wrong moment. A file whose name ends in `.tmp.<pid>` is the new content of the file beside it, which was about to be renamed into place; nothing reads it. Directories called `.try-lower`, `.try-upper`, `.try-work` and `.try-root` in a container's directory are where `create` and `reset` try whether an overlay can be mounted. A container that an older lightbox started, before 0.5, has `.pid`, `.pid_start` and `.state` in its own directory: they are read where today's records are missing, and removed with them.
+Three kinds of name are left by a command that was killed at the wrong moment. A file whose name ends in `.tmp.<pid>` is the new content of the file beside it, which was about to be renamed into place; nothing reads it. Directories called `.try-lower`, `.try-upper`, `.try-work` and `.try-root` in a container's directory are where `create` and `reset` try whether an overlay can be mounted, and `.rootfs.new` and `.rootfs.old` where `import --replace` puts an image's files and the container's own while it puts the one in the place of the other; the next `import --replace` takes them away. A container that an older lightbox started, before 0.5, has `.pid`, `.pid_start` and `.state` in its own directory: they are read where today's records are missing, and removed with them.
 
 ## Bases and snapshots {#bases}
 
@@ -148,7 +158,7 @@ A container's root filesystem is an overlay of two directories, which the kernel
 - **`.work/`** is the directory overlayfs needs beside the upper layer for its own use.
 - **The overlay is mounted on `.merged/`, in the container's mount namespace only.** On the host `.merged/` is an empty directory, and `rootfs/` shows the container's own files and nothing of the base. `inspect` gives the path of `rootfs/`.
 
-The overlay is mounted `nodev`, and `nosuid` unless the container is privileged ([Security](security.html#rootfs)). With `--userns` the snapshot is seen through an idmapped mount, so that its files, host root's on the disk, are the container's root's, and `rootfs/` belongs on the host to the container's own range of ids ([user namespaces](security.html#userns)).
+The overlay is mounted `nodev`, and `nosuid` unless the container is privileged ([Security](security.html#rootfs)). It is also mounted with `redirect_dir=off` and `metacopy=off`, whatever the host's own settings for overlays say, so that `rootfs/` is all of the container's own files: a directory of the base that the container moves is copied into `rootfs/`, and a file whose mode or owner it changes is copied whole. That is what lets `export` write a container's own files as a layer on every host. A container made before 0.10, on a host where either setting was on, may have in `rootfs/` a directory that stands for one in the snapshot or a file whose bytes are there, which would be empty or holes as it is mounted now: its first start looks through `rootfs/` once, refuses such a container with the entry named, and puts one that has none on record in `.overlay-whole`. With `--userns` the snapshot is seen through an idmapped mount, so that its files, host root's on the disk, are the container's root's, and `rootfs/` belongs on the host to the container's own range of ids ([user namespaces](security.html#userns)).
 
 :::warning[Changing a container's files from the host]
 A file of the base that you want to change from the host has to be in `rootfs/` first. Appending to `rootfs/etc/passwd` while the container has the base's `passwd` makes a file of only what you appended, which then hides the base's. Change the file inside the container, with `exec`, or copy it into `rootfs/` and change the copy. Do either while the container is stopped: the kernel does not say what an overlay shows when its layers are changed under it. Never change a snapshot.
@@ -202,6 +212,61 @@ What it does, in this order:
 A reset that is cut short leaves the container half made, with its mark: it is shown as `creating`, and `start` refuses it. `reset` again makes it whole.
 
 `reset` needs root. It refuses a container that is a copy of its base. A box of the agent profile is reset between tasks, to throw away all that a task did outside the workspace ([Agent boxes](agents.html#reset)); the [command reference](commands.html#reset) has the options.
+
+## Images {#images}
+
+An image is a container written as files that can be taken to another machine: a directory in the OCI image layout, which `export` writes and `import` reads, and which `skopeo` copies to a registry and back. [Commands](commands.html#images) has the commands and their options, and [Security](security.html#import) what an import takes on trust.
+
+```text
+/srv/images/web/
+├── oci-layout                    {"imageLayoutVersion":"1.0.0"}
+├── index.json                    the one manifest, by its digest
+└── blobs/sha256/
+    ├── 1403474481…               the manifest: the configuration, the layers, the annotations
+    ├── 43689ff103…               the configuration: the architecture and each layer's digest
+    ├── 86562f7331…               layer 2: the container's own files, a tar archive
+    └── a041bced6c…               layer 1: the snapshot, a tar archive
+```
+
+Every file under `blobs/sha256/` is named by its own SHA-256. The directory and its files are mode 0700 and 0600, its owner's alone, as an image holds every file of the container, its secrets among them.
+
+### A container as an image {#image-layers}
+
+- **An overlay is two layers.** The first is the snapshot of its base, the second the container's own files, `rootfs/`, with what it took out of its base marked as an image marks it: a file it removed as `.wh.<name>`, and a directory it made anew with `.wh..wh..opq` in it. A copy is one layer.
+- **One tree is one archive.** The layers are tar archives that are not compressed, with the entries of a directory in the order of their names and no time but the files' own, so that the same container gives the same image, byte for byte, and every container of one snapshot has the same first layer: a registry is sent it once. The snapshot keeps the digest of its layer in `layer`, and an `export` into the directory of the one before does not read it again.
+- **Ids from 0.** The files of a container with `--userns` are written as the container sees them, with its range taken off, and `import --userns` adds the range it draws.
+- **The manifest's annotations** carry the container's memory, swap, process and CPU limits and its `--ttl`, its name, and its generation, under `ac.ozkr.lightbox.`. Nothing in an image says what a container may do on a host.
+
+### An image as a container {#image-import}
+
+`import` reads the image whole and holds every blob to its digest, then makes a container as `create` makes one:
+
+- **Of an image that `export` wrote**, the first layer becomes a snapshot, unless one is here that is that layer, which the snapshot knows by `layer` or `image`; and the second the container's own files, its marks made the overlay's own.
+- **Of any other image**, all its layers become one snapshot, unpacked one over the other, so that a `reset` gives the container the whole image back.
+- **Where no overlay mounts**, and with `--copy`, every layer goes into one tree in `rootfs/`.
+
+A second import of the same image, or of another container on the same snapshot, takes no second snapshot.
+
+### A registry's image as a base {#image-base}
+
+An image that somebody else built is a base too, once a tool has copied it into a directory:
+
+```console
+# skopeo copy docker://docker.io/library/alpine:3.24 oci:/srv/images/alpine
+# lightbox base import /srv/images/alpine
+Base 82c36559d2d2 unpacked from the image sha256:0f49f331d9212aff11b932863be4eb01cdf962969aa86dab7d1ee21ac6f5f52b, 1 layer
+Note: the image names a command to start, which lightbox does not read: a container starts its /init.sh, where it has one
+A container of it: lightbox create <name> --base 82c36559d2d2
+# lightbox create web --base 82c36559d2d2
+```
+
+`create` finds the newest snapshot of a base directory by itself, and never takes a snapshot of an image for one; such a snapshot is named by its id, with `--base`. An image's command, environment, user and ports are not read: a container starts its `/init.sh`, so an image made for Docker gets a hook that runs what its `CMD` runs ([the init hook](guide.html#init)).
+
+### Generations {#generations}
+
+A container that goes back and forth between two machines is two copies, and an import over the wrong one would lose work. The first export of a container begins a *line*, 16 hex digits drawn then, at generation 1, and every generation has a token of 8 hex digits of its own. An export of a container that was started or reset since the one before is the next generation; one with no start between is the same, and gives the same image. The image carries the line, the number and the tokens of the last 32 generations, and `import` keeps them in `.generation`.
+
+`import --replace` puts an image in the place of a container only when the container's newest token is among those the image comes from and the container was not started since: the image then continues the container, and nothing is lost. `export` keeps to the same rule the other way: into a directory that holds an image of the container's line, it writes only where the container continues that image.
 
 ## Volumes {#volumes}
 
@@ -288,6 +353,7 @@ What takes room:
 | What | How much | To see it |
 |---|---|---|
 | A snapshot | The base's size, once for all its containers; next to nothing where the filesystem shares blocks | `du -sh /var/lib/lightbox/bases/*/rootfs` |
+| An image | The container's files, the snapshot among them, not compressed, wherever it was written | `du -sh <dir>` |
 | An overlay container | What it wrote, changed or removed | `du -sh /var/lib/lightbox/containers/*/rootfs` |
 | A copy | The base's size, each, and what the container wrote | the same |
 | `console.log` | Everything the container's services printed | `ls -lh /var/lib/lightbox/containers/*/console.log` |
@@ -298,7 +364,7 @@ To free it:
 
 - `lightbox rm <name>` removes a container with all its own files and its `console.log`. Its volumes' sources stay, and so do its lines in the audit log.
 - `lightbox reset <name>` throws away what an overlay container wrote in its root.
-- `lightbox base ls` shows the snapshots that no container is on, with `-`, and `lightbox base rm <id>` removes them.
+- `lightbox base ls` shows the snapshots that no container is on, with `-`, and `lightbox base rm <id>` removes them; a snapshot that `base import` made is one of them until a container is made of it.
 - `console.log` is opened to append, so it can be emptied while the container runs: `truncate -s 0 /var/lib/lightbox/containers/web/console.log`.
 - `audit.log` is opened anew for every line, so it can be moved aside. `logs --audit` then shows what is in the file that is there.
 - A directory in `bases/` whose name begins with a dot and ends in `.new` is a snapshot that a killed command did not finish. Nothing uses it, and it can be removed.
@@ -310,4 +376,4 @@ To keep a container from filling a disk, put what it writes where there is a lim
 - **`container_dir` on a filesystem of its own**, so that the containers fill that and not the host's root.
 
 {.source}
-`lightbox_base.c` keeps the snapshots and has the `base` commands. `lightbox_state.c` names every file of a container and of its records. `lightbox_container.c` decides what a volume may be. `lightbox.c` has `create`, `reset`, and the taking and mounting of volumes; `lightbox_audit.c` writes the audit log.
+`lightbox_base.c` keeps the snapshots and has the `base` commands. `lightbox_image.c` writes and reads images and their generations, `lightbox_tar.c` their layers, `lightbox_json.c` their JSON and `lightbox_sha256.c` their digests. `lightbox_state.c` names every file of a container and of its records. `lightbox_container.c` decides what a volume may be. `lightbox.c` has `create`, `reset`, and the taking and mounting of volumes; `lightbox_audit.c` writes the audit log.

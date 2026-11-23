@@ -18,7 +18,7 @@
 
 /* What --version says: the release, set when it is tagged, and "-dev" after
  * it on the way to the next one. */
-#define LIGHTBOX_VERSION "0.10.0-dev"
+#define LIGHTBOX_VERSION "0.10.0"
 
 #define MAX_PATH         512
 #define NAME_MAX_LEN     30

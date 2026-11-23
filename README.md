@@ -1,6 +1,6 @@
 # lightbox
 
-A minimal, secure Linux container runtime: one static binary of about 320 KB, with no libc, built on [lightc](https://github.com/OscarAC/lightc). It makes the Linux system calls it needs itself, a container's network among them, and runs a few host tools for the rest: `iptables` or `nft` for the firewall, and `cp` and `rm` for a container's files (see [How it works](#how-it-works)).
+A minimal, secure Linux container runtime: one static binary of about 330 KB, with no libc, built on [lightc](https://github.com/OscarAC/lightc). It makes the Linux system calls it needs itself, a container's network among them, and runs a few host tools for the rest: `iptables` or `nft` for the firewall, and `cp` and `rm` for a container's files (see [How it works](#how-it-works)).
 
 **Documentation:** [ozkr.ac/lightbox](https://ozkr.ac/lightbox/), ten pages on getting started, every command, the configuration, storage, the network, the sandbox, agent boxes, how lightbox works and what to do when something is wrong. They are the `docs/` directory of this repository; this file has the same in short.
 
@@ -45,10 +45,10 @@ From 0.9.0 on a [release](https://github.com/OzkrAC/lightbox/releases) holds lig
 sha256sum --check --ignore-missing SHA256SUMS
 
 # Debian, Ubuntu
-sudo apt install ./lightbox_0.9.0-1_amd64.deb
+sudo apt install ./lightbox_0.10.0-1_amd64.deb
 
 # Void Linux
-xbps-rindex -a lightbox-0.9.0_1.*.xbps
+xbps-rindex -a lightbox-0.10.0_1.*.xbps
 sudo xbps-install --repository="$PWD" lightbox
 ```
 

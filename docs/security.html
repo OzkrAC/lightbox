@@ -408,6 +408,23 @@ When it is the right choice:
 
 `--privileged` and `--userns` can be given together. The container then has every capability and no filter, in a user namespace whose root is an unprivileged uid of the host's: it mounts and configures what is its own, and is nobody to the host. `--profile agent` refuses `--privileged`.
 
+## What an import trusts {#import}
+
+An image is somebody else's word: the export of a container on another machine, or an image that somebody built and a registry keeps. `import` and `base import` take its files, as a base is taken, and the limits it carries within what this host allows; they take nothing else on its word.
+
+- **Every blob is held to the size and the SHA-256 it is named by** before a byte of it is unpacked: the manifest by the index, the configuration and the layers by the manifest. What is unpacked from a layer is held once more to the digest the configuration names for it, compressed or not, and also where its snapshot is here already. An image that is not what it says is refused, and nothing is made.
+- **The JSON is read strictly.** A name that is there twice in one object, a name on the way to a value in letters of another case, bytes that are no UTF-8, half a surrogate pair and `\u0000` are refused, so that lightbox and a registry never read two different manifests in one text.
+- **A layer is unpacked by lightbox's own reader,** in a process whose root is the directory it fills, so that no name and no link of the archive leads out of it. It takes the tar formats a layer is written in and refuses the rest by name; a device is not made. Before it reads a byte it closes every descriptor but the archive's, its root's and the pipe it answers on, and installs a seccomp filter of the twenty-odd calls unpacking makes, with no `execve`, `mount`, `chroot`, `ptrace`, socket or signal and no page of code: a call that is not there ends it. That holds against a fault in the reader that bytes of an archive could reach.
+- **The host's `gzip` unpacks a compressed layer** as nobody, with no capability, a network of its own with nothing in it, `no_new_privs`, and a seccomp filter of its own calls: one `execve`, of that `gzip`, and `ioctl` only to ask whether a descriptor is a terminal, so that it cannot type into yours. It has the blob, a pipe and the command's standard error. zstd is refused.
+- **What a container may do on this host is said on this host.** `--privileged`, volumes, `--net`, links, `--userns` and the seccomp profile are the options of `import` and their defaults here; an image that asks for any of them is told so, and is not obeyed. Its memory, process and CPU limits are taken only where they are no more than `lightbox.conf` gives a new container, and its swap not at all.
+- **An image's command, environment, user and ports are not read.** A container of it starts its own `/init.sh`, in the sandbox.
+
+What an import does not do:
+
+- **It does not say who made an image.** A digest says that the bytes are the ones the manifest names, not whose they are. Who may push to a repository is the registry's accounts; a signature, where you want one, is checked by the tool that fetches the image, as `skopeo` can, and a name with a digest, `docker://docker.io/library/alpine@sha256:<digest>`, pins one image.
+- **It does not limit what an image unpacks to.** A layer may fill the disk that `lightbox_dir` and `container_dir` are on (see [What it does not keep out](#not-covered)).
+- **Its files run in the container.** What an image holds is trusted as a base is: it runs in the sandbox, as the container's root. Take images from where you would take software for the host.
+
 ## Threat model {#threat-model}
 
 lightbox keeps what runs in a container away from the host and from the other containers, as far as the kernel's namespaces, the sandbox and the firewall can:
@@ -428,10 +445,10 @@ A container has no cgroup namespace and no time namespace of its own: it sees th
 - **`--privileged` turns the sandbox off.** Such a container has all capabilities, no seccomp filter and no device program. Give it only to what needs that (see [`--privileged`](#privileged)).
 - **With `--net nat` the host itself is in reach,** as it was for every container before 0.8, and still is for a container created then: services of the host that listen on the bridge's address, or on all addresses, answer such a container, and so do the host's networks. Give a container `--net outside`, the default, unless it needs them, or keep the services to the addresses they are for.
 - **What a container writes in a volume comes back untrusted.** A file there cannot be setuid, but it can be a script, a Makefile, a git hook or a configuration that names a command, and it runs with your rights when you run it. Read what changed before anything on the host builds, opens or runs it, and mount `:ro` what a container only has to read.
-- **Disk is not limited.** A container's files, its `console.log`, which is not rotated, and the audit log take what the disk has. Keep `lightbox_dir` and `container_dir` on a filesystem of their own if a full disk there must not be a full disk for the host.
+- **Disk is not limited.** A container's files, its `console.log`, which is not rotated, the audit log, and what an image unpacks to take what the disk has. Keep `lightbox_dir` and `container_dir` on a filesystem of their own if a full disk there must not be a full disk for the host.
 - **A lifetime is kept inside the container.** `--ttl` ends a container that is forgotten, and does not hold one that has got past its sandbox (see [Limits](#limits)).
 - **Whoever runs lightbox is root.** lightbox does not decide who may use it: giving someone `sudo lightbox` is giving them root, as a volume can be any directory of the host.
-- **Images are trusted as files.** `create` takes a base as it is. What it contains runs in the sandbox, with the container's root, and no signature or checksum of it is checked: take a base from where you trust, and check what you download.
+- **Images are trusted as files.** `create` takes a base as it is, and `import` an image as its digests say. What either contains runs in the sandbox, with the container's root, and no signature is checked: take a base or an image from where you trust, and check what you download (see [What an import trusts](#import)).
 - **The network rules are the firewall's.** A reload or flush of the host's firewall takes them until `lightbox reload` or the next `start` puts them back (see [After a firewall's reload](networking.html#reload)).
 
 ## A container for code you do not trust {#hardening}
@@ -462,4 +479,4 @@ What no option does for you:
 - **Run `lightbox doctor`** after a change of kernel or of host, and `doctor --profile agent` before the first box: each check that fails says how to fix it.
 
 {.source}
-Source: `lightbox_seccomp.h` for the two profiles, `lightbox_devices.h` for the devices and their program, `lightbox_userns.c` for ranges and idmapped mounts, and `lightbox.c` for capabilities, the masks, the mounts of a container and `exec`. `tests/seccomp_cases.sh`, `tests/devices_filter.c` and the sandbox cases of `tests/lifecycle.sh` check each of them.
+Source: `lightbox_seccomp.h` for the two profiles and the filters of the process that unpacks and of `gzip`, `lightbox_tar.c` for the reader of a layer, `lightbox_image.c` and `lightbox_json.c` for the reading of an image, `lightbox_devices.h` for the devices and their program, `lightbox_userns.c` for ranges and idmapped mounts, and `lightbox.c` for capabilities, the masks, the mounts of a container and `exec`. `tests/seccomp_cases.sh`, `tests/devices_filter.c` and the sandbox cases of `tests/lifecycle.sh` check each of them.

@@ -533,6 +533,21 @@ Error: --profile agent refuses --privileged
 What the agent profile needs and refuses: [The profile](agents.html#profile).
 :::
 
+:::member
+```text
+Error: /srv/images/web is no image that import takes: a layer is not what it is named by: its bytes have another SHA-256
+Error: /srv/images/web is an image for linux on arm64, and this lightbox runs linux on amd64: nothing in it would run
+```
+`import` and `base import` read an image whole before they make anything, and say what is wrong with it: a blob that is not what it is named by, one that is missing, a layer in zstd, a Docker manifest, an index of several images. Nothing was made. A directory that `skopeo copy` wrote while it was cut short, or a copy that a disk ran full under, is not whole: copy the image again into a directory that is not there.
+:::
+
+:::member
+```text
+Error: container 'web' is not replaced: the container was started since generation 2, which the image is: the container is the newer, and the image would take away what it did since
+```
+`import --replace` puts an image in the place of a container only where the image continues the container and the container was not started since its generation was written, so that no work is lost. The message says what the two are to each other. Export the container first if what it did is to be kept, then decide which of the two goes on; `--force` replaces all the same ([Generations](storage.html#generations)).
+:::
+
 ### Starting and stopping {#errors-start}
 
 :::member
@@ -624,6 +639,15 @@ lightbox.conf, and containers reach this host and nothing beyond it
 Error: interrupted by signal 2; the start was undone
 ```
 Ctrl-C, or a `kill`, while `start` was working. Nothing of the container is left running, and the exit status is 128 plus the signal's number.
+:::
+
+:::member
+```text
+Error: container 'web' has in its own files what an overlay leaves when it moves a directory of the
+snapshot by a mark or keeps a file's bytes there, which lightbox's overlays no longer do:
+  srv/data
+```
+A container made by a lightbox before 0.10, on a host whose overlays had `redirect_dir` or `metacopy` on, moved a directory of its base, or changed a file's mode or owner, in a way that leaves the directory or the file's bytes in the snapshot. lightbox now mounts every overlay with both off, and such an entry would show as an empty directory or as holes, so the container is not started. Copy out what it has with the lightbox it was made with, or create it again. A container that has no such entry starts, and is not looked through again ([Storage](storage.html#overlay)).
 :::
 
 ### Running a command {#errors-exec}
@@ -740,7 +764,8 @@ lightbox clears up after itself, also after a container that ended without a sto
 - **A cgroup that cannot be removed.** A container's cgroup is `<cgroup_base>/<name>`, `/sys/fs/cgroup/lightbox/<name>` unless `lightbox.conf` says otherwise, and each `exec` has one below it, `exec-<pid>-<start time>`. `stop` kills what is left in them and removes them, and says `Error: cannot remove the cgroup` with the path when it could not, which is a process that the kernel has not let go of yet. `cgroup.procs` in it lists what is there. Once that is gone, the next `start`, `stop` or `rm` of the container removes the cgroup. The cgroup of an `exec` whose command left something running in the background stays for as long as that runs, and is removed by the next `exec` or by `stop` once it is empty.
 - **The box of a `run` that was killed.** It runs on, under its name, `run-` and twelve hex digits, which `ls` shows. The next `run` removes every such box, and `lightbox rm -f <name>` removes one by hand. A box with a `--ttl` stops by itself in the meantime.
 - **A container that is half made.** `ls` shows it as `creating`. `lightbox rm <name>` removes it.
-- **Snapshots that no container uses.** `lightbox base ls` lists them with the containers on each, and `lightbox base rm <id>` removes one that has none: [Bases and snapshots](storage.html#bases).
+- **Snapshots that no container uses.** `lightbox base ls` lists them with the containers on each, and `lightbox base rm <id>` removes one that has none: [Bases and snapshots](storage.html#bases). A snapshot that `base import` made has no container until one is made of it, and one that an `import` made stays when its container is removed.
+- **What a replace was cut short at.** `.rootfs.new` or `.rootfs.old` in a container's directory, beside a mark that the container is half made, are an image's files and the container's own while `import --replace` put the one in the place of the other. The next `import --replace` of that container takes them away; `lightbox rm` takes them with the container.
 - **Logs.** A container's `console.log` goes with the container. The audit log stays, as it is the record of boxes that are gone, and neither is rotated: [Logs](storage.html#logs).
 - **The host's network.** `lightbox setup --teardown` takes away the bridge, lightbox's firewall rules and `cgroup_base`, once no container runs, and names the containers that still do when it refuses. Containers and their files stay.
 
