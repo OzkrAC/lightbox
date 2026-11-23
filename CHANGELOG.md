@@ -2,9 +2,13 @@
 
 What changed for someone who uses lightbox, newest first. `ROADMAP.md` has the reasons and the finding each change closes.
 
+## 0.11.0
+
+Not tagged yet: what is written of the next release so far.
+
 ## 0.10.0
 
-Track I of the roadmap: images, so that a container can be taken to another machine. `export` writes a container that is not running as an image in the OCI layout, which `skopeo` carries to a registry and back, and `import` makes a container of it there, with its files and its limits and none of what it may do on a host; `import --replace` puts a newer image in the place of the container it continues, and refuses one that would take work away. An image of a registry's is a base, with `base import` and `create --base`. lightbox reads and writes tar, JSON and SHA-256 in its own code; it unpacks a layer in a process whose root is the directory it fills and which may make the few system calls unpacking needs, and runs the host's `gzip` for a compressed layer as nobody, under a filter of its own. One change may need you: overlays are mounted with `redirect_dir=off,metacopy=off` now, and a container that an earlier lightbox made on a host with either on can be refused at its start, as below.
+Tagged `v0.10.0`, at `bcefe66`. Track I of the roadmap: images, so that a container can be taken to another machine. `export` writes a container that is not running as an image in the OCI layout, which `skopeo` carries to a registry and back, and `import` makes a container of it there, with its files and its limits and none of what it may do on a host; `import --replace` puts a newer image in the place of the container it continues, and refuses one that would take work away. An image of a registry's is a base, with `base import` and `create --base`. lightbox reads and writes tar, JSON and SHA-256 in its own code; it unpacks a layer in a process whose root is the directory it fills and which may make the few system calls unpacking needs, and runs the host's `gzip` for a compressed layer as nobody, under a filter of its own. One change may need you: overlays are mounted with `redirect_dir=off,metacopy=off` now, and a container that an earlier lightbox made on a host with either on can be refused at its start, as below.
 
 ### Changes you may have to act on
 
