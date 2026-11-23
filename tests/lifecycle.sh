@@ -28,6 +28,9 @@
 # loses meanwhile is reported and does not count.
 #
 #   LIGHTBOX_TEST_ROOTFS=/path  use a copy of this root filesystem (Alpine, Debian ...)
+#   LIGHTBOX_TEST_IMAGE=/path   an image of a registry's, as an OCI image layout that
+#                               tests/fetch_image.sh --oci fetched: one case makes it a
+#                               base (ROADMAP I.9), and is skipped without it
 #   LIGHTBOX_TEST_USERNS=overlay
 #                               make every container with --userns: every case is
 #                               then one of a container whose root is an
@@ -3752,6 +3755,112 @@ reg2
 no-group' ] || { echo "what came back from the registry: $said"; return 1; }
 }
 
+# A registry's image as a base (ROADMAP I.9), with one made here as somebody
+# else builds one: the export of a copy, with nothing of lightbox's said in
+# it, a command to start, and a second layer over the first that adds a file
+# and takes one out. base import unpacks both layers into one snapshot, and
+# create --base makes a container that overlays it, starts, and shows the
+# image's files with its own name in /etc; its snapshot is not removed under
+# it. A reset gives it the whole image again, as both layers are its base.
+# import of the same image is a container on that snapshot with nothing of
+# its own: only an image that export wrote has its second layer as the
+# container's own files, which a reset takes away. --copy is a copy of the
+# snapshot.
+t_base_import() {
+    command -v python3 >/dev/null 2>&1 || { echo "no python3 to make the image with"; return 77; }
+    local said id
+    box bisrc --copy && lb export bisrc "$T/bi-export" >/dev/null </dev/null || return 1
+    python3 -I -c '
+import io, sys, tarfile
+with tarfile.open(sys.argv[1], "w", format=tarfile.PAX_FORMAT) as t:
+    d = tarfile.TarInfo("added"); d.type = tarfile.DIRTYPE; d.mode = 0o755; t.addfile(d)
+    f = tarfile.TarInfo("added/file"); f.size = 7; f.mode = 0o644; f.uid, f.gid = 12, 34; t.addfile(f, io.BytesIO(b"second\n"))
+    w = tarfile.TarInfo("etc/.wh.group"); t.addfile(w)
+' "$T/bi-second.tar" && cp -r "$T/bi-export" "$T/bi-image" && python3 -I "$HERE/image_edit.py" "$T/bi-image" no-annotations &&
+        python3 -I "$HERE/image_edit.py" "$T/bi-image" command && python3 -I "$HERE/image_edit.py" "$T/bi-image" add-layer "$T/bi-second.tar" ||
+        { echo "no image to import"; return 1; }
+
+    said=$(lb base import "$T/bi-image" 2>&1 </dev/null) || { printf '%s\n' "$said"; return 1; }
+    printf '%s\n' "$said"
+    id=$(printf '%s\n' "$said" | sed -n 's/^Base \([0-9a-f]\{12\}\) unpacked from the image sha256:[0-9a-f]\{64\}, 2 layers$/\1/p')
+    [ -n "$id" ] || { echo "base import does not say what it made"; return 1; }
+    printf '%s\n' "$said" | grep -q '^Note: the image names a command to start, which lightbox does not read' ||
+        { echo "the image's command, which is not read, is not said"; return 1; }
+    [ "$(cat "$T/lb/bases/$id/rootfs/added/file")" = second ] && [ "$(stat -c %u:%g "$T/lb/bases/$id/rootfs/added/file")" = 12:34 ] &&
+        [ ! -e "$T/lb/bases/$id/rootfs/etc/group" ] && [ -e "$T/lb/bases/$id/rootfs$KIT" ] ||
+        { echo "the snapshot is not the two layers, one over the other"; return 1; }
+    said=$(lb base import "$T/bi-image" 2>&1 </dev/null) && printf '%s\n' "$said" | grep -q "^Base $id is the image sha256:[0-9a-f]\{64\} already, 2 layers: nothing was unpacked\$" ||
+        { printf '%s\n' "$said"; echo "a second base import took a second snapshot"; return 1; }
+
+    OVERLAY=1
+    up bi1 --base "$id" || return 1
+    [ "$(base_of bi1)" = "$id" ] || { echo "the container does not overlay the snapshot it was given: $(base_of bi1)"; return 1; }
+    said=$(sh_in bi1 'cat /added/file /etc/hostname; stat -c %u:%g /added/file; test -e /etc/group || echo no-group')
+    [ "$said" = 'second
+bi1
+12:34
+no-group' ] || { echo "in the container of the image: $said"; return 1; }
+    lb base ls | grep -E "^$id  .*  bi1\$" || { lb base ls; echo "base ls does not show the container on its snapshot"; return 1; }
+    refused lb base rm "$id" || { echo "a snapshot was removed under its container"; return 1; }
+    # its base is the whole image: a reset gives back both layers
+    sh_in bi1 'echo mine > /added/mine && rm /added/file' && lb reset bi1 >/dev/null 2>&1 </dev/null && start bi1 || return 1
+    [ "$(sh_in bi1 'cat /added/file; test -e /added/mine || echo gone')" = 'second
+gone' ] || { echo "after a reset the container is not the image again"; return 1; }
+
+    # import of that image: all of it is the snapshot, and its own files are what create writes
+    imported "$T/bi-image" bi2 || return 1
+    [ "$(base_of bi2)" = "$id" ] && grep -q ", on the base snapshot $id, which was here\$" "$OUT/bi2.import" ||
+        { echo "an image that export did not write is not all snapshot"; return 1; }
+    [ -z "$(cd "$C/bi2/rootfs" && find . -type f ! -path './etc/hostname' ! -path './etc/hosts' ! -path './etc/resolv.conf')" ] ||
+        { echo "its own files are more than create writes: $(cd "$C/bi2/rootfs" && find . -type f | paste -sd' ')"; return 1; }
+    start bi2 && lb reset bi2 >/dev/null 2>&1 </dev/null && start bi2 && [ "$(sh_in bi2 'cat /added/file /etc/hostname' | paste -sd' ')" = 'second bi2' ] ||
+        { echo "the import of the image is not the image after a reset"; return 1; }
+
+    # and a copy of the snapshot
+    OVERLAY=
+    up bi3 --base "$id" --copy || return 1
+    [ -z "$(base_of bi3)" ] && [ "$(sh_in bi3 'cat /added/file /etc/hostname' | paste -sd' ')" = 'second bi3' ] ||
+        { echo "create --base --copy is no copy of the snapshot"; return 1; }
+    refused lb create bi4 --base 000000000000 </dev/null && [ ! -e "$C/bi4" ] || { echo "a snapshot that is not there was taken, or left a container"; return 1; }
+}
+
+# Alpine's or Debian's image as its registry has it (ROADMAP I.9): the
+# directory LIGHTBOX_TEST_IMAGE names, which tests/fetch_image.sh --oci
+# filled with skopeo, by the digest of the manifest that is pinned there.
+# Its layers are compressed, and written by another program than lightbox's
+# tests. base import makes a snapshot of it, a container of that starts with
+# no /init.sh of its own and runs the image's own shell and package tool, and
+# a file of another group than root's is that group's inside. import of the
+# directory is a container on the same snapshot.
+t_registry_image() {
+    [ -n "${LIGHTBOX_TEST_IMAGE:-}" ] ||
+        { echo "LIGHTBOX_TEST_IMAGE names no image of a registry's; tests/fetch_image.sh --oci alpine|debian <dir> fetches one"; return 77; }
+    local said id os tool
+    said=$(lb base import "$LIGHTBOX_TEST_IMAGE" 2>&1 </dev/null) || { printf '%s\n' "$said"; return 1; }
+    printf '%s\n' "$said"
+    id=$(printf '%s\n' "$said" | sed -n 's/^Base \([0-9a-f]\{12\}\) unpacked from the image sha256:[0-9a-f]\{64\}, [0-9]* layers\{0,1\}$/\1/p')
+    [ -n "$id" ] || { echo "base import does not say what it made"; return 1; }
+    echo "in the snapshot: $(find "$T/lb/bases/$id/rootfs" | wc -l) entries, $(du -sh "$T/lb/bases/$id/rootfs" | cut -f1)"
+    OVERLAY=1
+    up rimg --base "$id" || return 1
+    os=$(sh_in rimg '. /etc/os-release && echo "$ID"')
+    case $os in
+        alpine) tool='apk --version' ;;
+        debian) tool='dpkg --version' ;;
+        *)      echo "the image says it is neither Alpine nor Debian: $os"; return 1 ;;
+    esac
+    said=$(sh_in rimg "$tool" 2>&1) && [ -n "$said" ] || { echo "the image's own $tool did not run: $said"; return 1; }
+    printf '%s\n' "$said" | head -n 1
+    said=$(sh_in rimg 'cat /etc/hostname; stat -c %u:%g /etc/shadow; test -e /init.sh || echo no-hook')
+    [ "$said" = 'rimg
+0:42
+no-hook' ] || { echo "in the container of the image: $said"; return 1; }
+    imported "$LIGHTBOX_TEST_IMAGE" rimg2 || return 1
+    [ "$(base_of rimg2)" = "$id" ] && grep -q ", on the base snapshot $id, which was here\$" "$OUT/rimg2.import" ||
+        { echo "import of the image took another snapshot than base import made"; return 1; }
+    start rimg2 && sh_in rimg2 "$tool" >/dev/null || { echo "the import of the image does not start, or run $tool"; return 1; }
+}
+
 # ─── Cases: where the settings are ──────────────────────────────────────────
 
 # Named by neither --config nor LIGHTBOX_CONFIG, the settings are those of
@@ -4686,6 +4795,8 @@ if [ "$MODE" = inside ]; then
     check 'export writes a container that ran as an image: its snapshot, and its own files and marks' t_export
     check 'import makes a container of an image that shows what the exported one showed' t_import
     check 'an image goes to a registry and back with skopeo, and is the container again' t_registry
+    check "base import makes a snapshot of an image's layers, and create --base a container that starts" t_base_import
+    check "a registry's own image is a base, and a container of it runs the image's tools" t_registry_image
     check 'no case ran ip or nsenter, which were masked in every one'     t_no_ip_or_nsenter_ran
 
     # last: it may leave a kernel setting changed for the rest of this suite's life

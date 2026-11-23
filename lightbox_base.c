@@ -379,7 +379,7 @@ static void base_ls(void) {
 
 void cmd_base(int argc, char **argv) {
     if (argc < 1)
-        die("Usage: lightbox base ls | base rm <id>... | base add <dir>");
+        die("Usage: lightbox base ls | base rm <id>... | base add <dir> | base import <dir>");
     if (streq(argv[0], "ls")) {
         if (argc > 1)
             die2(argv[1][0] == '-' ? "Error: unknown option: " : "Error: unexpected argument: ", argv[1]);
@@ -394,6 +394,8 @@ void cmd_base(int argc, char **argv) {
             die2("Error: base rootfs is not a directory: ", source);
         if (dir_is_empty(source) != 0)
             die2("Error: base rootfs is empty or cannot be read: ", source);
+        if (image_layout_at(source))
+            die2("Error: this is an image and no root filesystem, and base import <dir> makes a base of one: ", source);
         require_tool("cp", tool_path_cp());
         (void)store_lock();
         char id[BASE_ID_TEXT];
@@ -404,6 +406,49 @@ void cmd_base(int argc, char **argv) {
         print_str(STDOUT, " taken of ");
         print_str(STDOUT, source);
         print_str(STDOUT, "; new containers of it use this one\n");
+        return;
+    }
+    if (streq(argv[0], "import")) {
+        /*
+         * base import <dir> (ROADMAP I.9): an image that somebody else
+         * built, as a tool copied it from a registry into a directory, made
+         * a base: all of its layers, one unpacked over the other, are a
+         * snapshot, which create --base makes containers of. The image is
+         * read as import reads one, whole and held to its digests before
+         * root is asked for and before anything is made, and is unpacked as
+         * import unpacks one. A snapshot that is those layers already is it.
+         */
+        if (argc != 2)
+            die(argc < 2 ? "Usage: lightbox base import <dir>" : "Error: base import takes one directory, with an image in it");
+        static image img;
+        image_open(argv[1], &img);
+        require_root("base import");
+        for (int i = 0; i < img.nlayers; i++)
+            if (img.layers[i].gzip) {
+                require_tool("gzip", tool_path_gzip());
+                break;
+            }
+        (void)store_lock();
+        char id[BASE_ID_TEXT], layers[24];
+        bool took = false;
+        image_unpacked unpacked = { 0 };
+        if (image_base(&img, img.nlayers, id, &took, &unpacked) != 0)
+            die("Error: the image was not unpacked, and no snapshot of it is kept");
+        int n = img.nlayers, at = (int)sizeof(layers);
+        layers[--at] = '\0';
+        do { layers[--at] = (char)('0' + n % 10); n /= 10; } while (n);
+        print_str(STDOUT, "Base ");
+        print_str(STDOUT, id);
+        print_str(STDOUT, took ? " unpacked from the image sha256:" : " is the image sha256:");
+        print_str(STDOUT, img.manifest);
+        print_str(STDOUT, took ? ", " : " already, ");
+        print_str(STDOUT, layers + at);
+        print_str(STDOUT, img.nlayers == 1 ? " layer" : " layers");
+        print_str(STDOUT, took ? "\n" : ": nothing was unpacked\n");
+        image_notes(&img, &unpacked);
+        print_str(STDOUT, "A container of it: lightbox create <name> --base ");
+        print_str(STDOUT, id);
+        lc_print_char(STDOUT, '\n');
         return;
     }
     if (streq(argv[0], "rm")) {

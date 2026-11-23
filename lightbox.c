@@ -1364,7 +1364,7 @@ static const char *make_resolv(container_config *cfg, char dns[MAX_DNS][16], int
  * cmd_create's loop: validation gives run every option create --help names.
  */
 static const char *const create_value_options[] = {
-    "--mem", "--swap", "--pids", "--cpu", "--io-max", "--vol", "--rootfs", "--seccomp", "--net",
+    "--mem", "--swap", "--pids", "--cpu", "--io-max", "--vol", "--rootfs", "--base", "--seccomp", "--net",
     "--oom-score", "--ttl", "--link", "--dns", "--profile", "--workspace",
 };
 static const char *const create_flag_options[] = { "--userns", "--read-only", "--copy", "--privileged" };
@@ -1486,14 +1486,7 @@ static void say_imported(const image *img, const container_config *cfg, const im
     }
     if (any)
         lc_print_char(STDOUT, '\n');
-    if (unpacked->devices)
-        say_count("Note: ", unpacked->devices, unpacked->devices == 1
-                      ? " device of the image's was not made: a container's devices are lightbox's to give\n"
-                      : " devices of the image's were not made: a container's devices are lightbox's to give\n");
-    if (unpacked->attributes_left)
-        say_count("Note: ", unpacked->attributes_left, unpacked->attributes_left == 1
-                      ? " extended attribute of the image's was not set\n"
-                      : " extended attributes of the image's were not set\n");
+    image_notes(img, unpacked);
 }
 
 /*
@@ -1618,8 +1611,9 @@ static void cmd_create(int argc, char **argv) {
     cfg.net = NET_OUTSIDE;
     char dns[MAX_DNS][16];
     int ndns = 0;
-    bool net_given = false, agent = false;
+    bool net_given = false, agent = false, rootfs_given = false;
     const char *workspace = NULL;
+    const char *base_id = NULL;     /* --base: the snapshot it is made of, and no base directory */
 
     for (int i = address_given ? 2 : 1; i < argc; i++) {
         const char *opt = argv[i];
@@ -1666,6 +1660,16 @@ static void cmd_create(int argc, char **argv) {
             if (create_image)
                 die("Error: import makes a container of an image, which is all the base it has: no --rootfs");
             str_copy_or_die(cfg_global.rootfs, option_value(argc, argv, &i), MAX_PATH, "--rootfs");
+            rootfs_given = true;
+        } else if (streq(opt, "--base")) {
+            const char *value = option_value(argc, argv, &i);
+            if (create_image)
+                die("Error: import makes a container of an image, which is all the base it has: no --base");
+            if (base_id)
+                die("Error: --base is given once: a container has one base");
+            if (!base_id_ok(value))
+                die2("Error: --base takes the id of a base snapshot, as base ls shows it, not: ", value);
+            base_id = value;
         } else if (streq(opt, "--copy")) {
             full_copy = true;
         } else if (streq(opt, "--read-only")) {
@@ -1701,6 +1705,8 @@ static void cmd_create(int argc, char **argv) {
         }
     }
 
+    if (base_id && rootfs_given)
+        die("Error: --rootfs names a base and --base a snapshot of one: a container is made of one of the two");
     if (agent)
         agent_profile(&cfg, net_given, full_copy);
     if (workspace)
@@ -1752,7 +1758,12 @@ static void cmd_create(int argc, char **argv) {
     /* The base must be a directory with something in it. A link to one is
      * followed. Checked before anything is created, so a refusal leaves
      * nothing behind. An image has been read whole by now. */
-    if (!create_image) {
+    if (base_id) {
+        /* the snapshot's files are the base, for a copy too; it is looked at
+         * once more with the store locked, when no base rm can come between */
+        if (!base_rootfs_path(cfg_global.rootfs, base_id) || !path_is_directory(cfg_global.rootfs))
+            die2("Error: there is no base snapshot ", base_id);
+    } else if (!create_image) {
         struct lb_statx stx;
         if (lb_sys_statx(AT_FDCWD, cfg_global.rootfs, 0, LB_STATX_TYPE, &stx) < 0)
             die2("Error: base rootfs does not exist: ", cfg_global.rootfs);
@@ -1763,11 +1774,20 @@ static void cmd_create(int argc, char **argv) {
             die2("Error: base rootfs cannot be read: ", cfg_global.rootfs);
         if (empty)
             die2("Error: base rootfs is empty: ", cfg_global.rootfs);
+        if (image_layout_at(cfg_global.rootfs)) {
+            print_str(STDERR, "Error: the base is an image and no root filesystem: ");
+            print_str(STDERR, cfg_global.rootfs);
+            print_str(STDERR, "\nlightbox import <dir> <name> makes a container of one, and lightbox base import <dir> a\n"
+                              "base that create --base <id> takes\n");
+            lc_kernel_exit(failure_status);
+        }
     }
 
     /* One create at a time: what one decides about names and addresses holds
      * until it is done. */
     store_lock();
+    if (base_id && !path_is_directory(cfg_global.rootfs))
+        die2("Error: there is no base snapshot ", base_id);
     /* A link to a container of --net proxy would be a way out of it. The
      * firewall drops what the bridge would switch to or from one, whatever
      * links name it; one that is there already is refused here. */
@@ -1862,7 +1882,7 @@ static void cmd_create(int argc, char **argv) {
          * those layers; otherwise the layers are unpacked into a new one,
          * which is put in place when it is whole.
          */
-        int own = create_image->nlayers == 2 ? 1 : 0;
+        int own = create_image->lightbox && create_image->nlayers == 2 ? 1 : 0;
         int under = create_image->nlayers - own;
         bool took = false;
         if (image_base(create_image, under, cfg.base, &took, &unpacked) != 0) {
@@ -1893,7 +1913,9 @@ static void cmd_create(int argc, char **argv) {
         }
     } else if (overlay_here) {
         bool took = false;
-        if (base_snapshot_for(cfg_global.rootfs, cfg.base, &took) != 0) {
+        if (base_id) {
+            lc_bytes_copy(cfg.base, base_id, BASE_ID_TEXT);
+        } else if (base_snapshot_for(cfg_global.rootfs, cfg.base, &took) != 0) {
             create_err = "failed to take a snapshot of the base";
             goto fail_create;
         }
@@ -5972,6 +5994,8 @@ static const struct { const char *name; const char *text; } command_help[] = {
         "                                riops or wiops (default: none)\n"
         "         --vol  <src:dst[:ro]>  Bind mount (repeatable)\n"
         "         --rootfs <path>        The base it is made from (default: $LIGHTBOX_ROOTFS or lightbox.conf)\n"
+        "         --base <id>            The snapshot it is made from, as base ls shows it, in the place\n"
+        "                                of a base: the one base import unpacked an image into\n"
         "         --userns               A user namespace of its own: its root is an unprivileged uid\n"
         "                                on the host, from the range of /etc/subuid; as root\n"
         "         --read-only            Read-only root filesystem\n"
@@ -6048,12 +6072,14 @@ static const struct { const char *name; const char *text; } command_help[] = {
     { "import",
         "  import <dir> <name> [<ip>] [options]\n"
         "                                Make a container of the image in <dir>, an OCI image layout, with\n"
-        "                                the options of create but --rootfs. Every blob is held to the\n"
+        "                                the options of create but --rootfs and --base. Every blob is held to the\n"
         "                                digest it is named by first. The limits no option gives are the\n"
         "                                image's, where they are no more than lightbox.conf's; as root\n" },
     { "base",
         "  base ls                       List the snapshots of bases that containers overlay\n"
         "  base add <dir>                Take a new snapshot of a base, for the containers made after it\n"
+        "  base import <dir>             Unpack the image in <dir>, an OCI image layout as skopeo copies\n"
+        "                                one from a registry, into a snapshot, for create --base; as root\n"
         "  base rm <id>...               Remove snapshots that no container uses\n" },
     { "setup",
         "  setup                         Setup host networking\n"

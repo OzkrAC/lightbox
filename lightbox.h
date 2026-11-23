@@ -729,6 +729,8 @@ typedef struct {
     char        pids[PIDS_TEXT_MAX];
     char        cpu[CPU_TEXT_MAX];
     char        ttl[DURATION_TEXT_MAX];
+    bool        lightbox;                   /* export wrote it: its annotations are lightbox's, of the version read here */
+    bool        command;                    /* its configuration names a command to start, which lightbox does not read */
 } image;
 
 /* The image in a directory, read and held to its digests. What is no image
@@ -756,6 +758,12 @@ typedef struct {
  * and whether it was made now; -1 once said, with nothing kept.
  */
 [[nodiscard]] int image_base(const image *img, int count, char id[BASE_ID_TEXT], bool *took, image_unpacked *total);
+/* What of an image was left out when it was unpacked, and what of it lightbox
+ * does not read, each as a note on standard output */
+void image_notes(const image *img, const image_unpacked *unpacked);
+/* Whether a directory is laid out as an image, and so is no root filesystem:
+ * what create and base add are told is a base, by mistake */
+bool image_layout_at(const char *dir);
 
 /* What a host tool runs under that reads bytes somebody else wrote, as gzip
  * does a layer: no network of the host's, nobody's ids, no capability, no

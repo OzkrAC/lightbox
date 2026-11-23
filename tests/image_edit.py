@@ -7,6 +7,8 @@ something else.
     image_edit.py <directory> <change> [<argument>]
 
     annotation KEY=VALUE    the manifest gets this annotation
+    no-annotations          the manifest has none: an image that somebody else built says nothing of lightbox's
+    command                 the configuration names a command to start and an environment, as such an image does
     gzip                    every layer is compressed, as skopeo compresses one that it copies
     gzip-other              the first layer is compressed, and is another tree than the configuration names
     gzip-cut                the first layer is compressed and its last bytes are gone
@@ -112,6 +114,11 @@ raw_manifest = None
 if change == "annotation":
     key, value = argument.split("=", 1)
     manifest.setdefault("annotations", {})[key] = value
+elif change == "no-annotations":
+    manifest.pop("annotations", None)
+elif change == "command":
+    config["config"] = {"Entrypoint": ["/bin/sh", "-c"], "Cmd": ["echo started"],
+                        "Env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]}
 elif change == "gzip":
     for n in range(len(manifest["layers"])):
         gzip_layer(n)

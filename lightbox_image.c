@@ -761,6 +761,18 @@ static void annotations_read(const char *dir, json_value manifest, image *img) {
              ", and this lightbox reads " ANNOTATIONS_VERSION ": none of them is taken");
         img->name[0] = img->mem[0] = img->swap[0] = img->pids[0] = img->cpu[0] = img->ttl[0] = '\0';
     }
+    /* a container that export wrote says so, and no other image is taken for one */
+    img->lightbox = said_version && streq(version, ANNOTATIONS_VERSION);
+}
+
+bool image_layout_at(const char *dir) {
+    static const char *const parts[] = { OCI_LAYOUT_FILE, OCI_INDEX_FILE, "blobs" };
+    for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
+        char path[MAX_PATH];
+        if (!path_join(path, sizeof(path), dir, parts[i]) || !path_exists(path))
+            return false;
+    }
+    return true;
 }
 
 void image_open(const char *dir, image *img) {
@@ -852,6 +864,15 @@ void image_open(const char *dir, image *img) {
         print_str(STDERR, shown(arch));
         print_str(STDERR, ", and this lightbox runs linux on " OCI_ARCHITECTURE ": nothing in it would run\n");
         fail_now();
+    }
+    /* A command to start is the image's word for what a container of
+     * lightbox's has /init.sh for: it is not read, and that it is there is
+     * said. A name in letters of another case is nothing to refuse here. */
+    static const char *const commands[] = { "/config/Entrypoint", "/config/Cmd" };
+    for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
+        json_value found;
+        if (json_at(v, commands[i], &found) == 1 && json_kind_of(found) == JSON_ARRAY && json_count(found) > 0)
+            img->command = true;
     }
     json_value ids = image_at(dir, v, "/rootfs/diff_ids", "the configuration");
     if (!text_at(dir, v, "/rootfs/type", "the configuration", text, sizeof(text)) || !streq(text, "layers") ||
@@ -999,6 +1020,23 @@ int image_unpack(const image *img, int first, int count, const char *dir, tar_in
     }
     lc_kernel_close_file((int32_t)dirfd);
     return rc;
+}
+
+void image_notes(const image *img, const image_unpacked *unpacked) {
+    char count[24];
+    if (unpacked->devices) {
+        u64_text(count, unpacked->devices);
+        note(count, unpacked->devices == 1 ? " device of the image's was not made" : " devices of the image's were not made",
+             ": a container's devices are lightbox's to give");
+    }
+    if (unpacked->attributes_left) {
+        u64_text(count, unpacked->attributes_left);
+        note(count, unpacked->attributes_left == 1 ? " extended attribute of the image's was not set"
+                                                   : " extended attributes of the image's were not set", "");
+    }
+    if (img->command)
+        note("the image names a command to start, which lightbox does not read", "",
+             ": a container starts its /init.sh, where it has one");
 }
 
 int image_base(const image *img, int count, char id[BASE_ID_TEXT], bool *took, image_unpacked *total) {
