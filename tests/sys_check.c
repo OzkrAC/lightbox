@@ -66,6 +66,7 @@ SAME_NR(fchdir);
 SAME_NR(capget);
 SAME_NR(capset);
 SAME_NR(statfs);
+SAME_NR(fstatfs);
 SAME_NR(chroot);
 SAME_NR(renameat);
 SAME_NR(ppoll);

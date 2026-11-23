@@ -4788,6 +4788,9 @@ static void start_one(const char *name, int hook_wait) {
             lc_kernel_exit(failure_status);
         }
         const char *refused = device_refused(dev->host, &stx, config.profile == PROFILE_AGENT);
+        struct lb_statfs sfs;
+        if (!refused && lb_sys_fstatfs((int32_t)tree, &sfs) == 0 && (sfs.f_flags & LB_ST_NODEV))
+            refused = device_on_nodev(dev->host);
         if (refused)
             die2("Error: a device of the container's cannot be given: ", refused);
         dev_trees[d] = (int32_t)tree;

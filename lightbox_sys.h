@@ -36,6 +36,7 @@
 #define LB_SYS_capget     125
 #define LB_SYS_capset     126
 #define LB_SYS_statfs     137
+#define LB_SYS_fstatfs    138
 #define LB_SYS_chroot     161
 #define LB_SYS_fsetxattr  190
 #define LB_SYS_fgetxattr  193
@@ -66,6 +67,7 @@
 #define LB_SYS_linkat     37
 #define LB_SYS_renameat   38
 #define LB_SYS_statfs     43
+#define LB_SYS_fstatfs    44
 #define LB_SYS_fchdir     50
 #define LB_SYS_chroot     51
 #define LB_SYS_fchmod     52
@@ -731,6 +733,11 @@ static inline lc_sysret lb_sys_umask(uint32_t mask) {
 
 static inline lc_sysret lb_sys_statfs(const char *path, struct lb_statfs *buf) {
     return lc_syscall2(LB_SYS_statfs, (int64_t)path, (int64_t)buf);
+}
+
+/* the same of what a descriptor is open on, one of open_tree's among them */
+static inline lc_sysret lb_sys_fstatfs(int32_t fd, struct lb_statfs *buf) {
+    return lc_syscall2(LB_SYS_fstatfs, fd, (int64_t)buf);
 }
 
 static inline lc_sysret lb_sys_statx(int32_t dirfd, const char *path, int32_t flags,

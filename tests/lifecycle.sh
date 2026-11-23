@@ -2344,10 +2344,11 @@ t_device() {
     opens() { # name, path, how: what a shell of the container says when it opens it
         sh_in "$1" "if exec 3$3$2; then echo opened; fi" 2>&1
     }
+    numbers() { sh_in "$1" "ls -ln $2" | awk '{ print $1, $5 $6 }'; }   # name, path: "<mode> <major>,<minor>"
     up devrw --device "$d/fuse:/dev/gpu/fuse" || return 1
-    said=$(sh_in devrw 'ls -ln /dev/gpu/fuse')
+    said=$(numbers devrw /dev/gpu/fuse)
     echo "in the container: $said"
-    case $said in 'crw-rw-rw- '*' 10, 229 '*'/dev/gpu/fuse') ;; *) echo "the node is not there as the host has it"; return 1 ;; esac
+    [ "$said" = 'crw-rw-rw- 10,229' ] || { echo "the node is not there as the host has it"; return 1; }
     said=$(opens devrw /dev/gpu/fuse '<>')
     [ "$said" = opened ] || { echo "it does not open for reading and writing: $said"; return 1; }
     up devro --device "$d/fuse2:/dev/fuse:ro" || return 1
@@ -2360,9 +2361,9 @@ t_device() {
     lb stop devrw >/dev/null || return 1
     rm -f "$d/fuse" && mknod -m 666 "$d/fuse" c 1 3 || return 1
     start devrw || return 1
-    said=$(sh_in devrw 'ls -ln /dev/gpu/fuse; echo x > /dev/gpu/fuse && echo written')
+    said="$(numbers devrw /dev/gpu/fuse) $(sh_in devrw 'echo x > /dev/gpu/fuse && echo written')"
     echo "after the node was made again: $said"
-    case $said in *' 1, 3 '*'written') ;; *) echo "the container does not have the node as it is now"; return 1 ;; esac
+    [ "$said" = 'crw-rw-rw- 1,3 written' ] || { echo "the container does not have the node as it is now"; return 1; }
     # gone: said at start, and nothing of the container is made
     lb stop devrw >/dev/null && rm -f "$d/fuse" || return 1
     said=$(lb start devrw 2>&1 </dev/null) && { echo "a start with a device that has gone succeeded"; return 1; }
@@ -2372,7 +2373,7 @@ t_device() {
     # a render node to a box of --profile agent, on a host whose kernel has no such GPU
     need_subids || { echo "no ranges of ids here for a box of --profile agent: that is not tried"; return 0; }
     mknod -m 666 "$d/renderD128" c 226 128 || return 1
-    agent_box agpu "$(next_ip)" --device "$d/renderD128:/dev/dri/renderD128" && start agpu || return 1
+    agent_box agpu --device "$d/renderD128:/dev/dri/renderD128" && start agpu || return 1
     said=$(opens agpu /dev/dri/renderD128 '<>')
     echo "a render node in a box of --profile agent: $said"
     case $said in *opened*|*'ermitted'*) echo "the device program did not let it through, or a GPU is here"; return 1 ;; *'No such device'*) ;; *) return 1 ;; esac

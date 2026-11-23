@@ -540,6 +540,15 @@ const char *device_refused(const char *host, const struct lb_statx *stx, bool ag
     return why;
 }
 
+const char *device_on_nodev(const char *host) {
+    static char why[MAX_PATH + 80];
+    bool cut = false;
+    str_append(why, str_append(why, 0, host, sizeof(why), &cut),
+               " is on a mount of the host's with nodev, where no device opens, nor is it lifted for a container",
+               sizeof(why), &cut);
+    return why;
+}
+
 const char *device_check(const device_spec *dev, bool agent, uint32_t *major, uint32_t *minor) {
     static char why[MAX_PATH + 40];
     bool cut = false;
@@ -550,6 +559,9 @@ const char *device_check(const device_spec *dev, bool agent, uint32_t *major, ui
                    rc == -LB_ENOENT ? " is not there" : " cannot be looked at", sizeof(why), &cut);
         return why;
     }
+    struct lb_statfs sfs;
+    if ((stx.stx_mode & LB_S_IFMT) == LB_S_IFCHR && lb_sys_statfs(dev->host, &sfs) == 0 && (sfs.f_flags & LB_ST_NODEV))
+        return device_on_nodev(dev->host);
     *major = stx.stx_rdev_major;
     *minor = stx.stx_rdev_minor;
     return device_refused(dev->host, &stx, agent);

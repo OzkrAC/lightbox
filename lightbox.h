@@ -262,6 +262,9 @@ int config_volume_at(const container_config *config, const char *dst);
  * it took of the node: NULL, or why the node at host is not given. */
 struct lb_statx;
 [[nodiscard]] const char *device_refused(const char *host, const struct lb_statx *stx, bool agent);
+/* Why a node on a mount with nodev is not given: the host's nodev is not
+ * lifted for a container, and in a user namespace it could not be. */
+[[nodiscard]] const char *device_on_nodev(const char *host);
 /* Take out every volume at a destination: how many there were. */
 int config_remove_volumes_at(container_config *config, const char *dst);
 
