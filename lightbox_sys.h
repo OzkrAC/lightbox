@@ -268,6 +268,10 @@
 #define LB_MOVE_MOUNT_F_EMPTY_PATH    0x00000004    /* the tree is the descriptor itself */
 #define LB_MOVE_MOUNT_T_SYMLINKS      0x00000010    /* follow a link at the end of the target */
 
+/* clone(2) and unshare(2): the namespace that lightc does not name yet
+ * (linux/sched.h; ROADMAP U.4) */
+#define LB_CLONE_NEWCGROUP            0x02000000
+
 /* prctl(2) requests (linux/prctl.h) */
 #define LB_PR_SET_DUMPABLE            4
 #define LB_PR_SET_KEEPCAPS            8

@@ -3804,7 +3804,8 @@ static int exec_inside_container(const char *cg, int target_pid, int privileged,
     int ipcfd = open_target_path(target_pid, "/ns/ipc");
     int netfd = open_target_path(target_pid, "/ns/net");
     int pidfd = open_target_path(target_pid, "/ns/pid");
-    if (mntfd < 0 || utsfd < 0 || ipcfd < 0 || netfd < 0 || pidfd < 0)
+    int cgroupfd = open_target_path(target_pid, "/ns/cgroup");
+    if (mntfd < 0 || utsfd < 0 || ipcfd < 0 || netfd < 0 || pidfd < 0 || cgroupfd < 0)
         die("Error: failed to open target namespace fd");
 
     /* Join the exec's cgroup, below the container's, before switching mount
@@ -3823,6 +3824,12 @@ static int exec_inside_container(const char *cg, int target_pid, int privileged,
         if (write_file("/proc/self/oom_score_adj", score) < 0)
             die("Error: failed to give the command the container's OOM score");
     }
+
+    /* The cgroup namespace before the user namespace, as host root, who may
+     * join it whichever user namespace owns it: the container's, or the
+     * host's for a container that a lightbox before 0.11 started (ROADMAP
+     * U.4). The exec's cgroup, joined above, is then below its root. */
+    require_setns_fd(cgroupfd, LB_CLONE_NEWCGROUP, "cgroup");
 
     /* The user namespace first, whose root then joins the others, which it
      * owns, as the container's root: what it makes there is the container's,
@@ -4355,6 +4362,13 @@ static void attach_volumes(const struct volume_mount *vols, int count) {
  * with the reason on stderr; the command then sees init's pipe close.
  */
 static void build_container(const struct child_args *ca) {
+    /* A cgroup namespace of its own, whose root is the container's cgroup,
+     * which the command put init in before its first byte: the container
+     * sees its cgroup as / and nothing of the host's paths above it
+     * (ROADMAP U.4). What init starts is in it, and exec joins it. */
+    if (lc_kernel_unshare(LB_CLONE_NEWCGROUP) < 0)
+        die("Error: failed to give the container a cgroup namespace of its own");
+
     /* make all mounts private — prevents host mount events (including
      * the host's /proc) from propagating into the container */
     require_mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
@@ -4461,6 +4475,11 @@ static void build_container(const struct child_args *ca) {
     require_mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL);
 
     require_mount("sysfs", "/sys", "sysfs", MS_RDONLY, NULL);
+    /* the container's own cgroup and what is below it, through its cgroup
+     * namespace: to read its limits and its use, and read-only, so that no
+     * process of it changes a limit; a privileged container may */
+    require_mount("cgroup2", "/sys/fs/cgroup", "cgroup2",
+                  MS_NOSUID | MS_NODEV | MS_NOEXEC | (ca->privileged ? 0 : MS_RDONLY), NULL);
     cleanup_old_root_or_die();
 
     /* devpts and shm inside container */

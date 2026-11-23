@@ -785,7 +785,8 @@ t_exec_cgroup() {
     up excg || return 1
     said=$(sh_in excg 'cat /proc/self/cgroup')
     echo "the cgroup of an exec: $said"
-    printf '%s\n' "$said" | grep -Eq '/excg/exec-[0-9]+-[0-9]+$' || { echo "it is not in a cgroup of its own"; return 1; }
+    # as the container's cgroup namespace has it, whose root is the container's cgroup (ROADMAP U.4)
+    printf '%s\n' "$said" | grep -Eqx '0::/exec-[0-9]+-[0-9]+' || { echo "it is not in a cgroup of its own"; return 1; }
     [ -z "$(exec_cgroups excg)" ] || { echo "left after the exec: $(exec_cgroups excg)"; return 1; }
     sh_in excg "$KIT setsid sleep 1071 >/dev/null 2>&1 </dev/null &" || return 1
     wait_until 5 running_cmd 'sleep 1071' || { echo "what it started is not running"; return 1; }
@@ -2303,13 +2304,27 @@ t_start_mounts_cgroup2() {
         { echo "the refused start left something of the container"; return 1; }
 }
 
+# Init is in the container's cgroup, and a command that exec runs in the
+# exec's own below it (ROADMAP 8.7). Through the container's cgroup
+# namespace each sees its cgroup from the container's, and no path of the
+# host's (ROADMAP U.4); /sys/fs/cgroup is the container's cgroup and what is
+# below it, read-only: its limits are there to read, and not to change.
 t_cgroup_membership() {
-    up member || return 1
+    local where init mounted
+    up member --mem 96M || return 1
     grep -qx "$(pid_of member)" "$CG/member/cgroup.procs" || { echo "init is not in the container's cgroup"; return 1; }
     where=$(sh_in member 'cat /proc/self/cgroup')
-    echo "a command run by exec is in: $where"
-    # the exec's own, below the container's (ROADMAP 8.7)
-    case $where in *"/${CG##*/}/member/exec-"[0-9]*-[0-9]*) ;; *) return 1 ;; esac
+    init=$(sh_in member 'cat /proc/1/cgroup')
+    echo "init is in: $init; a command run by exec in: $where"
+    [ "$init" = '0::/' ] || { echo "init does not see its cgroup as the root"; return 1; }
+    case $where in 0::/exec-[0-9]*-[0-9]*) ;; *) echo "the exec does not see its cgroup below the root"; return 1 ;; esac
+    mounted=$(sh_in member "grep ' /sys/fs/cgroup ' /proc/self/mountinfo")
+    echo "$mounted"
+    case $mounted in *" /sys/fs/cgroup ro,"*" - cgroup2 "*) ;; *) echo "/sys/fs/cgroup is not a read-only cgroup2"; return 1 ;; esac
+    [ "$(sh_in member 'cat /sys/fs/cgroup/memory.max')" = "$(cat "$CG/member/memory.max")" ] &&
+        [ "$(cat "$CG/member/memory.max")" = 100663296 ] || { echo "the container's limit is not what it reads"; return 1; }
+    sh_in member 'echo max > /sys/fs/cgroup/memory.max' 2>/dev/null && { echo "the container changed its limit"; return 1; }
+    [ "$(cat "$CG/member/memory.max")" = 100663296 ] || { echo "the limit changed"; return 1; }
 }
 
 # ─── Cases: the init hook, starting and stopping ────────────────────────────
