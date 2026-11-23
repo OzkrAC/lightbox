@@ -2040,6 +2040,42 @@ t_base_snapshots() {
     return $bad
 }
 
+# What a command that was killed while it took a snapshot left, a .<id>.new
+# with a base's files in it, is taken away by the next snapshot and by base
+# rm, which say so (ROADMAP F.7). A name that is not such a directory's stays;
+# and where there is no store, whose lock every command that takes a
+# snapshot holds, nothing is taken away, as one may be being made.
+t_base_unfinished() {
+    B="$W/data/bases"
+    mkdir -p "$B/.0123456789ab.new/rootfs/bin" "$B/.0123456789ab.newer" "$B/.0123456789AB.new" "$B/0123456789ab.new" ||
+        return 1
+    echo placeholder > "$B/.0123456789ab.new/rootfs/bin/placeholder"
+    rmdir "$C" || return 1
+    said=$(lb base add "$BASE" 2>&1)
+    rc=$?
+    mkdir "$C" || return 1
+    [ $rc -eq 0 ] || { printf '%s\n' "$said"; return 1; }
+    case $said in *Removed*) printf '%s\n' "$said"; echo "cleared without the store's lock"; return 1 ;; esac
+    [ -f "$B/.0123456789ab.new/rootfs/bin/placeholder" ] || { echo "taken away without the store's lock"; return 1; }
+    said=$(lb base add "$BASE") || { printf '%s\n' "$said"; return 1; }
+    printf '%s\n' "$said"
+    printf '%s\n' "$said" |
+        grep -qx "Removed an unfinished base snapshot, which a command that was killed left: $B/.0123456789ab.new" ||
+        return 1
+    [ ! -e "$B/.0123456789ab.new" ] || { echo "the unfinished snapshot is still there"; return 1; }
+    for other in .0123456789ab.newer .0123456789AB.new 0123456789ab.new; do
+        [ -d "$B/$other" ] || { echo "$other was taken away"; return 1; }
+    done
+    # base rm takes one away too, and removes what it was asked to
+    id=$(printf '%s\n' "$said" | sed -n 's/^Base \([0-9a-f]\{12\}\) taken of .*/\1/p')
+    [ -n "$id" ] && mkdir "$B/.fedcba987654.new" || return 1
+    said=$(lb base rm "$id") || { printf '%s\n' "$said"; return 1; }
+    printf '%s\n' "$said"
+    printf '%s\n' "$said" |
+        grep -qx "Removed an unfinished base snapshot, which a command that was killed left: $B/.fedcba987654.new" &&
+        printf '%s\n' "$said" | grep -qx "Base $id removed" && [ ! -e "$B/.fedcba987654.new" ] && [ ! -e "$B/$id" ]
+}
+
 # A start_timeout or stop_timeout that cannot be read is said so, and stops
 # no command.
 t_start_timeout_setting() {
@@ -2357,6 +2393,7 @@ check 'update, restart, rm -f and reset check their options before anything'  t_
 check 'update writes the limits into a stopped container'"'"'s .conf'       t_update_rewrites_the_conf
 check 'create --userns is root'"'"'s, and inspect and doctor show the ranges' t_userns_as_a_user_sees_it
 check 'base add, ls and rm manage the snapshots of bases'              t_base_snapshots
+check 'a snapshot a killed command left is cleared by the next, and by base rm' t_base_unfinished
 check 'start without root is a clean error'                   t_start_without_root_is_a_clean_error
 
 # ─── Images (ROADMAP Track I) ───────────────────────────────────────────────

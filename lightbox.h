@@ -679,6 +679,10 @@ int base_take(const char *source, char id[BASE_ID_TEXT]);
  * id. Each 0, or -1 once said, with the directory taken away. */
 int base_begin(const char *source, char id[BASE_ID_TEXT], char fresh[MAX_PATH]);
 int base_commit(const char *id, const char *fresh);
+/* Every <bases>/.<id>.new that a command which was killed left, taken away
+ * and said, where this process holds the store's lock (ROADMAP F.7);
+ * base_begin does it first, and base rm. */
+void bases_clear_unfinished(void);
 /* A snapshot that was put in place and that nothing came to use, taken away */
 void base_discard(const char *id);
 /* The newest snapshot of a base directory, or one taken now, which took
@@ -922,6 +926,9 @@ void container_lock_if_free(const char *name);
 /* The store's lock: the descriptor that holds it, to close when it may go,
  * or -1 when there is no store yet to lock. */
 int32_t store_lock(void);
+/* Whether this process holds the store's lock: it does from a store_lock()
+ * that found a store until it ends. */
+bool store_lock_held(void);
 /* A container's lock if no command holds it, without waiting: the
  * descriptor that holds it, or -1. */
 int32_t container_lock_try(const char *name);

@@ -15,8 +15,9 @@
  *                                      from, a line each, where import made it
  *
  * A snapshot is made in .<id>.new and renamed into place when it is whole,
- * so one that a killed command left is never taken for one. The id is 12
- * hex digits of a hash of the source and the time.
+ * so one that a killed command left is never taken for one, and the next
+ * snapshot clears it away. The id is 12 hex digits of a hash of the source
+ * and the time.
  */
 
 bool base_id_ok(const char *id) {
@@ -71,6 +72,45 @@ static bool base_read(const char *id, char source[MAX_PATH], int64_t *seconds, i
     return true;
 }
 
+/* ".<id>.new": the name of a snapshot while it is made */
+static bool base_unfinished_ok(const char *name) {
+    static const char suffix[] = ".new";
+    char id[BASE_ID_TEXT];
+    if (lc_string_length(name) != 1 + BASE_ID_LEN + sizeof(suffix) - 1 || name[0] != '.' ||
+        !streq(name + 1 + BASE_ID_LEN, suffix))
+        return false;
+    lc_bytes_copy(id, name + 1, BASE_ID_LEN);
+    id[BASE_ID_LEN] = '\0';
+    return base_id_ok(id);
+}
+
+/*
+ * What a command that was killed while it made a snapshot left in the
+ * directory of the bases: a .<id>.new with up to a base's size in it
+ * (ROADMAP F.7). No later snapshot has its name, as an id is made from the
+ * time, so nothing else takes it away. Every command that makes a snapshot
+ * holds the store's lock until it ends, so that under the lock none is being
+ * made but this process's own; without it nothing is cleared, which is where
+ * there is no store yet, before setup.
+ */
+void bases_clear_unfinished(void) {
+    if (!store_lock_held())
+        return;
+    static char names[MAX_LISTED][NAME_MAX_LEN + 1];
+    char dir[MAX_PATH];
+    bases_dir_path(dir);
+    int count = list_entries(dir, base_unfinished_ok, names, MAX_LISTED, NULL);
+    for (int i = 0; i < count; i++) {
+        char path[MAX_PATH];
+        if (!path_join(path, sizeof(path), dir, names[i]))
+            continue;
+        require_rm_rf(path);
+        print_str(STDOUT, "Removed an unfinished base snapshot, which a command that was killed left: ");
+        print_str(STDOUT, path);
+        lc_print_char(STDOUT, '\n');
+    }
+}
+
 static uint64_t fnv1a64(const char *text, uint64_t hash) {
     for (; *text; text++) {
         hash ^= (uint8_t)*text;
@@ -109,6 +149,7 @@ int base_begin(const char *source, char id[BASE_ID_TEXT], char fresh[MAX_PATH]) 
     char dir[MAX_PATH], name[BASE_ID_TEXT + 8], path[MAX_PATH], line[MAX_PATH + 2];
     bases_dir_path(dir);
     (void)lc_kernel_mkdirat(AT_FDCWD, dir, MODE_PRIVATE_DIR);   /* it may be there */
+    bases_clear_unfinished();
     str_append(name, str_append(name, str_append(name, 0, ".", sizeof(name), &cut), id, sizeof(name), &cut),
                ".new", sizeof(name), &cut);
     if (cut || !path_join(fresh, MAX_PATH, dir, name)) {
@@ -540,6 +581,7 @@ void cmd_base(int argc, char **argv) {
                 die2("Error: not the id of a base snapshot: ", argv[i]);
         require_tool("rm", tool_path_rm());
         (void)store_lock();
+        bases_clear_unfinished();
         int failed = 0;
         for (int i = 1; i < argc; i++) {
             char path[MAX_PATH], users[1024];

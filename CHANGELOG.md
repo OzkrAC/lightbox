@@ -6,6 +6,10 @@ What changed for someone who uses lightbox, newest first. `ROADMAP.md` has the r
 
 Not tagged yet: what is written of the next release so far.
 
+### Fixed
+
+- **A snapshot that a killed command left unfinished is cleared away.** A `create`, `import`, `base add` or `base import` that was killed while it took a snapshot of a base left `bases/.<id>.new`, with up to the base's size in it, and nothing ever removed it, as no later snapshot has that name. The next command that takes a snapshot takes every such directory away, as `base rm` does, and says so: `Removed an unfinished base snapshot, which a command that was killed left: <path>`. It does that only under the store's lock, which every command that takes a snapshot holds, so that none of them loses one it is making.
+
 ## 0.10.0
 
 Tagged `v0.10.0`, at `bcefe66`. Track I of the roadmap: images, so that a container can be taken to another machine. `export` writes a container that is not running as an image in the OCI layout, which `skopeo` carries to a registry and back, and `import` makes a container of it there, with its files and its limits and none of what it may do on a host; `import --replace` puts a newer image in the place of the container it continues, and refuses one that would take work away. An image of a registry's is a base, with `base import` and `create --base`. lightbox reads and writes tar, JSON and SHA-256 in its own code; it unpacks a layer in a process whose root is the directory it fills and which may make the few system calls unpacking needs, and runs the host's `gzip` for a compressed layer as nobody, under a filter of its own. One change may need you: overlays are mounted with `redirect_dir=off,metacopy=off` now, and a container that an earlier lightbox made on a host with either on can be refused at its start, as below.

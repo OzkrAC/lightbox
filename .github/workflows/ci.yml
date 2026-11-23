@@ -89,7 +89,7 @@ jobs:
   lifecycle:
     name: Lifecycle suite (${{ matrix.arch }}${{ matrix.mode.name && format(', {0}', matrix.mode.name) || '' }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 15
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -161,7 +161,12 @@ jobs:
         if: ${{ matrix.mode.image != '' }}
         run: tests/fetch_image.sh --oci ${{ matrix.mode.image }} "$RUNNER_TEMP/oci"
       # sudo drops the environment, so the suite's options are make variables.
+      # It takes 3 to 4 minutes, and once took 11.5 on an aarch64 runner. Its
+      # limit is below the job's, so that a suite that hangs fails this step
+      # and the kernel log is still read, where a job that is cancelled at
+      # its limit runs nothing more.
       - name: Lifecycle suite
+        timeout-minutes: 15
         run: >-
           sudo make CC=gcc-14 test-lifecycle GITHUB_ACTIONS=true LIGHTBOX_TEST_MODPROBE=1
           LIGHTBOX_TEST_USERNS=${{ matrix.mode.userns }} LIGHTBOX_TEST_SECCOMP=${{ matrix.mode.seccomp }}

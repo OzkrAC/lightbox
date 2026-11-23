@@ -4690,10 +4690,15 @@ if [ "$MODE" = inside ]; then
     SHOW_FILTER="s#$T#<T>#g"
     . "$HERE/lib.sh"
 
+    # Seconds from one ${EPOCHREALTIME} to another, to a tenth.
+    elapsed() { awk -v a="${1/,/.}" -v b="${2/,/.}" 'BEGIN { printf "%.1f", b - a }'; }
+
     run_case() { # function -> sets rc and out
         n=$((n + 1))
+        local began=$EPOCHREALTIME ran
         timeout -k 5 "$CASE_TIMEOUT" bash "$SELF" --case "$1" >"$T/case.out" 2>&1 </dev/null
         rc=$?
+        ran=$EPOCHREALTIME
         out=$(cat "$T/case.out")
         if [ $rc -eq 124 ] || [ $rc -eq 137 ]; then
             out="$out
@@ -4701,6 +4706,24 @@ if [ "$MODE" = inside ]; then
             rc=1
         fi
         teardown
+        # what the case and its teardown took, for the slowest at the end
+        printf '%s %s %s\n' "$(elapsed "$began" "$ran")" "$(elapsed "$ran" "$EPOCHREALTIME")" "$1" >>"$T/times"
+    }
+
+    # The cases that took longest, each with its teardown, and the time of
+    # them all: in the log, and as a notice on the run's page, which says
+    # where a run that is slow spent its time without the log.
+    slowest() {
+        [ -s "$T/times" ] || return 0
+        local list total
+        list=$(awk '{ printf "%.1f %s %s %s\n", $1 + $2, $1, $2, $3 }' "$T/times" | sort -k1,1nr | head -n 8 |
+               awk '{ printf "%ss %s (the case %ss, its teardown %ss)\n", $1, $4, $2, $3 }')
+        total=$(awk '{ s += $1 + $2 } END { printf "%.0f", s }' "$T/times")
+        printf '\nlifecycle: the slowest cases, of %ss for all %s:\n%s\n' "$total" "$n" "$(printf '%s\n' "$list" | sed 's/^/  /')"
+        if [ "${GITHUB_ACTIONS:-}" = true ]; then
+            printf '::notice title=%s suite - the slowest cases (%ss in all)::%s\n' "$SUITE" "$total" \
+                "$(printf '%s\n' "$list" | sed -e 's/%/%25/g' | awk '{ printf "%s%%0A", $0 }')"
+        fi
     }
 
     check 'setup makes the bridge, the forwarding and the firewall rules, and closes storage' t_setup
@@ -4897,6 +4920,7 @@ if [ "$MODE" = inside ]; then
     # last: it may leave a kernel setting changed for the rest of this suite's life
     check 'exec works where a memfd may not be executed'                  t_exec_where_memfds_may_not_be_executed
 
+    slowest
     summary "$SUITE"
     exit $?
 fi
