@@ -2457,6 +2457,11 @@ t_export_image() {
 # is said, and nothing of an image is left where one was to be.
 t_export_refusals() {
     local bad=0 before said
+    # What lightbox keeps, with every time to the nanosecond: a refused export
+    # that made a directory among it and took it away again left the directory
+    # above with the time of now, which a look in whole seconds saw only when
+    # a second had ended in between (CI run 45177356327, on 2026-11-23).
+    kept_sum() { find "$W/data" "$R" -printf '%p %y %s %T@\n' | LC_ALL=C sort; }
     lb create web 10.0.0.2 >/dev/null || return 1
     mkdir "$W/full" "$W/there" "$W/data/bases" && : > "$W/full/file" && : > "$W/afile" && ln -s "$C" "$W/link" &&
         ln -s there "$W/link-to-there" && chmod 755 "$W/full" || return 1
@@ -2482,12 +2487,15 @@ t_export_refusals() {
     no "among lightbox's own files" export web "$C/web/rootfs/image"
     no "among lightbox's own files" export web "$W/data/bases/image"
     no "among lightbox's own files" export web "$W/link/web/rootfs/image"
-    # a tree that cannot be a layer ends it, with the entry named
+    [ "$before" = "$(kept_sum)" ] || { echo "a refused export changed what lightbox keeps"; bad=1; }
+    # A tree that cannot be a layer ends it, with the entry named. What is
+    # kept is looked at with the file in it, as making it is a change.
     : > "$C/web/rootfs/.wh.x"
+    before=$(kept_sum)
     no ': .wh.x: has a name that begins with .wh.' export web "$W/x"
     no ': .wh.x: has a name that begins with .wh.' export web "$W/there"
+    [ "$before" = "$(kept_sum)" ] || { echo "a refused export of a tree that is no layer changed what lightbox keeps"; bad=1; }
     rm "$C/web/rootfs/.wh.x"
-    [ "$before" = "$(kept_sum)" ] || { echo "a refused export changed what lightbox keeps"; bad=1; }
     [ ! -e "$W/x" ] && [ ! -e "$C/image" ] && [ ! -e "$C/web/rootfs/image" ] && [ ! -e "$W/data/bases/image" ] ||
         { echo "a refused export left a directory"; bad=1; }
     [ "$(ls -A "$W/full")" = file ] && [ "$(mode_of "$W/full")" = 755 ] && [ -d "$W/there" ] && [ -z "$(ls -A "$W/there")" ] ||

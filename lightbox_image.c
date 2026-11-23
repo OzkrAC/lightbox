@@ -333,6 +333,25 @@ static void image_dir_make(const char *dir) {
         die2("Error: the path of the image's directory is too long: ", dir);
     on_failure(export_undo);
 
+    /* An image inside what it is an image of would be read while it is
+     * written. Looked at before the directory is made, by the one it is to
+     * be in: making it among lightbox's own files and taking it away again
+     * gave the directory above it the time of now, a container's rootfs/
+     * among them, which is in the container's next image. And once more
+     * below, when the directory is there. */
+    char bases[MAX_PATH], within[MAX_PATH], above[MAX_PATH];
+    bases_dir_path(bases);
+    size_t len = lc_string_length(dir);
+    while (len > 1 && dir[len - 1] == '/')
+        len--;
+    if (len < sizeof(within)) {
+        lc_bytes_copy(within, dir, len);
+        within[len] = '\0';
+        if (parent_dir(above, sizeof(above), within) &&
+            (dir_is_under(above, cfg_global.container_dir) || dir_is_under(above, bases)))
+            die2("Error: export does not write an image among lightbox's own files: ", dir);
+    }
+
     lc_sysret rc = lc_kernel_mkdirat(AT_FDCWD, dir, MODE_PRIVATE_DIR);
     if (rc == 0) {
         made.made_dir = true;
@@ -342,9 +361,7 @@ static void image_dir_make(const char *dir) {
         image_dir_take(dir);
     }
 
-    /* an image inside what it is an image of would be read while it is written */
-    char bases[MAX_PATH];
-    bases_dir_path(bases);
+    /* by what the directory is, now that it is there: one that was there may be one of lightbox's own */
     if (dir_is_under(dir, cfg_global.container_dir) || dir_is_under(dir, bases))
         die2("Error: export does not write an image among lightbox's own files: ", dir);
 
