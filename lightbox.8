@@ -353,8 +353,11 @@ the container's own files.
 A layer compressed with gzip is unpacked through
 .BR gzip (1),
 which runs as nobody, without capabilities or a network.
-The limits that no option gives are the image's; nothing else an image says
-of its container is taken.
+The limits that no option gives are the image's, where they are no more than
+.I lightbox.conf
+gives a new container; what is more is said and not taken, and the option
+gives it.
+Nothing else an image says of its container is taken.
 .TP
 .B base ls
 List the snapshots of bases that containers overlay.

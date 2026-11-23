@@ -37,7 +37,22 @@
  * with 0 as octal, so one may not: 0100M would be 64M.
  */
 bool mem_limit_ok(const char *text) {
-    if (streq(text, "max"))
+    uint64_t bytes;
+    return !streq(text, "0") && limit_bytes(text, &bytes);
+}
+
+/* What memory.swap.max takes: what memory.max does, or none at all. */
+bool swap_limit_ok(const char *text) {
+    return streq(text, "0") || mem_limit_ok(text);
+}
+
+bool limit_bytes(const char *text, uint64_t *bytes) {
+    *bytes = 0;
+    if (streq(text, "max")) {
+        *bytes = UINT64_MAX;
+        return true;
+    }
+    if (streq(text, "0"))
         return true;
     if (text[0] < '1' || text[0] > '9')
         return false;
@@ -51,21 +66,19 @@ bool mem_limit_ok(const char *text) {
         value = value * 10 + digit;
     }
 
-    unsigned shift;
+    unsigned shift = 0;
     switch (text[i]) {
-        case '\0':          return true;
+        case '\0':          break;
         case 'K': case 'k': shift = 10; break;
         case 'M': case 'm': shift = 20; break;
         case 'G': case 'g': shift = 30; break;
         case 'T': case 't': shift = 40; break;
         default:            return false;
     }
-    return text[i + 1] == '\0' && value <= ((uint64_t)INT64_MAX >> shift);
-}
-
-/* What memory.swap.max takes: what memory.max does, or none at all. */
-bool swap_limit_ok(const char *text) {
-    return streq(text, "0") || mem_limit_ok(text);
+    if ((shift && text[i + 1] != '\0') || value > ((uint64_t)INT64_MAX >> shift))
+        return false;
+    *bytes = value << shift;
+    return true;
 }
 
 /* A number at *p from min to max, without a zero in front unless it is 0;

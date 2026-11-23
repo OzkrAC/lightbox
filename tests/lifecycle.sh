@@ -160,6 +160,18 @@ box() { # name [create options] : create a container on the next free address
     port_of "$name" >/dev/null
 }
 
+# The same with import: a container of an image, on the next free address,
+# which $ip then is, with what import said in $OUT/<name>.import.
+imported() { # image, name, [options]
+    local image=$1 name=$2
+    shift 2
+    ip=$(next_ip) || return 1
+    # shellcheck disable=SC2046  # options of one word each
+    lb import "$image" "$name" "$ip" "$@" $(mode_options "$@") >"$OUT/$name.import" 2>&1 </dev/null || { cat "$OUT/$name.import"; return 1; }
+    cat "$OUT/$name.import"
+    port_of "$name" >/dev/null
+}
+
 # What LIGHTBOX_TEST_USERNS adds to a create: --userns, and with copy --copy
 # too, where the case did not give them. A case about overlays sets OVERLAY=1,
 # which keeps --copy out; a container that is to have no range is made with
@@ -3614,7 +3626,7 @@ no-group' ] || { echo "after its export the container is not what it was"; retur
 # removed, links, a second name and owners of several ids, is exported and
 # made a container again under another name. What it shows inside is what
 # the first showed, with its own name and address in /etc; its limits are
-# the first one's; it overlays the snapshot the first overlays, which is
+# the first one's, which are within lightbox.conf's; it overlays the snapshot the first overlays, which is
 # found by the layer export wrote it as, so that nothing of it is unpacked.
 # Its own files are its root's on this host, whatever range it has, and the
 # marks of the image are the overlay's own: a device for the file that was
@@ -3629,17 +3641,8 @@ t_import() {
     shown_in() {
         sh_in "$1" 'cd / && { find work lbt -type f -exec stat -c "%n file %a %u:%g %s %Y %h" {} + ; find work lbt ! -type f -exec stat -c "%N %F %a %u:%g %Y" {} + ; } | sort'
     }
-    imported() { # image, name, [options] : as box, with import
-        local image=$1 name=$2
-        shift 2
-        ip=$(next_ip) || return 1
-        # shellcheck disable=SC2046  # options of one word each
-        lb import "$image" "$name" "$ip" "$@" $(mode_options "$@") >"$OUT/$name.import" 2>&1 </dev/null || { cat "$OUT/$name.import"; return 1; }
-        cat "$OUT/$name.import"
-        port_of "$name" >/dev/null
-    }
     OVERLAY=1
-    up imp --mem 300M --ttl 2h || return 1
+    up imp --mem 200M --ttl 2h || return 1
     sh_in imp 'mkdir -p /work/sub && echo mine > /work/file && ln -s file /work/link && ln /work/file /work/sub/second &&
         chown 1000:1001 /work/sub && chmod 2750 /work/sub && echo more >> /etc/passwd && rm /etc/group &&
         rm -r /lbt && mkdir /lbt && echo again > /lbt/again && chown 12:34 /lbt/again && touch -d "2020-02-02 02:02:02" /work/file' || return 1
@@ -3652,7 +3655,7 @@ t_import() {
     [ -n "$(base_of imp)" ] && [ "$(base_of imp2)" = "$(base_of imp)" ] &&
         grep -q ", on the base snapshot $(base_of imp), which was here\$" "$OUT/imp2.import" ||
         { echo "the import does not overlay the snapshot the container overlays"; return 1; }
-    [ "$(conf_value imp2 mem)" = 300M ] && [ "$(conf_value imp2 ttl)" = 2h ] && grep -q "^Limits of the image's: mem=300M " "$OUT/imp2.import" ||
+    [ "$(conf_value imp2 mem)" = 200M ] && [ "$(conf_value imp2 ttl)" = 2h ] && grep -q "^Limits of the image's: mem=200M " "$OUT/imp2.import" ||
         { echo "the limits are not the image's"; return 1; }
     # its own files: its root's on this host, and the overlay's marks
     owner=0:0
@@ -3699,6 +3702,54 @@ no-busybox' ] || { echo "in the import: $said"; return 1; }
     start imp4 && [ "$(sh_in imp4 'cat /made-here /etc/hostname' | paste -sd' ')" = 'copied imp4' ] || { echo "the import of a copy does not start as itself"; return 1; }
     # a container made of a base after it does not take the image's snapshot for its base's
     box impn && [ "$(base_of impn)" != "$(base_of imp4)" ] || { echo "a snapshot of an image was taken for one of the base"; return 1; }
+}
+
+# To a registry and back (ROADMAP I.8), with a container that ran: it is
+# exported, skopeo copies the image to tests/registry.py, a registry of this
+# case's own on the loopback, and back into an empty directory, and import
+# makes of that a container that starts and has the first one's files, on the
+# snapshot the first one overlays. skopeo runs as another user than root,
+# with its home, its runtime directory and its temporary files in the work
+# directory: it keeps a record of what it copied, and root's would be the
+# host's.
+t_registry() {
+    command -v python3 >/dev/null 2>&1 && command -v skopeo >/dev/null 2>&1 && command -v setpriv >/dev/null 2>&1 ||
+        { echo "no python3, skopeo or setpriv to carry an image to a registry with"; return 77; }
+    local pid port n=0 rc said ip
+    OVERLAY=1
+    up reg --mem 200M || return 1
+    sh_in reg 'echo there > /made-here && rm /etc/group' || return 1
+    lb stop reg >/dev/null && lb export reg "$T/reg-image" >/dev/null </dev/null || return 1
+    mkdir -p "$T/carry/home" "$T/carry/run" "$T/carry/tmp" && cp -r "$T/reg-image" "$T/carry/image" && chown -R 4711:4711 "$T/carry" || return 1
+    python3 -I "$HERE/registry.py" "$T/carry/registry" "$T/carry/port" "$T/carry/log" > "$T/carry/registry.out" 2>&1 &
+    pid=$!
+    while [ ! -s "$T/carry/port" ] && [ $n -lt 50 ]; do sleep 0.1; n=$((n + 1)); done
+    port=$(cat "$T/carry/port" 2>/dev/null)
+    carried() {
+        [ -n "$port" ] || { cat "$T/carry/registry.out"; echo "the registry did not start"; return 1; }
+        python3 -I -c 'import socket, sys; socket.create_connection(("127.0.0.1", int(sys.argv[1])), 3)' "$port" 2>/dev/null ||
+            { echo "the loopback reaches no listener in the suite's namespace"; return 77; }
+        copy() {
+            setpriv --reuid=4711 --regid=4711 --clear-groups env HOME="$T/carry/home" XDG_RUNTIME_DIR="$T/carry/run" TMPDIR="$T/carry/tmp" \
+                timeout 120 skopeo --insecure-policy copy --dest-tls-verify=false --src-tls-verify=false "$@" </dev/null
+        }
+        copy "oci:$T/carry/image" "docker://127.0.0.1:$port/boxes/reg:latest" || { echo "skopeo did not copy the image to the registry"; return 1; }
+        copy "docker://127.0.0.1:$port/boxes/reg:latest" "oci:$T/carry/back" || { echo "skopeo did not copy the image back"; return 1; }
+    }
+    carried
+    rc=$?
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    cat "$T/carry/log" 2>/dev/null
+    [ $rc -ne 77 ] || return 77
+    [ $rc -eq 0 ] || return 1
+    imported "$T/carry/back" reg2 || return 1
+    [ "$(base_of reg2)" = "$(base_of reg)" ] || { echo "what came back does not overlay the snapshot it was exported from"; return 1; }
+    start reg2 || return 1
+    said=$(sh_in reg2 'cat /made-here /etc/hostname; test -e /etc/group || echo no-group')
+    [ "$said" = 'there
+reg2
+no-group' ] || { echo "what came back from the registry: $said"; return 1; }
 }
 
 # ─── Cases: where the settings are ──────────────────────────────────────────
@@ -4634,6 +4685,7 @@ if [ "$MODE" = inside ]; then
     check 'base ls, base rm and base add manage the snapshots'            t_base_commands
     check 'export writes a container that ran as an image: its snapshot, and its own files and marks' t_export
     check 'import makes a container of an image that shows what the exported one showed' t_import
+    check 'an image goes to a registry and back with skopeo, and is the container again' t_registry
     check 'no case ran ip or nsenter, which were masked in every one'     t_no_ip_or_nsenter_ran
 
     # last: it may leave a kernel setting changed for the rest of this suite's life

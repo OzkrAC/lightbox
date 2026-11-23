@@ -2637,7 +2637,9 @@ t_import_refusals() {
 # is root and unpacking is allowed: the tree is the exported one but for the
 # files create writes in /etc, which are the new container's, with the line
 # of the old one gone from its hosts file. The limits no option gives are
-# the image's. An image whose layer was compressed, as skopeo compresses one,
+# the image's, where they are no more than lightbox.conf gives a new
+# container; what is more is said and not taken, and an option or the
+# settings give it. An image whose layer was compressed, as skopeo compresses one,
 # gives the same tree; one that unpacks to another layer than its
 # configuration names, or whose gzip stream is cut or has more after its end,
 # is refused, and nothing of a container or a snapshot is left. Layers of an
@@ -2666,7 +2668,7 @@ t_import_round_trip() {
         snapshots() { ls "$W/data/bases" 2>/dev/null | wc -l; }
         conf() { grep -qx -- "$2" "$C/$1/.conf" || fail "$1 has no $2 in its .conf: $(paste -sd" " "$C/$1/.conf")"; }
 
-        "$LB" create web 10.0.0.2 --mem 1G --swap 512M --pids 64 --cpu 0.5 --ttl 8h --copy > /dev/null || fail "create"
+        "$LB" create web 10.0.0.2 --mem 128M --pids 64 --cpu 0.5 --ttl 8h --copy > /dev/null || fail "create"
         echo work > "$C/web/rootfs/work.txt" && chmod 640 "$C/web/rootfs/work.txt" &&
             touch -d "2020-02-02 02:02:02 UTC" "$C/web/rootfs/work.txt" "$C/web/rootfs/bin" || fail "the container could not be changed"
         "$LB" export web "$W/image" > "$W/export.out" || fail "export"
@@ -2677,8 +2679,8 @@ t_import_round_trip() {
         cat "$W/import.out"
         grep -qx "Container .back. imported (ip=10.0.0.9)" "$W/import.out" || fail "import does not say what it made"
         grep -q "^$(grep "^Image sha256:" "$W/export.out")" "$W/import.out" || fail "import names another image than export wrote"
-        grep -qx "Limits of the image.s: mem=1G swap=512M pids=64 cpu=0.5 ttl=8h" "$W/import.out" || fail "the limits it took are not said"
-        for line in mem=1G swap=512M pids=64 cpu=0.5 ttl=8h; do conf back "$line"; done
+        grep -qx "Limits of the image.s: mem=128M pids=64 cpu=0.5 ttl=8h" "$W/import.out" || fail "the limits it took are not said"
+        for line in mem=128M pids=64 cpu=0.5 ttl=8h; do conf back "$line"; done
         listing "$(tree_of back)" > "$W/back.list"
         diff "$W/web.list" "$W/back.list" || fail "the tree is not the exported one"
         [ "$(cat "$C/back/rootfs/etc/hostname")" = back ] || fail "its hostname is not its own"
@@ -2696,13 +2698,40 @@ t_import_round_trip() {
 
         echo "--- an option is before the image, and the image before lightbox.conf"
         "$LB" import "$W/image" opt --mem 2G --ttl 1h > "$W/opt.out" 2>&1 || { cat "$W/opt.out"; fail "import with options"; }
-        for line in mem=2G swap=512M pids=64 cpu=0.5 ttl=1h; do conf opt "$line"; done
-        grep -qx "Limits of the image.s: swap=512M pids=64 cpu=0.5" "$W/opt.out" || fail "the limits it took, beside the options: $(cat "$W/opt.out")"
+        for line in mem=2G pids=64 cpu=0.5 ttl=1h; do conf opt "$line"; done
+        grep -qx "Limits of the image.s: pids=64 cpu=0.5" "$W/opt.out" || fail "the limits it took, beside the options: $(cat "$W/opt.out")"
         said=$("$LB" import "$W/image" other --rootfs "$W/base" 2>&1) && fail "import took --rootfs"
         case $said in *"no --rootfs"*) ;; *) fail "--rootfs: $said" ;; esac
         said=$("$LB" import "$W/image" web 2>&1) && fail "import over a container that is there"
         case $said in *"container already exists: web"*) ;; *) fail "an existing name: $said" ;; esac
         [ ! -e "$C/other" ] || fail "a refused import left a container"
+
+        echo "--- an image gives its container no more than lightbox.conf gives a new one"
+        cp -r "$W/image" "$W/more" || fail "cp"
+        for pair in mem=4G swap=1G pids=max cpu=8; do
+            python3 -I "$EDIT" "$W/more" annotation "ac.ozkr.lightbox.$pair" || fail "image_edit"
+        done
+        "$LB" import "$W/more" capped > "$W/capped.out" 2>&1 || { cat "$W/capped.out"; fail "import of an image that has more"; }
+        cat "$W/capped.out"
+        grep -qx "Note: the image has mem=4G, which is more than lightbox.conf gives a new container, 256M: it is not taken, and --mem gives it more" "$W/capped.out" &&
+            grep -qx "Note: the image has pids=max, which is more than lightbox.conf gives a new container, 128: it is not taken, and --pids gives it more" "$W/capped.out" &&
+            grep -qx "Note: the image has cpu=8, which is more than lightbox.conf gives a new container, 1: it is not taken, and --cpu gives it more" "$W/capped.out" &&
+            grep -qx "Note: the image has swap=1G, and a new container here has no swap: it has none, and --swap gives it some" "$W/capped.out" ||
+            fail "what the image has more of is not said"
+        for line in mem=256M pids=128 cpu=1 ttl=8h; do conf capped "$line"; done
+        ! grep -q "^swap=" "$C/capped/.conf" || fail "the image gave its container swap"
+        grep -qx "Limits of the image.s: ttl=8h" "$W/capped.out" || fail "a lifetime, which only takes away, is not the image.s: $(grep "^Limits" "$W/capped.out")"
+        # the option gives it, and then nothing is said of it
+        "$LB" import "$W/more" given --mem 4G --swap 1G --pids max --cpu 8 > "$W/given.out" 2>&1 || { cat "$W/given.out"; fail "import with what the image has, as options"; }
+        for line in mem=4G swap=1G pids=max cpu=8; do conf given "$line"; done
+        ! grep -q "^Note: the image has " "$W/given.out" || fail "a limit an option gave is held against the image.s"
+        # and so does a lightbox.conf that gives a new container as much
+        printf "default_mem = 4G\ndefault_pids = max\ndefault_cpu = 8\n" >> "$LIGHTBOX_CONFIG"
+        "$LB" import "$W/more" roomy > "$W/roomy.out" 2>&1 || { cat "$W/roomy.out"; fail "import where lightbox.conf gives as much"; }
+        for line in mem=4G pids=max cpu=8; do conf roomy "$line"; done
+        grep -qx "Limits of the image.s: mem=4G pids=max cpu=8 ttl=8h" "$W/roomy.out" && ! grep -q "^swap=" "$C/roomy/.conf" ||
+            fail "what lightbox.conf gives as much of is not the image.s: $(grep "^Limits\|^Note" "$W/roomy.out" | paste -sd"|")"
+        sed -i "/^default_/d" "$LIGHTBOX_CONFIG"
 
         echo "--- what an image says beyond its limits is said and not taken"
         cp -r "$W/image" "$W/asking" && python3 -I "$EDIT" "$W/asking" annotation ac.ozkr.lightbox.privileged=1 &&
@@ -2768,10 +2797,94 @@ with tarfile.open(sys.argv[1], \"w\", format=tarfile.PAX_FORMAT) as t:
     [ $rc -eq 0 ] && ! grep -q '^FAILED: ' "$W/ns.out"
 }
 
+# To a registry and back (ROADMAP I.8). lightbox writes and reads a
+# directory, and skopeo carries it: tests/registry.py is a registry for this
+# case alone, on the loopback. Two containers that overlay one snapshot are
+# exported and copied to it; of the second, the layer that is the snapshot is
+# not sent again, which the registry's own record of what it was sent shows.
+# What is copied back, into empty directories, has its layers compressed, and
+# import makes of it the tree that it makes of the directory export wrote.
+REGISTRY=$(cd "$(dirname "$0")" && pwd)/registry.py
+t_registry() {
+    need_python || return 77
+    command -v skopeo >/dev/null 2>&1 || { echo "no skopeo to carry an image to a registry with"; return 77; }
+    local rc pid port sent n
+    mkdir -p "$BASE/lib" && echo gone > "$BASE/lib/gone" && echo keep > "$BASE/lib/keep" || return 1
+    # shellcheck disable=SC2016     # the script is for the shell in the namespace
+    HOME="$W/home" LIGHTBOX_CONFIG="$CONF" unshare -r --mount -- bash -c '
+        W=$1 LB=$2 C=$1/data/containers
+        "$LB" create one --mem 128M --ttl 8h --copy > /dev/null && "$LB" create two --copy > /dev/null || exit 1
+        id=$("$LB" base add "$W/base" | sed -n "s/^Base \([0-9a-f]\{12\}\) taken of .*/\1/p")
+        [ -n "$id" ] || exit 1
+        for name in one two; do
+            echo "base=$id" >> "$C/$name/.conf"
+            mv "$C/$name/rootfs" "$C/$name/copy" && mkdir -p "$C/$name/rootfs/etc" "$C/$name/rootfs/srv" &&
+                cp "$C/$name/copy/etc/hostname" "$C/$name/rootfs/etc/hostname" && echo "of $name" > "$C/$name/rootfs/srv/own" || exit 1
+        done
+        mkdir "$C/one/rootfs/lib" && mknod "$C/one/rootfs/lib/gone" c 0 0 2>/dev/null || exit 77
+        "$LB" export one "$W/one" > /dev/null && "$LB" export two "$W/two" > /dev/null
+    ' _ "$W" "$LB" > "$W/ns.out" 2>&1
+    rc=$?
+    cat "$W/ns.out"
+    [ $rc -ne 77 ] || { echo "no device 0:0 can be made in a user namespace here"; return 77; }
+    [ $rc -eq 0 ] || return 1
+
+    python3 -I "$REGISTRY" "$W/registry" "$W/port" "$W/registry.log" > "$W/registry.out" 2>&1 &
+    pid=$!
+    n=0
+    while [ ! -s "$W/port" ] && [ $n -lt 50 ]; do sleep 0.1; n=$((n + 1)); done
+    port=$(cat "$W/port" 2>/dev/null)
+    carried() {
+        [ -n "$port" ] || { cat "$W/registry.out"; echo "the registry did not start"; return 1; }
+        copy() { HOME="$W/home" timeout 120 skopeo --insecure-policy copy --dest-tls-verify=false --src-tls-verify=false "$@" 2>&1; }
+        copy "oci:$W/one" "docker://127.0.0.1:$port/boxes/one:latest" || { echo "skopeo did not copy the image to the registry"; return 1; }
+        sent=$(grep -c '^PATCH ' "$W/registry.log")
+        copy "oci:$W/two" "docker://127.0.0.1:$port/boxes/two:latest" || { echo "skopeo did not copy the second image"; return 1; }
+        sed 's/sha256:\([0-9a-f]\{12\}\)[0-9a-f]*/\1/g; s/sha256%3A\([0-9a-f]\{12\}\)[0-9a-f]*/\1/g' "$W/registry.log"
+        # the first image: two layers and the configuration; the second: its own layer and its configuration
+        [ "$sent" = 3 ] && [ "$(grep -c '^PATCH ' "$W/registry.log")" = 5 ] ||
+            { echo "the registry was sent $sent blobs and then $(($(grep -c '^PATCH ' "$W/registry.log") - sent)), not 3 and then 2"; return 1; }
+        copy "docker://127.0.0.1:$port/boxes/one:latest" "oci:$W/one-back" && copy "docker://127.0.0.1:$port/boxes/two:latest" "oci:$W/two-back" ||
+            { echo "skopeo did not copy the images back"; return 1; }
+        grep -q 'image.layer.v1.tar+gzip' "$W/one-back/blobs/sha256/"* || { echo "what came back has no compressed layer: is this still what a registry gives?"; return 1; }
+    }
+    carried
+    rc=$?
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    [ $rc -eq 0 ] || return 1
+
+    # what came back is the container that was exported
+    # shellcheck disable=SC2016
+    HOME="$W/home" LIGHTBOX_CONFIG="$CONF" unshare -r --mount -- bash -c '
+        W=$1 LB=$2 C=$1/data/containers
+        listing() {
+            (cd "$1" && find . -mindepth 1 ! -path ./etc ! -path ./etc/hostname ! -path ./etc/hosts ! -path ./etc/resolv.conf \
+                -printf "%P %y %m %U:%G %l %n %Ts " \( -type f -printf "%s" -o -true \) -printf "\n" | LC_ALL=C sort)
+        }
+        for name in one two; do
+            "$LB" import "$W/$name" "$name-direct" --copy > "$W/$name-direct.out" 2>&1 || { cat "$W/$name-direct.out"; exit 1; }
+            "$LB" import "$W/$name-back" "$name-carried" --copy > "$W/$name-carried.out" 2>&1 || { cat "$W/$name-carried.out"; exit 1; }
+            listing "$C/$name-direct/rootfs" > "$W/direct.list" && listing "$C/$name-carried/rootfs" > "$W/carried.list" || exit 1
+            diff "$W/direct.list" "$W/carried.list" || { echo "FAILED: $name came back from the registry as another tree"; exit 1; }
+            [ "$(cat "$C/$name-carried/rootfs/srv/own")" = "of $name" ] && [ -e "$C/$name-carried/rootfs/lib/keep" ] ||
+                { echo "FAILED: $name came back without its files"; exit 1; }
+        done
+        [ ! -e "$C/one-carried/rootfs/lib/gone" ] && [ -e "$C/two-carried/rootfs/lib/gone" ] ||
+            { echo "FAILED: what one took out of its base is not what came back as taken out"; exit 1; }
+        grep -qx "Limits of the image.s: mem=128M pids=128 cpu=1 ttl=8h" "$W/one-carried.out" && grep -qx "ttl=8h" "$C/one-carried/.conf" ||
+            { echo "FAILED: the limits did not come back: $(grep "^Limits" "$W/one-carried.out")"; exit 1; }
+    ' _ "$W" "$LB" > "$W/ns2.out" 2>&1
+    rc=$?
+    cat "$W/ns2.out"
+    [ $rc -eq 0 ]
+}
+
 check 'export writes a container as an image whose every blob is what it is named by' t_export_image
 check 'export refuses what would be no image, and leaves nothing of one'  t_export_refusals
 check 'an overlay is exported as its snapshot and, over it, its own files and marks' t_export_overlay
 check 'import refuses what is no image, or another than it is named, before anything is made' t_import_refusals
 check 'import makes of an image the container that was exported, and of a compressed one too' t_import_round_trip
+check 'an image goes to a registry and back with skopeo, its base sent once, and is the same container' t_registry
 
 summary validation

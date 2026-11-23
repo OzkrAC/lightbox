@@ -1504,18 +1504,76 @@ static void say_imported(const image *img, const container_config *cfg, const im
  */
 static const image *create_image;
 
-/* The limits no option gave, and no profile, are the image's, where it
- * carries them; lightbox.conf's come after. */
+/* How much of a thing a limit lets a container have: bytes of memory or of
+ * swap, processes, or microseconds of CPU in each period. False for a text
+ * that is no such limit. */
+enum { LIMIT_MEM, LIMIT_SWAP, LIMIT_PIDS, LIMIT_CPU };
+
+static bool limit_amount(int kind, const char *text, uint64_t *amount) {
+    int64_t count;
+    int quota;
+    switch (kind) {
+    case LIMIT_MEM:
+    case LIMIT_SWAP:
+        return (kind == LIMIT_SWAP ? swap_limit_ok(text) : mem_limit_ok(text)) && limit_bytes(text, amount);
+    case LIMIT_PIDS:
+        if (streq(text, "max")) {
+            *amount = UINT64_MAX;
+            return true;
+        }
+        if (!pids_limit_ok(text) || !parse_number(text, 1, PIDS_LIMIT_MAX, &count))
+            return false;
+        *amount = (uint64_t)count;
+        return true;
+    default:
+        if (!parse_cpu_limit(text, &quota))
+            return false;
+        *amount = (uint64_t)quota;
+        return true;
+    }
+}
+
+/*
+ * The limits no option gave, and no profile, are the image's, where it
+ * carries them and where they give the container no more than lightbox.conf
+ * gives a new one: its default_mem, default_pids and default_cpu, and no
+ * swap. An image is somebody else's word; what a container may use up of
+ * this host is said here. One that asks for more is told, and the option
+ * gives it. A lifetime only takes away, and is the image's.
+ */
 static void take_image_limits(const image *img, container_config *cfg) {
-    struct { char *field; size_t size; const char *value; } limits[] = {
-        { cfg->mem,  sizeof(cfg->mem),  img->mem },
-        { cfg->swap, sizeof(cfg->swap), img->swap },
-        { cfg->pids, sizeof(cfg->pids), img->pids },
-        { cfg->cpu,  sizeof(cfg->cpu),  img->cpu },
+    struct { int kind; const char *name; char *field; size_t size; const char *images, *hosts; } limits[] = {
+        { LIMIT_MEM,  "mem",  cfg->mem,  sizeof(cfg->mem),  img->mem,  cfg_global.default_mem },
+        { LIMIT_SWAP, "swap", cfg->swap, sizeof(cfg->swap), img->swap, "0" },
+        { LIMIT_PIDS, "pids", cfg->pids, sizeof(cfg->pids), img->pids, cfg_global.default_pids },
+        { LIMIT_CPU,  "cpu",  cfg->cpu,  sizeof(cfg->cpu),  img->cpu,  cfg_global.default_cpu },
     };
-    for (size_t i = 0; i < sizeof(limits) / sizeof(limits[0]); i++)
-        if (!limits[i].field[0] && limits[i].value[0])
-            str_copy_or_die(limits[i].field, limits[i].value, limits[i].size, "a limit of the image's");
+    for (size_t i = 0; i < sizeof(limits) / sizeof(limits[0]); i++) {
+        uint64_t asked, given;
+        if (limits[i].field[0] || !limits[i].images[0] || !limit_amount(limits[i].kind, limits[i].images, &asked))
+            continue;
+        /* a setting that cannot be used holds nothing against: the image's is not taken */
+        if (limits[i].hosts[0] && limit_amount(limits[i].kind, limits[i].hosts, &given) && asked <= given) {
+            str_copy_or_die(limits[i].field, limits[i].images, limits[i].size, "a limit of the image's");
+            continue;
+        }
+        print_str(STDOUT, "Note: the image has ");
+        print_str(STDOUT, limits[i].name);
+        print_str(STDOUT, "=");
+        print_str(STDOUT, limits[i].images);
+        if (limits[i].kind == LIMIT_SWAP) {
+            print_str(STDOUT, ", and a new container here has no swap: it has none, and --swap gives it some\n");
+        } else {
+            print_str(STDOUT, ", which is more than lightbox.conf gives a new container");
+            if (limits[i].hosts[0]) {
+                print_str(STDOUT, ", ");
+                print_str(STDOUT, limits[i].hosts);
+            }
+            print_str(STDOUT, ": it is not taken, and --");
+            print_str(STDOUT, limits[i].name);
+            print_str(STDOUT, " gives it more\n");
+        }
+    }
     if (!cfg->ttl[0] && img->ttl[0] && parse_duration_ms(img->ttl, &cfg->ttl_ms))
         str_copy_or_die(cfg->ttl, img->ttl, sizeof(cfg->ttl), "the lifetime of the image's");
 }
@@ -5991,8 +6049,8 @@ static const struct { const char *name; const char *text; } command_help[] = {
         "  import <dir> <name> [<ip>] [options]\n"
         "                                Make a container of the image in <dir>, an OCI image layout, with\n"
         "                                the options of create but --rootfs. Every blob is held to the\n"
-        "                                digest it is named by first; the limits no option gives are the\n"
-        "                                image's; as root\n" },
+        "                                digest it is named by first. The limits no option gives are the\n"
+        "                                image's, where they are no more than lightbox.conf's; as root\n" },
     { "base",
         "  base ls                       List the snapshots of bases that containers overlay\n"
         "  base add <dir>                Take a new snapshot of a base, for the containers made after it\n"

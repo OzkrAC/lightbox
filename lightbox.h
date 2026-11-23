@@ -180,6 +180,8 @@ typedef struct {
 /* Is this a limit as an option, a setting and the file may give it? */
 [[nodiscard]] bool mem_limit_ok(const char *text);      /* <number>[K|M|G|T] or max */
 [[nodiscard]] bool swap_limit_ok(const char *text);     /* the same, or 0 */
+/* The bytes such a limit is: all there are for max, none for a swap of 0 */
+[[nodiscard]] bool limit_bytes(const char *text, uint64_t *bytes);
 /* A line for io.max: <major>:<minor> and one or more of rbps, wbps, riops and
  * wiops, each =<number> or =max, with a space before each */
 [[nodiscard]] bool io_limit_ok(const char *text);

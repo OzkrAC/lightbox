@@ -52,7 +52,7 @@ jobs:
       - name: Install the toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build uidmap libarchive-tools ${{ matrix.packages }}
+          sudo apt-get install -y ninja-build uidmap libarchive-tools skopeo ${{ matrix.packages }}
       # Ubuntu's AppArmor keeps unprivileged processes from using user
       # namespaces. The seccomp suite makes one to watch the filter refuse
       # the next; with the restriction on, it skips that case.
@@ -109,7 +109,7 @@ jobs:
       - name: Install the toolchain and what the suite needs
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build gcc-14 busybox-static iproute2 iptables nftables util-linux strace squid
+          sudo apt-get install -y ninja-build gcc-14 busybox-static iproute2 iptables nftables util-linux strace squid skopeo
           sudo systemctl disable --now squid || true
       - name: Build
         run: make CC=gcc-14
