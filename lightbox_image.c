@@ -406,6 +406,26 @@ void cmd_export(int argc, char **argv) {
     if (cfg.base[0] && (!base_rootfs_path(lower, cfg.base) || !path_is_directory(lower)))
         die2("Error: the base snapshot that the container overlays is not there: ", cfg.base);
 
+    /* The generation this export is: the one on record where the container
+     * was not started since, so that one container gives one image; one more
+     * where it was; the first of a line where it has none. It goes on record
+     * when the image is whole. */
+    static generation gen;
+    bool of_a_line = generation_read(name, &gen), started_since = generation_changed(name);
+    if (!of_a_line) {
+        gen = (generation){ .number = 1, .count = 1 };
+        if (!random_hex(gen.lineage, LINEAGE_HEX / 2) || !random_hex(gen.tokens[0], GENERATION_HEX / 2))
+            die("Error: cannot draw what names the container's line and this generation of it");
+    } else if (started_since) {
+        if (gen.count == GENERATIONS_KEPT) {
+            lc_bytes_move(gen.tokens[0], gen.tokens[1], sizeof(gen.tokens[0]) * (GENERATIONS_KEPT - 1));
+            gen.count--;
+        }
+        if (gen.number == INT32_MAX || !random_hex(gen.tokens[gen.count++], GENERATION_HEX / 2))
+            die("Error: cannot draw what names this generation of the container");
+        gen.number++;
+    }
+
     image_dir_make(dir);
     print_str(STDOUT, "Exporting container '");
     print_str(STDOUT, name);
@@ -475,6 +495,12 @@ void cmd_export(int argc, char **argv) {
     add_annotation(&t, "cpu", cfg.cpu);
     if (cfg.ttl[0])
         add_annotation(&t, "ttl", cfg.ttl);
+    char generation_number[24], history[GENERATION_HISTORY_MAX];
+    u64_text(generation_number, gen.number);
+    generation_history_text(&gen, history);
+    add_annotation(&t, "lineage", gen.lineage);
+    add_annotation(&t, "generation", generation_number);
+    add_annotation(&t, "history", history);
     add(&t, "}}");
     text_whole(&t, "the image's manifest");
     blob_of_text(&t, &manifest);
@@ -503,6 +529,17 @@ void cmd_export(int argc, char **argv) {
     print_str(STDOUT, "Image sha256:");
     print_str(STDOUT, manifest.digest);
     lc_print_char(STDOUT, '\n');
+    /* the image is whole: the container is at its generation, and not started since */
+    if ((!of_a_line || started_since) && generation_keep(name, &gen) != 0)
+        print_str(STDERR, "Warning: the generation of this export could not be kept beside the container: import --replace\n"
+                          "will not know an image that continues it\n");
+    else
+        generation_unchanged(name);
+    print_str(STDOUT, "Generation ");
+    print_str(STDOUT, generation_number);
+    print_str(STDOUT, !of_a_line ? ", the first of the container's line\n"
+                                 : started_since ? ": the container was started since the one before\n"
+                                                 : ", as the export before: the container was not started since\n");
     if (written.sockets)
         say_count("Note: ", written.sockets, written.sockets == 1 ? " socket was left out: it is of a process that is gone\n"
                                                                  : " sockets were left out: they are of processes that are gone\n");
@@ -602,6 +639,16 @@ static bool text_at(const char *dir, json_value v, const char *path, const char 
 static bool whole_at(const char *dir, json_value v, const char *path, const char *what, uint64_t *number) {
     json_value found = image_at(dir, v, path, what);
     return found.len != 0 && json_kind_of(found) == JSON_NUMBER && json_whole(found, number);
+}
+
+/* exactly so many digits of lower-case hex */
+static bool hex_digits(const char *text, size_t count) {
+    if (lc_string_length(text) != count)
+        return false;
+    for (size_t i = 0; i < count; i++)
+        if (!((text[i] >= '0' && text[i] <= '9') || (text[i] >= 'a' && text[i] <= 'f')))
+            return false;
+    return true;
 }
 
 /* "sha256:<64 hex digits>": the digits, or false */
@@ -715,10 +762,15 @@ static void annotations_read(const char *dir, json_value manifest, image *img) {
 
     char version[16] = "";
     bool said_version = false;
+    /* its generation: a line, a number and the tokens, or none of the three */
+    static generation gen;
+    char lineage[LINEAGE_HEX + 1] = "", number[16] = "", history[GENERATION_HISTORY_MAX] = "";
+    int64_t generation_number = 0;
+    gen = (generation){ 0 };
     size_t prefix = sizeof(ANNOTATION) - 1;
     json_item item;
     for (bool more = json_first(all, &item); more; more = json_next(&item)) {
-        char name[sizeof(ANNOTATION) + 64], value[128];
+        char name[sizeof(ANNOTATION) + 64], value[GENERATION_HISTORY_MAX + 8];
         if (json_text(item.name, name, sizeof(name)) < 0) {
             /* too long to be one of lightbox's, unless it begins as one */
             if (item.name.len > prefix + 1 && lc_bytes_compare(item.name.text + 1, ANNOTATION, prefix) == 0)
@@ -750,6 +802,12 @@ static void annotations_read(const char *dir, json_value manifest, image *img) {
             into = img->cpu, size = sizeof(img->cpu), ok = is_text && parse_cpu_limit(value, &quota);
         } else if (streq(key, "ttl")) {
             into = img->ttl, size = sizeof(img->ttl), ok = is_text && parse_duration_ms(value, &ms);
+        } else if (streq(key, "lineage")) {
+            into = lineage, size = sizeof(lineage), ok = is_text && hex_digits(value, LINEAGE_HEX);
+        } else if (streq(key, "generation")) {
+            into = number, size = sizeof(number), ok = is_text && parse_number(value, 1, INT32_MAX, &generation_number);
+        } else if (streq(key, "history")) {
+            into = history, size = sizeof(history), ok = is_text && generation_history_take(value, &gen);
         }
         if (!into)
             note("the image says ", shown(name), ", which import does not take: what a container may do is said here");
@@ -763,6 +821,144 @@ static void annotations_read(const char *dir, json_value manifest, image *img) {
     }
     /* a container that export wrote says so, and no other image is taken for one */
     img->lightbox = said_version && streq(version, ANNOTATIONS_VERSION);
+    /* a generation is all three, and a number that its tokens fit under */
+    if (img->lightbox && lineage[0] && number[0] && history[0] && generation_number >= gen.count) {
+        lc_bytes_copy(gen.lineage, lineage, sizeof(gen.lineage));
+        gen.number = (uint32_t)generation_number;
+        img->gen = gen;
+    } else if (lineage[0] || number[0] || history[0]) {
+        note("the image names a generation of its container", " in part, or with a number its history does not fit",
+             ": it is taken to name none");
+    }
+}
+
+/* ─── Generations (ROADMAP I.10) ────────────────────────────────────────── */
+
+void generation_history_text(const generation *g, char out[GENERATION_HISTORY_MAX]) {
+    bool cut = false;
+    size_t pos = 0;
+    out[0] = '\0';
+    for (int i = 0; i < g->count && i < GENERATIONS_KEPT; i++) {
+        pos = str_append(out, pos, i ? "," : "", GENERATION_HISTORY_MAX, &cut);
+        pos = str_append(out, pos, g->tokens[i], GENERATION_HISTORY_MAX, &cut);
+    }
+}
+
+bool generation_history_take(const char *text, generation *g) {
+    g->count = 0;
+    for (const char *p = text; ; p += GENERATION_HEX + 1) {
+        if (g->count == GENERATIONS_KEPT)
+            return false;
+        for (int i = 0; i < GENERATION_HEX; i++)
+            if (!((p[i] >= '0' && p[i] <= '9') || (p[i] >= 'a' && p[i] <= 'f')))
+                return false;
+        lc_bytes_copy(g->tokens[g->count], p, GENERATION_HEX);
+        g->tokens[g->count++][GENERATION_HEX] = '\0';
+        if (p[GENERATION_HEX] == '\0')
+            return true;
+        if (p[GENERATION_HEX] != ',')
+            return false;
+    }
+}
+
+static bool generation_path(char out[MAX_PATH], const char *name, const char *file) {
+    char cdir[MAX_PATH];
+    container_dir_path(cdir, name);
+    return path_join(out, MAX_PATH, cdir, file);
+}
+
+bool generation_read(const char *name, generation *g) {
+    char path[MAX_PATH], text[LINEAGE_HEX + 16 + GENERATION_HISTORY_MAX + 4];
+    *g = (generation){ 0 };
+    if (!generation_path(path, name, ".generation") || read_file(path, text, sizeof(text)) <= 0)
+        return false;
+    size_t len = lc_string_length(text);
+    if (len && text[len - 1] == '\n')
+        text[--len] = '\0';
+    /* "<line> <number> <tokens>" */
+    char *number = text + LINEAGE_HEX + 1, *tokens = number;
+    if (len < LINEAGE_HEX + 4 || text[LINEAGE_HEX] != ' ')
+        return false;
+    text[LINEAGE_HEX] = '\0';
+    while (*tokens && *tokens != ' ')
+        tokens++;
+    if (*tokens != ' ')
+        return false;
+    *tokens++ = '\0';
+    int64_t n;
+    if (!hex_digits(text, LINEAGE_HEX) || !parse_number(number, 1, INT32_MAX, &n) || !generation_history_take(tokens, g) ||
+        n < g->count) {
+        *g = (generation){ 0 };
+        return false;
+    }
+    lc_bytes_copy(g->lineage, text, LINEAGE_HEX + 1);
+    g->number = (uint32_t)n;
+    return true;
+}
+
+int generation_keep(const char *name, const generation *g) {
+    char path[MAX_PATH], text[LINEAGE_HEX + 16 + GENERATION_HISTORY_MAX + 4], number[24], history[GENERATION_HISTORY_MAX];
+    bool cut = false;
+    u64_text(number, g->number);
+    generation_history_text(g, history);
+    size_t pos = str_append(text, 0, g->lineage, sizeof(text), &cut);
+    pos = str_append(text, pos, " ", sizeof(text), &cut);
+    pos = str_append(text, pos, number, sizeof(text), &cut);
+    pos = str_append(text, pos, " ", sizeof(text), &cut);
+    pos = str_append(text, pos, history, sizeof(text), &cut);
+    str_append(text, pos, "\n", sizeof(text), &cut);
+    if (cut || !g->lineage[0] || g->count < 1 || !generation_path(path, name, ".generation"))
+        return -1;
+    return write_file_atomic(path, text, MODE_PRIVATE_FILE);
+}
+
+void generation_forget(const char *name) {
+    char path[MAX_PATH];
+    if (generation_path(path, name, ".generation") && path_exists(path))
+        (void)remove_file_durably(path);
+    generation_unchanged(name);
+}
+
+bool generation_changed(const char *name) {
+    char path[MAX_PATH];
+    return generation_path(path, name, ".changed") && path_exists(path);
+}
+
+int generation_started(const char *name) {
+    char record[MAX_PATH], path[MAX_PATH];
+    if (!generation_path(record, name, ".generation") || !generation_path(path, name, ".changed"))
+        return -1;
+    /* a container of no line has nothing an image could continue */
+    if (!path_exists(record) || path_exists(path))
+        return 0;
+    return write_file_atomic(path, "", MODE_PRIVATE_FILE);
+}
+
+void generation_unchanged(const char *name) {
+    char path[MAX_PATH];
+    if (generation_path(path, name, ".changed") && path_exists(path))
+        (void)remove_file_durably(path);
+}
+
+/* where among a generation's tokens one is, the newest being 0; -1: nowhere */
+static int generation_behind(const generation *g, const char *token) {
+    for (int i = g->count - 1; i >= 0; i--)
+        if (streq(g->tokens[i], token))
+            return g->count - 1 - i;
+    return -1;
+}
+
+generation_relation generation_compare(const generation *first, const generation *second) {
+    if (!first->lineage[0] || first->count < 1 || second->count < 1 || !streq(first->lineage, second->lineage))
+        return GENERATION_OF_ANOTHER_LINE;
+    const char *newest_first = first->tokens[first->count - 1], *newest_second = second->tokens[second->count - 1];
+    if (streq(newest_first, newest_second))
+        return GENERATION_THE_SAME;
+    if (generation_behind(second, newest_first) > 0)
+        return GENERATION_CONTINUED;
+    if (generation_behind(first, newest_second) > 0)
+        return GENERATION_CONTINUES;
+    return GENERATION_APART;
 }
 
 bool image_layout_at(const char *dir) {

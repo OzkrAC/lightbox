@@ -706,6 +706,57 @@ void cmd_base(int argc, char **argv);
 void cmd_export(int argc, char **argv);
 
 /*
+ * Generations (ROADMAP I.10). A container that is exported is of a line,
+ * which the first export names with 16 hex digits drawn then, and at a
+ * generation of it: the first export is 1, and each export of a container
+ * that was started since the one before is one more. A generation has a
+ * token of its own, 8 hex digits drawn when it is made, and a container and
+ * an image keep those of the generations they come from, the newest last:
+ * by them one is known to continue the other, or not to.
+ *
+ *   <container>/.generation   "<line> <number> <token>,<token>,...\n"
+ *   <container>/.changed      there when the container was started, or
+ *                             reset, since its generation was written
+ */
+#define LINEAGE_HEX            16
+#define GENERATION_HEX         8
+#define GENERATIONS_KEPT       32
+#define GENERATION_HISTORY_MAX (GENERATIONS_KEPT * (GENERATION_HEX + 1) + 1)
+
+typedef struct {
+    char     lineage[LINEAGE_HEX + 1];      /* empty: of no line */
+    uint32_t number;                        /* of the newest generation: 1 and up */
+    int      count;                         /* how many tokens are kept: at least 1 */
+    char     tokens[GENERATIONS_KEPT][GENERATION_HEX + 1];
+} generation;
+
+/* what one generation is to another of its line, or that it is of none */
+typedef enum {
+    GENERATION_OF_ANOTHER_LINE,
+    GENERATION_THE_SAME,
+    GENERATION_CONTINUED,                   /* the second continues the first */
+    GENERATION_CONTINUES,                   /* the first continues the second */
+    GENERATION_APART,                       /* of one line, and neither continues the other */
+} generation_relation;
+
+/* A container's generation on record: false where it has none, or what is
+ * there is none. */
+[[nodiscard]] bool generation_read(const char *name, generation *g);
+[[nodiscard]] int generation_keep(const char *name, const generation *g);
+/* Of no line any more: what is on record is taken away */
+void generation_forget(const char *name);
+/* Whether the container was started, or reset, since its generation was written */
+[[nodiscard]] bool generation_changed(const char *name);
+/* On record that it was: 0, also for a container of no line, which keeps no
+ * such record; -1 when it could not be written. And that record taken away. */
+[[nodiscard]] int generation_started(const char *name);
+void generation_unchanged(const char *name);
+/* The tokens as an image carries them, "<token>,<token>,...", and taken from that */
+void generation_history_text(const generation *g, char out[GENERATION_HISTORY_MAX]);
+[[nodiscard]] bool generation_history_take(const char *text, generation *g);
+generation_relation generation_compare(const generation *first, const generation *second);
+
+/*
  * An image that import read (ROADMAP I.6): every blob of it was held to the
  * size and the SHA-256 it is named by, and its layers are open. The limits
  * are those its manifest carries, each empty where it carries none.
@@ -730,6 +781,7 @@ typedef struct {
     char        cpu[CPU_TEXT_MAX];
     char        ttl[DURATION_TEXT_MAX];
     bool        lightbox;                   /* export wrote it: its annotations are lightbox's, of the version read here */
+    generation  gen;                        /* the generation it is, of its container's line; of none where it names none */
     bool        command;                    /* its configuration names a command to start, which lightbox does not read */
 } image;
 

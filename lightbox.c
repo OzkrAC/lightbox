@@ -2000,6 +2000,12 @@ static void cmd_create(int argc, char **argv) {
     create_err = container_config_save(name, &cfg);
     if (create_err)
         goto fail_create;
+    /* the generation the image is, of its line, is the container's: an image
+     * that continues it may be put in its place (ROADMAP I.10) */
+    if (create_image && create_image->gen.lineage[0] && generation_keep(name, &create_image->gen) != 0) {
+        create_err = "failed to keep which generation of its line the container is";
+        goto fail_create;
+    }
 
     /* made: and with no runtime record, stopped */
     if (remove_file_durably(creating) != 0) {
@@ -2042,12 +2048,30 @@ fail_create:
  * root, so that anyone can ask whether a directory is one. Unpacking is
  * root's: the process that does it makes the directory it fills its root.
  */
+static void import_replace(const image *img, const char *name, bool force);
+
 static void cmd_import(int argc, char **argv) {
     static image img;
     if (argc < 2 || argv[0][0] == '-')
         die(argc > 0 && argv[0][0] == '-' ? "Error: import takes the image's directory first, and then the name"
-                                          : "Usage: lightbox import <dir> <name> [<ip>] [options]");
+                                          : "Usage: lightbox import <dir> <name> [<ip>] [options] | import <dir> <name> --replace [--force]");
     validate_name(argv[1]);
+    /* --replace: the image in the place of a container that is there, which
+     * keeps its address and its settings, so that no other option goes with it */
+    bool replace = false, force = false;
+    for (int i = 2; i < argc; i++) {
+        if (streq(argv[i], "--replace"))
+            replace = true;
+        else if (streq(argv[i], "--force"))
+            force = true;
+    }
+    if (force && !replace)
+        die("Error: --force goes with --replace: import <dir> <name> --replace --force");
+    if (replace)
+        for (int i = 2; i < argc; i++)
+            if (!streq(argv[i], "--replace") && !streq(argv[i], "--force"))
+                die2("Error: import --replace puts the image in the place of a container, which keeps its address\n"
+                     "and its settings; nothing goes with it but --force, and this does not: ", argv[i]);
     image_open(argv[0], &img);
     require_root("import");
     for (int i = 0; i < img.nlayers; i++)
@@ -2055,6 +2079,10 @@ static void cmd_import(int argc, char **argv) {
             require_tool("gzip", tool_path_gzip());
             break;
         }
+    if (replace) {
+        import_replace(&img, argv[1], force);
+        return;
+    }
     create_image = &img;
     cmd_create(argc - 1, argv + 1);
 }
@@ -4785,6 +4813,14 @@ static void start_one(const char *name, int hook_wait) {
         nuserns_volumes = config.nvols;
     }
 
+    /* A container of a line, one that was exported or imported, is on
+     * record as started from here on: an image is not put in the place of
+     * what it does from now (ROADMAP I.10). */
+    if (generation_started(name) != 0) {
+        start_err = "failed to record that the container is started since its generation was written";
+        goto fail_start;
+    }
+
     /* clone init; it waits for its first byte */
     struct child_args ca = {
         .starter_signals = signal_fd,
@@ -5174,6 +5210,24 @@ static void cmd_restart(int argc, char **argv) {
  * not finished: a reset cut short leaves it half made, not started by start,
  * and a reset again makes it whole, or rm removes it.
  */
+/* What a container's resolv.conf said when it was made, which create kept;
+ * for one made before create kept it, what create would write now, with the
+ * name servers of --net outside as they are on record. */
+static void kept_resolv(const char *name, const container_config *cfg, char resolv[RESOLV_TEXT_MAX]) {
+    char resolv_path[MAX_PATH];
+    container_resolv_path(resolv_path, name);
+    if (read_file(resolv_path, resolv, RESOLV_TEXT_MAX) > 0)
+        return;
+    static container_config again;
+    again = *cfg;
+    char dns[MAX_DNS][16];
+    const char *failed = make_resolv(&again, dns, 0, resolv);
+    if (failed)
+        die2("Error: ", failed);
+    print_str(STDERR, "Note: the container was made before lightbox kept its resolv.conf: it gets the one\n"
+                      "create would write now\n");
+}
+
 static void reset_one(const char *name, int seconds) {
     require_root("reset");
     static container_config cfg;
@@ -5202,20 +5256,7 @@ static void reset_one(const char *name, int seconds) {
     if (cfg.net != NET_NONE && read_container_ip(name, ip, sizeof(ip)) < 0)
         die2("Error: the container's address is not on record: ", name);
     static char resolv[RESOLV_TEXT_MAX];
-    char resolv_path[MAX_PATH];
-    container_resolv_path(resolv_path, name);
-    if (read_file(resolv_path, resolv, sizeof(resolv)) <= 0) {
-        /* made before create kept it: what create would write now, with
-         * the name servers of --net outside as they are on record */
-        static container_config again;
-        again = cfg;
-        char dns[MAX_DNS][16];
-        const char *failed = make_resolv(&again, dns, 0, resolv);
-        if (failed)
-            die2("Error: ", failed);
-        print_str(STDERR, "Note: the container was made before lightbox kept its resolv.conf: it gets the one\n"
-                          "create would write now\n");
-    }
+    kept_resolv(name, &cfg, resolv);
 
     char creating[MAX_PATH], root[MAX_PATH], work[MAX_PATH], merged[MAX_PATH];
     container_creating_path(creating, name);
@@ -5235,11 +5276,221 @@ static void reset_one(const char *name, int seconds) {
         die2("Error: failed to write the container's files in /etc; it is left half made, and reset\n"
              "makes it whole: ", name);
     container_forget_run(name);
+    /* it is not what its generation was written of any more (ROADMAP I.10) */
+    if (generation_started(name) != 0)
+        print_str(STDERR, "Warning: could not record that the container was reset since its generation was written\n");
     if (remove_file_durably(creating) != 0)
         die("Error: failed to mark the container as reset");
     print_str(STDOUT, "Container '");
     print_str(STDOUT, name);
     print_str(STDOUT, "' reset: its root filesystem is its base's again\n");
+}
+
+/* "<number>" of a generation, for a message */
+static const char *generation_said(char out[24], uint32_t number) {
+    int at = 23;
+    out[at] = '\0';
+    do { out[--at] = (char)('0' + number % 10); number /= 10; } while (number);
+    return out + at;
+}
+
+/* A replace that failed after the container's files were taken out of their
+ * place: said, with where they are, and the end. */
+[[noreturn]] static void replace_failed(const char *what, const char *name) {
+    print_str(STDERR, "Error: ");
+    print_str(STDERR, what);
+    print_str(STDERR, "; the container is left half made, with the files it had in .rootfs.old in\nits directory: ");
+    print_str(STDERR, name);
+    lc_print_char(STDERR, '\n');
+    lc_kernel_exit(failure_status);
+}
+
+/*
+ * import <dir> <name> --replace [--force] (ROADMAP I.10): the image in the
+ * place of a container that is there and not running. A container that goes
+ * back and forth between two machines is two copies, and the image of the
+ * one may only take the place of the other where nothing is lost by it:
+ * where the image continues the generation the container is, and the
+ * container was not started since that was written. Otherwise what the two
+ * are to each other is said, and both are left; --force replaces all the
+ * same. The container keeps its name, its address, its id, its limits and
+ * every setting: what it may do on this host was said here, and the image
+ * brings files. The files are unpacked beside the container's own first, and
+ * put in their place when they are whole.
+ */
+static void import_replace(const image *img, const char *name, bool force) {
+    store_lock();
+    container_lock(name);
+    char creating[MAX_PATH], cdir[MAX_PATH], root[MAX_PATH], fresh[MAX_PATH], old[MAX_PATH], work[MAX_PATH], merged[MAX_PATH];
+    container_creating_path(creating, name);
+    container_dir_path(cdir, name);
+    container_root(root, name);
+    if (path_exists(creating))
+        die2("Error: the container was not created completely, and no image is put in its place; remove it with rm: ", name);
+    if (is_running(name))
+        die2("Error: container is running (stop it first): ", name);
+    (void)reconcile(name);
+    static container_config cfg;
+    container_config_load_or_die(name, &cfg);
+    if (!path_is_directory(root))
+        die2("Error: the container has no root filesystem to put an image in the place of: ", name);
+
+    /* what the two are to each other */
+    static generation here;
+    bool of_a_line = generation_read(name, &here), changed = generation_changed(name);
+    const generation *there = &img->gen;
+    char ours[24], theirs[24];
+    const char *mine = generation_said(ours, here.number), *its = generation_said(theirs, there->number);
+    generation_relation relation = of_a_line && there->lineage[0] ? generation_compare(&here, there) : GENERATION_OF_ANOTHER_LINE;
+    if (!force) {
+        const char *why[6] = { NULL };
+        if (!there->lineage[0]) {
+            why[0] = "the image names no generation of a container's, so that nothing says it continues this one";
+        } else if (!of_a_line) {
+            why[0] = "the container was never exported or imported, so that nothing says the image continues it";
+        } else if (relation == GENERATION_OF_ANOTHER_LINE) {
+            why[0] = "the image is generation ", why[1] = its, why[2] = " of another container's line than this one is of";
+        } else if (relation == GENERATION_THE_SAME && !changed) {
+            print_str(STDOUT, "Container '");
+            print_str(STDOUT, name);
+            print_str(STDOUT, "' is generation ");
+            print_str(STDOUT, mine);
+            print_str(STDOUT, " of its line already, as the image is, and was not started since: nothing was replaced\n");
+            return;
+        } else if (relation == GENERATION_THE_SAME) {
+            why[0] = "the container was started since generation ", why[1] = mine,
+            why[2] = ", which the image is: the container is the newer, and the image would take away what it did since";
+        } else if (relation == GENERATION_CONTINUED && changed) {
+            why[0] = "the container was started since generation ", why[1] = mine, why[2] = ", and the image is generation ",
+            why[3] = its, why[4] = ", which continues generation ", why[5] = mine;
+        } else if (relation == GENERATION_CONTINUES) {
+            why[0] = "the container is generation ", why[1] = mine, why[2] = ", which continues generation ", why[3] = its,
+            why[4] = ", the image's: the container is the newer";
+        } else if (relation == GENERATION_APART) {
+            why[0] = "the container is generation ", why[1] = mine, why[2] = " and the image generation ", why[3] = its,
+            why[4] = " of one line, and neither continues the other: each has what the other has not";
+        }
+        if (why[0]) {
+            print_str(STDERR, "Error: container '");
+            print_str(STDERR, name);
+            print_str(STDERR, "' is not replaced: ");
+            for (size_t i = 0; i < sizeof(why) / sizeof(why[0]) && why[i]; i++)
+                print_str(STDERR, why[i]);
+            if (relation == GENERATION_CONTINUED)
+                print_str(STDERR, " too: each has what the other has not");
+            print_str(STDERR, "\nBoth are left as they are. --force puts the image in its place all the same; lightbox export ");
+            print_str(STDERR, name);
+            print_str(STDERR, " <dir>\nkeeps the container first.\n");
+            lc_kernel_exit(failure_status);
+        }
+    }
+
+    /* what create kept, which the new files are written with */
+    char ip[IPV4_TEXT_MAX] = "";
+    if (cfg.net != NET_NONE && read_container_ip(name, ip, sizeof(ip)) < 0)
+        die2("Error: the container's address is not on record: ", name);
+    static char resolv[RESOLV_TEXT_MAX];
+    kept_resolv(name, &cfg, resolv);
+    bool overlay = cfg.base[0] != '\0';
+    /* nothing is taken away before an overlay is known to mount */
+    if (overlay && !overlay_mounts_here(name, cfg.userns ? &cfg : NULL))
+        die2("Error: no overlay can be mounted here, and the container is left as it was: ", name);
+    if (!overlay_dirs(name, work, merged) || !path_join(fresh, sizeof(fresh), cdir, ".rootfs.new") ||
+        !path_join(old, sizeof(old), cdir, ".rootfs.old"))
+        die2("Error: the paths of the container are too long: ", name);
+    /* what a replace that was killed left: files that were no container's yet, or no longer */
+    if (path_exists(fresh))
+        require_rm_rf(fresh);
+    if (path_exists(old))
+        require_rm_rf(old);
+
+    print_str(STDOUT, "Replacing container '");
+    print_str(STDOUT, name);
+    print_str(STDOUT, "' with the image in ");
+    print_str(STDOUT, img->dir);
+    print_str(STDOUT, "...\n");
+
+    /* The image's files, beside the container's: as import unpacks them for
+     * a container of this kind, an overlay of a snapshot or a copy. */
+    image_unpacked unpacked = { 0 };
+    char base[BASE_ID_TEXT] = "", taken_base[BASE_ID_TEXT] = "";
+    bool unpacked_whole = lc_kernel_mkdirat(AT_FDCWD, fresh, 0755) == 0;
+    if (unpacked_whole && overlay) {
+        int own = img->lightbox && img->nlayers == 2 ? 1 : 0;
+        int under = img->nlayers - own;
+        bool took = false;
+        unpacked_whole = image_base(img, under, base, &took, &unpacked) == 0;
+        if (unpacked_whole && took)
+            lc_bytes_copy(taken_base, base, sizeof(taken_base));
+        unpacked_whole = unpacked_whole &&
+            (!cfg.userns || lc_kernel_fchownat(AT_FDCWD, fresh, cfg.uid_start, cfg.gid_start, 0) == 0) &&
+            (!own || image_unpack(img, under, own, fresh, TAR_INTO_UPPER, cfg.userns ? cfg.uid_start : 0,
+                                  cfg.userns ? cfg.gid_start : 0, &unpacked) == 0);
+    } else if (unpacked_whole) {
+        unpacked_whole = image_unpack(img, 0, img->nlayers, fresh, TAR_INTO_TREE, 0, 0, &unpacked) == 0;
+    }
+    if (!unpacked_whole) {
+        if (path_exists(fresh))
+            require_rm_rf(fresh);
+        if (taken_base[0])
+            base_discard(taken_base);
+        die2("Error: the image was not unpacked, and the container is as it was: ", name);
+    }
+
+    /* and in their place: from here to the end the container is half made */
+    if (write_file_atomic(creating, "", MODE_PRIVATE_FILE) != 0) {
+        require_rm_rf(fresh);
+        if (taken_base[0])
+            base_discard(taken_base);
+        die("Error: failed to mark the container as being replaced; it is as it was");
+    }
+    const char *dirs[] = { work, merged };
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++)
+        if (path_exists(dirs[i]))
+            require_rm_rf(dirs[i]);
+    if (lb_sys_renameat(AT_FDCWD, root, AT_FDCWD, old) < 0 || lb_sys_renameat(AT_FDCWD, fresh, AT_FDCWD, root) < 0)
+        replace_failed("failed to put the image's files in the place of the container's", name);
+    if (overlay && !streq(cfg.base, base)) {
+        lc_bytes_copy(cfg.base, base, sizeof(cfg.base));
+        const char *wrong = container_config_save(name, &cfg);
+        if (wrong)
+            replace_failed("failed to write which snapshot the container overlays", name);
+    }
+    if (overlay ? overlay_etc(name, &cfg, ip, resolv, img->name) != 0
+                : write_etc_files(root, name, ip, resolv, img->name) != NULL)
+        replace_failed("failed to write the container's files in /etc", name);
+    if (there->lineage[0] ? generation_keep(name, there) != 0 : (generation_forget(name), false))
+        replace_failed("failed to keep which generation of its line the container is now", name);
+    generation_unchanged(name);
+    container_forget_run(name);
+    if (remove_file_durably(creating) != 0)
+        die("Error: failed to mark the container as replaced");
+    require_rm_rf(old);
+
+    print_str(STDOUT, "Container '");
+    print_str(STDOUT, name);
+    print_str(STDOUT, "' replaced");
+    if (there->lineage[0]) {
+        print_str(STDOUT, ": generation ");
+        print_str(STDOUT, its);
+        if (of_a_line && relation != GENERATION_OF_ANOTHER_LINE) {
+            print_str(STDOUT, " in the place of generation ");
+            print_str(STDOUT, mine);
+            print_str(STDOUT, changed ? ", which was started since" : "");
+        }
+    }
+    print_str(STDOUT, "\nImage sha256:");
+    print_str(STDOUT, img->manifest);
+    say_count(": ", (uint64_t)img->nlayers, img->nlayers == 1 ? " layer" : " layers");
+    if (overlay) {
+        print_str(STDOUT, taken_base[0] ? ", on the new base snapshot " : ", on the base snapshot ");
+        print_str(STDOUT, cfg.base);
+        print_str(STDOUT, taken_base[0] ? "\n" : ", which was here\n");
+    } else {
+        print_str(STDOUT, ", as a copy\n");
+    }
+    print_str(STDOUT, "Its address, its limits and its settings are as they were\n");
+    image_notes(img, &unpacked);
 }
 
 static void cmd_reset(int argc, char **argv) {
@@ -6070,6 +6321,11 @@ static const struct { const char *name; const char *text; } command_help[] = {
         "                                which is made: an OCI image layout, as skopeo and oras carry\n"
         "                                one to a registry\n" },
     { "import",
+        "  import <dir> <name> --replace [--force]\n"
+        "                                Put the image in the place of a container that is there and not\n"
+        "                                running, which keeps its address and settings: where the image\n"
+        "                                continues the generation the container was exported or imported\n"
+        "                                as, and it was not started since. --force: whatever they are\n"
         "  import <dir> <name> [<ip>] [options]\n"
         "                                Make a container of the image in <dir>, an OCI image layout, with\n"
         "                                the options of create but --rootfs and --base. Every blob is held to the\n"

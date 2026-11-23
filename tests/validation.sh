@@ -2372,19 +2372,27 @@ annotations_of() { printf '%s\n' "$1" | sed -n 's/^annotation //p' | paste -sd' 
 # descriptor says, with one layer that has the container's files, links and
 # second names, and the container's limits as annotations. What a container
 # may do on a host is not in it. The same container gives the same bytes, and
-# nothing lightbox keeps is changed.
+# nothing lightbox keeps is changed but the record of the generation the
+# first export is, of the line it begins (ROADMAP I.10); a second changes
+# nothing.
 t_export_image() {
     need_python || return 77
-    local me said out before layer config
+    local me said out before layer config line token
+    # everything lightbox keeps but that record, and the time of the directory it is made in
+    kept_but_generation() { find "$W/data" "$R" ! -path "$C/web" ! -name .generation -printf '%p %y %s %T@\n' | LC_ALL=C sort; }
     me="$(id -u):$(id -g)"
     ln -s placeholder "$BASE/bin/link" && ln "$BASE/bin/placeholder" "$BASE/bin/second-name" || return 1
     lb create web 10.0.0.2 --mem 1G --swap 512M --pids 64 --cpu 0.5 --ttl 8h --privileged --read-only \
         --seccomp deny --net nat --vol "$W/vol:/data" --dns 9.9.9.9 --oom-score 100 >/dev/null || return 1
     printf 'work\n' > "$C/web/rootfs/work.txt" && chmod 640 "$C/web/rootfs/work.txt" || return 1
-    before=$(kept_sum)
+    before=$(kept_but_generation)
     said=$(lb export web "$W/image") || { printf '%s\n' "$said"; return 1; }
     printf '%s\n' "$said"
-    [ "$before" = "$(kept_sum)" ] || { echo "export changed what lightbox keeps"; return 1; }
+    [ "$before" = "$(kept_but_generation)" ] || { echo "export changed what lightbox keeps, beyond the record of the generation"; return 1; }
+    grep -qxE '[0-9a-f]{16} 1 [0-9a-f]{8}' "$C/web/.generation" && [ "$(mode_of "$C/web/.generation")" = 600 ] &&
+        printf '%s\n' "$said" | grep -qx "Generation 1, the first of the container's line" ||
+        { echo "the first export is not on record as generation 1 of a line: $(cat "$C/web/.generation" 2>&1)"; return 1; }
+    line=$(cut -d' ' -f1 "$C/web/.generation") token=$(cut -d' ' -f3 "$C/web/.generation")
     out=$(python3 -I "$IMAGE_CHECK" "$W/image") || { printf '%s\n' "$out"; return 1; }
     printf '%s\n' "$out"
     printf '%s\n' "$said" | grep -q "^Container 'web' exported: 1 layer, " &&
@@ -2394,8 +2402,8 @@ t_export_image() {
         [ -z "$(find "$W/image/blobs" -type f ! -perm 600)" ] || { echo "the image is not its owner's alone"; return 1; }
 
     # the limits, and nothing else of the container's configuration
-    [ "$(annotations_of "$out")" = 'ac.ozkr.lightbox.cpu=0.5 ac.ozkr.lightbox.mem=1G ac.ozkr.lightbox.name=web ac.ozkr.lightbox.pids=64 ac.ozkr.lightbox.swap=512M ac.ozkr.lightbox.ttl=8h ac.ozkr.lightbox.version=1' ] ||
-        { echo "the annotations are not the container's limits: $(annotations_of "$out")"; return 1; }
+    [ "$(annotations_of "$out")" = "ac.ozkr.lightbox.cpu=0.5 ac.ozkr.lightbox.generation=1 ac.ozkr.lightbox.history=$token ac.ozkr.lightbox.lineage=$line ac.ozkr.lightbox.mem=1G ac.ozkr.lightbox.name=web ac.ozkr.lightbox.pids=64 ac.ozkr.lightbox.swap=512M ac.ozkr.lightbox.ttl=8h ac.ozkr.lightbox.version=1" ] ||
+        { echo "the annotations are not the container's limits and its generation: $(annotations_of "$out")"; return 1; }
     layer=$(printf '%s\n' "$out" | sed -n 's/^layer 1 \(sha256:[0-9a-f]*\) .*/\1/p')
     config=$(printf '%s\n' "$out" | sed -n 's/^config sha256://p')
     [ "$(cat "$W/image/blobs/sha256/$config")" = \
@@ -2409,14 +2417,17 @@ t_export_image() {
         has "file 0[0-7]{3} $me 12 bin/placeholder" && has "hardlink 0[0-7]{3} $me 0 bin/second-name -> bin/placeholder" || return 1
 
     # the same container is the same image, in a directory that was there and empty too
-    mkdir -m 777 "$W/empty" && lb export web "$W/again" >/dev/null && lb export web "$W/empty" >/dev/null || return 1
+    before=$(kept_sum)
+    mkdir -m 777 "$W/empty" && lb export web "$W/again" > "$W/again.out" && lb export web "$W/empty" >/dev/null || return 1
     diff -r "$W/image" "$W/again" && diff -r "$W/image" "$W/empty" || { echo "a second export wrote another image"; return 1; }
+    [ "$before" = "$(kept_sum)" ] && grep -qx 'Generation 1, as the export before: the container was not started since' "$W/again.out" ||
+        { echo "a second export of a container that was not started is another generation, or changed what lightbox keeps"; return 1; }
     [ "$(mode_of "$W/empty")" = 700 ] || { echo "a directory that was there is not its owner's alone: $(mode_of "$W/empty")"; return 1; }
 
     # a container that no option gave a swap or a lifetime says nothing of them
     lb create plain 10.0.0.3 >/dev/null && lb export plain "$W/plain" >/dev/null || return 1
     out=$(python3 -I "$IMAGE_CHECK" "$W/plain") || { printf '%s\n' "$out"; return 1; }
-    [ "$(annotations_of "$out")" = 'ac.ozkr.lightbox.cpu=1 ac.ozkr.lightbox.mem=256M ac.ozkr.lightbox.name=plain ac.ozkr.lightbox.pids=128 ac.ozkr.lightbox.version=1' ] ||
+    [ "$(annotations_of "$out" | sed 's/ ac\.ozkr\.lightbox\.\(generation\|history\|lineage\)=[0-9a-f]*//g')" = 'ac.ozkr.lightbox.cpu=1 ac.ozkr.lightbox.mem=256M ac.ozkr.lightbox.name=plain ac.ozkr.lightbox.pids=128 ac.ozkr.lightbox.version=1' ] ||
         { echo "the annotations of a container with the defaults: $(annotations_of "$out")"; return 1; }
 
     # skopeo, where the host has it, reads the image as the one export named,
@@ -3033,6 +3044,115 @@ with tarfile.open(sys.argv[1], "w", format=tarfile.PAX_FORMAT) as t:
     [ $rc -eq 0 ] && ! grep -q '^FAILED: ' "$W/ns.out"
 }
 
+# An import takes no work away (ROADMAP I.10). A container that is exported is
+# of a line and at a generation of it, which the image carries and an import
+# keeps; an export of a container that was started since is the next one.
+# import --replace puts an image in the place of a container that is there
+# only where the image continues the generation the container is, and the
+# container was not started since that was written: it then has the image's
+# files and generation, and its own name, address and settings. What the two
+# are to each other otherwise is said, with both generations, and both are
+# left; --force replaces all the same. No start is made here: that a
+# container was started is the record a start leaves, made by hand.
+t_import_replace() {
+    need_python || return 77
+    local rc
+    # shellcheck disable=SC2016     # the script is for the shell in the namespace
+    HOME="$W/home" LIGHTBOX_CONFIG="$CONF" unshare -r --mount -- bash -c '
+        W=$1 LB=$2 EDIT=$3 C=$1/data/containers
+        fail() { echo "FAILED: $*"; exit 1; }
+        started() { : > "$C/$1/.changed"; }
+        gen() { cat "$C/$1/.generation"; }
+        # what a refused replace says, the image, the container; and that it changed nothing
+        no() {
+            before=$(cd "$C/$3" && find . -printf "%p %y %s %T@\n" | LC_ALL=C sort)
+            said=$("$LB" import "$2" "$3" --replace 2>&1) && fail "$3 was replaced by $2: $said"
+            # the first as a pattern of grep, in which a dot stands for the apostrophe this script cannot have
+            printf "%s\n" "$said" | grep -q "$1" || fail "replace of $3 by $2: $said"
+            case $said in *"Both are left as they are. --force puts the image in its place all the same; lightbox export $3 <dir>"*) ;;
+                *) fail "replace of $3 by $2 does not say what else can be done: $said" ;; esac
+            [ "$before" = "$(cd "$C/$3" && find . -printf "%p %y %s %T@\n" | LC_ALL=C sort)" ] || fail "a refused replace changed $3"
+        }
+
+        "$LB" create web 10.0.0.2 --copy --mem 128M --vol "$W/vol:/data" > /dev/null && echo one > "$C/web/rootfs/work.txt" || fail "create"
+        "$LB" export web "$W/g1" > /dev/null || fail "export"
+        line=$(gen web | cut -d" " -f1)
+        echo "--- the next generation is of a container that was started since"
+        started web && echo two >> "$C/web/rootfs/work.txt" && "$LB" export web "$W/g2" > "$W/g2.out" || fail "a second export"
+        grep -qx "Generation 2: the container was started since the one before" "$W/g2.out" && [ ! -e "$C/web/.changed" ] &&
+            gen web | grep -qxE "$line 2 [0-9a-f]{8},[0-9a-f]{8}" || fail "not generation 2 with the first behind it: $(gen web)"
+
+        echo "--- an import is the generation its image is"
+        "$LB" import "$W/g1" there 10.0.0.9 --copy --mem 64M > /dev/null || fail "import"
+        [ "$(gen there)" = "$line 1 $(gen web | cut -d" " -f3 | cut -d, -f1)" ] && [ ! -e "$C/there/.changed" ] || fail "the import is not generation 1 of the line: $(gen there)"
+
+        echo "--- the image that continues it takes its place"
+        conf=$(grep -v "^base=" "$C/there/.conf")
+        "$LB" import "$W/g2" there --replace > "$W/replace.out" 2>&1 || { cat "$W/replace.out"; fail "replace"; }
+        cat "$W/replace.out"
+        grep -qx "Container .there. replaced: generation 2 in the place of generation 1" "$W/replace.out" &&
+            grep -qx "Its address, its limits and its settings are as they were" "$W/replace.out" || fail "replace does not say what it did"
+        [ "$(cat "$C/there/rootfs/work.txt" | paste -sd" ")" = "one two" ] && [ "$(cat "$C/there/rootfs/etc/hostname")" = there ] &&
+            grep -qx "10.0.0.9	there" "$C/there/rootfs/etc/hosts" && ! grep -q "	web\$" "$C/there/rootfs/etc/hosts" || fail "its files are not the image.s, with its own name"
+        [ "$(gen there)" = "$(gen web)" ] && [ "$(cat "$C/there/.ip")" = 10.0.0.9 ] && [ "$conf" = "$(grep -v "^base=" "$C/there/.conf")" ] &&
+            grep -qx "mem=64M" "$C/there/.conf" || fail "its generation is not the image.s, or its address and settings are not its own"
+        [ -z "$(ls -A "$C/there" | grep -v -x -e .conf -e .generation -e .ip -e .resolv -e rootfs)" ] || fail "a replace left: $(ls -A "$C/there" | paste -sd" ")"
+        said=$("$LB" import "$W/g2" there --replace 2>&1) || fail "the same image again: $said"
+        case $said in "Container "*" is generation 2 of its line already, as the image is, and was not started since: nothing was replaced") ;;
+            *) fail "the same image again: $said" ;; esac
+
+        echo "--- what is refused, with both generations"
+        no "the container is generation 2, which continues generation 1, the image.s: the container is the newer" "$W/g1" web
+        started there
+        no "the container was started since generation 2, which the image is: the container is the newer" "$W/g2" there
+        "$LB" export there "$W/g3-there" > /dev/null && started web && "$LB" export web "$W/g3-web" > /dev/null || fail "exports of both"
+        no "the container is generation 3 and the image generation 3 of one line, and neither continues the other: each has what the other has not" "$W/g3-there" web
+        "$LB" import "$W/g2" behind --copy > /dev/null && started behind || fail "import"
+        no "the container was started since generation 2, and the image is generation 3, which continues generation 2 too: each has what the other has not" "$W/g3-web" behind
+        "$LB" create fresh --copy > /dev/null || fail "create"
+        no "the container was never exported or imported, so that nothing says the image continues it" "$W/g2" fresh
+        "$LB" export fresh "$W/fresh" > /dev/null || fail "export"
+        no "the image is generation 1 of another container.s line than this one is of" "$W/fresh" web
+        cp -r "$W/g2" "$W/foreign" && python3 -I "$EDIT" "$W/foreign" no-annotations || fail "image_edit"
+        no "the image names no generation of a container.s, so that nothing says it continues this one" "$W/foreign" web
+        cp -r "$W/g2" "$W/half" && python3 -I "$EDIT" "$W/half" annotation ac.ozkr.lightbox.generation=many || fail "image_edit"
+        no "the image names no generation" "$W/half" web
+        case $said in *"Note: the image says ac.ozkr.lightbox.generation with what is no such value, which is not taken"*) ;; *) fail "a generation that is no number is not said: $said" ;; esac
+
+        echo "--- what goes with --replace, and what it needs"
+        for words in "--force" "--replace --mem 1G" "10.0.0.7 --replace" "--replace --copy"; do
+            # shellcheck disable=SC2086
+            said=$("$LB" import "$W/g3-there" web $words 2>&1) && fail "import web $words was taken"
+            case $said in *"--force goes with --replace"*|*"nothing goes with it but --force, and this does not: "*) ;; *) fail "import web $words: $said" ;; esac
+        done
+        said=$("$LB" import "$W/g2" nosuch --replace 2>&1) && fail "a container that is not there was replaced"
+        case $said in *"container does not exist: nosuch"*) ;; *) fail "no such container: $said" ;; esac
+        : > "$C/fresh/.creating"
+        said=$("$LB" import "$W/g2" fresh --replace --force 2>&1) && fail "a half-made container was replaced"
+        case $said in *"was not created completely, and no image is put in its place"*) ;; *) fail "a half-made container: $said" ;; esac
+        python3 -I -c "import os, sys; os.unlink(sys.argv[1])" "$C/fresh/.creating"
+
+        echo "--- --force replaces all the same"
+        "$LB" import "$W/g3-there" web --replace --force > "$W/force.out" 2>&1 || { cat "$W/force.out"; fail "replace --force"; }
+        grep -qx "Container .web. replaced: generation 3 in the place of generation 3" "$W/force.out" && [ "$(gen web)" = "$(gen there)" ] &&
+            [ "$(cat "$C/web/rootfs/etc/hostname")" = web ] && grep -qx "mem=128M" "$C/web/.conf" && grep -q "^vol=" "$C/web/.conf" ||
+            fail "--force did not put the image in the place of the container, with its settings kept: $(cat "$W/force.out")"
+        "$LB" import "$W/foreign" fresh --replace --force > "$W/foreign.out" 2>&1 || { cat "$W/foreign.out"; fail "replace --force by an image of no line"; }
+        [ ! -e "$C/fresh/.generation" ] && [ "$(cat "$C/fresh/rootfs/work.txt" | paste -sd" ")" = "one two" ] || fail "an image of no line left the container of one"
+
+        echo "--- an image that cannot be unpacked leaves the container as it was"
+        cp -r "$W/g3-web" "$W/broken" && python3 -I "$EDIT" "$W/broken" gzip-other || fail "image_edit"
+        # but for the time of its directory, in which the image.s files were for a while
+        before=$(cd "$C/behind" && find . -mindepth 1 -printf "%p %y %s %T@\n" | LC_ALL=C sort)
+        said=$("$LB" import "$W/broken" behind --replace --force 2>&1) && fail "an image that is not what it says was put in the place of a container"
+        case $said in *"not the layer its configuration names"*"the image was not unpacked, and the container is as it was: behind"*) ;; *) fail "a layer that is another: $said" ;; esac
+        [ "$before" = "$(cd "$C/behind" && find . -mindepth 1 -printf "%p %y %s %T@\n" | LC_ALL=C sort)" ] || fail "a replace that failed changed the container"
+    ' _ "$W" "$LB" "$IMAGE_EDIT" > "$W/ns.out" 2>&1
+    rc=$?
+    cat "$W/ns.out"
+    [ $rc -eq 0 ] && ! grep -q '^FAILED: ' "$W/ns.out"
+}
+
 check 'export writes a container as an image whose every blob is what it is named by' t_export_image
 check 'export refuses what would be no image, and leaves nothing of one'  t_export_refusals
 check 'an overlay is exported as its snapshot and, over it, its own files and marks' t_export_overlay
@@ -3040,5 +3160,6 @@ check 'import refuses what is no image, or another than it is named, before anyt
 check 'import makes of an image the container that was exported, and of a compressed one too' t_import_round_trip
 check 'an image goes to a registry and back with skopeo, its base sent once, and is the same container' t_registry
 check "base import makes one snapshot of an image's layers, and create --base a container of it" t_base_import
+check 'import --replace puts an image in the place of the container it continues, and of no other' t_import_replace
 
 summary validation

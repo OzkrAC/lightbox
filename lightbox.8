@@ -346,6 +346,21 @@ The manifest carries the container's limits, and nothing of what it may do on
 a host.
 The same container gives the same image, byte for byte.
 .TP
+.BI import " dir name " \-\-replace " \fR[" \-\-force \fR]
+Put the image in
+.I dir
+in the place of a container that is there and not running, which keeps its
+name, address, limits and settings.
+An export gives a container a generation of its line, one more for each
+export of a container that was started since the one before, which the image
+carries and an import keeps.
+The image replaces the container where it continues the generation the
+container is and the container was not started since that was written;
+otherwise both are left, and what they are to each other is said.
+.B \-\-force
+replaces all the same.
+No other option goes with it.
+.TP
 .BI import " dir name \fR[\fIip\fR] [\fIoptions\fR]"
 Make a container of the image in
 .IR dir ,

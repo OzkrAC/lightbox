@@ -3866,6 +3866,58 @@ no-hook' ] || { echo "in the container of the image: $said"; return 1; }
     start rimg2 && sh_in rimg2 "$tool" >/dev/null || { echo "the import of the image does not start, or run $tool"; return 1; }
 }
 
+# An import takes no work away (ROADMAP I.10), with containers that run. One
+# is exported, and its image imported: both are generation 1 of one line. The
+# second works and is exported, generation 2, and that image takes the place
+# of the first, which was not started since its export: it has the second's
+# files, and its own name, address and limits, and starts. Started, it is on
+# record as changed, and the same exchange the other way is refused with both
+# generations named, as each has what the other has not; --force does it all
+# the same. A reset is a change too.
+t_import_replace() {
+    command -v python3 >/dev/null 2>&1 || { echo "no python3 for the case's listener"; return 77; }
+    local said line
+    OVERLAY=1
+    up gena --mem 200M || return 1
+    sh_in gena 'echo one > /work.txt' && lb stop gena >/dev/null && lb export gena "$T/gen-1" > "$OUT/gen-1.export" 2>&1 </dev/null || { cat "$OUT/gen-1.export"; return 1; }
+    grep -qx "Generation 1, the first of the container's line" "$OUT/gen-1.export" || { cat "$OUT/gen-1.export"; echo "the first export is not generation 1"; return 1; }
+    line=$(cut -d' ' -f1 "$C/gena/.generation")
+    imported "$T/gen-1" genb --mem 100M >/dev/null || return 1
+    [ "$(cat "$C/genb/.generation")" = "$(cat "$C/gena/.generation")" ] && [ ! -e "$C/genb/.changed" ] || { echo "the import is not the generation its image is"; return 1; }
+
+    # the second one works: started, it is on record as changed, and its export is generation 2
+    start genb && [ -e "$C/genb/.changed" ] || { echo "a start left no record that the container changed"; return 1; }
+    sh_in genb 'echo two >> /work.txt && rm /etc/group' && lb stop genb >/dev/null && lb export genb "$T/gen-2" > "$OUT/gen-2.export" 2>&1 </dev/null || { cat "$OUT/gen-2.export"; return 1; }
+    grep -qx 'Generation 2: the container was started since the one before' "$OUT/gen-2.export" && [ ! -e "$C/genb/.changed" ] &&
+        grep -qxE "$line 2 [0-9a-f]{8},[0-9a-f]{8}" "$C/genb/.generation" || { cat "$OUT/gen-2.export"; echo "the export of a container that was started is not generation 2"; return 1; }
+
+    # and takes the place of the first, which was not started since its export
+    said=$(lb import "$T/gen-2" gena --replace 2>&1 </dev/null) || { printf '%s\n' "$said"; return 1; }
+    printf '%s\n' "$said"
+    printf '%s\n' "$said" | grep -qx "Container 'gena' replaced: generation 2 in the place of generation 1" || { echo "replace does not say what it did"; return 1; }
+    [ "$(cat "$C/gena/.generation")" = "$(cat "$C/genb/.generation")" ] && [ "$(conf_value gena mem)" = 200M ] &&
+        [ "$(base_of gena)" = "$(base_of genb)" ] || { echo "the container is not the image's generation with its own limits, on the snapshot"; return 1; }
+    start gena || return 1
+    said=$(sh_in gena 'cat /work.txt /etc/hostname; test -e /etc/group || echo no-group' | paste -sd' ')
+    [ "$said" = 'one two gena no-group' ] || { echo "in the container that was replaced: $said"; return 1; }
+    sh_in gena "grep -q '	gena\$' /etc/hosts && ! grep -q '	genb\$' /etc/hosts" || { echo "its hosts file is not its own"; return 1; }
+
+    # it was started: the exchange the other way is refused, with both generations
+    sh_in gena 'echo three >> /work.txt' && lb stop gena >/dev/null || return 1
+    start genb && sh_in genb 'echo other >> /work.txt' && lb stop genb >/dev/null && lb export genb "$T/gen-3" >/dev/null 2>&1 </dev/null || return 1
+    said=$(lb import "$T/gen-3" gena --replace 2>&1 </dev/null) && { echo "an image took the place of a container that was started since"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *"the container was started since generation 2, and the image is generation 3, which continues generation 2 too: each has what the other has not"*) ;;
+        *) echo "the refusal does not name both generations"; return 1 ;; esac
+    start gena && [ "$(sh_in gena 'cat /work.txt' | paste -sd' ')" = 'one two three' ] && lb stop gena >/dev/null ||
+        { echo "a refused replace changed the container"; return 1; }
+    # --force does it all the same
+    lb import "$T/gen-3" gena --replace --force > "$OUT/gena.force" 2>&1 </dev/null || { cat "$OUT/gena.force"; return 1; }
+    start gena && [ "$(sh_in gena 'cat /work.txt' | paste -sd' ')" = 'one two other' ] || { echo "--force did not put the image in its place"; return 1; }
+    # a reset is a change too
+    lb reset genb >/dev/null 2>&1 </dev/null && [ -e "$C/genb/.changed" ] || { echo "a reset left no record that the container changed"; return 1; }
+}
+
 # ─── Cases: where the settings are ──────────────────────────────────────────
 
 # Named by neither --config nor LIGHTBOX_CONFIG, the settings are those of
@@ -4802,6 +4854,7 @@ if [ "$MODE" = inside ]; then
     check 'an image goes to a registry and back with skopeo, and is the container again' t_registry
     check "base import makes a snapshot of an image's layers, and create --base a container that starts" t_base_import
     check "a registry's own image is a base, and a container of it runs the image's tools" t_registry_image
+    check 'import --replace puts an image in the place of the container it continues, and of none that was started since' t_import_replace
     check 'no case ran ip or nsenter, which were masked in every one'     t_no_ip_or_nsenter_ran
 
     # last: it may leave a kernel setting changed for the rest of this suite's life
