@@ -337,6 +337,9 @@ void require_write_file(const char *path, const char *data);
  * descriptor, or -errno. A program the kernel refuses is loaded once more
  * for the verifier to say why, into log, which is empty otherwise. */
 lc_sysret device_program_load(char *log, uint32_t log_size);
+/* Whether the kernel has no bpf system call at all, which anyone may ask:
+ * then no device program is loaded, by root either (ROADMAP R.4). */
+[[nodiscard]] bool bpf_call_missing(void);
 
 [[nodiscard]] int write_file_in_root(const char *root, const char *dir, const char *name,
                                      const char *data, int32_t mode);
@@ -1134,6 +1137,9 @@ bool host_port_ok(const char *ifname);
 [[nodiscard]] int iptables_kernel_missing(const char *proc_net, const char *modules, char *missing, size_t max,
                                           char *links, size_t links_max);
 [[nodiscard]] bool running_kernel_modules(char out[MAX_PATH]);
+/* Whether a module of that name is in the lists of the modules directory,
+ * built in or to load; listed says whether either list could be read. */
+[[nodiscard]] bool kernel_module_listed(const char *modules, const char *name, bool *listed);
 /* nft --check of the rules setup puts in, which the kernel validates and
  * nothing commits: 1 taken, 0 refused with what nft said in said, -1 not
  * asked, as there is no nft or the bridge's name is not one nft takes. Only

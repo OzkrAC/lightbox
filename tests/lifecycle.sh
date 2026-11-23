@@ -927,7 +927,7 @@ t_agent_doctor() {
     rc=$?
     printf '%s\n' "$said" | grep -A1 '^agent\.'
     [ "$rc" = 0 ] || { echo "doctor --profile agent exited $rc on a host set up for the profile"; return 1; }
-    for check in kernel userns_ranges idmap nft cgroup_kill; do
+    for check in kernel userns_ranges overlayfs idmap nft cgroup_kill; do
         printf '%s\n' "$said" | grep -Eq "^agent\.$check: (yes|ok) " || { echo "agent.$check does not pass"; return 1; }
     done
     nft=$(printf '%s\n' "$said" | sed -n 's/^agent\.nft: ok (\(.*\))$/\1/p')

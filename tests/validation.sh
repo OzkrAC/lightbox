@@ -1878,7 +1878,7 @@ sys.exit(0 if d["overall"] == "ok" else 1)
 }
 
 # doctor --profile agent (ROADMAP 8.11): after the checks of every container,
-# five of what a box of the profile needs, in text and in --json, each one
+# six of what a box of the profile needs, in text and in --json, each one
 # that fails followed by its fix. An ordinary user cannot make an idmapped
 # mount, and is told that whether one works is not known. Without the option
 # there are none of them, and a value that is not agent, or none, is refused.
@@ -1889,7 +1889,7 @@ t_doctor_profile() {
     report=$(lb doctor --profile agent 2>&1) && { printf '%s\n' "$report"; echo "doctor exited 0 for an ordinary user"; return 1; }
     printf '%s\n' "$report" | sed -n '/^agent\./,$p'
     names=$(printf '%s\n' "$report" | sed -n 's/^\(agent\.[a-z_]*\): .*/\1/p' | paste -sd' ')
-    [ "$names" = 'agent.kernel agent.userns_ranges agent.idmap agent.nft agent.cgroup_kill' ] ||
+    [ "$names" = 'agent.kernel agent.userns_ranges agent.overlayfs agent.idmap agent.nft agent.cgroup_kill' ] ||
         { echo "the profile's checks: $names"; return 1; }
     printf '%s\n' "$report" | grep -Eqx 'agent\.kernel: (yes|no) \(.+; the profile needs Linux 5\.19 or later, for an overlay on an idmapped layer\)' ||
         { echo "agent.kernel does not say what it needs"; return 1; }
@@ -1897,6 +1897,22 @@ t_doctor_profile() {
       'agent.idmap: no (not known: only root may make an idmapped mount)|  to fix: sudo lightbox doctor --profile agent' ] ||
         { echo "agent.idmap does not say that only root can tell"; return 1; }
     printf '%s\n' "$report" | grep -Eqx 'agent\.nft: (ok|missing) \(/.+/nft\)' || { echo "agent.nft does not name nft"; return 1; }
+    # overlayfs as the host has it (ROADMAP R.4): listed, a module of the
+    # running kernel's to load, or none, which a box cannot do without
+    local mods want
+    mods=/lib/modules/$(uname -r)
+    [ -d "$mods" ] || mods=/usr/lib/modules/$(uname -r)
+    if grep -q "$(printf '\toverlay$')" /proc/filesystems; then
+        want='agent.overlayfs: yes (in /proc/filesystems)'
+    elif grep -qs '/overlay\.ko' "$mods/modules.builtin" "$mods/modules.dep"; then
+        want="agent.overlayfs: yes (a module of the kernel's, which the first overlay mounted loads)"
+    elif [ -e "$mods/modules.builtin" ] || [ -e "$mods/modules.dep" ]; then
+        want='agent.overlayfs: no (the kernel has none, built in or as a module: a box is an overlay of its base)'
+    else
+        want="agent.overlayfs: no (not in /proc/filesystems, and the running kernel's modules are not listed)"
+    fi
+    printf '%s\n' "$report" | grep -Fqx "$want" ||
+        { printf '%s\n' "$report" | grep '^agent\.overlayfs: '; echo "expected: $want"; return 1; }
     printf '%s\n' "$report" | awk '/^agent\./ { on = 1 }
         on && want { if ($0 !~ /^  to fix: ./) { print "no fix after " name; bad = 1 } want = 0; next }
         on && /^agent\.[a-z_]+: (no|missing)( |$)/ { want = 1; name = $1 }
@@ -1908,7 +1924,7 @@ t_doctor_profile() {
 import json, sys
 d = json.load(sys.stdin)
 names = [c["check"] for c in d["checks"] if c["check"].startswith("agent.")]
-assert names == ["agent.kernel", "agent.userns_ranges", "agent.idmap", "agent.nft", "agent.cgroup_kill"], names
+assert names == ["agent.kernel", "agent.userns_ranges", "agent.overlayfs", "agent.idmap", "agent.nft", "agent.cgroup_kill"], names
 for c in d["checks"]:
     assert isinstance(c["ok"], bool) and (c["fix"] is None) == c["ok"], c
     assert c["text"].startswith(("yes", "no", "ok", "missing", "unusable")) or c["check"] == "network", c
@@ -1919,6 +1935,28 @@ assert d["overall"] == "degraded", d["overall"]
     [ "$said" = 'Error: option --profile requires a value' ] || { echo "--profile alone: $said"; return 1; }
     said=$(lb doctor --profile other 2>&1) && return 1
     [ "$said" = 'Error: --profile takes agent, not: other' ] || { echo "--profile other: $said"; return 1; }
+}
+
+# device_filter without root (ROADMAP R.4): a kernel without the bpf call is
+# named, as anyone may ask it; on one with the call, whether the program
+# loads is root's to try, and an ordinary user is told it is not known.
+t_doctor_device_filter_as_a_user() {
+    [ "$(id -u)" -ne 0 ] || { echo "run as root: what an ordinary user is told is not shown"; return 77; }
+    command -v python3 >/dev/null 2>&1 || { echo "no python3 to ask for the bpf call with"; return 77; }
+    local want said
+    if python3 -I -c '
+import ctypes, platform, sys
+nr = {"x86_64": 321, "aarch64": 280}[platform.machine()]
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall(nr, 5, None, 0)
+sys.exit(0 if ctypes.get_errno() == 38 else 1)'; then
+        want='device_filter: no (the kernel has no bpf system call, which loads the program)|  to fix: boot a kernel with CONFIG_CGROUP_BPF and CONFIG_BPF_SYSCALL; only a --privileged container starts without it'
+    else
+        want='device_filter: no (not known: only root may load the program)|  to fix: sudo lightbox doctor'
+    fi
+    said=$(lb doctor 2>&1 | grep -A1 '^device_filter: ' | paste -sd'|')
+    printf '%s\n' "$said"
+    [ "$said" = "$want" ] || { echo "expected: $want"; return 1; }
 }
 
 # update takes --mem, --pids and --cpu, held to what create holds them to,
@@ -2389,6 +2427,7 @@ check 'a surplus argument is an error that names it'                    t_surplu
 check 'doctor says how to fix each thing it finds missing'              t_doctor_says_how_to_fix
 check 'doctor --json: settings and checks, typed'                       t_doctor_json
 check 'doctor --profile agent: what the profile needs, and its fixes'   t_doctor_profile
+check 'doctor says without root that a kernel has no bpf call, and else that root may tell' t_doctor_device_filter_as_a_user
 check 'update, restart, rm -f and reset check their options before anything'  t_update_restart_rm_options
 check 'update writes the limits into a stopped container'"'"'s .conf'       t_update_rewrites_the_conf
 check 'create --userns is root'"'"'s, and inspect and doctor show the ranges' t_userns_as_a_user_sees_it

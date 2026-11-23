@@ -990,6 +990,11 @@ void require_mount(const char *source, const char *target,
 
 /* ─── The device program ────────────────────────────────────────────────── */
 
+bool bpf_call_missing(void) {
+    /* given no program, refused whoever asks; ENOSYS where there is no call */
+    return lb_sys_bpf(LB_BPF_PROG_LOAD, NULL, 0) == -LB_ENOSYS;
+}
+
 lc_sysret device_program_load(char *log, uint32_t log_size) {
     static struct lb_ebpf_insn prog[LB_DEV_PROG_LEN];
     if (log && log_size)

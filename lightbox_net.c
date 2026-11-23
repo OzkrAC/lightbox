@@ -1609,6 +1609,19 @@ int iptables_kernel_missing(const char *proc_net, const char *modules, char *mis
     return missing[0] ? 0 : 1;
 }
 
+bool kernel_module_listed(const char *modules, const char *name, bool *listed) {
+    char needle[64], path[MAX_PATH];
+    bool cut = false, found[1] = { false };
+    str_append(needle, str_append(needle, str_append(needle, 0, "/", sizeof(needle), &cut), name, sizeof(needle), &cut),
+               ".ko", sizeof(needle), &cut);
+    const char *needles[1] = { needle };
+    *listed = false;
+    static const char *const lists[] = { "modules.builtin", "modules.dep" };
+    for (size_t l = 0; l < 2 && !cut; l++)
+        *listed = (path_join(path, sizeof(path), modules, lists[l]) && file_mentions(path, needles, found, 1)) || *listed;
+    return found[0];
+}
+
 bool running_kernel_modules(char out[MAX_PATH]) {
     char release[128];
     int n = read_file("/proc/sys/kernel/osrelease", release, sizeof(release));
