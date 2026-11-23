@@ -3161,6 +3161,97 @@ t_import_replace() {
     [ $rc -eq 0 ] && ! grep -q '^FAILED: ' "$W/ns.out"
 }
 
+# An export into the directory of the one before (ROADMAP I.13). The
+# directory holds the image of an export of the container before, and
+# nothing else: the new image takes its place, and is the image a new
+# directory gets. The layer that is the snapshot is in the directory already
+# and is not read again, which a snapshot that was changed since shows: its
+# layer is the one it was, and nothing is said of the change. No blob that
+# only the image before named is left. A directory with a file that is no
+# part of an image, an image with a blob that is not what it is named by, one
+# that export did not write so, the image of another container and a newer
+# one of this container's line are refused and left as they were, to the
+# time of every file; and so is the image before when the export fails.
+t_export_again() {
+    need_python || return 77
+    local rc
+    mkdir -p "$BASE/lib" && echo keep > "$BASE/lib/keep" || return 1
+    # shellcheck disable=SC2016     # the script is for the shell in the namespace
+    HOME="$W/home" LIGHTBOX_CONFIG="$CONF" unshare -r --mount -- bash -c '
+        W=$1 LB=$2 EDIT=$3 CHECK=$4 C=$1/data/containers
+        fail() { echo "FAILED: $*"; exit 1; }
+        listing() { (cd "$1" && find . -printf "%p %y %s %T@\n" | LC_ALL=C sort); }
+        # what a refused export says, as a pattern of grep, the container, the directory, which is left as it was
+        no() {
+            before=$(listing "$3")
+            said=$("$LB" export "$2" "$3" 2>&1) && fail "$2 was exported into $3: $said"
+            printf "%s\n" "$said" | grep -q "$1" || fail "export of $2 into $3: $said"
+            [ "$before" = "$(listing "$3")" ] || fail "an export that was refused with [$1] changed $3"
+        }
+        # a copy, made an overlay of a snapshot by its .conf, as no overlay is mounted for this
+        "$LB" create web 10.0.0.2 --copy > /dev/null && id=$("$LB" base add "$W/base" | sed -n "s/^Base \([0-9a-f]\{12\}\) taken of .*/\1/p") &&
+            [ -n "$id" ] && echo "base=$id" >> "$C/web/.conf" && mv "$C/web/rootfs" "$C/web/copy" && mkdir -p "$C/web/rootfs/etc" &&
+            cp "$C/web/copy/etc/hostname" "$C/web/rootfs/etc/hostname" || fail "no container that overlays a snapshot"
+        "$LB" export web "$W/img" > /dev/null || fail "export"
+        first=$(python3 -I "$CHECK" "$W/img" | sed -n "s/^layer 1 //p")
+
+        echo "--- into the directory of the export before: the image a new directory gets"
+        echo more > "$C/web/rootfs/more.txt" || fail "no file"
+        "$LB" export web "$W/img" > "$W/again.out" 2>&1 || { cat "$W/again.out"; fail "a second export into the directory"; }
+        cat "$W/again.out"
+        grep -q "^In the place of the image of the export before: the layer that is the base snapshot was there, and\$" "$W/again.out" ||
+            fail "the second export does not say that the snapshot was not written again"
+        "$LB" export web "$W/new" > /dev/null && diff -r "$W/img" "$W/new" || fail "it is another image than a new directory gets"
+        [ "$(ls -A "$W/img" | paste -sd" ")" = "blobs index.json oci-layout" ] && [ "$(ls -A "$W/img/blobs/sha256" | wc -l)" = 4 ] ||
+            fail "a blob that the image does not name is left: $(ls -A "$W/img/blobs/sha256" | paste -sd" ")"
+
+        echo "--- the snapshot is not read again"
+        echo changed > "$W/data/bases/$id/rootfs/lib/keep" && echo third > "$C/web/rootfs/third.txt" || fail "no change"
+        "$LB" export web "$W/img" > "$W/third.out" 2>&1 || { cat "$W/third.out"; fail "a third export into the directory"; }
+        ! grep -q "^Warning" "$W/third.out" || fail "the snapshot was read: $(grep "^Warning" "$W/third.out")"
+        out=$(python3 -I "$CHECK" "$W/img") || fail "the directory is no image any more: $out"
+        [ "$(printf "%s\n" "$out" | sed -n "s/^layer 1 //p")" = "$first" ] && printf "%s\n" "$out" | grep -q "^entry 2 file .* third.txt\$" &&
+            [ "$(ls -A "$W/img/blobs/sha256" | wc -l)" = 4 ] || fail "not the layer that was there and, over it, the files of now"
+        "$LB" export web "$W/read" 2>&1 | grep -q "^Warning: the base snapshot $id is another layer than it was" ||
+            fail "a new directory, for which the snapshot is read, does not say that it was changed"
+
+        echo "--- what is refused, and left as it was"
+        : > "$W/img/stray" && no "this one is not empty" web "$W/img" && python3 -I -c "import os, sys; os.unlink(sys.argv[1])" "$W/img/stray" || fail "stray"
+        : > "$W/img/blobs/sha256/stray" && no "holds another image, or more than one" web "$W/img" &&
+            python3 -I -c "import os, sys; os.unlink(sys.argv[1])" "$W/img/blobs/sha256/stray" || fail "stray blob"
+        cp -r "$W/img" "$W/bad" && python3 -I "$EDIT" "$W/bad" byte layer || fail "image_edit"
+        no "a layer is not what it is named by: its bytes have another SHA-256" web "$W/bad"
+        cp -r "$W/img" "$W/gz" && python3 -I "$EDIT" "$W/gz" gzip || fail "image_edit"
+        no "holds another image, or more than one" web "$W/gz"
+        cp -r "$W/img" "$W/foreign" && python3 -I "$EDIT" "$W/foreign" no-annotations || fail "image_edit"
+        no "holds another image, or more than one" web "$W/foreign"
+        "$LB" create other --copy > /dev/null || fail "create"
+        no "the directory holds the image of another container, which export does not write over" other "$W/img"
+        "$LB" import "$W/img" there --copy > /dev/null && : > "$C/there/.changed" && "$LB" export there "$W/newer" > /dev/null || fail "no newer generation"
+        no "an image of this container.s line that the container does not continue" web "$W/newer"
+        # And an export that fails while it writes leaves the image before:
+        # every file of it as it was. The layer it began was in the directory
+        # of the blobs for a while, whose own time is that of now.
+        : > "$C/web/rootfs/.wh.x"
+        files() { (cd "$W/img" && find . -type f -printf "%p %s %T@\n" | LC_ALL=C sort); }
+        before=$(files)
+        said=$("$LB" export web "$W/img" 2>&1) && fail "a tree that is no layer was exported: $said"
+        printf "%s\n" "$said" | grep -q ": .wh.x: has a name that begins with .wh." || fail "a tree that is no layer: $said"
+        [ "$before" = "$(files)" ] && [ "$(ls -A "$W/img/blobs/sha256" | wc -l)" = 4 ] || fail "an export that failed changed the image before, or left a file"
+        python3 -I -c "import os, sys; os.unlink(sys.argv[1])" "$C/web/rootfs/.wh.x"
+        python3 -I "$CHECK" "$W/img" > /dev/null || fail "after an export that failed the directory is no image"
+
+        echo "--- a copy, which is one layer"
+        "$LB" export other "$W/one" > /dev/null && echo more > "$C/other/rootfs/more.txt" && "$LB" export other "$W/one" > "$W/one.out" 2>&1 ||
+            { cat "$W/one.out"; fail "a second export of a copy into the directory"; }
+        grep -qx "In the place of the image of the export before" "$W/one.out" && [ "$(ls -A "$W/one/blobs/sha256" | wc -l)" = 3 ] &&
+            python3 -I "$CHECK" "$W/one" | grep -q "^entry 1 file .* more.txt\$" || fail "a copy was not exported in the place of its image before"
+    ' _ "$W" "$LB" "$IMAGE_EDIT" "$IMAGE_CHECK" > "$W/ns.out" 2>&1
+    rc=$?
+    cat "$W/ns.out"
+    [ $rc -eq 0 ] && ! grep -q '^FAILED: ' "$W/ns.out"
+}
+
 check 'export writes a container as an image whose every blob is what it is named by' t_export_image
 check 'export refuses what would be no image, and leaves nothing of one'  t_export_refusals
 check 'an overlay is exported as its snapshot and, over it, its own files and marks' t_export_overlay
@@ -3169,5 +3260,6 @@ check 'import makes of an image the container that was exported, and of a compre
 check 'an image goes to a registry and back with skopeo, its base sent once, and is the same container' t_registry
 check "base import makes one snapshot of an image's layers, and create --base a container of it" t_base_import
 check 'import --replace puts an image in the place of the container it continues, and of no other' t_import_replace
+check 'export into the directory of the export before writes the new image, and no snapshot again' t_export_again
 
 summary validation

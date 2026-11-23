@@ -334,7 +334,9 @@ checks what a box of that profile needs too.
 .BI export " name dir"
 Write a container that is not running as an image in
 .IR dir ,
-which is made, or taken when it is there, empty and the caller's own: an OCI
+which is made, or taken when it is there, the caller's own, and empty or
+with the image of an export of the container before in it and nothing else,
+whose layer for the base snapshot is then not written again: an OCI
 image layout, as
 .BR skopeo (1)
 and

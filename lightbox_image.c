@@ -76,9 +76,37 @@ static void made_file(const char *path) {
     str_copy_or_die(made.files[made.nfiles++], path, MAX_PATH, "a file of the image");
 }
 
+/*
+ * Or the directory holds the image of an export of this container before
+ * (ROADMAP I.13): then its blobs are on record here by their names. One the
+ * new image names too stays where it is, and is not written again where it
+ * is the snapshot; a failure takes away what this export wrote and none of
+ * those, so that what is left is the image that was there; and those the new
+ * image does not name go when the new index is in place, and no other file.
+ */
+#define BEFORE_BLOBS_MAX 8
+static struct {
+    bool     there;
+    int      nblobs;
+    char     blobs[BEFORE_BLOBS_MAX][SHA256_HEX + 1];
+    char     base[SHA256_HEX + 1];      /* its first layer of two: a snapshot */
+    uint64_t base_size;
+} earlier;
+
+static bool blob_was_there(const char *path) {
+    size_t len = lc_string_length(path);
+    if (!earlier.there || len < SHA256_HEX)
+        return false;
+    for (int i = 0; i < earlier.nblobs; i++)
+        if (streq(path + len - SHA256_HEX, earlier.blobs[i]))
+            return true;
+    return false;
+}
+
 static void export_undo(void) {
     for (int i = 0; i < made.nfiles; i++)
-        (void)lc_kernel_unlinkat(AT_FDCWD, made.files[i], 0);
+        if (!blob_was_there(made.files[i]))
+            (void)lc_kernel_unlinkat(AT_FDCWD, made.files[i], 0);
     if (made.made_sha256)
         (void)lc_kernel_unlinkat(AT_FDCWD, made.sha256, AT_REMOVEDIR);
     if (made.made_blobs)
@@ -305,7 +333,106 @@ static bool dir_is_under(const char *dir, const char *above) {
  * something else in the place of what is written there, and then it is no
  * longer this command that says what the image is.
  */
-static void image_dir_take(const char *dir) {
+/* The names in a directory, of no more than 64 characters each: how many,
+ * or -1 where it has more than max, a longer one, or cannot be read. */
+static int dir_names(const char *path, char names[][SHA256_HEX + 1], int max) {
+    lc_sysret fd = lc_kernel_open_file(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW, 0);
+    if (fd < 0)
+        return -1;
+    char buf[2048];
+    int count = 0;
+    while (count >= 0) {
+        lc_sysret n = lc_kernel_read_directory((int32_t)fd, buf, sizeof(buf));
+        if (n < 0)
+            count = -1;
+        if (n <= 0)
+            break;
+        for (lc_sysret pos = 0; pos < n && count >= 0; ) {
+            /* struct linux_dirent64: d_reclen at offset 16, d_name at 19 */
+            uint16_t reclen;
+            lc_bytes_copy(&reclen, buf + pos + 16, sizeof(reclen));
+            const char *entry = buf + pos + 19;
+            bool dot = entry[0] == '.' && (entry[1] == '\0' || (entry[1] == '.' && entry[2] == '\0'));
+            if (reclen == 0 || (!dot && (count == max || !str_copy(names[count], entry, SHA256_HEX + 1))))
+                count = -1;
+            else if (!dot)
+                count++;
+            pos += reclen;
+        }
+    }
+    lc_kernel_close_file((int32_t)fd);
+    return count;
+}
+
+static bool among(const char *name, char names[][SHA256_HEX + 1], int count) {
+    for (int i = 0; i < count; i++)
+        if (streq(names[i], name))
+            return true;
+    return false;
+}
+
+/*
+ * A directory that is there and not empty is taken when what it holds is
+ * the image of an export of this container before, and nothing else
+ * (ROADMAP I.13): the three files of an image layout, with the blobs the
+ * image names and no other; an image that export wrote, its layers not
+ * compressed; read as import reads one, every blob held to its digest; and
+ * of a generation that the one written now is, or continues, so that no
+ * export writes over the image of another container, or over a newer one of
+ * this container's line that came from somewhere else.
+ */
+static void image_dir_before(const char *dir, const generation *gen) {
+    static const char not_empty[] = "Error: export writes an image into a directory of its own, and this one is not empty: ";
+    static const char not_one[] = "Error: export writes over the image of an export of the container before and over nothing\n"
+                                  "else, and this directory holds another image, or more than one: ";
+    static char names[BEFORE_BLOBS_MAX][SHA256_HEX + 1];
+    static image img;
+    char blobs[MAX_PATH], sha256[MAX_PATH];
+    if (!path_join(blobs, sizeof(blobs), dir, "blobs") || !path_join(sha256, sizeof(sha256), blobs, "sha256"))
+        die2("Error: the path of the image's directory is too long: ", dir);
+    /* the three of an image layout, and the blobs in their one directory */
+    if (dir_names(dir, names, BEFORE_BLOBS_MAX) != 3 || !among(OCI_LAYOUT_FILE, names, 3) ||
+        !among(OCI_INDEX_FILE, names, 3) || !among("blobs", names, 3) ||
+        dir_names(blobs, names, BEFORE_BLOBS_MAX) != 1 || !streq(names[0], "sha256"))
+        die2(not_empty, dir);
+    int count = dir_names(sha256, names, BEFORE_BLOBS_MAX);
+    if (count < 0)
+        die2(not_empty, dir);
+
+    image_open(dir, &img);
+    for (int i = 0; i < img.nlayers; i++) {
+        lc_kernel_close_file(img.layers[i].fd);
+        if (img.layers[i].gzip)
+            die2(not_one, dir);
+    }
+    /* the manifest, the configuration and the layers, each a blob, and no file besides */
+    bool whole = img.lightbox && img.nlayers <= 2 && count == img.nlayers + 2 && among(img.manifest, names, count);
+    for (int i = 0; whole && i < img.nlayers; i++)
+        whole = among(img.layers[i].digest, names, count);
+    if (!whole)
+        die2(not_one, dir);
+    generation_relation is = img.gen.lineage[0] ? generation_compare(&img.gen, gen) : GENERATION_OF_ANOTHER_LINE;
+    if (is != GENERATION_THE_SAME && is != GENERATION_CONTINUED) {
+        print_str(STDERR, is == GENERATION_OF_ANOTHER_LINE
+                              ? "Error: the directory holds the image of another container, which export does not write over: "
+                              : "Error: the directory holds an image of this container's line that the container does not continue,\n"
+                                "a newer one or one that went on apart, which export does not write over: ");
+        print_str(STDERR, dir);
+        print_str(STDERR, "\nA directory that is not there yet takes the export.\n");
+        fail_now();
+    }
+
+    earlier.there = true;
+    earlier.nblobs = count;
+    for (int i = 0; i < count; i++)
+        lc_bytes_copy(earlier.blobs[i], names[i], sizeof(earlier.blobs[i]));
+    if (img.nlayers == 2) {
+        lc_bytes_copy(earlier.base, img.layers[0].digest, sizeof(earlier.base));
+        earlier.base_size = img.layers[0].size;
+    }
+}
+
+static void image_dir_take(const char *dir, const generation *gen) {
     struct lb_statx st;
     lc_sysret fd = lc_kernel_open_file(dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW, 0);
     if (fd < 0 && lb_sys_statx(AT_FDCWD, dir, AT_SYMLINK_NOFOLLOW, LB_STATX_TYPE, &st) == 0 &&
@@ -315,19 +442,24 @@ static void image_dir_take(const char *dir) {
         die2("Error: export writes an image into a directory, and this is none: ", dir);
     if (lb_sys_statx((int32_t)fd, "", LB_AT_EMPTY_PATH, LB_STATX_UID, &st) < 0 || st.stx_uid != (uint32_t)lb_sys_geteuid())
         die2("Error: export writes an image into a directory of its caller's own, and this is another user's: ", dir);
-    /* empty before its mode is touched, and empty still once nobody else can write in it */
-    if (dir_is_empty(dir) != 1)
-        die2("Error: export writes an image into a directory of its own, and this one is not empty: ", dir);
+    /* empty before its mode is touched, and empty still once nobody else can
+     * write in it; or with the image of an export of this container before in
+     * it, and nothing else */
+    int empty = dir_is_empty(dir);
+    if (empty < 0)
+        die2("Error: cannot read the directory the image is to be written into: ", dir);
+    if (empty == 0)
+        image_dir_before(dir, gen);     /* which ends the command where it is none: the directory is as it was */
     if (lb_sys_fchmod((int32_t)fd, MODE_PRIVATE_DIR) < 0)
         die2("Error: cannot make the image's directory its owner's alone: ", dir);
     lc_kernel_close_file((int32_t)fd);
-    if (dir_is_empty(dir) != 1)
+    if (empty == 1 && dir_is_empty(dir) != 1)
         die2("Error: export writes an image into a directory of its own, and this one is not empty: ", dir);
 }
 
 /* The image's directory, made, or found with nothing in it, and the two
  * inside it that hold the blobs. */
-static void image_dir_make(const char *dir) {
+static void image_dir_make(const char *dir, const generation *gen) {
     str_copy_or_die(made.dir, dir, MAX_PATH, "the image's directory");
     if (!path_join(made.blobs, MAX_PATH, dir, "blobs") || !path_join(made.sha256, MAX_PATH, made.blobs, "sha256"))
         die2("Error: the path of the image's directory is too long: ", dir);
@@ -358,13 +490,15 @@ static void image_dir_make(const char *dir) {
     } else if (rc != -LB_EEXIST) {
         die2("Error: cannot make the image's directory, which has to be in one that is there: ", dir);
     } else {
-        image_dir_take(dir);
+        image_dir_take(dir, gen);
     }
 
     /* by what the directory is, now that it is there: one that was there may be one of lightbox's own */
     if (dir_is_under(dir, cfg_global.container_dir) || dir_is_under(dir, bases))
         die2("Error: export does not write an image among lightbox's own files: ", dir);
 
+    if (earlier.there)
+        return;         /* its two directories are there */
     if (lc_kernel_mkdirat(AT_FDCWD, made.blobs, MODE_PRIVATE_DIR) < 0)
         die2("Error: cannot make ", made.blobs);
     made.made_blobs = true;
@@ -443,7 +577,7 @@ void cmd_export(int argc, char **argv) {
         gen.number++;
     }
 
-    image_dir_make(dir);
+    image_dir_make(dir, &gen);
     print_str(STDOUT, "Exporting container '");
     print_str(STDOUT, name);
     print_str(STDOUT, "' to ");
@@ -455,18 +589,29 @@ void cmd_export(int argc, char **argv) {
      * has them from 0, as the snapshot and a copy have them on the disk. */
     struct blob layers[LAYERS_MAX];
     int nlayers = 0;
+    bool base_there = false;
     if (cfg.base[0]) {
         struct blob *base = &layers[nlayers++];
-        blob_of_tree(lower, false, 0, 0, base);
         char kept[SHA256_HEX + 1];
         uint64_t kept_size;
-        if (base_layer_read(cfg.base, kept, &kept_size) && (!streq(kept, base->digest) || kept_size != base->size)) {
+        /* The snapshot as a layer is in the directory from the export before,
+         * named by the digest the snapshot keeps and held to it when the
+         * image there was read: it is not read again, nor written. */
+        base_there = earlier.there && earlier.base[0] && base_layer_read(cfg.base, kept, &kept_size) &&
+                     streq(kept, earlier.base) && kept_size == earlier.base_size;
+        if (base_there) {
+            lc_bytes_copy(base->digest, kept, sizeof(base->digest));
+            base->size = kept_size;
+        } else {
+            blob_of_tree(lower, false, 0, 0, base);
+        }
+        if (!base_there && base_layer_read(cfg.base, kept, &kept_size) && (!streq(kept, base->digest) || kept_size != base->size)) {
             print_str(STDERR, "Warning: the base snapshot ");
             print_str(STDERR, cfg.base);
             print_str(STDERR, " is another layer than it was when it was last written: its files were\n"
                               "changed after it was taken, under every container that overlays it\n");
         }
-        if (base_layer_keep(cfg.base, base->digest, base->size) != 0) {
+        if (!base_there && base_layer_keep(cfg.base, base->digest, base->size) != 0) {
             print_str(STDERR, "Warning: the digest of the base snapshot ");
             print_str(STDERR, cfg.base);
             print_str(STDERR, " could not be kept beside it\n");
@@ -525,13 +670,32 @@ void cmd_export(int argc, char **argv) {
     sync_dir_or_die(made.blobs);
 
     /* and last what makes the directory an image */
-    image_file(OCI_LAYOUT_FILE, OCI_LAYOUT_TEXT);
+    if (!earlier.there)
+        image_file(OCI_LAYOUT_FILE, OCI_LAYOUT_TEXT);
     t = (struct text){ 0 };
     add(&t, "{\"schemaVersion\":2,\"mediaType\":\"" MEDIA_INDEX "\",\"manifests\":[{");
     add_descriptor(&t, MEDIA_MANIFEST, &manifest);
     add(&t, ",\"platform\":{\"architecture\":\"" OCI_ARCHITECTURE "\",\"os\":\"linux\"}}]}");
     text_whole(&t, "the image's index");
-    image_file(OCI_INDEX_FILE, t.bytes);
+    if (!earlier.there) {
+        image_file(OCI_INDEX_FILE, t.bytes);
+    } else {
+        /* The index of the image before gives way to the new one in one
+         * step: until then the directory is the image it was, and a failure
+         * leaves it so. Then the blobs that only the image before named go. */
+        char index[MAX_PATH], gone[MAX_PATH];
+        if (!path_join(index, sizeof(index), made.dir, OCI_INDEX_FILE) || write_file_atomic(index, t.bytes, MODE_PRIVATE_FILE) != 0)
+            die2("Error: cannot write the image's index in ", made.dir);
+        on_failure(NULL);
+        for (int i = 0; i < earlier.nblobs; i++) {
+            bool named = streq(earlier.blobs[i], manifest.digest) || streq(earlier.blobs[i], config.digest);
+            for (int l = 0; l < nlayers; l++)
+                named = named || streq(earlier.blobs[i], layers[l].digest);
+            if (!named && path_join(gone, sizeof(gone), made.sha256, earlier.blobs[i]))
+                (void)lc_kernel_unlinkat(AT_FDCWD, gone, 0);
+        }
+        sync_dir_or_die(made.sha256);
+    }
     char parent[MAX_PATH];
     if (made.made_dir && parent_dir(parent, sizeof(parent), dir))
         sync_dir_or_die(parent);
@@ -546,6 +710,10 @@ void cmd_export(int argc, char **argv) {
     print_str(STDOUT, "Image sha256:");
     print_str(STDOUT, manifest.digest);
     lc_print_char(STDOUT, '\n');
+    if (earlier.there)
+        print_str(STDOUT, base_there ? "In the place of the image of the export before: the layer that is the base snapshot was there, and\n"
+                                       "is not written again\n"
+                                     : "In the place of the image of the export before\n");
     /* the image is whole: the container is at its generation, and not started since */
     if ((!of_a_line || started_since) && generation_keep(name, &gen) != 0)
         print_str(STDERR, "Warning: the generation of this export could not be kept beside the container: import --replace\n"

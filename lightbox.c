@@ -6318,8 +6318,8 @@ static const struct { const char *name; const char *text; } command_help[] = {
         "  ls [--json]                   List all containers\n" },
     { "export",
         "  export <name> <dir>           Write a container that is not running as an image in <dir>,\n"
-        "                                which is made: an OCI image layout, as skopeo and oras carry\n"
-        "                                one to a registry\n" },
+        "                                which is made, or holds the image of its export before: an OCI\n"
+        "                                image layout, as skopeo and oras carry one to a registry\n" },
     { "import",
         "  import <dir> <name> --replace [--force]\n"
         "                                Put the image in the place of a container that is there and not\n"
