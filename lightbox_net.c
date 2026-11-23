@@ -1485,6 +1485,154 @@ static bool iptables_chain_exists(const char *table, const char *chain) {
     return run_cmd_quiet(tool_path_iptables(), look) == 0;
 }
 
+/* ─── What the firewall needs of the kernel (ROADMAP R.3) ──────────────── */
+
+/*
+ * The extensions of iptables that the rules of firewall_setup_text and of a
+ * container's links use, each as the kernel registers it, the modules that
+ * give it and the option that builds them. iptables-nft takes them from the
+ * kernel as the legacy one does, through nft_compat.
+ */
+enum { XT_ALWAYS, XT_MASQ, XT_LINKS };
+static const struct {
+    const char *name;
+    bool target;
+    const char *modules[2];
+    const char *config;
+    int when;
+} XT_NEEDS[] = {
+    { "REJECT",     true,  { "ipt_REJECT", NULL },              "CONFIG_IP_NF_TARGET_REJECT",            XT_ALWAYS },
+    { "MASQUERADE", true,  { "xt_MASQUERADE", "ipt_MASQUERADE" }, "CONFIG_NETFILTER_XT_TARGET_MASQUERADE", XT_MASQ },
+    { "conntrack",  false, { "xt_conntrack", NULL },            "CONFIG_NETFILTER_XT_MATCH_CONNTRACK",   XT_ALWAYS },
+    { "addrtype",   false, { "xt_addrtype", NULL },             "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE",    XT_ALWAYS },
+    { "tcp",        false, { "xt_tcpudp", NULL },               "CONFIG_NETFILTER_XTABLES",              XT_ALWAYS },
+    { "physdev",    false, { "xt_physdev", NULL },              "CONFIG_NETFILTER_XT_MATCH_PHYSDEV",     XT_LINKS },
+};
+
+/* Is name a line of the text? */
+static bool text_has_line(const char *text, const char *name) {
+    size_t len = lc_string_length(name);
+    for (const char *p = text; *p; ) {
+        const char *end = p;
+        while (*end && *end != '\n')
+            end++;
+        if ((size_t)(end - p) == len && lc_bytes_compare(p, name, len) == 0)
+            return true;
+        p = *end ? end + 1 : end;
+    }
+    return false;
+}
+
+/*
+ * Which of the needles a file has in it, read a piece at a time: a list of
+ * modules is a megabyte on some hosts. found[i] is set for each one there;
+ * false when the file cannot be read.
+ */
+static bool file_mentions(const char *path, const char *const needles[], bool found[], size_t count) {
+    lc_sysret fd = lc_kernel_open_file(path, O_RDONLY | O_CLOEXEC, 0);
+    if (fd < 0)
+        return false;
+    static char buf[65536 + 64];
+    size_t kept = 0;          /* the end of the piece before, which a needle may begin in */
+    for (;;) {
+        lc_sysret n = lc_kernel_read_retry((int32_t)fd, buf + kept, sizeof(buf) - 1 - kept);
+        if (n <= 0)
+            break;
+        size_t have = kept + (size_t)n;
+        buf[have] = '\0';
+        for (size_t i = 0; i < count; i++) {
+            size_t len = lc_string_length(needles[i]);
+            for (size_t at = 0; !found[i] && at + len <= have; at++)
+                found[i] = buf[at] == needles[i][0] && lc_bytes_compare(buf + at, needles[i], len) == 0;
+        }
+        kept = have < 63 ? have : 63;
+        lc_bytes_move(buf, buf + have - kept, kept);
+    }
+    lc_kernel_close_file((int32_t)fd);
+    return true;
+}
+
+int iptables_kernel_missing(const char *proc_net, const char *modules, char *missing, size_t max,
+                            char *links, size_t links_max) {
+    char path[MAX_PATH];
+    static char targets[4096], matches[8192];
+    bool registered = path_join(path, sizeof(path), proc_net, "ip_tables_targets") &&
+                      read_file(path, targets, sizeof(targets)) >= 0 &&
+                      path_join(path, sizeof(path), proc_net, "ip_tables_matches") &&
+                      read_file(path, matches, sizeof(matches)) >= 0;
+    if (!registered)
+        targets[0] = matches[0] = '\0';
+
+    /* "/<module>.ko", as modules.dep and modules.builtin name a module's file,
+     * compressed or not */
+    enum { MAX_NEEDLES = 2 * (sizeof(XT_NEEDS) / sizeof(XT_NEEDS[0])) };
+    char names[MAX_NEEDLES][40];
+    const char *needles[MAX_NEEDLES];
+    bool found[MAX_NEEDLES] = { false };
+    size_t count = 0;
+    for (size_t i = 0; i < sizeof(XT_NEEDS) / sizeof(XT_NEEDS[0]); i++)
+        for (size_t m = 0; m < 2 && XT_NEEDS[i].modules[m]; m++) {
+            bool cut = false;
+            str_append(names[count], str_append(names[count], str_append(names[count], 0, "/", 40, &cut),
+                                                XT_NEEDS[i].modules[m], 40, &cut), ".ko", 40, &cut);
+            needles[count] = names[count];
+            count++;
+        }
+    bool listed = false;
+    static const char *const lists[] = { "modules.builtin", "modules.dep" };
+    for (size_t l = 0; l < 2; l++)
+        listed = (path_join(path, sizeof(path), modules, lists[l]) && file_mentions(path, needles, found, count)) ||
+                 listed;
+    missing[0] = links[0] = '\0';
+    if (!registered && !listed)
+        return -1;
+
+    size_t pos = 0, lpos = 0, at = 0;
+    bool cut = false;
+    for (size_t i = 0; i < sizeof(XT_NEEDS) / sizeof(XT_NEEDS[0]); i++) {
+        bool there = text_has_line(XT_NEEDS[i].target ? targets : matches, XT_NEEDS[i].name);
+        for (size_t m = 0; m < 2 && XT_NEEDS[i].modules[m]; m++, at++)
+            there = there || found[at];
+        if (there || (XT_NEEDS[i].when == XT_MASQ && !cfg_global.ip_masq))
+            continue;
+        char *out = XT_NEEDS[i].when == XT_LINKS ? links : missing;
+        size_t *p = XT_NEEDS[i].when == XT_LINKS ? &lpos : &pos;
+        size_t room = XT_NEEDS[i].when == XT_LINKS ? links_max : max;
+        *p = str_append(out, *p, *p ? "; " : "", room, &cut);
+        *p = str_append(out, *p, XT_NEEDS[i].name, room, &cut);
+        *p = str_append(out, *p, XT_NEEDS[i].target ? " target (" : " match (", room, &cut);
+        *p = str_append(out, *p, XT_NEEDS[i].modules[0], room, &cut);
+        *p = str_append(out, *p, ", ", room, &cut);
+        *p = str_append(out, *p, XT_NEEDS[i].config, room, &cut);
+        *p = str_append(out, *p, ")", room, &cut);
+    }
+    return missing[0] ? 0 : 1;
+}
+
+bool running_kernel_modules(char out[MAX_PATH]) {
+    char release[128];
+    int n = read_file("/proc/sys/kernel/osrelease", release, sizeof(release));
+    while (n > 0 && (release[n - 1] == '\n' || release[n - 1] == ' '))
+        release[--n] = '\0';
+    if (n <= 0)
+        return false;
+    static const char *const roots[] = { "/lib/modules", "/usr/lib/modules" };
+    for (size_t i = 0; i < 2; i++)
+        if (path_join(out, MAX_PATH, roots[i], release) && path_is_directory(out))
+            return true;
+    return path_join(out, MAX_PATH, roots[0], release);
+}
+
+int nft_kernel_check(const container_network *net, char *said, size_t max) {
+    said[0] = '\0';
+    static char text[FIREWALL_TEXT_MAX];
+    if (!plain_ifname(cfg_global.bridge) || !nft_setup_text(net, text, sizeof(text)) ||
+        !path_executable(tool_path_nft()))
+        return -1;
+    const char *check[] = { "nft", "--check", "-f", "-", NULL };
+    return run_cmd_input_capture(tool_path_nft(), check, text, said, max) == 0 ? 1 : 0;
+}
+
 /*
  * lightbox's chains, its rules in them, and the jumps to them from the top
  * of FORWARD and POSTROUTING: there, before the host's own rules and its
@@ -1510,8 +1658,21 @@ static void firewall_setup(const container_network *net) {
     const char *restore[] = { "iptables-restore", "--noflush", NULL };
     if (!firewall_setup_text(net, text, sizeof(text)))
         die("Error: setup's firewall rules are too long");
-    if (run_cmd_input(tool_path_iptables_restore(), restore, text, false) != 0)
-        die("Error: setup's firewall rules could not be put in");
+    if (run_cmd_input(tool_path_iptables_restore(), restore, text, false) != 0) {
+        /* what of the kernel's the rules needed, where that is what failed */
+        char modules[MAX_PATH];
+        static char missing[512], links[256];
+        if (running_kernel_modules(modules) &&
+            iptables_kernel_missing("/proc/net", modules, missing, sizeof(missing), links, sizeof(links)) == 0) {
+            print_str(STDERR, "Error: setup's iptables rules could not be put in: the kernel has no ");
+            print_str(STDERR, missing);
+            print_str(STDERR, ".\nfirewall_backend = nftables in lightbox.conf needs none of them, and nf_tables' bridge family\n"
+                              "instead; lightbox doctor checks the kernel for either\n");
+            lc_kernel_exit(failure_status);
+        }
+        die("Error: setup's iptables rules could not be put in. They need iptables with connection tracking,\n"
+            "the addrtype match and the REJECT and MASQUERADE targets; lightbox doctor checks the kernel for them");
+    }
 
     /* LIGHTBOX-USER first, then LIGHTBOX-FORWARD: when either is missing,
      * both are put back at the top in that order. */

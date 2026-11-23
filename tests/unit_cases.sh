@@ -4838,6 +4838,58 @@ t_overlay_whole() {
     return $bad
 }
 check 'an overlay is mounted with redirect_dir and metacopy off, and an upper directory is looked through for either' t_overlay_whole
+
+# What the iptables rules need of the kernel (ROADMAP R.3), from a /proc/net
+# and a directory of modules of the case's own: an extension the kernel has
+# registered, or can load as a module or has built in, is there; one that is
+# neither is named with its module and its option. MASQUERADE only counts
+# with ip_masq, and physdev, which only --link needs, is said apart. A name
+# is found where a piece of a long list of modules ends in it, and not where
+# it is the end of another module's name.
+t_firewall_kernel() {
+    local d bad=0
+    d=$(mktemp -d "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    mkdir -p "$d/proc" "$d/mods" "$d/none" || return 1
+    is() { # what, proc_net, modules, masq, said, status
+        local said rc
+        said=$("$UNIT" firewall-kernel "$2" "$3" "$4")
+        rc=$?
+        printf '%s: %s\n' "$1" "$said"
+        [ "$said" = "$5" ] && [ $rc -eq "$6" ] || { echo "  expected: $5, status $6; status $rc"; bad=1; }
+    }
+    printf 'REJECT\nMASQUERADE\nERROR\n' > "$d/proc/ip_tables_targets"
+    printf 'physdev\naddrtype\nconntrack\nudp\ntcp\nicmp\n' > "$d/proc/ip_tables_matches"
+    is "all registered" "$d/proc" "$d/none" true "all there" 0
+    printf 'MASQUERADE\nERROR\n' > "$d/proc/ip_tables_targets"
+    printf 'kernel/net/netfilter/xt_tcpudp.ko\n' > "$d/mods/modules.builtin"
+    printf 'kernel/net/ipv4/netfilter/ipt_REJECT.ko.zst: kernel/net/ipv4/netfilter/nf_reject_ipv4.ko.zst\n' > "$d/mods/modules.dep"
+    is "REJECT not registered and a module to load" "$d/proc" "$d/mods" true "all there" 0
+    printf 'kernel/net/ipv4/netfilter/nf_reject_ipv4.ko:\nkernel/net/netfilter/xyz_ipt_REJECT.ko:\nkernel/net/ipv4/netfilter/ipt_REJECTED.ko:\n' \
+        > "$d/mods/modules.dep"
+    is "REJECT neither registered nor a module" "$d/proc" "$d/mods" true \
+        "missing: REJECT target (ipt_REJECT, CONFIG_IP_NF_TARGET_REJECT)" 1
+    # no /proc/net to read, as without root: the lists of modules alone
+    printf 'kernel/net/netfilter/xt_tcpudp.ko\nkernel/net/netfilter/xt_conntrack.ko\nkernel/net/netfilter/xt_addrtype.ko\n' \
+        > "$d/mods/modules.builtin"
+    printf 'kernel/net/ipv4/netfilter/ipt_REJECT.ko:\n' > "$d/mods/modules.dep"
+    is "the lists alone, and no physdev" "$d/none" "$d/mods" false \
+        "all there
+links: physdev match (xt_physdev, CONFIG_NETFILTER_XT_MATCH_PHYSDEV)" 0
+    is "the same with ip_masq" "$d/none" "$d/mods" true \
+        "missing: MASQUERADE target (xt_MASQUERADE, CONFIG_NETFILTER_XT_TARGET_MASQUERADE)
+links: physdev match (xt_physdev, CONFIG_NETFILTER_XT_MATCH_PHYSDEV)" 1
+    printf 'kernel/net/ipv4/netfilter/ipt_MASQUERADE.ko:\nkernel/net/netfilter/xt_physdev.ko:\n' >> "$d/mods/modules.dep"
+    is "MASQUERADE by its old name" "$d/none" "$d/mods" true "all there" 0
+    # a long list, whose first piece ends inside the name
+    { head -c 65590 /dev/zero | tr '\0' 'a'; printf '/ipt_REJECT.ko:\n'; } > "$d/mods/modules.dep"
+    is "a name across the end of a piece" "$d/none" "$d/mods" false \
+        "all there
+links: physdev match (xt_physdev, CONFIG_NETFILTER_XT_MATCH_PHYSDEV)" 0
+    is "nothing to read" "$d/none" "$d/none" true "not known" 2
+    rm -rf -- "$d"
+    return $bad
+}
+check 'what the iptables rules need of the kernel is found registered, built in or as a module, or named' t_firewall_kernel
 check 'a host tool that reads an image runs as nobody, with no capability and no network' t_tool_sandbox
 check 'where nobody has no id the tool keeps its own, and where it cannot be confined it is not run' t_tool_sandbox_without_ids
 

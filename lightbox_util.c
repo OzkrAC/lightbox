@@ -694,6 +694,7 @@ struct run_opts {
     bool   quiet;               /* the program's stdout and stderr go to /dev/null */
     char  *capture;             /* when set, its stdout is collected here as a string */
     size_t capture_size;
+    bool   capture_stderr;      /* and its stderr with it */
     const char *input;          /* when set, its stdin, at most RUN_INPUT_MAX bytes */
 };
 
@@ -782,6 +783,8 @@ static int run_program(const char *prog, const char *const argv[], const struct 
         }
         if (opts->capture)
             lc_kernel_duplicate_fd(out_pipe[1], STDOUT, 0);
+        if (opts->capture && opts->capture_stderr)
+            lc_kernel_duplicate_fd(out_pipe[1], STDERR, 0);
         if (in_pipe[0] >= 0)
             lc_kernel_duplicate_fd(in_pipe[0], STDIN, 0);
 
@@ -858,6 +861,11 @@ int run_cmd_capture_quiet(const char *prog, const char *const argv[], char *out,
 
 int run_cmd_input(const char *prog, const char *const argv[], const char *input, bool quiet) {
     return run_program(prog, argv, &(struct run_opts){ .input = input, .quiet = quiet });
+}
+
+int run_cmd_input_capture(const char *prog, const char *const argv[], const char *input, char *out, size_t outsz) {
+    return run_program(prog, argv, &(struct run_opts){ .input = input, .capture = out, .capture_size = outsz,
+                                                       .capture_stderr = true });
 }
 
 void require_rm_rf(const char *path) {

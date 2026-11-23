@@ -387,6 +387,9 @@ extern const char *const TOOL_ENV[];   /* what tools run with: a fixed PATH */
 /* the same with input as the program's standard input, at most RUN_INPUT_MAX bytes of it */
 #define RUN_INPUT_MAX 32768
 [[nodiscard]] int run_cmd_input(const char *prog, const char *const argv[], const char *input, bool quiet);
+/* the same, with what it says on stdout and stderr both collected in out, cut to fit */
+[[nodiscard]] int run_cmd_input_capture(const char *prog, const char *const argv[], const char *input,
+                                        char *out, size_t outsz);
 
 lc_sysret exec_program(const char *prog, const char *const argv[], const char *const envp[]);
 [[nodiscard]] int wait_child(int32_t pid, int32_t *status);
@@ -1114,6 +1117,29 @@ void fwmark_text(char out[24], uint32_t mark, uint32_t mask);
 /* vb- and twelve lowercase hex digits: a name host_port_name gives. */
 bool host_port_ok(const char *ifname);
 [[nodiscard]] bool nft_setup_text(const container_network *net, char *out, size_t outsz);
+
+/*
+ * What the firewall needs of the kernel (ROADMAP R.3), asked without a rule
+ * put in. iptables_kernel_missing: of the targets and matches of lightbox's
+ * iptables rules, those the kernel has neither registered, as proc_net's
+ * ip_tables_targets and ip_tables_matches list them, nor in the lists of the
+ * modules directory, built in or to load; each with its module and its
+ * CONFIG_ option, "; " between them. What setup needs goes in missing, what
+ * a container with --link needs in links. 1 when setup has all it needs, 0
+ * when something is missing, -1 when neither can be read, as without root
+ * on a host whose modules are not listed. running_kernel_modules: the
+ * modules directory of the running kernel; false when its release cannot
+ * be read.
+ */
+[[nodiscard]] int iptables_kernel_missing(const char *proc_net, const char *modules, char *missing, size_t max,
+                                          char *links, size_t links_max);
+[[nodiscard]] bool running_kernel_modules(char out[MAX_PATH]);
+/* nft --check of the rules setup puts in, which the kernel validates and
+ * nothing commits: 1 taken, 0 refused with what nft said in said, -1 not
+ * asked, as there is no nft or the bridge's name is not one nft takes. Only
+ * root may ask; the kernel may load the modules the rules need, as it would
+ * for setup. */
+[[nodiscard]] int nft_kernel_check(const container_network *net, char *said, size_t max);
 /* The record of a container's links, from its configuration. */
 [[nodiscard]] bool nft_links_record(const char *name, const container_config *config, char *out, size_t outsz);
 /* What nft is given for a record: its elements added, and with removal taken

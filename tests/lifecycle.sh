@@ -681,6 +681,28 @@ t_doctor() {
     [ $rc -eq 0 ] && printf '%s\n' "$said" | grep -qx 'overall: ok'
 }
 
+# doctor asks the kernel what the firewall's rules need, with each backend,
+# and puts no rule in to ask (ROADMAP R.3): here the kernel has all of it,
+# a container's links among it, and the host's rules are as they were.
+t_doctor_firewall_kernel() {
+    local nft=no
+    nft_ok >/dev/null && nft=yes
+    rules() { iptables-save | sed -e '/^#/d' -e 's/\[[0-9]*:[0-9]*\]//'; nft list ruleset | sed 's/packets [0-9]* bytes [0-9]*//'; }
+    before=$(rules)
+    said=$(lb doctor | grep '^firewall_kernel: ')
+    printf '%s\n' "$said"
+    [ "$said" = 'firewall_kernel: yes (the targets and matches of its iptables rules)' ] || return 1
+    if [ $nft = yes ]; then
+        alt_conf nftdoc 'firewall_backend = nftables' || return 1
+        said=$(alt_lb doctor | grep '^firewall_kernel: ')
+        printf '%s\n' "$said"
+        [ "$said" = 'firewall_kernel: yes (the kernel takes the nftables rules setup puts in: nft --check)' ] || return 1
+    else
+        echo "no nftables with the bridge family here: only iptables was asked"
+    fi
+    [ "$before" = "$(rules)" ] || { echo "the rules changed:"; diff <(printf '%s\n' "$before") <(rules); return 1; }
+}
+
 # ─── Cases: the life of a container ─────────────────────────────────────────
 
 t_lifecycle() {
@@ -4743,6 +4765,7 @@ if [ "$MODE" = inside ]; then
     check 'firewall = false: no rule is made, and a container with links is refused' t_firewall_false
     check 'firewall = false: forwarding is left as it is, by setup and by a start' t_firewall_false_leaves_forwarding
     check 'doctor finds nothing missing'                                  t_doctor
+    check 'doctor asks the kernel what the firewall needs, with each backend, and changes no rule' t_doctor_firewall_kernel
     check 'doctor names each precondition of start that is broken, and its fix' t_doctor_names_what_is_missing
 
     check 'create, start, exec, stop and rm'                              t_lifecycle

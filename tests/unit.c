@@ -148,6 +148,11 @@
  *                                             "refused" and status 1
  *   unit overlay-whole <dir>                  overlay_upper_whole: "whole", "not whole: <path>"
  *                                             with status 1, or "cannot read" with status 2
+ *   unit firewall-kernel <proc_net> <modules> true|false
+ *                                             iptables_kernel_missing with ip_masq as given:
+ *                                             "all there", "missing: <what>" with status 1, or
+ *                                             "not known" with status 2; then "links: <what>"
+ *                                             where a container with --link lacks something
  *   unit volspec <spec>                       parse_volume_spec: "<src> -> <dst> ro|rw",
  *                                             or "invalid: <what is wrong>"
  *   unit volumes <root> <spec>... [-- <probe>...]
@@ -1952,6 +1957,20 @@ int main(int argc, char **argv, char **envp) {
         }
         put_line(options, "");
         return 0;
+    }
+    if (argc == 5 && streq(argv[1], "firewall-kernel")) {
+        static char missing[512], links[256];
+        cfg_global.ip_masq = streq(argv[4], "true");
+        int rc = iptables_kernel_missing(argv[2], argv[3], missing, sizeof(missing), links, sizeof(links));
+        if (rc < 0)
+            put("not known\n");
+        else if (rc == 0)
+            put_line("missing: ", missing);
+        else
+            put("all there\n");
+        if (links[0])
+            put_line("links: ", links);
+        return rc < 0 ? 2 : rc == 0 ? 1 : 0;
     }
     if (argc == 3 && streq(argv[1], "overlay-whole")) {
         static char found[MAX_PATH];

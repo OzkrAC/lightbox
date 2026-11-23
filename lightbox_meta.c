@@ -650,6 +650,83 @@ static void check_device_filter(struct doctor *d) {
                "boot a kernel with CONFIG_CGROUP_BPF and CONFIG_BPF_SYSCALL; only a --privileged container starts without it");
 }
 
+/*
+ * What the rules of the firewall need of the kernel (ROADMAP R.3), asked
+ * without a rule put in: with nftables, what nft --check of the rules setup
+ * puts in says; with iptables, each target and match of its rules that the
+ * kernel has neither registered nor can load. What only a container with
+ * --link needs is said and not counted, as bridge_filtering is.
+ */
+static void check_firewall_kernel(struct doctor *d, const container_network *net) {
+    if (!cfg_global.firewall)
+        return;
+    static char text[1024];
+    bool cut = false;
+    if (cfg_global.firewall_backend == FIREWALL_NFTABLES) {
+        static const char fix[] = "boot a kernel with nf_tables with NAT, masquerading, conntrack, rejection and the bridge "
+                                  "family (CONFIG_NF_TABLES_BRIDGE, CONFIG_NFT_BRIDGE_META)";
+        if (lb_sys_geteuid() != 0) {
+            doc_check(d, "firewall_kernel", false, "not known: only root may ask the kernel, with nft --check",
+                      "sudo lightbox doctor");
+            return;
+        }
+        static char said[1024];
+        int rc = nft_kernel_check(net, said, sizeof(said));
+        if (rc < 0) {
+            doc_check(d, "firewall_kernel", false, "not known: there is no nft, or the bridge's name is not one nft takes",
+                      "install nftables");
+            return;
+        }
+        if (rc == 1) {
+            doc_check(d, "firewall_kernel", true, "yes (the kernel takes the nftables rules setup puts in: nft --check)", NULL);
+            return;
+        }
+        /* nft's first error, and the line of the rules it is about */
+        int64_t at = lc_string_find_substring(said, lc_string_length(said), "Error: ", 7);
+        const char *error = at >= 0 ? said + at + 7 : said;
+        size_t pos = str_append(text, 0, "no (nft --check: ", sizeof(text), &cut);
+        const char *end = error;
+        while (*end && *end != '\n')
+            end++;
+        const char *rule = *end ? end + 1 : end, *rule_end = rule;
+        while (*rule_end && *rule_end != '\n')
+            rule_end++;
+        for (const char *p = error; p < end && !cut; p++)
+            pos = str_append(text, pos, (char[2]){ *p, '\0' }, sizeof(text), &cut);
+        if (rule < rule_end) {
+            pos = str_append(text, pos, ", at: ", sizeof(text), &cut);
+            for (const char *p = rule; p < rule_end && !cut; p++)
+                pos = str_append(text, pos, (char[2]){ *p, '\0' }, sizeof(text), &cut);
+        }
+        str_append(text, pos, ")", sizeof(text), &cut);
+        doc_check(d, "firewall_kernel", false, text, fix);
+        return;
+    }
+    char modules[MAX_PATH];
+    if (!running_kernel_modules(modules))
+        lc_bytes_copy(modules, "/lib/modules/(unknown)", sizeof("/lib/modules/(unknown)"));
+    static char missing[512], links[256];
+    int rc = iptables_kernel_missing("/proc/net", modules, missing, sizeof(missing), links, sizeof(links));
+    size_t pos;
+    if (rc < 0) {
+        pos = str_append(text, 0, "not known: /proc/net/ip_tables_targets cannot be read, and ", sizeof(text), &cut);
+        pos = str_append(text, pos, modules, sizeof(text), &cut);
+        str_append(text, pos, " lists no modules", sizeof(text), &cut);
+        doc_check(d, "firewall_kernel", false, text, "sudo lightbox doctor");
+        return;
+    }
+    pos = str_append(text, 0, rc ? "yes (the targets and matches of its iptables rules)" : "no (missing: ", sizeof(text), &cut);
+    if (!rc)
+        pos = str_append(text, str_append(text, pos, missing, sizeof(text), &cut), ")", sizeof(text), &cut);
+    if (links[0]) {
+        pos = str_append(text, pos, "; a container with --link does not start without the ", sizeof(text), &cut);
+        str_append(text, pos, links, sizeof(text), &cut);
+    }
+    doc_check(d, "firewall_kernel", rc == 1, text,
+              "boot a kernel with each CONFIG_ option named, as a module or built in; firewall_backend = nftables in "
+              "lightbox.conf needs none of iptables' targets and matches, and the kernel's nf_tables with the bridge family");
+}
+
 /* The base root filesystem: a directory with something in it to copy. */
 static void check_rootfs(struct doctor *d) {
     const char *rootfs = cfg_global.rootfs;
@@ -945,11 +1022,12 @@ void cmd_doctor(int argc, char **argv) {
     check_root(d);
     check_kernel(d);
     check_syscalls(d);
+    /* the two as one network: what setup, create and start go by */
+    container_network net;
+    const char *wrong;
     {
-        /* the two as one network: what setup, create and start go by */
-        container_network net;
         const char *setting;
-        const char *wrong = container_network_parse(cfg_global.subnet, cfg_global.gw, &net, &setting);
+        wrong = container_network_parse(cfg_global.subnet, cfg_global.gw, &net, &setting);
         char text[128], subnet[CIDR_TEXT_MAX];
         if (wrong) {
             char detail[96];
@@ -965,6 +1043,8 @@ void cmd_doctor(int argc, char **argv) {
     }
     check_cgroups(d);
     check_device_filter(d);
+    if (!wrong)                     /* the rules are of the network; one that is unusable has none */
+        check_firewall_kernel(d, &net);
     if (nftables && cfg_global.firewall && cfg_global.ip_forward) {
         char forwarding[8];
         bool on = read_file("/proc/sys/net/ipv4/ip_forward", forwarding, sizeof(forwarding)) > 0 && forwarding[0] == '1';

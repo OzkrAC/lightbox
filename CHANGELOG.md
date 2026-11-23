@@ -6,6 +6,10 @@ What changed for someone who uses lightbox, newest first. `ROADMAP.md` has the r
 
 Not tagged yet: what is written of the next release so far.
 
+### Added
+
+- **`doctor` checks what the firewall's rules need of the kernel.** A host learnt that its kernel lacked a part of them from a `setup` that failed, and with iptables `setup` said only that its rules could not be put in, after iptables' own `Extension REJECT revision 0 not supported`. The new check, `firewall_kernel`, asks without putting a rule in. With iptables it looks for each target and match of lightbox's rules, `REJECT`, `MASQUERADE`, `conntrack`, `addrtype` and `tcp`, among those the kernel has registered and in the lists of the running kernel's modules, built in or to load, and names each that is in neither with its module and its option, such as `REJECT target (ipt_REJECT, CONFIG_IP_NF_TARGET_REJECT)`; the `physdev` match, which only a container with `--link` needs, is said and not counted. With nftables it gives the very rules `setup` puts in to `nft --check`, which the kernel validates and nothing commits, and says what the kernel refused, such as `Could not process rule: Operation not supported, at: table bridge lightbox {` on a kernel without the bridge family. Without root the iptables check reads the lists of modules alone, and the nftables one says it cannot know. `setup` that fails with iptables now names what of the kernel's its rules lacked, where that is why.
+
 ### Fixed
 
 - **A snapshot that a killed command left unfinished is cleared away.** A `create`, `import`, `base add` or `base import` that was killed while it took a snapshot of a base left `bases/.<id>.new`, with up to the base's size in it, and nothing ever removed it, as no later snapshot has that name. The next command that takes a snapshot takes every such directory away, as `base rm` does, and says so: `Removed an unfinished base snapshot, which a command that was killed left: <path>`. It does that only under the store's lock, which every command that takes a snapshot holds, so that none of them loses one it is making.
