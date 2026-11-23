@@ -3030,7 +3030,7 @@ config_strict() {
     got=$(config)
     case $got in "refused: $D/web/.conf: line 10: more than 8 links") ;; *) echo "9 links: $got"; bad=1 ;; esac
     # a file too large to be a configuration
-    { echo version=1; head -c 30000 /dev/zero | tr '\0' '\n'; } > "$D/web/.conf"
+    { echo version=1; head -c 50000 /dev/zero | tr '\0' '\n'; } > "$D/web/.conf"
     got=$(config)
     case $got in "refused: $D/web/.conf: is larger than lightbox supports") ;; *) echo "large: $got"; bad=1 ;; esac
     # the line that is named is the line an editor shows, empty ones counted

@@ -163,6 +163,21 @@ stops it, and is
 A directory or a file of the host's in the container.
 Repeatable, up to 16.
 .TP
+.BI \-\-device " host" \fR[\fB:\fIpath\fR][\fB:ro\fR]
+A character device of the host's in the container, at
+.I path
+under
+.IR /dev ,
+or at its own path; read alone with
+.BR :ro .
+Its numbers are read at each start.
+Never a block device, nor the host's memory, ports, kernel log, consoles,
+input devices, uinput, watchdog, MSRs or cpuid;
+to a box of
+.B \-\-profile agent
+a GPU's compute nodes alone.
+Repeatable, up to 16.
+.TP
 .BI \-\-workspace " dir"
 A directory of the host's at
 .IR /workspace ,

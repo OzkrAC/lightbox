@@ -2327,6 +2327,57 @@ t_cgroup_membership() {
     [ "$(cat "$CG/member/memory.max")" = 100663296 ] || { echo "the limit changed"; return 1; }
 }
 
+# create --device and start (ROADMAP G.1), with nodes of the case's own made
+# with mknod, which any path of the host's may be: one of /dev/fuse's numbers
+# is in the container at the path given and opens for reading and writing,
+# and given with :ro for reading alone, which the device program holds to
+# whatever the mount says. Its numbers are read at each start: after the node
+# is made again with others, the container has those. A device that has gone
+# is said at start, before anything of the container is made. A box of
+# --profile agent is given a render node, which opens as far as the device
+# program goes on a host with no GPU: the kernel says there is no such
+# device, and not that the program refused it.
+t_device() {
+    local d=$T/devs said
+    [ -c /dev/fuse ] || { echo "this host has no /dev/fuse, whose numbers the case uses"; return 77; }
+    mkdir -p "$d" && mknod -m 666 "$d/fuse" c 10 229 && mknod -m 666 "$d/fuse2" c 10 229 || return 1
+    opens() { # name, path, how: what a shell of the container says when it opens it
+        sh_in "$1" "if exec 3$3$2; then echo opened; fi" 2>&1
+    }
+    up devrw --device "$d/fuse:/dev/gpu/fuse" || return 1
+    said=$(sh_in devrw 'ls -ln /dev/gpu/fuse')
+    echo "in the container: $said"
+    case $said in 'crw-rw-rw- '*' 10, 229 '*'/dev/gpu/fuse') ;; *) echo "the node is not there as the host has it"; return 1 ;; esac
+    said=$(opens devrw /dev/gpu/fuse '<>')
+    [ "$said" = opened ] || { echo "it does not open for reading and writing: $said"; return 1; }
+    up devro --device "$d/fuse2:/dev/fuse:ro" || return 1
+    said=$(opens devro /dev/fuse '<')
+    [ "$said" = opened ] || { echo "given with :ro, it does not open for reading: $said"; return 1; }
+    said=$(opens devro /dev/fuse '<>')
+    echo "given with :ro, opened to write: $said"
+    case $said in *opened*) echo "it opened for writing"; return 1 ;; *'ermitted'*) ;; *) return 1 ;; esac
+    # read again at each start: other numbers, as a kernel gives after a boot
+    lb stop devrw >/dev/null || return 1
+    rm -f "$d/fuse" && mknod -m 666 "$d/fuse" c 1 3 || return 1
+    start devrw || return 1
+    said=$(sh_in devrw 'ls -ln /dev/gpu/fuse; echo x > /dev/gpu/fuse && echo written')
+    echo "after the node was made again: $said"
+    case $said in *' 1, 3 '*'written') ;; *) echo "the container does not have the node as it is now"; return 1 ;; esac
+    # gone: said at start, and nothing of the container is made
+    lb stop devrw >/dev/null && rm -f "$d/fuse" || return 1
+    said=$(lb start devrw 2>&1 </dev/null) && { echo "a start with a device that has gone succeeded"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *"a device of the container's cannot be given: $d/fuse is not there"*) ;; *) return 1 ;; esac
+    [ "$(state_of devrw)" = stopped ] && [ ! -d "$CG/devrw" ] && nothing_left devrw || return 1
+    # a render node to a box of --profile agent, on a host whose kernel has no such GPU
+    need_subids || { echo "no ranges of ids here for a box of --profile agent: that is not tried"; return 0; }
+    mknod -m 666 "$d/renderD128" c 226 128 || return 1
+    agent_box agpu "$(next_ip)" --device "$d/renderD128:/dev/dri/renderD128" && start agpu || return 1
+    said=$(opens agpu /dev/dri/renderD128 '<>')
+    echo "a render node in a box of --profile agent: $said"
+    case $said in *opened*|*'ermitted'*) echo "the device program did not let it through, or a GPU is here"; return 1 ;; *'No such device'*) ;; *) return 1 ;; esac
+}
+
 # ─── Cases: the init hook, starting and stopping ────────────────────────────
 
 t_hook_runs() {
@@ -4903,6 +4954,7 @@ if [ "$MODE" = inside ]; then
     check 'without io, a container starts and is told once; with an I/O limit, not' t_without_io_controller
     check 'start mounts cgroup2 at a cgroup_root of its own that a reboot emptied, as setup does' t_start_mounts_cgroup2
     check "init is in the container's cgroup, and a command run by exec in its exec's below it" t_cgroup_membership
+    check "create --device: a node of the host's opens in the container as it is given, and its numbers are read at each start" t_device
 
     check 'the init hook runs with /tmp and /run mounted'                 t_hook_runs
     check 'a service the hook starts outlives the start command'          t_service_outlives_start

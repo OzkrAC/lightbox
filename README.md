@@ -426,6 +426,11 @@ Commands:
          --io-max <limit>       I/O limit for one disk: "8:0 wbps=10485760", with rbps, wbps,
                                 riops or wiops (default: none)
          --vol  <src:dst[:ro]>  Bind mount (repeatable)
+         --device <host>[:<path>][:ro]
+                                A character device of the host's at <path> under /dev, or at its
+                                own path, read alone with :ro (repeatable); never a block device
+                                or one that gives the host away, and to --profile agent a GPU's
+                                compute nodes alone
          --rootfs <path>        The base it is made from (default: $LIGHTBOX_ROOTFS or lightbox.conf)
          --base <id>            The snapshot it is made from, as base ls shows it, in the place
                                 of a base: the one base import unpacked an image into
@@ -529,6 +534,7 @@ A container's name is 1 to 30 characters of `a-z`, `A-Z`, `0-9`, `_` and `-`.
 | `--cpu <num>` | `1` | CPUs, 0.01 to 512, with up to two decimals: `2`, `0.5`, `1.25` |
 | `--io-max "<major>:<minor> <key>=<value>..."` | none | I/O limit for one whole disk of the host, as `io.max` takes it: `"8:0 wbps=10485760 riops=1000"`, with `rbps`, `wbps`, `riops` and `wiops`, each a number or `max` |
 | `--vol <src>:<dst>[:ro]` | — | Bind mount (repeatable, up to 16, one at a destination) |
+| `--device <host>[:<path>][:ro]` | — | A character device of the host's in the container, at `<path>` under `/dev` or at its own path, read alone with `:ro` (repeatable, up to 16). Its numbers are read at each start. Never a block device, nor the host's memory, ports, kernel log, consoles, input devices, `uinput`, watchdog, MSRs or cpuid; to a box of `--profile agent` a GPU's compute nodes alone: render nodes, NVIDIA's and AMD's `/dev/kfd` |
 | `--userns` | off | A user namespace of its own: its root is an unprivileged uid on the host (see [User namespaces](#user-namespaces)); `create` runs as root |
 | `--read-only` | off | Read-only root filesystem |
 | `--copy` | off | A full copy of the base, as before 0.7, and not an overlay of its snapshot |

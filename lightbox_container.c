@@ -367,6 +367,194 @@ const char *parse_volume_spec(const char *spec, volume_spec *vol) {
     return destination_problem(vol->dst);
 }
 
+/* ─── Devices (ROADMAP G.1) ─────────────────────────────────────────────── */
+
+/* What every container has in its /dev already, and what init makes there:
+ * no device is put in their place, nor below one, which would make it a
+ * directory before init puts it there. */
+static bool device_path_taken(const char *path) {
+    static const char *const nodes[] = {
+        "/dev/null", "/dev/zero", "/dev/full", "/dev/random", "/dev/urandom", "/dev/tty", "/dev/ptmx",
+        "/dev/fd", "/dev/stdin", "/dev/stdout", "/dev/stderr", "/dev/pts", "/dev/shm",
+    };
+    for (size_t i = 0; i < sizeof(nodes) / sizeof(nodes[0]); i++)
+        if (path_is_under(path, nodes[i]))
+            return true;
+    return false;
+}
+
+const char *parse_device_spec(const char *spec, device_spec *dev) {
+    /* one line of a file of lines, as a volume is */
+    if (has_control_chars(spec))
+        return "a device's paths may not contain control characters";
+    const char *parts[4] = { spec, NULL, NULL, NULL };
+    size_t nparts = 1;
+    for (const char *c = spec; *c; c++)
+        if (*c == ':') {
+            if (nparts == 3)
+                return "a device is written <host path>[:<path in the container>][:ro], and its paths have no colon in them";
+            parts[nparts++] = c + 1;
+        }
+    *dev = (device_spec){ 0 };
+    size_t hlen = (size_t)((nparts > 1 ? parts[1] - 1 : spec + lc_string_length(spec)) - spec);
+    if (hlen == 0 || hlen >= sizeof(dev->host))
+        return "the device's path on the host is empty or too long";
+    lc_bytes_copy(dev->host, spec, hlen);
+    dev->host[hlen] = '\0';
+    if (!normalise_path(dev->host))
+        return "the device's path on the host must be an absolute path without ..";
+
+    /* host:ro, host:path or host:path:ro */
+    const char *path = NULL;
+    size_t plen = 0;
+    if (nparts == 3) {
+        if (!streq(parts[2], "ro"))
+            return "after the device's path in the container only :ro may follow";
+        dev->ro = true;
+        path = parts[1];
+        plen = (size_t)(parts[2] - 1 - parts[1]);
+    } else if (nparts == 2) {
+        if (streq(parts[1], "ro"))
+            dev->ro = true;
+        else {
+            path = parts[1];
+            plen = lc_string_length(parts[1]);
+        }
+    }
+    if (path) {
+        if (plen == 0 || plen >= sizeof(dev->path))
+            return "the device's path in the container is empty or too long";
+        lc_bytes_copy(dev->path, path, plen);
+        dev->path[plen] = '\0';
+    } else {
+        if (!path_is_under(dev->host, "/dev"))
+            return "a device that is not under /dev on the host needs its path in the container: <host path>:/dev/<name>";
+        lc_bytes_copy(dev->path, dev->host, hlen + 1);
+    }
+    if (!normalise_path(dev->path))
+        return "the device's path in the container must be an absolute path without ..";
+    if (!path_is_under(dev->path, "/dev") || streq(dev->path, "/dev"))
+        return "a device's path in the container is under /dev";
+    if (device_path_taken(dev->path))
+        return "every container has that path of /dev already";
+    return NULL;
+}
+
+const char *config_add_device(container_config *config, const device_spec *dev) {
+    for (int i = 0; i < config->ndevs; i++)
+        if (streq(config->devs[i].path, dev->path))
+            return "there is already a device at that path in the container";
+    if (config->ndevs >= MAX_DEVICES)
+        return "the container already has the maximum of " STRINGIFY(MAX_DEVICES) " devices";
+    config->devs[config->ndevs++] = *dev;
+    return NULL;
+}
+
+/*
+ * The devices whose use is the host's (ROADMAP G.1, by the maintainer's word
+ * of 2026-11-23), by their numbers (Documentation/admin-guide/devices.txt):
+ * no container is given one, whatever its path.
+ */
+#define DEV_ANY_MINOR 0xfffffU
+static const struct { uint32_t major, minor_first, minor_last; const char *what; } DEVICES_REFUSED[] = {
+    { 1,   1,   2,   "the host's memory" },
+    { 1,   4,   4,   "the host's I/O ports" },
+    { 1,   11,  11,  "the kernel's log" },
+    { 4,   0,   63,  "a virtual console of the host's" },
+    { 5,   1,   1,   "the host's console" },
+    { 7,   0,   DEV_ANY_MINOR, "what a virtual console of the host's shows" },
+    { 13,  0,   DEV_ANY_MINOR, "an input device of the host's, which reads its keys and its pointer" },
+    { 10,  223, 223, "uinput, which makes a host's keys and pointer" },
+    { 10,  130, 130, "the watchdog, which restarts the host when it is closed" },
+    { 202, 0,   DEV_ANY_MINOR, "a CPU's model-specific registers" },
+    { 203, 0,   DEV_ANY_MINOR, "a CPU's cpuid" },
+};
+
+/* The major of a kind of character device as /proc/devices names it, given
+ * by the kernel at boot, or 0. */
+static uint32_t char_major_named(const char *name) {
+    static char text[8192];
+    if (read_file("/proc/devices", text, sizeof(text)) <= 0)
+        return 0;
+    bool chars = false;
+    size_t len = lc_string_length(name);
+    for (const char *line = text; *line; ) {
+        const char *end = line;
+        while (*end && *end != '\n')
+            end++;
+        if (lc_string_starts_with(line, (size_t)(end - line), "Character devices:", 18))
+            chars = true;
+        else if (lc_string_starts_with(line, (size_t)(end - line), "Block devices:", 14))
+            chars = false;
+        else if (chars) {
+            const char *p = line;
+            while (p < end && *p == ' ')
+                p++;
+            uint32_t major = 0;
+            while (p < end && *p >= '0' && *p <= '9')
+                major = major * 10 + (uint32_t)(*p++ - '0');
+            if (p < end && *p == ' ' && (size_t)(end - p - 1) == len && lc_bytes_compare(p + 1, name, len) == 0)
+                return major;
+        }
+        line = *end ? end + 1 : end;
+    }
+    return 0;
+}
+
+/* A GPU's compute nodes, the devices a box of --profile agent may have: a
+ * render node; NVIDIA's GPUs, its control node and nvidia-uvm, whose major
+ * is given at boot, but nvidia-modeset; and AMD's kfd. */
+static bool gpu_compute_node(uint32_t major, uint32_t minor) {
+    if (major == 226)
+        return minor >= 128 && minor <= 255;
+    if (major == 195)
+        return minor <= 253 || minor == 255;
+    uint32_t uvm = char_major_named("nvidia-uvm"), kfd = char_major_named("kfd");
+    return (uvm && major == uvm) || (kfd && major == kfd);
+}
+
+const char *device_refused(const char *host, const struct lb_statx *stx, bool agent) {
+    static char why[MAX_PATH + 160];
+    bool cut = false;
+    const char *wrong = NULL;
+    uint32_t major = stx->stx_rdev_major, minor = stx->stx_rdev_minor;
+    if ((stx->stx_mode & LB_S_IFMT) == LB_S_IFBLK)
+        wrong = " is a block device: no container is given one";
+    else if ((stx->stx_mode & LB_S_IFMT) != LB_S_IFCHR)
+        wrong = " is not a character device";
+    for (size_t i = 0; i < sizeof(DEVICES_REFUSED) / sizeof(DEVICES_REFUSED[0]) && !wrong; i++)
+        if (major == DEVICES_REFUSED[i].major && minor >= DEVICES_REFUSED[i].minor_first &&
+            minor <= DEVICES_REFUSED[i].minor_last) {
+            size_t pos = str_append(why, 0, host, sizeof(why), &cut);
+            pos = str_append(why, pos, " is ", sizeof(why), &cut);
+            pos = str_append(why, pos, DEVICES_REFUSED[i].what, sizeof(why), &cut);
+            str_append(why, pos, ": no container is given it", sizeof(why), &cut);
+            return why;
+        }
+    if (!wrong && agent && !gpu_compute_node(major, minor))
+        wrong = " is not a GPU's compute node: a box of --profile agent is given render nodes, NVIDIA's "
+                "and AMD's kfd, and nothing else";
+    if (!wrong)
+        return NULL;
+    str_append(why, str_append(why, 0, host, sizeof(why), &cut), wrong, sizeof(why), &cut);
+    return why;
+}
+
+const char *device_check(const device_spec *dev, bool agent, uint32_t *major, uint32_t *minor) {
+    static char why[MAX_PATH + 40];
+    bool cut = false;
+    struct lb_statx stx;
+    lc_sysret rc = lb_sys_statx(AT_FDCWD, dev->host, 0, LB_STATX_TYPE, &stx);
+    if (rc < 0) {
+        str_append(why, str_append(why, 0, dev->host, sizeof(why), &cut),
+                   rc == -LB_ENOENT ? " is not there" : " cannot be looked at", sizeof(why), &cut);
+        return why;
+    }
+    *major = stx.stx_rdev_major;
+    *minor = stx.stx_rdev_minor;
+    return device_refused(dev->host, &stx, agent);
+}
+
 int config_volume_at(const container_config *config, const char *dst) {
     for (int i = 0; i < config->nvols; i++) {
         if (streq(config->vols[i].dst, dst))
@@ -538,6 +726,16 @@ static const char *config_line(container_config *config, char *line, unsigned *s
             return wrong;
         config->nvols++;
         return NULL;
+    }
+
+    if (streq(key, "device")) {
+        if (config->ndevs >= MAX_DEVICES)
+            return "more than " STRINGIFY(MAX_DEVICES) " devices";
+        device_spec dev;
+        const char *wrong = parse_device_spec(value, &dev);
+        if (wrong)
+            return wrong;
+        return config_add_device(config, &dev);
     }
 
     if (streq(key, "link")) {
@@ -802,6 +1000,14 @@ const char *container_config_save(const char *name, const container_config *conf
         put(&out, ":");
         put(&out, vol->dst);
         put(&out, vol->ro ? ":ro\n" : "\n");
+    }
+    for (int i = 0; i < config->ndevs; i++) {
+        const device_spec *dev = &config->devs[i];
+        put(&out, "device=");
+        put(&out, dev->host);
+        put(&out, ":");
+        put(&out, dev->path);
+        put(&out, dev->ro ? ":ro\n" : "\n");
     }
     for (int i = 0; i < config->nlinks; i++)
         put_line(&out, "link", config->links[i]);

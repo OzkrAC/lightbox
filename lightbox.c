@@ -293,9 +293,9 @@ static const char *text_with_number(char *buf, size_t bufsz, const char *before,
  * cgroup below it may have another. NULL, or what failed: a container that
  * is not privileged does not start without it.
  */
-static const char *device_filter_attach(const char *cg) {
+static const char *device_filter_attach(const char *cg, const struct lb_dev_row *given, size_t ngiven) {
     static char err[200], log[4096];
-    lc_sysret prog = device_program_load(log, sizeof(log));
+    lc_sysret prog = device_program_load(given, ngiven, log, sizeof(log));
     if (prog < 0) {
         if (log[0]) {
             print_str(STDERR, "The kernel's verifier said of the device program:\n");
@@ -326,7 +326,8 @@ static const char *device_filter_attach(const char *cg) {
     return NULL;
 }
 
-static const char *cgroup_create(const char *name, int pid, const container_config *config) {
+static const char *cgroup_create(const char *name, int pid, const container_config *config,
+                                 const struct lb_dev_row *given) {
     char cg[MAX_PATH], path[MAX_PATH];
     if (!cgroup_path(cg, name) || !path_join(path, sizeof(path), cg, "cgroup.controllers"))
         return "the path of the container's cgroup is too long";
@@ -385,7 +386,7 @@ static const char *cgroup_create(const char *name, int pid, const container_conf
 
     /* the devices it may open, before anything of it runs in the cgroup */
     if (!config->privileged) {
-        const char *failed = device_filter_attach(cg);
+        const char *failed = device_filter_attach(cg, given, (size_t)config->ndevs);
         if (failed)
             return failed;
     }
@@ -1378,7 +1379,7 @@ static const char *make_resolv(container_config *cfg, char dns[MAX_DNS][16], int
  */
 static const char *const create_value_options[] = {
     "--mem", "--swap", "--pids", "--cpu", "--io-max", "--vol", "--rootfs", "--base", "--seccomp", "--net",
-    "--oom-score", "--ttl", "--link", "--dns", "--profile", "--workspace",
+    "--oom-score", "--ttl", "--link", "--dns", "--profile", "--workspace", "--device",
 };
 static const char *const create_flag_options[] = { "--userns", "--read-only", "--copy", "--privileged" };
 
@@ -1705,6 +1706,14 @@ static void cmd_create(int argc, char **argv) {
             const char *wrong = config_add_volume(&cfg, &vol);
             if (wrong)
                 die_about("Error: --vol: ", wrong, value);
+        } else if (streq(opt, "--device")) {
+            const char *value = option_value(argc, argv, &i);
+            device_spec dev;
+            const char *wrong = parse_device_spec(value, &dev);
+            if (!wrong)
+                wrong = config_add_device(&cfg, &dev);
+            if (wrong)
+                die_about("Error: --device: ", wrong, value);
         } else if (streq(opt, "--dns")) {
             const char *value = option_value(argc, argv, &i);
             if (ndns >= MAX_DNS) die("Error: more than " STRINGIFY(MAX_DNS) " --dns options: a resolver reads no more");
@@ -1727,6 +1736,15 @@ static void cmd_create(int argc, char **argv) {
         agent_profile(&cfg, net_given, full_copy);
     if (workspace)
         add_workspace(&cfg, workspace);
+    /* each device as the host has it now, which start looks at again
+     * (ROADMAP G.1): never one that gives the host away, and to a box of
+     * --profile agent a GPU's compute nodes alone */
+    for (int d = 0; d < cfg.ndevs; d++) {
+        uint32_t major, minor;
+        const char *refused = device_check(&cfg.devs[d], cfg.profile == PROFILE_AGENT, &major, &minor);
+        if (refused)
+            die2("Error: --device: ", refused);
+    }
     if (create_image)
         take_image_limits(create_image, &cfg);
 
@@ -2150,6 +2168,8 @@ struct child_args {
     int32_t      exit_fd;                   /* where init says how it ended; -1: nowhere */
     const char  *name;
     const container_config *config;         /* read by the command, before the clone */
+    const struct lb_dev_row *dev_rows;      /* the numbers of config's devices, as start found them */
+    const int32_t *dev_trees;               /* and their nodes' mounts, cloned, attached nowhere yet */
     const char  *root;
     const char  *overlay;                   /* the options of the overlay init mounts; NULL: none */
     bool         userns;                    /* in a user namespace of its own, whose maps the command writes */
@@ -2257,10 +2277,13 @@ static void init_begin(const struct child_args *ca) {
     if (ca->starter_signals >= 0)
         lc_kernel_close_file(ca->starter_signals);
     /* and the volumes the command took, which build_container attaches */
-    int32_t keep[5 + MAX_VOLS] = { ca->go_rd, ca->report_wr, ca->null_fd, ca->log_fd, ca->exit_fd };
+    int32_t keep[5 + MAX_VOLS + MAX_DEVICES] = { ca->go_rd, ca->report_wr, ca->null_fd, ca->log_fd, ca->exit_fd };
     size_t nkeep = 5;
     for (int i = 0; ca->volumes && i < ca->nvolumes; i++)
         keep[nkeep++] = ca->volumes[i].tree;
+    /* and the devices', which build_container attaches */
+    for (int i = 0; ca->config && ca->dev_trees && i < ca->config->ndevs; i++)
+        keep[nkeep++] = ca->dev_trees[i];
     close_all_but(keep, nkeep);
 
     if (!go_received(ca->go_rd))
@@ -4448,6 +4471,38 @@ static void build_container(const struct child_args *ca) {
             }
         }
 
+        /* The devices it is given (ROADMAP G.1): the mount of each node that
+         * start took, at its path under /dev, read-only with :ro, as those
+         * of every container are bound; and what is there then is looked at
+         * once more, as the device program lets the container open the
+         * numbers start found and no others. */
+        for (int d = 0; ca->config && ca->dev_trees && d < ca->config->ndevs; d++) {
+            const device_spec *dev = &ca->config->devs[d];
+            const char *in_root = dev->path + 1;        /* "dev/...", from the root */
+            char dir[MAX_PATH];
+            for (size_t at = 4; in_root[at]; at++)
+                if (in_root[at] == '/') {
+                    lc_bytes_copy(dir, in_root, at);
+                    dir[at] = '\0';
+                    (void)lc_kernel_mkdirat(AT_FDCWD, dir, 0755);
+                }
+            lc_sysret fd = lc_kernel_open_file(in_root, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+            if (fd < 0)
+                die2("Error: cannot make the place of a device in the container: ", dev->path);
+            lc_kernel_close_file((int32_t)fd);
+            if (attach_tree(ca->dev_trees[d], in_root) < 0)
+                die2("Error: cannot put a device in the container: ", dev->path);
+            lc_kernel_close_file(ca->dev_trees[d]);
+            if (!ca->privileged)
+                require_mount(NULL, in_root, NULL, MS_REMOUNT | MS_BIND | MS_NOSUID | MS_NOEXEC | (dev->ro ? MS_RDONLY : 0),
+                              NULL);
+            struct lb_statx bound;
+            if (lb_sys_statx(AT_FDCWD, in_root, AT_SYMLINK_NOFOLLOW, LB_STATX_TYPE, &bound) < 0 ||
+                (bound.stx_mode & LB_S_IFMT) != LB_S_IFCHR || bound.stx_rdev_major != ca->dev_rows[d].major_first ||
+                bound.stx_rdev_minor != ca->dev_rows[d].minor_first)
+                die2("Error: the device bound into the container is not the one start looked at: ", dev->host);
+        }
+
         /* pts and shm */
         char pts[MAX_PATH], shm[MAX_PATH];
         path_join_or_die(pts, MAX_PATH, dev_path, "pts");
@@ -4706,6 +4761,39 @@ static void start_one(const char *name, int hook_wait) {
     static container_config config;
     container_config_load_or_die(name, &config);
     bool privileged = config.privileged;
+
+    /* The devices it is given, as the host has them now (ROADMAP G.1): each
+     * node's mount, cloned here as host root, where a box of --userns could
+     * not reach the node's path, and attached by init as it is, so that
+     * what the container gets is the very node looked at. The kernel may have
+     * given one other numbers since the last start; the device program goes
+     * by these. One that is refused now is said before anything of the start
+     * is made. */
+    static struct lb_dev_row dev_rows[MAX_DEVICES];
+    static int32_t dev_trees[MAX_DEVICES];
+    for (int d = 0; d < config.ndevs; d++) {
+        const device_spec *dev = &config.devs[d];
+        lc_sysret tree = lb_sys_open_tree(AT_FDCWD, dev->host, LB_OPEN_TREE_CLONE | LB_OPEN_TREE_CLOEXEC);
+        struct lb_statx stx;
+        if (tree == -LB_ENOENT) {
+            print_str(STDERR, "Error: a device of the container's cannot be given: ");
+            print_str(STDERR, dev->host);
+            print_str(STDERR, " is not there\n");
+            lc_kernel_exit(failure_status);
+        }
+        if (tree < 0 || lb_sys_statx((int32_t)tree, "", LB_AT_EMPTY_PATH, LB_STATX_TYPE, &stx) < 0) {
+            say_with_number("Error: cannot take a device of the container's (errno ", (int)(tree < 0 ? -tree : 0), "): ");
+            print_str(STDERR, dev->host);
+            lc_print_char(STDERR, '\n');
+            lc_kernel_exit(failure_status);
+        }
+        const char *refused = device_refused(dev->host, &stx, config.profile == PROFILE_AGENT);
+        if (refused)
+            die2("Error: a device of the container's cannot be given: ", refused);
+        dev_trees[d] = (int32_t)tree;
+        dev_rows[d] = (struct lb_dev_row){ stx.stx_rdev_major, stx.stx_rdev_major, stx.stx_rdev_minor,
+                                           stx.stx_rdev_minor, dev->ro ? LB_DEV_R : LB_DEV_RW };
+    }
     /* --net none: loopback, and no address, interface or rule (ROADMAP 8.5) */
     bool networked = config.net != NET_NONE;
 
@@ -4920,6 +5008,8 @@ static void start_one(const char *name, int hook_wait) {
         .exit_fd = exit_fd,
         .name = name,
         .config = &config,
+        .dev_rows = dev_rows,
+        .dev_trees = dev_trees,
         .root = start_root,
         .overlay = config.base[0] && !config.userns ? overlay : NULL,
         .userns = config.userns,
@@ -4959,7 +5049,7 @@ static void start_one(const char *name, int hook_wait) {
     }
 
     /* set up cgroup */
-    start_err = cgroup_create(name, child_pid, &config);
+    start_err = cgroup_create(name, child_pid, &config, dev_rows);
     if (start_err)
         goto fail_start;
 
@@ -6339,6 +6429,11 @@ static const struct { const char *name; const char *text; } command_help[] = {
         "         --io-max <limit>       I/O limit for one disk: \"8:0 wbps=10485760\", with rbps, wbps,\n"
         "                                riops or wiops (default: none)\n"
         "         --vol  <src:dst[:ro]>  Bind mount (repeatable)\n"
+        "         --device <host>[:<path>][:ro]\n"
+        "                                A character device of the host's at <path> under /dev, or at its\n"
+        "                                own path, read alone with :ro (repeatable); never a block device\n"
+        "                                or one that gives the host away, and to --profile agent a GPU's\n"
+        "                                compute nodes alone\n"
         "         --rootfs <path>        The base it is made from (default: $LIGHTBOX_ROOTFS or lightbox.conf)\n"
         "         --base <id>            The snapshot it is made from, as base ls shows it, in the place\n"
         "                                of a base: the one base import unpacked an image into\n"

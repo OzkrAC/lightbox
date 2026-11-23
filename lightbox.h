@@ -24,6 +24,7 @@
 #define NAME_MAX_LEN     30
 #define MAX_VOLS         16
 #define MAX_LINKS        8
+#define MAX_DEVICES      16     /* LB_DEV_EXTRA_MAX of lightbox_devices.h (ROADMAP G.1) */
 #define MAX_DNS          3       /* as many as a resolver reads from resolv.conf */
 
 /* What a container may reach (ROADMAP 8.5, 8.6): today's network, the
@@ -33,12 +34,14 @@
 enum { NET_NAT = 0, NET_OUTSIDE = 1, NET_NONE = 2, NET_PROXY = 3 };
 #define NET_MODE_TEXT_MAX 12    /* "proxy:65535" and its NUL */
 
-/* The largest legal container .conf: MAX_VOLS volumes of two MAX_PATH paths,
- * MAX_LINKS links and the scalar keys. The reader and the writer of a .conf
- * use a buffer of exactly this size, so a config is never cut on the way in
- * or out; one that does not fit is an error. */
-#define CONF_MAX         20480
-_Static_assert(CONF_MAX > MAX_VOLS * (2 * MAX_PATH + 8) + MAX_LINKS * (NAME_MAX_LEN + 8) + 512,
+/* The largest legal container .conf: MAX_VOLS volumes and MAX_DEVICES
+ * devices of two MAX_PATH paths each, MAX_LINKS links and the scalar keys.
+ * The reader and the writer of a .conf use a buffer of exactly this size, so
+ * a config is never cut on the way in or out; one that does not fit is an
+ * error. */
+#define CONF_MAX         40960
+_Static_assert(CONF_MAX > MAX_VOLS * (2 * MAX_PATH + 8) + MAX_DEVICES * (2 * MAX_PATH + 12) +
+                          MAX_LINKS * (NAME_MAX_LEN + 8) + 512,
                "CONF_MAX is too small for the largest legal container config");
 
 /* The limits as text, the way they are given and the way the file has them. */
@@ -127,6 +130,16 @@ typedef struct {
     bool ro;
 } volume_spec;
 
+/* A device of the host's that a container is given (ROADMAP G.1): its node
+ * on the host, whose numbers are read at each start, as the kernel may give
+ * one others after a boot; where it is in the container, under /dev; and
+ * whether it is given to read alone. */
+typedef struct {
+    char host[MAX_PATH];
+    char path[MAX_PATH];
+    bool ro;
+} device_spec;
+
 /* A box's id (ROADMAP 8.9): 16 lowercase hex digits that create draws and
  * .conf keeps, which the audit log tells a box from a later one of its name
  * by. A box made before boxes had one has none. */
@@ -171,6 +184,8 @@ typedef struct {
     uint32_t gid_start;
     int  nvols;
     volume_spec vols[MAX_VOLS];
+    int  ndevs;
+    device_spec devs[MAX_DEVICES];
     int  nlinks;
     char links[MAX_LINKS][NAME_MAX_LEN + 1];
 } container_config;
@@ -233,6 +248,20 @@ void container_config_load_or_die(const char *name, container_config *config);
 int config_volume_at(const container_config *config, const char *dst);
 /* NULL, or why the volume cannot be added: no room, or the destination is taken. */
 [[nodiscard]] const char *config_add_volume(container_config *config, const volume_spec *vol);
+/* --device <host>[:<path>][:ro] and a .conf's device line (ROADMAP G.1):
+ * NULL, or what is wrong with it. The path in the container is the host's
+ * where none is given, and is under /dev and none of the nodes every
+ * container has. */
+[[nodiscard]] const char *parse_device_spec(const char *spec, device_spec *dev);
+[[nodiscard]] const char *config_add_device(container_config *config, const device_spec *dev);
+/* What a device given to a container is on the host now: NULL with its
+ * numbers, or why it is not given. Never a block device, nor one that gives
+ * the host away; to a box of --profile agent a GPU's compute nodes alone. */
+[[nodiscard]] const char *device_check(const device_spec *dev, bool agent, uint32_t *major, uint32_t *minor);
+/* The same of what is known of a node already, as start has it of the mount
+ * it took of the node: NULL, or why the node at host is not given. */
+struct lb_statx;
+[[nodiscard]] const char *device_refused(const char *host, const struct lb_statx *stx, bool agent);
 /* Take out every volume at a destination: how many there were. */
 int config_remove_volumes_at(container_config *config, const char *dst);
 
@@ -333,10 +362,13 @@ void require_write_file(const char *path, const char *data);
  * Writing is atomic, and replaces a link of that name with the file. 0 or -1.
  * Reading gives the text and its length, 0 for a file that is not there, and
  * -1 for one that cannot be read, is not a regular file or does not fit. */
-/* The cgroup device program of lightbox_devices.h, loaded (ROADMAP 8.4): its
- * descriptor, or -errno. A program the kernel refuses is loaded once more
- * for the verifier to say why, into log, which is empty otherwise. */
-lc_sysret device_program_load(char *log, uint32_t log_size);
+/* The cgroup device program of lightbox_devices.h, loaded (ROADMAP 8.4),
+ * with a row for each device a container is given (ROADMAP G.1): its
+ * descriptor, or -errno, -EINVAL for rows it may not have. A program the
+ * kernel refuses is loaded once more for the verifier to say why, into log,
+ * which is empty otherwise. */
+struct lb_dev_row;
+lc_sysret device_program_load(const struct lb_dev_row *extra, size_t nextra, char *log, uint32_t log_size);
 /* Whether the kernel has no bpf system call at all, which anyone may ask:
  * then no device program is loaded, by root either (ROADMAP R.4). */
 [[nodiscard]] bool bpf_call_missing(void);

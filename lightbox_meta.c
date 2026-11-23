@@ -293,6 +293,34 @@ static void report_volumes(struct report *r, const container_config *config) {
     lc_print_char(STDOUT, ']');
 }
 
+/* The devices (ROADMAP G.1): a line each, "<host>:<path>[:ro]", or an array of objects. */
+static void report_devices(struct report *r, const container_config *config) {
+    if (!r->json) {
+        if (config->ndevs == 0)
+            print_kv("device", "-");
+        for (int i = 0; i < config->ndevs; i++) {
+            print_str(STDOUT, "device: ");
+            print_str(STDOUT, config->devs[i].host);
+            lc_print_char(STDOUT, ':');
+            print_str(STDOUT, config->devs[i].path);
+            print_str(STDOUT, config->devs[i].ro ? ":ro\n" : "\n");
+        }
+        return;
+    }
+    json_key("devices", r->first);
+    r->first = false;
+    lc_print_char(STDOUT, '[');
+    for (int i = 0; i < config->ndevs; i++) {
+        if (i) lc_print_char(STDOUT, ',');
+        lc_print_char(STDOUT, '{');
+        json_key("host", true);  json_string(config->devs[i].host);
+        json_key("path", false); json_string(config->devs[i].path);
+        json_key("ro", false);   print_str(STDOUT, config->devs[i].ro ? "true" : "false");
+        lc_print_char(STDOUT, '}');
+    }
+    lc_print_char(STDOUT, ']');
+}
+
 /* The containers it is linked to: a line each, or an array of names. */
 static void report_links(struct report *r, const container_config *config) {
     if (!r->json) {
@@ -411,6 +439,7 @@ void cmd_inspect(int argc, char **argv) {
         report_text(&r, "profile", config.profile == PROFILE_AGENT ? "agent" : NULL);
         report_text(&r, "workdir", config.workdir[0] ? config.workdir : NULL);
         report_volumes(&r, &config);
+        report_devices(&r, &config);
         report_links(&r, &config);
     }
     if (json)
@@ -643,7 +672,7 @@ static void check_device_filter(struct doctor *d) {
         return;
     }
     static char log[2048];
-    lc_sysret fd = device_program_load(log, sizeof(log));
+    lc_sysret fd = device_program_load(NULL, 0, log, sizeof(log));
     if (fd >= 0) {
         lc_kernel_close_file((int32_t)fd);
         doc_yes_no(d, "device_filter", true, "the kernel loads the cgroup device program", NULL);

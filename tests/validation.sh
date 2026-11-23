@@ -1612,6 +1612,82 @@ assert c["seccomp"] == "allow", "the profile"
     grep -q "^Error: the container's configuration cannot be used: " "$W/err"
 }
 
+# create --device (ROADMAP G.1), as an ordinary user, with nodes every Linux
+# has: a character device of the host's goes in .conf as host:path[:ro], at
+# its own path under /dev or the one given, and inspect shows it in text and
+# in JSON. Refused, each with its reason and before anything is made: a block
+# device, the host's memory and log and the other devices that give the host
+# away, anything that is no character device or not there, a path in the
+# container outside /dev or one every container has, a spec of the wrong
+# shape, a seventeenth device; and to a box of --profile agent anything that
+# is no GPU's compute node. A device line of .conf that cannot be read is an
+# error of the configuration.
+t_create_device() {
+    local bad=0 said json before blk
+    no() { # what it says, create's options
+        local want=$1
+        shift
+        said=$(lb create dev 10.0.0.4 "$@" 2>&1) && { echo "create --device $*: succeeded"; lb rm dev >/dev/null 2>&1; bad=1; return; }
+        case $said in *"$want"*) ;; *) echo "create $*: $said"; bad=1 ;; esac
+        [ ! -e "$C/dev" ] || { echo "create $*: the container is there"; bad=1; }
+    }
+    # one at its own path, read alone, as host:ro: a node most hosts have that no container has already
+    local own="" d
+    for d in /dev/fuse /dev/net/tun /dev/loop-control; do [ -c "$d" ] && { own=$d; break; }; done
+    [ -n "$own" ] || echo "none of /dev/fuse, /dev/net/tun and /dev/loop-control here: host:ro at its own path is not tried"
+    lb create web 10.0.0.2 --device /dev/null:/dev/gpu/null --device /dev/zero:/dev/zero2:ro ${own:+--device "$own:ro"} \
+        >/dev/null || return 1
+    want='device=/dev/null:/dev/gpu/null
+device=/dev/zero:/dev/zero2:ro'
+    [ -n "$own" ] && want="$want
+device=$own:$own:ro"
+    [ "$(grep '^device=' "$C/web/.conf")" = "$want" ] || { grep '^device=' "$C/web/.conf"; echo "the .conf does not have them"; return 1; }
+    said=$(lb inspect web | grep '^device: ')
+    [ "$said" = "$(printf '%s\n' "$want" | sed 's/^device=/device: /')" ] || { echo "$said"; echo "inspect does not show them"; return 1; }
+    if command -v python3 >/dev/null 2>&1; then
+        lb inspect web --json | python3 -I -c '
+import json, sys
+d = json.load(sys.stdin)[0]["devices"]
+want = [{"host": "/dev/null", "path": "/dev/gpu/null", "ro": False}, {"host": "/dev/zero", "path": "/dev/zero2", "ro": True}]
+if sys.argv[1]:
+    want.append({"host": sys.argv[1], "path": sys.argv[1], "ro": True})
+assert d == want, d
+' "$own" || { echo "inspect --json does not have them"; return 1; }
+    fi
+    lb create db 10.0.0.3 >/dev/null && [ "$(lb inspect db | grep '^device')" = 'device: -' ] ||
+        { echo "a container without devices is not shown so"; return 1; }
+    before=$(ls "$C")
+    blk=$(find /dev -maxdepth 2 -type b 2>/dev/null | head -n 1)
+    [ -n "$blk" ] && no 'is a block device: no container is given one' --device "$blk:/dev/disk0"
+    for refused in '/dev/mem:the host'"'"'s memory' '/dev/kmsg:the kernel'"'"'s log' '/dev/port:the host'"'"'s I/O ports' \
+                   '/dev/tty0:a virtual console' '/dev/console:the host'"'"'s console' '/dev/uinput:uinput'; do
+        [ -c "${refused%%:*}" ] && no "${refused%%:*} is ${refused#*:}" --device "${refused%%:*}"
+    done
+    mkfifo "$W/fifo"
+    no 'is not a character device' --device "$W/fifo:/dev/fifo"
+    no 'is not there' --device /dev/lightbox-no-such-node
+    no 'needs its path in the container' --device "$W/fifo"
+    no 'is under /dev' --device /dev/null:/etc/null
+    no 'is under /dev' --device /dev/null:/dev
+    no 'every container has that path of /dev already' --device /dev/null
+    no 'every container has that path of /dev already' --device /dev/zero:/dev/pts/7
+    no 'every container has that path of /dev already' --device /dev/zero:/dev/shm/x
+    no 'only :ro may follow' --device /dev/null:/dev/a:rw
+    no 'its paths have no colon in them' --device /dev/null:/dev/a:ro:x
+    no 'must be an absolute path without ..' --device dev/null:/dev/a
+    no 'must be an absolute path without ..' --device /dev/null:/dev/../etc/a
+    no 'there is already a device at that path' --device /dev/null:/dev/a --device /dev/zero:/dev/a
+    set -- ; for i in $(seq 1 17); do set -- "$@" --device "/dev/null:/dev/n$i"; done
+    no 'the maximum of 16 devices' "$@"
+    no 'is not a GPU'"'"'s compute node: a box of --profile agent is given render nodes' --profile agent --device /dev/null:/dev/gpu
+    [ "$before" = "$(ls "$C")" ] || { echo "a refused create left something in the store"; bad=1; }
+    # what a .conf of the container's says, read back
+    echo 'device=/dev/null' >> "$C/web/.conf"
+    said=$(lb inspect web 2>&1) && { echo "inspect of a .conf with a device line that cannot be read succeeded"; bad=1; }
+    case $said in *"configuration cannot be used"*"every container has that path"*) ;; *) echo "$said"; bad=1 ;; esac
+    return $bad
+}
+
 # A carriage return at the end of a line is no part of the value, as a file
 # written on Windows has it, and neither is a # after a space: the rest of
 # the line is a comment. A # with no space before it is part of the value.
@@ -2416,6 +2492,7 @@ check 'ls is sorted by name'                                  t_ls_is_sorted
 check 'ls lists only directories with a container name'       t_ls_lists_only_containers
 check 'inspect shows volumes, links and the log'                       t_inspect_shows_volumes_and_links
 check 'inspect --json is one JSON object, typed, or nothing'             t_inspect_json
+check 'create --device keeps a character device of the host'"'"'s, and refuses what gives the host away' t_create_device
 check 'configuration: carriage returns are stripped'                   t_config_strips_carriage_returns
 check 'configuration: inline comments are stripped'                    t_config_strips_inline_comments
 check 'configuration: unknown keys and lines that are no setting are said, with the line' t_config_reports_unknown_keys
