@@ -248,9 +248,12 @@
 #define LB_LOCK_EX                    2
 #define LB_LOCK_NB                    4
 
-/* open(2): fail if the file is there already (asm-generic/fcntl.h); the one
- * open flag lightbox uses that lightc does not name */
+/* open(2): fail if the file is there already, and a descriptor that only
+ * names a file, for which the right to pass its directory is enough
+ * (asm-generic/fcntl.h); the open flags lightbox uses that lightc does not
+ * name */
 #define LB_O_EXCL                     0200
+#define LB_O_PATH                     010000000
 
 /* openat2(2), Linux 5.6 (linux/openat2.h): look a path up as if the directory
  * it starts from were the root. A link to "/x" then leads to x in that

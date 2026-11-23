@@ -88,7 +88,7 @@ LB_CFLAGS  = $(CSTD) -DNDEBUG $(WARN) $(HARDEN) $(ARCH_CFLAGS) $(CFLAGS) $(EXTRA
 LB_LDFLAGS = $(LDFLAGS) -static -no-pie -nostdlib -nostartfiles -nodefaultlibs \
              -fno-lto -T $(LIGHTC)/lightc.ld
 
-SRCS = lightbox.c lightbox_meta.c lightbox_state.c lightbox_container.c lightbox_net.c lightbox_config.c lightbox_util.c lightbox_base.c lightbox_netlink.c lightbox_userns.c lightbox_audit.c lightbox_sha256.c lightbox_tar.c lightbox_json.c
+SRCS = lightbox.c lightbox_meta.c lightbox_state.c lightbox_container.c lightbox_net.c lightbox_config.c lightbox_util.c lightbox_base.c lightbox_netlink.c lightbox_userns.c lightbox_audit.c lightbox_sha256.c lightbox_tar.c lightbox_json.c lightbox_image.c
 OBJS = $(SRCS:.c=.o)
 DEPS = $(OBJS:.o=.d)
 

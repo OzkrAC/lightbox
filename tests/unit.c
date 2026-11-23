@@ -69,6 +69,7 @@
  *   unit loopback                             loopback_up
  *   unit caps                                 drop_capabilities, then this process's own sets
  *   unit sandbox <program> [args...]          apply_sandbox, then the program in its place
+ *   unit tool-sandbox <program> [args...]     sandbox_host_tool, then the program in its place
  *   unit maskproc                             mask_proc_paths
  *   unit noipv6  <pid>                        netns_disable_ipv6
  *   unit seconds <text>                       parse_seconds
@@ -135,6 +136,13 @@
  *   unit json-text <file> <path> <size>       json_text of the value at a path into <size> bytes:
  *                                             "<length> <text>", or "none"
  *   unit json-is <file> <path> <text>         json_text_is of it: same or other
+ *   unit image-base <lightbox_dir> <image> <count>
+ *                                             image_open of the image in a directory, and image_base
+ *                                             of its first <count> layers, with lightbox's files in
+ *                                             <lightbox_dir>: "took <id>" or "found <id>", and
+ *                                             "entries <n>", "devices <n>" of what was unpacked; what
+ *                                             is no image, or cannot be unpacked, is said as import
+ *                                             says it, with status 1
  *   unit volspec <spec>                       parse_volume_spec: "<src> -> <dst> ro|rw",
  *                                             or "invalid: <what is wrong>"
  *   unit volumes <root> <spec>... [-- <probe>...]
@@ -1238,6 +1246,11 @@ int main(int argc, char **argv, char **envp) {
         exec_program(argv[2], (const char *const *)(argv + 2), TOOL_ENV);
         die2("unit: cannot execute ", argv[2]);
     }
+    if (argc >= 3 && streq(argv[1], "tool-sandbox")) {
+        sandbox_host_tool();
+        exec_program(argv[2], (const char *const *)(argv + 2), TOOL_ENV);
+        die2("unit: cannot execute ", argv[2]);
+    }
     if (argc == 2 && streq(argv[1], "maskproc")) {
         mask_proc_paths();
         put_result(0);
@@ -1868,6 +1881,23 @@ int main(int argc, char **argv, char **envp) {
             return 0;
         }
         put(json_text_is(v, argv[4]) ? "same\n" : "other\n");
+        return 0;
+    }
+    if (argc == 5 && streq(argv[1], "image-base")) {
+        static image img;
+        image_unpacked unpacked = { 0 };
+        char id[BASE_ID_TEXT];
+        bool took = false;
+        cfg_global_init();
+        str_copy_or_die(cfg_global.lightbox_dir, argv[2], sizeof(cfg_global.lightbox_dir), "lightbox_dir");
+        image_open(argv[3], &img);
+        if (image_base(&img, number_arg(argv[4]), id, &took, &unpacked) != 0)
+            return 1;
+        put_line(took ? "took " : "found ", id);
+        put("entries ");
+        put_int64((int64_t)unpacked.entries);
+        put("devices ");
+        put_int64((int64_t)unpacked.devices);
         return 0;
     }
     if (argc == 3 && streq(argv[1], "sha256-name")) {

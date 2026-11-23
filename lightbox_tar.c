@@ -322,6 +322,13 @@ static int64_t attribute_value(struct out *o, int32_t fd, const char *name) {
  * The attributes of an open file or directory: those an archive carries
  * become pax records, in the order of their names; an overlay's own say
  * whether a directory is opaque; the others are counted and left.
+ *
+ * An upper directory is written as a layer from what is in it alone. That
+ * holds for an overlay as the kernel makes one unless it is asked for more:
+ * with redirect_dir a directory that was moved stays in the base and the
+ * upper one only says from where, with metacopy a file's bytes stay there,
+ * and a whiteout may be an attribute and no device. Such an entry ends the
+ * writing, as a layer without what it stands for would be another tree.
  */
 static int take_attributes(struct out *o, int32_t fd, bool *opaque) {
     *opaque = false;
@@ -341,13 +348,20 @@ static int take_attributes(struct out *o, int32_t fd, bool *opaque) {
             o->w->attributes_left++;
             continue;
         }
-        if (streq(name, "trusted.overlay.opaque") || streq(name, "user.overlay.opaque")) {
+        const char *own = name + (name[0] == 't' ? sizeof("trusted.overlay.") : sizeof("user.overlay.")) - 1;
+        bool unread = streq(own, "redirect") || streq(own, "metacopy") || streq(own, "whiteout");
+        if (streq(own, "opaque")) {
             int64_t n = attribute_value(o, fd, name);
             if (n == -2)
                 return -1;
             if (n == 1 && o->xattr_value[0] == 'y')
                 *opaque = true;
+            else if (n >= 0)
+                unread = true;
         }
+        if (unread && o->w->overlay)
+            return fail(o, "is as an overlay with redirect_dir, metacopy or whiteouts in attributes leaves it, "
+                           "which is not written as a layer");
     }
 
     /* the carried ones, each time the first by name after the one before */
@@ -495,7 +509,14 @@ static int write_entry(struct out *o, int32_t dirfd, const char *name) {
         return fail(o, "has a name that begins with .wh., which in an image marks what a layer removes");
 
     struct entry e = { .mode = st.stx_mode & 07777u, .mtime = st.stx_mtime_sec };
-    if (!shifted_id(st.stx_uid, o->w->uid_start, &e.uid) || !shifted_id(st.stx_gid, o->w->gid_start, &e.gid))
+    /* What an overlay marks a file of its base as taken out with, the device
+     * 0:0, is made by the kernel as whoever mounted the overlay, which is
+     * host root and nobody of the container's range: its mark is root's in
+     * the image, whoever the device belongs to. */
+    bool taken_out = o->w->overlay && (st.stx_mode & LB_S_IFMT) == LB_S_IFCHR && st.stx_rdev_major == 0 &&
+                     st.stx_rdev_minor == 0;
+    if (!taken_out &&
+        (!shifted_id(st.stx_uid, o->w->uid_start, &e.uid) || !shifted_id(st.stx_gid, o->w->gid_start, &e.gid)))
         return fail(o, "belongs to an id outside the container's range");
 
     switch (st.stx_mode & LB_S_IFMT) {
@@ -524,7 +545,7 @@ static int write_entry(struct out *o, int32_t dirfd, const char *name) {
         return put_header(o, &e);
     }
     case LB_S_IFCHR:
-        if (o->w->overlay && st.stx_rdev_major == 0 && st.stx_rdev_minor == 0) {
+        if (taken_out) {
             /* taken out of the base: .wh.<name>, in the place of the name */
             size_t dir_len = o->len - name_len;
             lc_bytes_copy(o->path + dir_len, WHITEOUT_PREFIX, sizeof(WHITEOUT_PREFIX) - 1);

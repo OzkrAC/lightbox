@@ -9,6 +9,10 @@
  *   <lightbox_dir>/bases/<id>/rootfs   the copy, the overlay's lower layer
  *                             source   the base it was taken of, a line
  *                             taken    when: seconds and nanoseconds since 1970
+ *                             layer    what it is as a layer of an image, once an
+ *                                      export wrote it: its digest and its size
+ *                             image    the layers of an image it was unpacked
+ *                                      from, a line each, where import made it
  *
  * A snapshot is made in .<id>.new and renamed into place when it is whole,
  * so one that a killed command left is never taken for one. The id is 12
@@ -75,7 +79,7 @@ static uint64_t fnv1a64(const char *text, uint64_t hash) {
     return hash;
 }
 
-int base_take(const char *source, char id[BASE_ID_TEXT]) {
+int base_begin(const char *source, char id[BASE_ID_TEXT], char fresh[MAX_PATH]) {
     lc_timespec now = { 0, 0 };
     lc_kernel_get_clock(LC_CLOCK_REALTIME, &now);
     /* "<seconds> <nanoseconds>\n", by hand: fmt_int is for an int */
@@ -102,12 +106,12 @@ int base_take(const char *source, char id[BASE_ID_TEXT]) {
         id[i] = hex[(hash >> (60 - 4 * i)) & 0xf];
     id[BASE_ID_LEN] = '\0';
 
-    char dir[MAX_PATH], fresh[MAX_PATH], name[BASE_ID_TEXT + 8], path[MAX_PATH], line[MAX_PATH + 2];
+    char dir[MAX_PATH], name[BASE_ID_TEXT + 8], path[MAX_PATH], line[MAX_PATH + 2];
     bases_dir_path(dir);
     (void)lc_kernel_mkdirat(AT_FDCWD, dir, MODE_PRIVATE_DIR);   /* it may be there */
     str_append(name, str_append(name, str_append(name, 0, ".", sizeof(name), &cut), id, sizeof(name), &cut),
                ".new", sizeof(name), &cut);
-    if (cut || !path_join(fresh, sizeof(fresh), dir, name)) {
+    if (cut || !path_join(fresh, MAX_PATH, dir, name)) {
         print_str(STDERR, "Error: the path of a base snapshot is too long\n");
         return -1;
     }
@@ -126,6 +130,24 @@ int base_take(const char *source, char id[BASE_ID_TEXT]) {
         require_rm_rf(fresh);
         return -1;
     }
+    return 0;
+}
+
+int base_commit(const char *id, const char *fresh) {
+    char dir[MAX_PATH], final[MAX_PATH];
+    bases_dir_path(dir);
+    if (!path_join(final, sizeof(final), dir, id) || lb_sys_renameat(AT_FDCWD, fresh, AT_FDCWD, final) < 0) {
+        print_str(STDERR, "Error: cannot put the base snapshot in place\n");
+        require_rm_rf(fresh);
+        return -1;
+    }
+    return 0;
+}
+
+int base_take(const char *source, char id[BASE_ID_TEXT]) {
+    char fresh[MAX_PATH];
+    if (base_begin(source, id, fresh) != 0)
+        return -1;
 
     /* what is in the base ("<base>/."), not the path: given a link to the
      * base, the snapshot would be that link. A reflink where the filesystem
@@ -150,19 +172,112 @@ int base_take(const char *source, char id[BASE_ID_TEXT]) {
             return -1;
         }
     }
-    char final[MAX_PATH];
-    if (!path_join(final, sizeof(final), dir, id) || lb_sys_renameat(AT_FDCWD, fresh, AT_FDCWD, final) < 0) {
-        print_str(STDERR, "Error: cannot put the base snapshot in place\n");
-        require_rm_rf(fresh);
-        return -1;
-    }
-    return 0;
+    return base_commit(id, fresh);
+}
+
+void base_discard(const char *id) {
+    char path[MAX_PATH];
+    if (base_id_ok(id) && base_file_path(path, id, NULL) && path_exists(path))
+        require_rm_rf(path);
 }
 
 int list_bases(char ids[][NAME_MAX_LEN + 1], int max) {
     char dir[MAX_PATH];
     bases_dir_path(dir);
     return list_entries(dir, base_id_ok, ids, max, NULL);
+}
+
+/*
+ * <bases>/<id>/layer: "sha256:<digest> <size>" and a newline, what the
+ * snapshot is as a layer of an image. A snapshot does not change, so that
+ * what an export found once holds: an import knows by it a base that is here
+ * already.
+ */
+#define LAYER_RECORD_PREFIX "sha256:"
+
+bool base_layer_read(const char *id, char digest[SHA256_HEX + 1], uint64_t *size) {
+    char path[MAX_PATH], text[sizeof(LAYER_RECORD_PREFIX) + SHA256_HEX + 24];
+    size_t prefix = sizeof(LAYER_RECORD_PREFIX) - 1;
+    digest[0] = '\0';
+    *size = 0;
+    if (!base_id_ok(id) || !base_file_path(path, id, "layer") || read_file(path, text, sizeof(text)) <= 0)
+        return false;
+    size_t len = lc_string_length(text);
+    if (len && text[len - 1] == '\n')
+        text[--len] = '\0';
+    if (len < prefix + SHA256_HEX + 2 || lc_bytes_compare(text, LAYER_RECORD_PREFIX, prefix) != 0 ||
+        text[prefix + SHA256_HEX] != ' ')
+        return false;
+    text[prefix + SHA256_HEX] = '\0';
+    int64_t bytes;
+    if (!sha256_hex_ok(text + prefix) || !parse_number(text + prefix + SHA256_HEX + 1, 0, INT64_MAX, &bytes))
+        return false;
+    lc_bytes_copy(digest, text + prefix, SHA256_HEX + 1);
+    *size = (uint64_t)bytes;
+    return true;
+}
+
+int base_layer_keep(const char *id, const char *digest, uint64_t size) {
+    char path[MAX_PATH], text[sizeof(LAYER_RECORD_PREFIX) + SHA256_HEX + 24], digits[24];
+    int at = (int)sizeof(digits);
+    digits[--at] = '\0';
+    do { digits[--at] = (char)('0' + size % 10); size /= 10; } while (size);
+    bool cut = false;
+    size_t pos = str_append(text, 0, LAYER_RECORD_PREFIX, sizeof(text), &cut);
+    pos = str_append(text, pos, digest, sizeof(text), &cut);
+    pos = str_append(text, pos, " ", sizeof(text), &cut);
+    pos = str_append(text, pos, digits + at, sizeof(text), &cut);
+    str_append(text, pos, "\n", sizeof(text), &cut);
+    if (cut || !sha256_hex_ok(digest) || !base_id_ok(id) || !base_file_path(path, id, "layer"))
+        return -1;
+    return write_file_atomic(path, text, MODE_PRIVATE_FILE);
+}
+
+/*
+ * <bases>/<id>/image: the layers an import unpacked the snapshot from, each
+ * as "sha256:<digest>" on a line, the digest of the layer as it is unpacked.
+ * A later import of an image with the same layers under its own finds the
+ * snapshot by it, and takes no second one.
+ */
+int base_image_keep(const char *fresh, const char *layers) {
+    char path[MAX_PATH];
+    return path_join(path, sizeof(path), fresh, "image") ? write_file_volatile(path, layers) : -1;
+}
+
+static bool base_image_read(const char *id, char layers[BASE_IMAGE_TEXT_MAX]) {
+    char path[MAX_PATH];
+    layers[0] = '\0';
+    if (!base_file_path(path, id, "image"))
+        return false;
+    lc_sysret fd = lc_kernel_open_file(path, O_RDONLY | O_NOFOLLOW, 0);
+    if (fd < 0)
+        return false;
+    lc_sysret n = lc_kernel_read_all((int32_t)fd, layers, BASE_IMAGE_TEXT_MAX);
+    lc_kernel_close_file((int32_t)fd);
+    if (n <= 0 || n >= BASE_IMAGE_TEXT_MAX)
+        return false;
+    layers[n] = '\0';
+    return true;
+}
+
+bool base_of_layers(const char *layers, char id[BASE_ID_TEXT]) {
+    static char ids[MAX_LISTED][NAME_MAX_LEN + 1];
+    static char kept[BASE_IMAGE_TEXT_MAX];
+    int count = list_bases(ids, MAX_LISTED);
+    /* one layer: a snapshot that an export here wrote as that very layer is it too */
+    size_t prefix = sizeof(LAYER_RECORD_PREFIX) - 1, len = lc_string_length(layers);
+    bool one = len == prefix + SHA256_HEX + 1 && layers[len - 1] == '\n';
+    id[0] = '\0';
+    for (int i = 0; i < count && !id[0]; i++) {
+        char digest[SHA256_HEX + 1], rootfs[MAX_PATH];
+        uint64_t size;
+        bool is = base_image_read(ids[i], kept) && streq(kept, layers);
+        if (!is && one && base_layer_read(ids[i], digest, &size))
+            is = lc_bytes_compare(digest, layers + prefix, SHA256_HEX) == 0;
+        if (is && base_rootfs_path(rootfs, ids[i]) && path_is_directory(rootfs))
+            lc_bytes_copy(id, ids[i], BASE_ID_TEXT);
+    }
+    return id[0] != '\0';
 }
 
 int base_snapshot_for(const char *source, char id[BASE_ID_TEXT], bool *took) {
@@ -172,9 +287,12 @@ int base_snapshot_for(const char *source, char id[BASE_ID_TEXT], bool *took) {
     *took = false;
     id[0] = '\0';
     for (int i = 0; i < count; i++) {
-        char from[MAX_PATH];
+        char from[MAX_PATH], record[MAX_PATH];
         int64_t s, n;
         if (!base_read(ids[i], from, &s, &n) || !streq(from, source))
+            continue;
+        /* what import unpacked is of an image, whatever its source line reads as */
+        if (base_file_path(record, ids[i], "image") && path_exists(record))
             continue;
         if (s > best_s || (s == best_s && n > best_n)) {
             best_s = s;

@@ -3772,6 +3772,37 @@ c kept/gone-too
 d opaque/
 - opaque/file"
     [ "$got" = "$want" ] || { echo "as a tree:"; echo "$got"; bad=1; }
+
+    # The kernel makes the device as whoever mounted the overlay, which is
+    # host root and nobody of a container's range: its mark is written all
+    # the same, as root's. Outside an overlay such a device is of no
+    # container of that range.
+    chown -R 1000:1000 upper && chown 0:0 upper/gone upper/kept/gone-too || exit 1
+    said=$("$UNIT" tar upper r.tar overlay 1000 1000) || { echo "with a range of ids: $said"; bad=1; }
+    got=$(tar -tvf r.tar --numeric-owner | awk "{ print \$2, \$NF }" | paste -sd" " -)
+    [ "$got" = "0/0 .wh.gone 0/0 kept/ 0/0 kept/file 0/0 kept/.wh.gone-too 0/0 opaque/ 0/0 opaque/.wh..wh..opq 0/0 opaque/file" ] ||
+        { echo "with a range of ids, the owners are: $got"; bad=1; }
+    said=$("$UNIT" tar upper s.tar 1000 1000)
+    [ $? = 1 ] && [ "$said" = "failed: gone: belongs to an id outside the container's range" ] ||
+        { echo "a device of host root's in a tree of a range: $said"; bad=1; }
+    chown -R 0:0 upper
+
+    # What an overlay keeps in part in its base, a directory it moved with
+    # redirect_dir, a file whose bytes metacopy left there, and a whiteout
+    # that is an attribute, is no layer by the upper directory alone: each
+    # ends the writing with the entry named. In a tree of its own they say
+    # nothing.
+    unread="is as an overlay with redirect_dir, metacopy or whiteouts in attributes leaves it, which is not written as a layer"
+    for pair in moved:redirect:/kept meta:metacopy: white:whiteout:y opaque:opaque:x; do
+        name=${pair%%:*} rest=${pair#*:}
+        [ -e "upper/$name" ] || { if [ "$name" = moved ]; then mkdir upper/moved; else : > "upper/$name"; fi; }
+        python3 -I -c "import os, sys; os.setxattr(sys.argv[1], \"user.overlay.\" + sys.argv[2], sys.argv[3].encode())" \
+            "upper/$name" "${rest%%:*}" "${rest#*:}" || exit 1
+        said=$("$UNIT" tar upper t.tar overlay)
+        [ $? = 1 ] && [ "$said" = "failed: $name: $unread" ] || { echo "user.overlay.${rest%%:*} on $name: $said"; bad=1; }
+        "$UNIT" tar upper u.tar > /dev/null || { echo "user.overlay.${rest%%:*} in a tree of its own ended the writing"; bad=1; }
+        python3 -I -c "import os, sys; os.removexattr(sys.argv[1], \"user.overlay.\" + sys.argv[2])" "upper/$name" "${rest%%:*}"
+    done
     exit $bad
 }
 t_tar_overlay() { in_namespace_with_ids "$(declare -f tar_helpers tar_overlay_case); tar_helpers; tar_overlay_case"; }
@@ -4085,10 +4116,12 @@ untar_marks_case() {
     "$UNIT" tar upper o.tar overlay >/dev/null || exit 1
 
     # Into an overlay's upper directory each mark is the overlay's own again,
-    # and the directory gives the archive it was unpacked from.
+    # and the directory gives the archive it was unpacked from. Whose the
+    # device was is not written: the kernel makes it as whoever mounted the
+    # overlay, and its mark is root's.
     said=$("$UNIT" untar o.tar again upper-user) || { echo "$said"; exit 1; }
     is "the marks of names" "$(stat -c "%n %F %t:%T %u:%g" again/gone again/kept/gone-too | paste -sd" ")" \
-        "again/gone character special file 0:0 5:6 again/kept/gone-too character special file 0:0 0:0"
+        "again/gone character special file 0:0 0:0 again/kept/gone-too character special file 0:0 0:0"
     is "the mark of a directory" \
         "$(python3 -I -c "import os; print(os.getxattr(\"again/opaque\", \"user.overlay.opaque\"))")" "b'y'"
     is "the names" "$(names again)" "gone kept kept/file kept/gone-too opaque opaque/file"
@@ -4586,5 +4619,131 @@ t_json_python() {
     return $bad
 }
 check "what Python's reader takes of 3000 texts, and gives, is what this one does" t_json_python
+
+# I.6: a layer that is compressed is unpacked by the host's gzip, which reads
+# what somebody else wrote. What it runs under: nobody's ids and no group
+# besides, no capability in any set, no new privilege, the allow-list, and a
+# network of its own with nothing in it but its loopback.
+tool_sandbox_case() {
+    out=$("$UNIT" tool-sandbox "$SH" -c "id -u; id -g; id -G; grep -E \"^(Cap(Inh|Prm|Eff|Bnd|Amb)|NoNewPrivs|Seccomp):\" /proc/self/status" 2>&1 | tr -s "\t" " ")
+    printf "%s\n" "$out"
+    [ "$out" = "65534
+65534
+65534
+CapInh: 0000000000000000
+CapPrm: 0000000000000000
+CapEff: 0000000000000000
+CapBnd: 0000000000000000
+CapAmb: 0000000000000000
+NoNewPrivs: 1
+Seccomp: 2" ] || { echo "a host tool is not held to that"; exit 1; }
+    links=$("$UNIT" tool-sandbox "$SH" -c "sed -n \"s/^ *\\([^ :]*\\):.*/\\1/p\" /proc/net/dev" 2>&1 | paste -sd" " -)
+    [ "$links" = lo ] || { echo "a host tool has more of a network than a loopback: $links"; exit 1; }
+    # what is no root of its own may not write what root may
+    : > "$D/roots" && chmod 600 "$D/roots"
+    "$UNIT" tool-sandbox "$SH" -c "echo x > \"$D/roots\"" 2>/dev/null && { echo "a host tool wrote a file of root's"; exit 1; }
+    exit 0
+}
+t_tool_sandbox() {
+    in_namespace_with_ids "SH=$(printf %q "$SH"); $(declare -f tool_sandbox_case); tool_sandbox_case"
+}
+# Where nobody has no id, in a user namespace that an ordinary user made of
+# one id, the ids stay, and the rest holds all the same. Without the right to
+# a network of its own, which an ordinary user has not, nothing is run.
+t_tool_sandbox_without_ids() {
+    unshare -r --mount true 2>/dev/null || { echo "user namespaces with capabilities are not available to this user"; return 77; }
+    out=$(unshare -r "$UNIT" tool-sandbox "$SH" -c 'id -u; grep -E "^(Cap(Prm|Eff|Bnd)|NoNewPrivs|Seccomp):" /proc/self/status' 2>&1 | tr -s '\t' ' ')
+    printf '%s\n' "$out"
+    [ "$out" = '0
+CapPrm: 0000000000000000
+CapEff: 0000000000000000
+CapBnd: 0000000000000000
+NoNewPrivs: 1
+Seccomp: 2' ] || return 1
+    [ "$(id -u)" != 0 ] || return 0
+    out=$("$UNIT" tool-sandbox "$SH" -c 'echo the program ran' 2>&1)
+    rc=$?
+    echo "as an ordinary user, exit $rc: $out"
+    [ $rc -ne 0 ] && case $out in *'the program ran'*) false ;; *'Error: cannot give a host tool a network of its own'*) true ;; *) false ;; esac
+}
+# I.6: the snapshot an import makes of an image's layers, where the container
+# is an overlay. tests/image_make.py puts tar archives the writer wrote into
+# an image; the snapshot is the layers unpacked one over the other, kept with
+# the layers it was unpacked from, by which a second import finds it and
+# unpacks nothing. A snapshot that an export wrote as that layer is found by
+# what export keeps of it. A layer that is compressed gives the same
+# snapshot, and one that cannot be unpacked leaves none.
+image_base_case() {
+    cd "$D" || exit 1
+    attrs=no
+    arch=amd64
+    [ "$(uname -m)" = aarch64 ] && arch=arm64
+    mkdir -p one/bin one/lib two/lib two/srv three/added merged store other exported/bases/0123456789ab/rootfs gz bad archives
+    echo tool > one/bin/tool && ln -s tool one/bin/link && echo gone > one/lib/gone && echo keep > one/lib/keep &&
+        chown 12:34 one/lib/keep && echo new > two/srv/new && echo third > three/added/file || exit 1
+    mknod two/lib/gone c 0 0 || { echo "this kernel lets no one but root make a whiteout"; exit 77; }
+    "$UNIT" tar one one.tar > /dev/null && "$UNIT" tar two two.tar overlay > /dev/null && "$UNIT" tar three three.tar > /dev/null &&
+        python3 -I "$HERE/image_make.py" image "$arch" one.tar two.tar three.tar || exit 1
+    digest=$(sha256sum < one.tar)
+    digest=${digest%% *}
+    bad=0
+
+    # the first layer, a snapshot
+    said=$("$UNIT" image-base "$D/store" "$D/image" 1) || { echo "$said"; exit 1; }
+    id=$(printf "%s\n" "$said" | sed -n "s/^took //p")
+    [ -n "$id" ] && [ "$(field entries "$said")" = 6 ] || { echo "the first layer: $said"; exit 1; }
+    same_tree one "store/bases/$id/rootfs" || { echo "the snapshot is not the layer unpacked"; bad=1; }
+    is "its source" "$(cat "store/bases/$id/source")" "sha256:$digest"
+    is "the layers it keeps" "$(cat "store/bases/$id/image")" "sha256:$digest"
+    is "the snapshots" "$(ls -A store/bases)" "$id"
+    # a second time it is found, and nothing is unpacked
+    is "a second time" "$("$UNIT" image-base "$D/store" "$D/image" 1 | paste -sd" " -)" "found $id entries 0 devices 0"
+    is "the snapshots still" "$(ls -A store/bases)" "$id"
+
+    # all three, one over the other, are another snapshot: a mark took out what it names
+    said=$("$UNIT" image-base "$D/store" "$D/image" 3) || { echo "$said"; exit 1; }
+    all=$(printf "%s\n" "$said" | sed -n "s/^took //p")
+    [ -n "$all" ] && [ "$all" != "$id" ] || { echo "three layers: $said"; exit 1; }
+    cp -a one/. merged/ && rm merged/lib/gone && cp -a two/srv merged/ && cp -a three/added merged/ || exit 1
+    is "three layers" "$(names "store/bases/$all/rootfs")" "$(names merged)"
+    is "what three layers took out" "$(ls "store/bases/$all/rootfs/lib")" keep
+    is "their source" "$(cat "store/bases/$all/source")" "sha256:$digest and the layers over it"
+    is "how many layers it keeps" "$(wc -l < "store/bases/$all/image")" 3
+    is "three layers a second time" "$("$UNIT" image-base "$D/store" "$D/image" 3 | sed -n 1p)" "found $all"
+    # and no snapshot of a base directory, whatever is asked for under its source's text
+    is "the first of two is not the three" "$("$UNIT" image-base "$D/store" "$D/image" 2 | sed -n 1p | cut -d" " -f1)" took
+
+    # a snapshot that an export here wrote as that layer is the layer unpacked
+    printf "sha256:%s %s\n" "$digest" "$(($(wc -c < one.tar)))" > exported/bases/0123456789ab/layer
+    is "a snapshot that was exported as the layer" "$("$UNIT" image-base "$D/exported" "$D/image" 1 | sed -n 1p)" "found 0123456789ab"
+    is "and no other" "$("$UNIT" image-base "$D/exported" "$D/image" 3 | sed -n 1p | cut -d" " -f1)" took
+
+    # a compressed layer is the same snapshot
+    if command -v gzip >/dev/null; then
+        cp -r image compressed && python3 -I "$HERE/image_edit.py" compressed gzip || exit 1
+        said=$("$UNIT" image-base "$D/gz" "$D/compressed" 1) || { echo "a compressed layer: $said"; exit 1; }
+        same_tree one "gz/bases/$(printf "%s\n" "$said" | sed -n "s/^took //p")/rootfs" || { echo "a compressed layer is another snapshot"; bad=1; }
+        # and found by the layer as it is unpacked, however it was packed
+        is "the layer, compressed, where it is a snapshot already" "$("$UNIT" image-base "$D/store" "$D/compressed" 1 | sed -n 1p)" "found $id"
+    else
+        echo "no gzip here: no compressed layer was unpacked"
+    fi
+
+    # a layer that is no archive of a tree leaves no snapshot, and no half of one
+    python3 -I "$HERE/tar_archives.py" archives "$D/other" && python3 -I "$HERE/image_make.py" hostile "$arch" one.tar archives/dotdot.tar || exit 1
+    said=$("$UNIT" image-base "$D/bad" "$D/hostile" 2 2>&1)
+    [ $? = 1 ] || { echo "a hostile layer was unpacked: $said"; bad=1; }
+    case $said in *"Error: layer 2 of the image cannot be unpacked: "*"has .. in its name"*) ;; *) echo "a hostile layer: $said"; bad=1 ;; esac
+    is "what a hostile layer left" "$(ls -A bad/bases 2>/dev/null)" ""
+    is "outside the snapshot" "$(ls -A other)" ""
+    exit $bad
+}
+t_image_base() {
+    in_namespace_with_ids "HERE=$(printf %q "$HERE"); $(declare -f tar_helpers untar_helpers image_base_case)
+        tar_helpers; untar_helpers; image_base_case"
+}
+check "an image's layers are unpacked into a snapshot once, which is found by them after" t_image_base
+check 'a host tool that reads an image runs as nobody, with no capability and no network' t_tool_sandbox
+check 'where nobody has no id the tool keeps its own, and where it cannot be confined it is not run' t_tool_sandbox_without_ids
 
 summary unit

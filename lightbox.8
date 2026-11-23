@@ -49,9 +49,10 @@ open, and a network that reaches the internet and nothing of the host.
 .BR restart ,
 .BR reset ,
 .BR update ,
-.B exec
-and
+.BR exec ,
 .B run
+and
+.B import
 are run as root, and so is
 .B create
 with
@@ -319,6 +320,41 @@ Check what lightbox needs of this host, and say how to fix what is missing.
 It exits with 1 when a check fails.
 .B \-\-profile agent
 checks what a box of that profile needs too.
+.TP
+.BI export " name dir"
+Write a container that is not running as an image in
+.IR dir ,
+which is made, or taken when it is there, empty and the caller's own: an OCI
+image layout, as
+.BR skopeo (1)
+and
+.BR oras (1)
+copy one to a registry.
+A container that overlays a snapshot is two layers, the snapshot and its own
+files; a copy is one.
+The manifest carries the container's limits, and nothing of what it may do on
+a host.
+The same container gives the same image, byte for byte.
+.TP
+.BI import " dir name \fR[\fIip\fR] [\fIoptions\fR]"
+Make a container of the image in
+.IR dir ,
+an OCI image layout, with the options of
+.B create
+but
+.BR \-\-rootfs .
+The image is read first, and every blob of it held to the size and the
+SHA-256 it is named by; an image that is not what it says, or is of another
+architecture, is refused and nothing is made.
+An image of two layers is a container as
+.B export
+writes one: a snapshot, which is taken only when none here is that layer, and
+the container's own files.
+A layer compressed with gzip is unpacked through
+.BR gzip (1),
+which runs as nobody, without capabilities or a network.
+The limits that no option gives are the image's; nothing else an image says
+of its container is taken.
 .TP
 .B base ls
 List the snapshots of bases that containers overlay.
