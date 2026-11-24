@@ -265,6 +265,11 @@ struct lb_statx;
 /* Why a node on a mount with nodev is not given: the host's nodev is not
  * lifted for a container, and in a user namespace it could not be. */
 [[nodiscard]] const char *device_on_nodev(const char *host);
+/* What a container of --userns needs to open a node as it is given
+ * (ROADMAP G.2), from its mode and group, which stx has: NULL with *gid 0
+ * when anyone may, NULL with its group's gid when only its group may, which
+ * the container is then given; or why the container cannot open it. */
+[[nodiscard]] const char *device_userns_group(const char *host, const struct lb_statx *stx, bool ro, uint32_t *gid);
 /* Take out every volume at a destination: how many there were. */
 int config_remove_volumes_at(container_config *config, const char *dst);
 
@@ -518,6 +523,21 @@ void id_map_line(char out[ID_MAP_LINE_MAX], const id_map *map);
                                id_map *uids, id_map *gids);
 /* uid_map and gid_map of a process in a new user namespace: 0, or minus an errno */
 [[nodiscard]] int userns_write_maps(int pid, uint32_t uid_start, uint32_t gid_start);
+/*
+ * The host's groups of the devices a container of --userns is given, which
+ * only their group may open (ROADMAP G.2): each is one more line of its gid
+ * map, of one gid, at USERNS_DEVICE_GID and on, past its range, and its
+ * processes hold them. No id 0 of the host's is ever one of them.
+ * userns_gid_map_text: the map, false when it does not fit; userns_write_maps_with:
+ * both maps, the gid map with those lines; gid_map_device_groups: the gids
+ * inside of those lines in the text of a gid_map, how many.
+ */
+#define USERNS_DEVICE_GID USERNS_SIZE
+#define USERNS_MAP_TEXT_MAX (ID_MAP_LINE_MAX * (1 + MAX_DEVICES))
+[[nodiscard]] bool userns_gid_map_text(char *out, size_t max, uint32_t gid_start, const uint32_t *groups, size_t ngroups);
+[[nodiscard]] int userns_write_maps_with(int pid, uint32_t uid_start, uint32_t gid_start, const uint32_t *groups,
+                                         size_t ngroups);
+int gid_map_device_groups(const char *text, uint32_t *inside, int max);
 /* A user namespace with a container's maps, for idmapped mounts: a
  * descriptor, or minus an errno */
 [[nodiscard]] int userns_fd_with(uint32_t uid_start, uint32_t gid_start);

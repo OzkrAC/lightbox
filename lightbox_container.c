@@ -549,6 +549,28 @@ const char *device_on_nodev(const char *host) {
     return why;
 }
 
+const char *device_userns_group(const char *host, const struct lb_statx *stx, bool ro, uint32_t *gid) {
+    static char why[MAX_PATH + 160];
+    bool cut = false;
+    uint32_t want = ro ? 04u : 06u, other = stx->stx_mode & 07u, group = (stx->stx_mode >> 3) & 07u;
+    *gid = 0;
+    if ((other & want) == want)
+        return NULL;                        /* anyone may: nothing to map */
+    const char *wrong;
+    if ((group & want) != want)
+        wrong = ro ? " is read by its owner alone, whom no container of --userns stands for"
+                   : " is read and written by its owner alone, whom no container of --userns stands for";
+    else if (stx->stx_gid == 0)
+        wrong = " opens to its group, which is root's, gid 0, and that a container of --userns never holds: give the "
+                "node a group of its own";
+    else {
+        *gid = stx->stx_gid;
+        return NULL;
+    }
+    str_append(why, str_append(why, 0, host, sizeof(why), &cut), wrong, sizeof(why), &cut);
+    return why;
+}
+
 const char *device_check(const device_spec *dev, bool agent, uint32_t *major, uint32_t *minor) {
     static char why[MAX_PATH + 40];
     bool cut = false;

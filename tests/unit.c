@@ -148,6 +148,10 @@
  *                                             "refused" and status 1
  *   unit overlay-whole <dir>                  overlay_upper_whole: "whole", "not whole: <path>"
  *                                             with status 1, or "cannot read" with status 2
+ *   unit gidmap <gid_start> [<group>...]      userns_gid_map_text: the gid map of a container of
+ *                                             --userns with its devices' groups, or "refused"
+ *   unit devgroups <file>                     gid_map_device_groups of a gid_map's text: the gids
+ *                                             inside of the devices' groups, a line each
  *   unit cgroup2-root <store> <cgroup_root>   ensure_cgroup2_for_start with the store's lock in
  *                                             <store>: what it says, then "cgroup2"; or its error
  *   unit firewall-kernel <proc_net> <modules> true|false
@@ -1958,6 +1962,35 @@ int main(int argc, char **argv, char **envp) {
             return 1;
         }
         put_line(options, "");
+        return 0;
+    }
+    if (argc >= 3 && streq(argv[1], "gidmap")) {
+        uint32_t start, groups[MAX_DEVICES + 4];
+        size_t n = 0;
+        if (!parse_u32_text(argv[2], &start))
+            return 2;
+        for (int i = 3; i < argc && n < sizeof(groups) / sizeof(groups[0]); i++)
+            if (!parse_u32_text(argv[i], &groups[n++]))
+                return 2;
+        static char text[USERNS_MAP_TEXT_MAX + 64];
+        if (!userns_gid_map_text(text, sizeof(text), start, groups, n)) {
+            put("refused\n");
+            return 1;
+        }
+        put(text);
+        return 0;
+    }
+    if (argc == 3 && streq(argv[1], "devgroups")) {
+        static char text[4096];
+        if (read_file(argv[2], text, sizeof(text)) < 0)
+            return 2;
+        uint32_t inside[MAX_DEVICES];
+        int n = gid_map_device_groups(text, inside, MAX_DEVICES);
+        for (int i = 0; i < n; i++) {
+            char digits[11];
+            format_u32(digits, inside[i]);
+            put_line(digits, "");
+        }
         return 0;
     }
     if (argc == 4 && streq(argv[1], "cgroup2-root")) {

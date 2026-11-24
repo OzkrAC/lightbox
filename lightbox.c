@@ -1740,8 +1740,13 @@ static void cmd_create(int argc, char **argv) {
      * (ROADMAP G.1): never one that gives the host away, and to a box of
      * --profile agent a GPU's compute nodes alone */
     for (int d = 0; d < cfg.ndevs; d++) {
-        uint32_t major, minor;
+        uint32_t major, minor, group;
         const char *refused = device_check(&cfg.devs[d], cfg.profile == PROFILE_AGENT, &major, &minor);
+        /* and with --userns, one that it could open (ROADMAP G.2) */
+        struct lb_statx stx;
+        if (!refused && cfg.userns &&
+            lb_sys_statx(AT_FDCWD, cfg.devs[d].host, 0, LB_STATX_TYPE | LB_STATX_MODE | LB_STATX_GID, &stx) == 0)
+            refused = device_userns_group(cfg.devs[d].host, &stx, cfg.devs[d].ro, &group);
         if (refused)
             die2("Error: --device: ", refused);
     }
@@ -2170,6 +2175,7 @@ struct child_args {
     const container_config *config;         /* read by the command, before the clone */
     const struct lb_dev_row *dev_rows;      /* the numbers of config's devices, as start found them */
     const int32_t *dev_trees;               /* and their nodes' mounts, cloned, attached nowhere yet */
+    int          ndev_groups;               /* with --userns: how many devices' groups its gid map has */
     const char  *root;
     const char  *overlay;                   /* the options of the overlay init mounts; NULL: none */
     bool         userns;                    /* in a user namespace of its own, whose maps the command writes */
@@ -3820,6 +3826,15 @@ static int exec_inside_container(const char *cg, int target_pid, int privileged,
         die("Error: failed to open target root");
 
     int userfd = userns ? open_target_path(target_pid, "/ns/user") : -1;
+    /* the groups of its devices that its gid map has past its range (ROADMAP
+     * G.2), read here on the host: every command holds them, whoever it runs as */
+    uint32_t device_groups[MAX_DEVICES];
+    int ndevice_groups = 0;
+    if (userns) {
+        char path[64], map[USERNS_MAP_TEXT_MAX + 64];
+        if (proc_pid_path(path, sizeof(path), target_pid, "/gid_map") && read_file(path, map, sizeof(map)) > 0)
+            ndevice_groups = gid_map_device_groups(map, device_groups, MAX_DEVICES);
+    }
     if (userns && userfd < 0)
         die("Error: failed to open the container's user namespace");
     int mntfd = open_target_path(target_pid, "/ns/mnt");
@@ -3878,6 +3893,16 @@ static int exec_inside_container(const char *cg, int target_pid, int privileged,
      * are read here, where no path in them leads out of the container. */
     struct identity id;
     resolve_identity(req, "/etc/passwd", "/etc/group", &id);
+    for (int g = 0; g < ndevice_groups; g++) {
+        bool held = false;
+        for (int i = 0; i < id.ngroups && !held; i++)
+            held = id.groups[i] == device_groups[g];
+        if (held)
+            continue;
+        if (id.ngroups >= MAX_EXEC_GROUPS)
+            die("Error: the command's groups and those of the container's devices are more than " STRINGIFY(MAX_EXEC_GROUPS));
+        id.groups[id.ngroups++] = device_groups[g];
+    }
 
     /* What the command gets in the place of a terminal of the caller's: made
      * here, where /dev/pts is the container's. */
@@ -4435,7 +4460,13 @@ static void build_container(const struct child_args *ca) {
     /* In a user namespace of its own, init is the container's root from
      * here on, uid and gid 0 there and the first of its range on the host,
      * and what it makes is the container's root's. */
-    if (ca->userns && (lc_kernel_setgroups(0, NULL) < 0 || lc_kernel_setgid(0) < 0 || lc_kernel_setuid(0) < 0))
+    /* and holds the groups of the devices it is given that only their group
+     * opens, which its gid map has past its range (ROADMAP G.2), and no other */
+    uint32_t device_groups[MAX_DEVICES];
+    for (int g = 0; g < ca->ndev_groups; g++)
+        device_groups[g] = USERNS_DEVICE_GID + (uint32_t)g;
+    if (ca->userns && (lc_kernel_setgroups((size_t)ca->ndev_groups, device_groups) < 0 || lc_kernel_setgid(0) < 0 ||
+                       lc_kernel_setuid(0) < 0))
         die("Error: failed to become the root of the container's user namespace");
     if (lb_sys_fchdir((int32_t)rootfd) < 0)
         die2("Error: chdir to rootfs failed: ", ca->root);
@@ -4771,6 +4802,10 @@ static void start_one(const char *name, int hook_wait) {
      * is made. */
     static struct lb_dev_row dev_rows[MAX_DEVICES];
     static int32_t dev_trees[MAX_DEVICES];
+    /* and with --userns, the host's groups of those only their group may
+     * open, which its gid map and its processes get (ROADMAP G.2) */
+    static uint32_t dev_groups[MAX_DEVICES];
+    int ndev_groups = 0;
     for (int d = 0; d < config.ndevs; d++) {
         const device_spec *dev = &config.devs[d];
         lc_sysret tree = lb_sys_open_tree(AT_FDCWD, dev->host, LB_OPEN_TREE_CLONE | LB_OPEN_TREE_CLOEXEC);
@@ -4781,7 +4816,8 @@ static void start_one(const char *name, int hook_wait) {
             print_str(STDERR, " is not there\n");
             lc_kernel_exit(failure_status);
         }
-        if (tree < 0 || lb_sys_statx((int32_t)tree, "", LB_AT_EMPTY_PATH, LB_STATX_TYPE, &stx) < 0) {
+        if (tree < 0 || lb_sys_statx((int32_t)tree, "", LB_AT_EMPTY_PATH, LB_STATX_TYPE | LB_STATX_MODE | LB_STATX_GID,
+                                     &stx) < 0) {
             say_with_number("Error: cannot take a device of the container's (errno ", (int)(tree < 0 ? -tree : 0), "): ");
             print_str(STDERR, dev->host);
             lc_print_char(STDERR, '\n');
@@ -4791,8 +4827,16 @@ static void start_one(const char *name, int hook_wait) {
         struct lb_statfs sfs;
         if (!refused && lb_sys_fstatfs((int32_t)tree, &sfs) == 0 && (sfs.f_flags & LB_ST_NODEV))
             refused = device_on_nodev(dev->host);
+        uint32_t group = 0;
+        if (!refused && config.userns)
+            refused = device_userns_group(dev->host, &stx, dev->ro, &group);
         if (refused)
             die2("Error: a device of the container's cannot be given: ", refused);
+        bool have = group == 0;
+        for (int g = 0; g < ndev_groups && !have; g++)
+            have = dev_groups[g] == group;
+        if (!have)
+            dev_groups[ndev_groups++] = group;
         dev_trees[d] = (int32_t)tree;
         dev_rows[d] = (struct lb_dev_row){ stx.stx_rdev_major, stx.stx_rdev_major, stx.stx_rdev_minor,
                                            stx.stx_rdev_minor, dev->ro ? LB_DEV_R : LB_DEV_RW };
@@ -5013,6 +5057,7 @@ static void start_one(const char *name, int hook_wait) {
         .config = &config,
         .dev_rows = dev_rows,
         .dev_trees = dev_trees,
+        .ndev_groups = ndev_groups,
         .root = start_root,
         .overlay = config.base[0] && !config.userns ? overlay : NULL,
         .userns = config.userns,
@@ -5046,7 +5091,8 @@ static void start_one(const char *name, int hook_wait) {
      */
 
     /* its ids: uid and gid 0 there are the first of its range here */
-    if (config.userns && userns_write_maps(child_pid, config.uid_start, config.gid_start) != 0) {
+    if (config.userns && userns_write_maps_with(child_pid, config.uid_start, config.gid_start, dev_groups,
+                                                (size_t)ndev_groups) != 0) {
         start_err = "failed to write the maps of the container's user namespace";
         goto fail_start;
     }

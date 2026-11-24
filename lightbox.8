@@ -176,6 +176,11 @@ input devices, uinput, watchdog, MSRs or cpuid;
 to a box of
 .B \-\-profile agent
 a GPU's compute nodes alone.
+With
+.BR \-\-userns ,
+a node that only its group may open gives the container that group alone,
+mapped at gid 65536;
+one that only its owner may open, or of group 0, is refused.
 Repeatable, up to 16.
 .TP
 .BI \-\-workspace " dir"

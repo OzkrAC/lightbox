@@ -2379,6 +2379,43 @@ t_device() {
     case $said in *opened*|*'ermitted'*) echo "the device program did not let it through, or a GPU is here"; return 1 ;; *'No such device'*) ;; *) return 1 ;; esac
 }
 
+# A device that only its group may open, in a box of --userns (ROADMAP G.2):
+# the node's host group is one more line of the box's gid map, at 65536, and
+# the box's processes hold it, root's and another user's that exec runs, so
+# that the node opens for both. A node that only its owner may open, and one
+# of the host's group 0, are refused at create, and at start too when the
+# node changed after create.
+t_device_group() {
+    local d=$T/devgrp said map
+    need_subids || return $?
+    [ -c /dev/fuse ] || { echo "this host has no /dev/fuse, whose numbers the case uses"; return 77; }
+    mkdir -p "$d" && mknod -m 660 "$d/grp" c 10 229 && chgrp 4242 "$d/grp" || return 1
+    box dgrp --userns --device "$d/grp:/dev/grp" && start dgrp || return 1
+    map=$(awk '{ print $1, $2, $3 }' "/proc/$(pid_of dgrp)/gid_map")
+    echo "the box's gid map: $(printf '%s\n' "$map" | paste -sd'|')"
+    printf '%s\n' "$map" | grep -qx '65536 4242 1' || { echo "the node's group is not in the gid map"; return 1; }
+    said=$(sh_in dgrp 'if exec 3<>/dev/grp; then echo opened; fi; grep ^Groups: /proc/self/status' 2>&1)
+    echo "root in the box: $(printf '%s\n' "$said" | paste -sd' ')"
+    case $said in opened*'Groups:'*65536*) ;; *) echo "root of the box does not open it, or does not hold the group"; return 1 ;; esac
+    said=$(lb exec dgrp --user 1000:1000 /bin/sh -c 'if exec 3<>/dev/grp; then echo opened; fi; grep ^Groups: /proc/self/status' </dev/null 2>&1)
+    echo "uid 1000 in the box: $(printf '%s\n' "$said" | paste -sd' ')"
+    case $said in opened*'Groups:'*'65536'*) ;; *) echo "another user of the box does not open it"; return 1 ;; esac
+    # refused at create: the owner's alone, and the host's group 0
+    mknod -m 600 "$d/own" c 10 229 && mknod -m 660 "$d/root" c 10 229 || return 1
+    said=$(lb create downer "$(next_ip)" --userns --device "$d/own:/dev/own" 2>&1) && { echo "created with a node of its owner's alone"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *"$d/own is read and written by its owner alone"*) ;; *) return 1 ;; esac
+    said=$(lb create droot "$(next_ip)" --userns --device "$d/root:/dev/root0" 2>&1) && { echo "created with a node of group 0"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *"$d/root opens to its group, which is root's, gid 0"*) ;; *) return 1 ;; esac
+    # and at start, where the node changed after create
+    lb stop dgrp >/dev/null && chgrp 0 "$d/grp" || return 1
+    said=$(lb start dgrp 2>&1 </dev/null) && { echo "started with a node that changed to group 0"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *"cannot be given: $d/grp opens to its group, which is root's"*) ;; *) return 1 ;; esac
+    [ "$(state_of dgrp)" = stopped ] && [ ! -d "$CG/dgrp" ] && nothing_left dgrp
+}
+
 # ─── Cases: the init hook, starting and stopping ────────────────────────────
 
 t_hook_runs() {
@@ -4956,6 +4993,7 @@ if [ "$MODE" = inside ]; then
     check 'start mounts cgroup2 at a cgroup_root of its own that a reboot emptied, as setup does' t_start_mounts_cgroup2
     check "init is in the container's cgroup, and a command run by exec in its exec's below it" t_cgroup_membership
     check "create --device: a node of the host's opens in the container as it is given, and its numbers are read at each start" t_device
+    check "a device that only its group may open: its group is in a box's gid map, held by root and by another user" t_device_group
 
     check 'the init hook runs with /tmp and /run mounted'                 t_hook_runs
     check 'a service the hook starts outlives the start command'          t_service_outlives_start

@@ -4922,6 +4922,38 @@ cgroup2" ] && [ "$(stat -f -c %T "$D/empty")" = cgroup2fs ] || { echo "  not mou
     return $rc
 }
 check 'start mounts cgroup2 on an empty cgroup_root, once, and refuses one with something in it' t_start_cgroup2_root
+
+# The gid map of a container of --userns with the host's groups of devices
+# that only their group may open (ROADMAP G.2): its range, then a line of one
+# gid each at 65536 and on, written as one text; never the host's gid 0, nor
+# a group inside the range, which the kernel would refuse. exec reads the
+# gids inside of those lines back from a gid_map, padded as the kernel pads
+# it, and nothing else: not the range, not a line of more than one gid, not
+# one past the devices' window.
+t_userns_device_groups() {
+    local said bad=0 f
+    is() { # what, want, words...
+        local what=$1 want=$2
+        shift 2
+        said=$("$UNIT" "$@")
+        [ "$said" = "$want" ] || { printf '%s: %s\n  expected: %s\n' "$what" "$said" "$want"; bad=1; }
+    }
+    is "a range alone" "0 2147549183 65536" gidmap 2147549183
+    is "two groups" "0 2147549183 65536
+65536 993 1
+65537 44 1" gidmap 2147549183 993 44
+    is "the host's gid 0" refused gidmap 2147549183 993 0
+    is "a group inside the range" refused gidmap 100000 100005
+    is "the gid after the range" "0 100000 65536
+65536 165536 1" gidmap 100000 165536
+    f=$(mktemp "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    printf '%10s %10s %10s\n' 0 2147549183 65536 65536 993 1 65537 44 1 65538 7 2 65552 9 1 70000 5 1 > "$f"
+    is "read back, padded" "65536
+65537" devgroups "$f"
+    rm -f -- "$f"
+    return $bad
+}
+check 'a gid map has the range and a line of each device'"'"'s group, and exec reads them back' t_userns_device_groups
 check 'a host tool that reads an image runs as nobody, with no capability and no network' t_tool_sandbox
 check 'where nobody has no id the tool keeps its own, and where it cannot be confined it is not run' t_tool_sandbox_without_ids
 
