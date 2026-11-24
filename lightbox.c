@@ -4099,7 +4099,12 @@ static void close_container_streams(int32_t *null_fd, int32_t *log_fd) {
  * container then goes on, and the next command clears away what it leaves,
  * as before the monitor.
  */
-typedef void (*init_ended_fn)(const char *name, int32_t pid, const char *started, int32_t status, int32_t log_fd);
+typedef void (*init_ended_fn)(const char *name, int32_t pid, const char *started, int32_t status, bool expired,
+                              int32_t log_fd);
+
+/* How long past its --ttl and its grace the monitor lets init go on before
+ * it ends it from the host; init ends the container at the deadline itself. */
+#define MONITOR_TTL_MARGIN_MS 3000
 
 [[noreturn]] static void monitor_main(struct child_args *ca, int flags, int (*fn)(void *), init_ended_fn ended,
                                       int32_t pid_wr, int32_t control_rd, const int32_t ends[4]) {
@@ -4115,6 +4120,7 @@ typedef void (*init_ended_fn)(const char *name, int32_t pid, const char *started
     static char started[32];
     if (proc_starttime((int)pid, started, sizeof(started)) < 0)
         started[0] = '\0';
+    lc_sysret pidfd = lb_sys_pidfd_open((int32_t)pid, 0);
 
     /* its standard streams nobody's, and of start's descriptors the control
      * pipe and the container's log alone */
@@ -4123,8 +4129,13 @@ typedef void (*init_ended_fn)(const char *name, int32_t pid, const char *started
         (void)lc_kernel_duplicate_fd((int32_t)null, i, 0);
     for (int i = 0; i < 4; i++)
         lc_kernel_close_file(ends[i]);
-    int32_t keep[5] = { 0, 1, 2, control_rd, ca->log_fd };
-    close_all_but(keep, ca->log_fd >= 0 ? 5 : 4);
+    int32_t keep[6] = { 0, 1, 2, control_rd };
+    size_t nkeep = 4;
+    if (pidfd >= 0)
+        keep[nkeep++] = (int32_t)pidfd;
+    if (ca->log_fd >= 0)
+        keep[nkeep++] = ca->log_fd;
+    close_all_but(keep, nkeep);
     uint64_t no_signals = 0;
     lc_kernel_set_signal_mask(LC_SIG_SETMASK, &no_signals, NULL);
     (void)lc_kernel_prctl(LB_PR_SET_DUMPABLE, 0, 0, 0, 0);
@@ -4136,10 +4147,34 @@ typedef void (*init_ended_fn)(const char *name, int32_t pid, const char *started
         ;
     lc_kernel_close_file(control_rd);
 
+    /* --ttl, kept from the host as well: init ends the container at its
+     * deadline, and where init has not ended its grace and a margin after
+     * that, as one that something stopped would not, the monitor ends it,
+     * where nothing in the container can keep it from that. Counted from
+     * here, when start is done, which is after init began to count. */
+    bool expired = false;
+    int64_t deadline = ca->config && ca->config->ttl_ms && pidfd >= 0
+                       ? boottime_ms() + ca->config->ttl_ms + (int64_t)ca->stop_grace * 1000 + MONITOR_TTL_MARGIN_MS : 0;
+    while (deadline) {
+        int64_t left = deadline - boottime_ms();
+        if (left <= 0) {
+            (void)lb_sys_pidfd_send_signal((int32_t)pidfd, SIGKILL, NULL, 0);
+            expired = true;
+            break;
+        }
+        struct lb_pollfd one = { .fd = (int32_t)pidfd, .events = LB_POLLIN, .revents = 0 };
+        lc_timespec wait = { .seconds = left / 1000, .nanoseconds = (left % 1000) * 1000000 };
+        lc_sysret ready = lb_sys_ppoll(&one, 1, &wait);
+        if (ready > 0 || (ready < 0 && ready != -LB_EINTR))
+            break;                      /* init ended, or the wait cannot go on: it is waited for below */
+    }
+
+    if (pidfd >= 0)
+        lc_kernel_close_file((int32_t)pidfd);
     int32_t status = 0;
     if (wait_child((int32_t)pid, &status) != 0)
         lc_kernel_exit(failure_status);
-    ended(ca->name, (int32_t)pid, started, status, ca->log_fd);
+    ended(ca->name, (int32_t)pid, started, status, expired, ca->log_fd);
     lc_kernel_exit(0);
 }
 
@@ -4154,9 +4189,12 @@ static bool reconcile(const char *name);
  * finds nothing; a container that was removed meanwhile ends the monitor at
  * its lock. Without the monitor this waited for the next lightbox command.
  */
-static void monitor_cleanup(const char *name, int32_t pid, const char *started, int32_t status, int32_t log_fd) {
+static void monitor_cleanup(const char *name, int32_t pid, const char *started, int32_t status, bool expired,
+                            int32_t log_fd) {
     int signal = status & 0x7f;
-    if (signal && log_fd >= 0) {
+    if (expired && log_fd >= 0) {
+        print_str(log_fd, "lightbox: the container was still running past its --ttl and its grace; its monitor ended it\n");
+    } else if (signal && log_fd >= 0) {
         char digits[16];
         fmt_int(digits, signal);
         print_str(log_fd, "lightbox: the container's init was killed by signal ");
@@ -4182,6 +4220,13 @@ static void monitor_cleanup(const char *name, int32_t pid, const char *started, 
         }
         int32_t lock = container_lock_try(name);
         if (lock >= 0) {
+            /* what init would have said, had it ended the container itself */
+            int said;
+            char path[MAX_PATH];
+            if (expired && !container_exit_report(name, &said)) {
+                container_exit_path(path, name);
+                (void)write_file(path, STRINGIFY(INIT_EXPIRED) "\n");
+            }
             (void)reconcile(name);
             lc_kernel_close_file(lock);
             return;

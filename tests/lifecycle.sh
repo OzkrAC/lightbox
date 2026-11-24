@@ -1461,7 +1461,7 @@ t_monitor_clears_away() {
     [ "$(cat "/proc/$mon/comm")" = lightbox-mon ] || { echo "the parent of init is $(cat "/proc/$mon/comm")"; return 1; }
     fds=$(for f in /proc/"$mon"/fd/*; do readlink "$f"; done | sort | paste -sd'|')
     echo "the monitor's descriptors: $fds"
-    [ "$fds" = "$(printf '%s\n' "$C/mon1/console.log" /dev/null /dev/null /dev/null | sort | paste -sd'|')" ] ||
+    [ "$fds" = "$(printf '%s\n' "$C/mon1/console.log" /dev/null /dev/null /dev/null 'anon_inode:[pidfd]' | sort | paste -sd'|')" ] ||
         { echo "the monitor holds more"; return 1; }
     began=$(date +%s%N)
     kill -KILL "$pid"
@@ -1483,6 +1483,29 @@ t_monitor_clears_away() {
     box mon3 --ttl 2s && start mon3 || return 1
     wait_until 8 quietly_cleared mon3 expired || { nothing_left mon3; echo "state: $(state_of mon3)"; return 1; }
     echo "mon2: $(state_of mon2), mon3: $(state_of mon3), with no command run"
+}
+
+# A --ttl is kept from the host too (ROADMAP M.1): an init that something
+# stopped, here with SIGSTOP, does not end its container at the deadline,
+# and its monitor ends it from the host its grace and a margin later, 2 s,
+# 1 s and 3 s from when start was done, with no command run: expired, with
+# nothing left, and the log says why.
+t_monitor_keeps_the_ttl() {
+    local pid began ms
+    alt_conf monttl 'stop_timeout = 1' || return 1
+    export LIGHTBOX_CONFIG="$ALT_CONF"
+    box mttl --ttl 2s || return 1
+    start mttl || return 1
+    began=$(date +%s%N)
+    pid=$(pid_of mttl)
+    kill -STOP "$pid" || return 1
+    quietly_expired() { nothing_left mttl >/dev/null 2>&1 && [ "$(state_of mttl)" = expired ]; }
+    wait_until 12 quietly_expired || { nothing_left mttl; echo "state: $(state_of mttl)"; return 1; }
+    ms=$(( ($(date +%s%N) - began) / 1000000 ))
+    echo "expired and cleared away $ms ms after start was done, with init stopped"
+    [ "$ms" -ge 5500 ] && [ "$ms" -lt 9000 ] || { echo "not when its lifetime, grace and margin had gone"; return 1; }
+    grep -q 'still running past its --ttl and its grace; its monitor ended it' "$C/mttl/console.log" ||
+        { echo "the log does not say why"; return 1; }
 }
 
 # stop is a command that changes a container, so it is where the record of a
@@ -5025,6 +5048,7 @@ if [ "$MODE" = inside ]; then
     check 'a container whose init died starts again'                      t_start_after_init_died
     check 'stop of a container whose init died clears it away, as failed' t_stop_of_a_dead_container_cleans_up
     check "a container's monitor clears away what it leaves within a second, with no command run" t_monitor_clears_away
+    check 'a --ttl that init does not keep, as it was stopped, is kept by its monitor from the host' t_monitor_keeps_the_ttl
     check 'a container stopped from inside is exited, and cleared away by the next command' t_stopped_from_inside_is_exited
     check 'after a reboot containers are stopped, and start'              t_after_a_reboot
     check 'a container started before the upgrade is seen, and stopped'   t_container_started_before_the_upgrade

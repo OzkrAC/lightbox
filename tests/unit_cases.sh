@@ -5053,6 +5053,21 @@ status 137 fds 0 1 2
 reaped" ]
 }
 check 'a monitor is init'"'"'s parent, reaps it once the command is done, and holds nothing of the command'"'"'s' t_monitor
+
+# The monitor keeps a --ttl from the host as well (ROADMAP M.1): a child that
+# never ends by itself, as an init that something stopped would not, is ended
+# by the monitor its grace and a margin of 3 s past the deadline, which here
+# is 1 s with no grace, and the monitor says that it expired.
+t_monitor_ttl() {
+    local f said ms
+    f=$(mktemp -u "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    said=$(timeout -k 5 30 "$UNIT" monitor-ttl "$f" 1s)
+    printf '%s\n' "$said"
+    rm -f -- "$f"
+    ms=$(printf '%s\n' "$said" | sed -n 's/^after ms //p')
+    [ "$(printf '%s\n' "$said" | head -n 1)" = 'status 137 expired fds 0 1 2' ] && [ "${ms:-0}" -ge 3900 ] && [ "$ms" -lt 6000 ]
+}
+check 'the monitor ends a child past its --ttl, its grace and a margin, and says it expired' t_monitor_ttl
 check 'a host tool that reads an image runs as nobody, with no capability and no network' t_tool_sandbox
 check 'where nobody has no id the tool keeps its own, and where it cannot be confined it is not run' t_tool_sandbox_without_ids
 

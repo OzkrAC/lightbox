@@ -152,6 +152,8 @@
  *                                             killed, which it then is: whether it is the
  *                                             command's child, a zombie until the command is done,
  *                                             what the monitor wrote to record, whether it reaped
+ *   unit monitor-ttl <record> <duration>      the same with that --ttl and no grace, and a child
+ *                                             that never ends: what the monitor wrote, and when
  *   unit gpu <root>                           gpu_devices under root: "<host> -> <path>" a line
  *                                             each, or "more than <n>" with status 1
  *   unit nvidia <root>                        nvidia_libraries under root: "version <v>", then
@@ -563,7 +565,8 @@ static int unit_sleeper(void *arg) {
 
 /* What the monitor saw, into the file that the name is (ROADMAP M.1): the
  * exit code of its child, and the descriptors it holds. */
-static void unit_monitor_ended(const char *record, int32_t pid, const char *started, int32_t status, int32_t log_fd) {
+static void unit_monitor_ended(const char *record, int32_t pid, const char *started, int32_t status, bool expired,
+                               int32_t log_fd) {
     (void)log_fd;
     (void)pid;
     (void)started;
@@ -572,6 +575,8 @@ static void unit_monitor_ended(const char *record, int32_t pid, const char *star
     fmt_int(digits, exit_code_from_status(status));
     size_t pos = str_append(text, 0, "status ", sizeof(text), &cut);
     pos = str_append(text, pos, digits, sizeof(text), &cut);
+    if (expired)
+        pos = str_append(text, pos, " expired", sizeof(text), &cut);
     pos = str_append(text, pos, " fds", sizeof(text), &cut);
     lc_sysret dir = lc_kernel_open_file("/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
     char buf[2048];
@@ -1677,6 +1682,32 @@ int main(int argc, char **argv, char **envp) {
         int len = fmt_int(digits, (int)fd);
         lc_kernel_write_bytes((int32_t)fd, digits, (size_t)len);
         lc_kernel_close_file((int32_t)fd);
+        return 0;
+    }
+    if (argc == 4 && streq(argv[1], "monitor-ttl")) {
+        /* the same with a --ttl of argv[3] ms and no grace, and a child that
+         * never ends by itself: the monitor ends it, a margin past the deadline */
+        static container_config config;
+        if (!parse_duration_ms(argv[3], &config.ttl_ms))
+            return 2;
+        struct init_link link = INIT_LINK_NONE;
+        struct child_args ca = { .null_fd = -1, .log_fd = -1, .exit_fd = -1, .starter_signals = -1, .name = argv[2],
+                                 .config = &config, .stop_grace = 0 };
+        int64_t began = boottime_ms();
+        const char *failed = init_spawn_monitored(&link, &ca, 0, unit_sleeper, unit_monitor_ended);
+        if (failed)
+            die2("unit: ", failed);
+        link.pid = -1;
+        init_link_close(&link);
+        for (int i = 0; i < 200 && !path_exists(argv[2]); i++) {
+            lc_timespec tenth = { .seconds = 0, .nanoseconds = 100000000 };
+            lc_kernel_sleep(&tenth);
+        }
+        static char text[256];
+        put(read_file(argv[2], text, sizeof(text)) > 0 ? text : "the monitor said nothing\n");
+        char ms[24];
+        fmt_int(ms, (int)(boottime_ms() - began));
+        put_line("after ms ", ms);
         return 0;
     }
     if (argc == 3 && streq(argv[1], "monitor")) {
