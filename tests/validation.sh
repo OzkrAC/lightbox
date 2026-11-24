@@ -1656,6 +1656,15 @@ assert d == want, d
     fi
     lb create db 10.0.0.3 >/dev/null && [ "$(lb inspect db | grep '^device')" = 'device: -' ] ||
         { echo "a container without devices is not shown so"; return 1; }
+    [ "$(lb inspect db | grep '^gpu: ')" = 'gpu: 0' ] && ! grep -q '^gpu=' "$C/db/.conf" || { echo "a container without --gpu is said to have it"; return 1; }
+    # --gpu: kept as gpu=1, the nodes found at each start and none in .conf (ROADMAP G.3)
+    lb create gpu 10.0.0.5 --gpu >/dev/null || return 1
+    grep -qx 'gpu=1' "$C/gpu/.conf" && ! grep -q '^device=' "$C/gpu/.conf" && [ "$(lb inspect gpu | grep '^gpu: ')" = 'gpu: 1' ] ||
+        { grep -E '^(gpu|device)' "$C/gpu/.conf"; echo "--gpu is not kept as gpu=1 alone"; return 1; }
+    if command -v python3 >/dev/null 2>&1; then
+        lb inspect gpu --json | python3 -I -c 'import json, sys; d = json.load(sys.stdin)[0]; assert d["gpu"] is True and d["devices"] == [], d' ||
+            { echo "inspect --json does not say gpu"; return 1; }
+    fi
     before=$(ls "$C")
     blk=$(find /dev -maxdepth 2 -type b 2>/dev/null | head -n 1)
     [ -n "$blk" ] && no 'is a block device: no container is given one' --device "$blk:/dev/disk0"

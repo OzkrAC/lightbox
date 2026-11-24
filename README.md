@@ -426,6 +426,8 @@ Commands:
          --io-max <limit>       I/O limit for one disk: "8:0 wbps=10485760", with rbps, wbps,
                                 riops or wiops (default: none)
          --vol  <src:dst[:ro]>  Bind mount (repeatable)
+         --gpu                  The host's GPUs for compute, found at each start: its render
+                                nodes, NVIDIA's and /dev/kfd, each as --device gives one
          --device <host>[:<path>][:ro]
                                 A character device of the host's at <path> under /dev, or at its
                                 own path, read alone with :ro (repeatable); never a block device
@@ -534,6 +536,7 @@ A container's name is 1 to 30 characters of `a-z`, `A-Z`, `0-9`, `_` and `-`.
 | `--cpu <num>` | `1` | CPUs, 0.01 to 512, with up to two decimals: `2`, `0.5`, `1.25` |
 | `--io-max "<major>:<minor> <key>=<value>..."` | none | I/O limit for one whole disk of the host, as `io.max` takes it: `"8:0 wbps=10485760 riops=1000"`, with `rbps`, `wbps`, `riops` and `wiops`, each a number or `max` |
 | `--vol <src>:<dst>[:ro]` | — | Bind mount (repeatable, up to 16, one at a destination) |
+| `--gpu` | off | The host's GPUs for compute, found at each start and never kept: the render nodes of `/dev/dri`, NVIDIA's GPUs, `nvidiactl` and `nvidia-uvm`, and `/dev/kfd`, each given as `--device` gives one; not a card node or `nvidia-modeset`. A start that finds none ends and says so. To a box of `--profile agent` too |
 | `--device <host>[:<path>][:ro]` | — | A character device of the host's in the container, at `<path>` under `/dev` or at its own path, read alone with `:ro` (repeatable, up to 16). Its numbers are read at each start. Never a block device, nor the host's memory, ports, kernel log, consoles, input devices, `uinput`, watchdog, MSRs or cpuid; to a box of `--profile agent` a GPU's compute nodes alone: render nodes, NVIDIA's and AMD's `/dev/kfd`. With `--userns`, a node that only its group may open, such as a render node of mode 0660, gives the container that group alone, mapped at gid 65536; one that only its owner may open, or of group 0, is refused |
 | `--userns` | off | A user namespace of its own: its root is an unprivileged uid on the host (see [User namespaces](#user-namespaces)); `create` runs as root |
 | `--read-only` | off | Read-only root filesystem |

@@ -4954,6 +4954,37 @@ t_userns_device_groups() {
     return $bad
 }
 check 'a gid map has the range and a line of each device'"'"'s group, and exec reads them back' t_userns_device_groups
+
+# What --gpu finds of a host's (ROADMAP G.3), in a tree of the case's own that
+# stands for it: the render nodes of /dev/dri, NVIDIA's GPUs, control node and
+# nvidia-uvm with its tools, and /dev/kfd, each at its own path, in the order
+# of their names; not a card node, nvidia-modeset, nvidia-caps, which is a
+# directory, or a name that only begins as one does. A host with none of them
+# has none, and one with more than a container may have is said so.
+t_gpu_devices() {
+    local r said bad=0 i
+    r=$(mktemp -d "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    mkdir -p "$r/dev/dri" "$r/dev/nvidia-caps" "$r/none/dev" || return 1
+    for f in dri/renderD129 dri/renderD128 dri/card0 dri/renderDx nvidia1 nvidia0 nvidiactl nvidia-modeset nvidia-uvm \
+             nvidia-uvm-tools nvidiax kfd null; do : > "$r/dev/$f"; done
+    said=$("$UNIT" gpu "$r")
+    printf '%s\n' "$said" | sed "s#$r#<r>#g"
+    [ "$said" = "$r/dev/dri/renderD128 -> /dev/dri/renderD128
+$r/dev/dri/renderD129 -> /dev/dri/renderD129
+$r/dev/kfd -> /dev/kfd
+$r/dev/nvidia-uvm -> /dev/nvidia-uvm
+$r/dev/nvidia-uvm-tools -> /dev/nvidia-uvm-tools
+$r/dev/nvidia0 -> /dev/nvidia0
+$r/dev/nvidia1 -> /dev/nvidia1
+$r/dev/nvidiactl -> /dev/nvidiactl" ] || { echo "not what --gpu gives"; bad=1; }
+    [ -z "$("$UNIT" gpu "$r/none")" ] || { echo "a host without a GPU has one"; bad=1; }
+    for i in $(seq 0 16); do : > "$r/dev/dri/renderD$((200 + i))"; done
+    said=$("$UNIT" gpu "$r") && { echo "more than a container may have was taken"; bad=1; }
+    [ "$said" = 'more than 16' ] || { echo "$said"; bad=1; }
+    rm -rf -- "$r"
+    return $bad
+}
+check 'what --gpu finds of a host'"'"'s: render nodes, NVIDIA'"'"'s and kfd, and not a display'"'"'s' t_gpu_devices
 check 'a host tool that reads an image runs as nobody, with no capability and no network' t_tool_sandbox
 check 'where nobody has no id the tool keeps its own, and where it cannot be confined it is not run' t_tool_sandbox_without_ids
 

@@ -148,6 +148,8 @@
  *                                             "refused" and status 1
  *   unit overlay-whole <dir>                  overlay_upper_whole: "whole", "not whole: <path>"
  *                                             with status 1, or "cannot read" with status 2
+ *   unit gpu <root>                           gpu_devices under root: "<host> -> <path>" a line
+ *                                             each, or "more than <n>" with status 1
  *   unit gidmap <gid_start> [<group>...]      userns_gid_map_text: the gid map of a container of
  *                                             --userns with its devices' groups, or "refused"
  *   unit devgroups <file>                     gid_map_device_groups of a gid_map's text: the gids
@@ -1962,6 +1964,19 @@ int main(int argc, char **argv, char **envp) {
             return 1;
         }
         put_line(options, "");
+        return 0;
+    }
+    if (argc == 3 && streq(argv[1], "gpu")) {
+        static device_spec found[MAX_DEVICES];
+        int n = gpu_devices(argv[2], found, MAX_DEVICES);
+        if (n < 0) {
+            put("more than " STRINGIFY(MAX_DEVICES) "\n");
+            return 1;
+        }
+        for (int i = 0; i < n; i++) {
+            put(found[i].host);
+            put_line(" -> ", found[i].path);
+        }
         return 0;
     }
     if (argc >= 3 && streq(argv[1], "gidmap")) {

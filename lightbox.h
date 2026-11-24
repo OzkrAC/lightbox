@@ -186,6 +186,7 @@ typedef struct {
     volume_spec vols[MAX_VOLS];
     int  ndevs;
     device_spec devs[MAX_DEVICES];
+    bool gpu;                   /* --gpu: the host's GPUs, found at each start (ROADMAP G.3) */
     int  nlinks;
     char links[MAX_LINKS][NAME_MAX_LEN + 1];
 } container_config;
@@ -270,6 +271,11 @@ struct lb_statx;
  * when anyone may, NULL with its group's gid when only its group may, which
  * the container is then given; or why the container cannot open it. */
 [[nodiscard]] const char *device_userns_group(const char *host, const struct lb_statx *stx, bool ro, uint32_t *gid);
+/* The host's GPUs for compute, as --gpu gives them (ROADMAP G.3, lightbox_gpu.c):
+ * the render nodes of /dev/dri, NVIDIA's nodes and /dev/kfd under root, ""
+ * for the host itself, each at its own path, in the order of their names:
+ * how many, or -1 for more than max. */
+[[nodiscard]] int gpu_devices(const char *root, device_spec *out, int max);
 /* Take out every volume at a destination: how many there were. */
 int config_remove_volumes_at(container_config *config, const char *dst);
 

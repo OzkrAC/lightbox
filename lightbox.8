@@ -163,6 +163,21 @@ stops it, and is
 A directory or a file of the host's in the container.
 Repeatable, up to 16.
 .TP
+.B \-\-gpu
+The host's GPUs for compute, found at each start and never kept:
+the render nodes of
+.IR /dev/dri ,
+NVIDIA's GPUs,
+.I nvidiactl
+and
+.IR nvidia\-uvm ,
+and
+.IR /dev/kfd ,
+each given as
+.B \-\-device
+gives one.
+A start that finds none ends and says so.
+.TP
 .BI \-\-device " host" \fR[\fB:\fIpath\fR][\fB:ro\fR]
 A character device of the host's in the container, at
 .I path

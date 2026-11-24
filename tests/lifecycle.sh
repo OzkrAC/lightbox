@@ -2416,6 +2416,20 @@ t_device_group() {
     [ "$(state_of dgrp)" = stopped ] && [ ! -d "$CG/dgrp" ] && nothing_left dgrp
 }
 
+# --gpu on a host without a GPU (ROADMAP G.3), as a runner is: the start says
+# that there is none, and leaves nothing of the container.
+t_gpu_none() {
+    local said
+    if ls /dev/dri/renderD* /dev/nvidia[0-9]* /dev/kfd >/dev/null 2>&1; then
+        echo "this host has a GPU: what a start without one says is not tried"; return 77
+    fi
+    box nogpu --gpu || return 1
+    said=$(lb start nogpu 2>&1 </dev/null) && { echo "a container of --gpu started without a GPU"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *"created with --gpu, and this host has no GPU for it"*) ;; *) return 1 ;; esac
+    [ "$(state_of nogpu)" = stopped ] && [ ! -d "$CG/nogpu" ] && nothing_left nogpu
+}
+
 # ─── Cases: the init hook, starting and stopping ────────────────────────────
 
 t_hook_runs() {
@@ -4994,6 +5008,7 @@ if [ "$MODE" = inside ]; then
     check "init is in the container's cgroup, and a command run by exec in its exec's below it" t_cgroup_membership
     check "create --device: a node of the host's opens in the container as it is given, and its numbers are read at each start" t_device
     check "a device that only its group may open: its group is in a box's gid map, held by root and by another user" t_device_group
+    check '--gpu on a host without a GPU: the start says so, and leaves nothing' t_gpu_none
 
     check 'the init hook runs with /tmp and /run mounted'                 t_hook_runs
     check 'a service the hook starts outlives the start command'          t_service_outlives_start

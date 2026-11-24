@@ -700,7 +700,7 @@ enum {
     KEY_PRIVILEGED = 1 << 4, KEY_READONLY = 1 << 5, KEY_USERNS = 1 << 6,
     KEY_UID_START = 1 << 7, KEY_IO = 1 << 8, KEY_SWAP = 1 << 9, KEY_BASE = 1 << 10,
     KEY_GID_START = 1 << 11, KEY_SECCOMP = 1 << 12, KEY_NET = 1 << 13, KEY_DNS = 1 << 14,
-    KEY_TTL = 1 << 15, KEY_ID = 1 << 16, KEY_PROFILE = 1 << 17, KEY_WORKDIR = 1 << 18,
+    KEY_TTL = 1 << 15, KEY_ID = 1 << 16, KEY_PROFILE = 1 << 17, KEY_WORKDIR = 1 << 18, KEY_GPU = 1 << 19,
 };
 
 static unsigned key_bit(const char *key) {
@@ -710,7 +710,7 @@ static unsigned key_bit(const char *key) {
         { "uid_start", KEY_UID_START }, { "io", KEY_IO }, { "swap", KEY_SWAP }, { "base", KEY_BASE },
         { "gid_start", KEY_GID_START }, { "seccomp", KEY_SECCOMP }, { "net", KEY_NET },
         { "dns", KEY_DNS }, { "ttl", KEY_TTL }, { "id", KEY_ID },
-        { "profile", KEY_PROFILE }, { "workdir", KEY_WORKDIR },
+        { "profile", KEY_PROFILE }, { "workdir", KEY_WORKDIR }, { "gpu", KEY_GPU },
     };
     for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
         if (streq(key, keys[i].name))
@@ -818,6 +818,8 @@ static const char *config_line(container_config *config, char *line, unsigned *s
             return parse_flag(value, &config->read_only) ? NULL : "readonly is not 0 or 1";
         case KEY_USERNS:
             return parse_flag(value, &config->userns) ? NULL : "userns is not 0 or 1";
+        case KEY_GPU:
+            return parse_flag(value, &config->gpu) ? NULL : "gpu is not 0 or 1";
         case KEY_BASE:
             return base_id_ok(value) && str_copy(config->base, value, sizeof(config->base))
                    ? NULL : "base is not the id of a base snapshot";
@@ -988,6 +990,7 @@ const char *container_config_save(const char *name, const container_config *conf
     put_number(&out, "oom_score", config->oom_score);
     if (config->privileged) put_line(&out, "privileged", "1");
     if (config->read_only)  put_line(&out, "readonly", "1");
+    if (config->gpu)        put_line(&out, "gpu", "1");
     /* without the line, the deny-list: what create --seccomp deny makes, and
      * what every container had before 0.8 */
     if (config->seccomp_allow) put_line(&out, "seccomp", "allow");

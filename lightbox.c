@@ -1381,7 +1381,7 @@ static const char *const create_value_options[] = {
     "--mem", "--swap", "--pids", "--cpu", "--io-max", "--vol", "--rootfs", "--base", "--seccomp", "--net",
     "--oom-score", "--ttl", "--link", "--dns", "--profile", "--workspace", "--device",
 };
-static const char *const create_flag_options[] = { "--userns", "--read-only", "--copy", "--privileged" };
+static const char *const create_flag_options[] = { "--userns", "--read-only", "--copy", "--privileged", "--gpu" };
 
 /*
  * --profile agent (ROADMAP 8.10): what this phase built, with one switch. A
@@ -1691,6 +1691,8 @@ static void cmd_create(int argc, char **argv) {
             full_copy = true;
         } else if (streq(opt, "--read-only")) {
             cfg.read_only = true;
+        } else if (streq(opt, "--gpu")) {
+            cfg.gpu = true;
         } else if (streq(opt, "--oom-score")) {
             const char *value = option_value(argc, argv, &i);
             if (!parse_oom_score(value, &cfg.oom_score))
@@ -4800,6 +4802,28 @@ static void start_one(const char *name, int hook_wait) {
      * given one other numbers since the last start; the device program goes
      * by these. One that is refused now is said before anything of the start
      * is made. */
+    /* --gpu: the host's GPUs as they are now (ROADMAP G.3), each one more of
+     * the devices it is given, in this start alone and never in .conf */
+    if (config.gpu) {
+        static device_spec found[MAX_DEVICES];
+        int n = gpu_devices("", found, MAX_DEVICES);
+        if (n < 0)
+            die("Error: this host has more GPU nodes than the " STRINGIFY(MAX_DEVICES) " devices a container may have");
+        if (n == 0)
+            die("Error: the container was created with --gpu, and this host has no GPU for it: no render node in "
+                "/dev/dri, no NVIDIA node in /dev and no /dev/kfd");
+        print_str(STDOUT, "The host's GPU:");
+        for (int i = 0; i < n; i++) {
+            bool given = false;
+            for (int d = 0; d < config.ndevs && !given; d++)
+                given = streq(config.devs[d].path, found[i].path);
+            if (!given && config_add_device(&config, &found[i]) != NULL)
+                die("Error: the container's devices and the host's GPU nodes are more than " STRINGIFY(MAX_DEVICES));
+            lc_print_char(STDOUT, ' ');
+            print_str(STDOUT, found[i].path);
+        }
+        lc_print_char(STDOUT, '\n');
+    }
     static struct lb_dev_row dev_rows[MAX_DEVICES];
     static int32_t dev_trees[MAX_DEVICES];
     /* and with --userns, the host's groups of those only their group may
@@ -6478,6 +6502,8 @@ static const struct { const char *name; const char *text; } command_help[] = {
         "         --io-max <limit>       I/O limit for one disk: \"8:0 wbps=10485760\", with rbps, wbps,\n"
         "                                riops or wiops (default: none)\n"
         "         --vol  <src:dst[:ro]>  Bind mount (repeatable)\n"
+        "         --gpu                  The host's GPUs for compute, found at each start: its render\n"
+        "                                nodes, NVIDIA's and /dev/kfd, each as --device gives one\n"
         "         --device <host>[:<path>][:ro]\n"
         "                                A character device of the host's at <path> under /dev, or at its\n"
         "                                own path, read alone with :ro (repeatable); never a block device\n"
