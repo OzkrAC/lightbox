@@ -5033,6 +5033,26 @@ missing libcuda.so.$v" ] || { echo "$said"; bad=1; }
     return $bad
 }
 check 'NVIDIA'"'"'s libraries of the module'"'"'s version, with the host'"'"'s links to them, and musl told from glibc' t_nvidia_libraries
+
+# A container's monitor (ROADMAP M.1), with a child that waits to be killed in
+# the place of init: the child is the monitor's and not the command's; killed
+# through its pidfd it is not reaped while the command holds the control
+# pipe, so that its pid is still its own; then the monitor reaps it, sees the
+# signal that ended it, and holds nothing of the command's but its standard
+# streams, which are /dev/null.
+t_monitor() {
+    local f said
+    f=$(mktemp -u "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    said=$(timeout -k 5 30 "$UNIT" monitor "$f")
+    printf '%s\n' "$said"
+    rm -f -- "$f"
+    [ "$said" = "not the command's child
+ended, as its pidfd says
+a zombie until the command is done
+status 137 fds 0 1 2
+reaped" ]
+}
+check 'a monitor is init'"'"'s parent, reaps it once the command is done, and holds nothing of the command'"'"'s' t_monitor
 check 'a host tool that reads an image runs as nobody, with no capability and no network' t_tool_sandbox
 check 'where nobody has no id the tool keeps its own, and where it cannot be confined it is not run' t_tool_sandbox_without_ids
 

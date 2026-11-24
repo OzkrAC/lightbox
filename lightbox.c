@@ -3977,8 +3977,10 @@ struct init_link {
     int32_t go_wr;          /* -1: closed */
     int32_t report_rd;      /* -1: closed */
     void   *stack;          /* MAP_FAILED: none */
+    int32_t control_wr;     /* with a monitor: held until the command is done with init; -1: none */
+    int32_t pidfd;          /* with a monitor, whose child init is: init's pidfd; -1: none */
 };
-#define INIT_LINK_NONE { -1, -1, -1, MAP_FAILED }
+#define INIT_LINK_NONE { -1, -1, -1, MAP_FAILED, -1, -1 }
 
 /*
  * While a container is being started, SIGINT, SIGTERM and SIGHUP do not end
@@ -4043,9 +4045,11 @@ static void close_container_streams(int32_t *null_fd, int32_t *log_fd) {
  * Make the two pipes and clone init, which runs fn(ca) on a stack of its own
  * in the namespaces that flags names. The pipe ends in ca are filled in here.
  * NULL, or what failed; link then holds whatever exists, for init_abandon.
+ * Init is the caller's child: the unit harness's, which waits for it, while
+ * start has a monitor clone it (init_spawn_monitored, ROADMAP M.1).
  */
-static const char *init_spawn(struct init_link *link, struct child_args *ca,
-                              int flags, int (*fn)(void *)) {
+[[maybe_unused]] static const char *init_spawn(struct init_link *link, struct child_args *ca,
+                                               int flags, int (*fn)(void *)) {
     int32_t go[2], report[2];
 
     if (lc_kernel_create_pipe(go, O_CLOEXEC) < 0)
@@ -4083,6 +4087,140 @@ static const char *init_spawn(struct init_link *link, struct child_args *ca,
     return failed;
 }
 
+/*
+ * The monitor of a container (ROADMAP M.1): a process of the host's, forked
+ * by start, that clones init, so that init is its child and the kernel tells
+ * it how init ended, however it ends; and then does what ended says of it,
+ * once start is done with init, which it says by closing the control pipe.
+ * Until then init is not reaped, and its pid is init's for start to use. It
+ * keeps nothing of start's but the container's log: no lock, no descriptor
+ * of a volume or a device, no terminal. It is a session of its own, not
+ * dumpable, and holds no signal back, so that a SIGTERM ends it; the
+ * container then goes on, and the next command clears away what it leaves,
+ * as before the monitor.
+ */
+typedef void (*init_ended_fn)(const char *name, int32_t status, int32_t log_fd);
+
+[[noreturn]] static void monitor_main(struct child_args *ca, int flags, int (*fn)(void *), init_ended_fn ended,
+                                      int32_t pid_wr, int32_t control_rd, const int32_t ends[4]) {
+    (void)lc_kernel_create_session();
+    void *stack = lc_kernel_map_memory(NULL, CHILD_STACK_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    lc_sysret pid = stack == MAP_FAILED ? -LB_ENOMEM
+                                        : lc_kernel_clone(flags | SIGCHLD, (char *)stack + CHILD_STACK_SIZE, fn, ca);
+    int32_t said = (int32_t)pid;
+    (void)lc_kernel_write_all(pid_wr, &said, sizeof(said));
+    if (pid < 0)
+        lc_kernel_exit(failure_status);
+
+    /* its standard streams nobody's, and of start's descriptors the control
+     * pipe and the container's log alone */
+    lc_sysret null = lc_kernel_open_file("/dev/null", O_RDWR, 0);
+    for (int32_t i = 0; null >= 0 && i < 3; i++)
+        (void)lc_kernel_duplicate_fd((int32_t)null, i, 0);
+    for (int i = 0; i < 4; i++)
+        lc_kernel_close_file(ends[i]);
+    int32_t keep[5] = { 0, 1, 2, control_rd, ca->log_fd };
+    close_all_but(keep, ca->log_fd >= 0 ? 5 : 4);
+    uint64_t no_signals = 0;
+    lc_kernel_set_signal_mask(LC_SIG_SETMASK, &no_signals, NULL);
+    (void)lc_kernel_prctl(LB_PR_SET_DUMPABLE, 0, 0, 0, 0);
+    (void)lc_kernel_prctl(LB_PR_SET_NAME, (uint64_t)(uintptr_t)"lightbox-mon", 0, 0, 0);
+
+    /* until start is done with init */
+    char byte;
+    while (lc_kernel_read_retry(control_rd, &byte, 1) > 0)
+        ;
+    lc_kernel_close_file(control_rd);
+
+    int32_t status = 0;
+    if (wait_child((int32_t)pid, &status) != 0)
+        lc_kernel_exit(failure_status);
+    ended(ca->name, status, ca->log_fd);
+    lc_kernel_exit(0);
+}
+
+static bool reconcile(const char *name);
+
+/*
+ * What a container's monitor does once its init has ended, however it ended
+ * (ROADMAP M.1): says so in the container's log when a signal ended it, which
+ * init could not say itself, and clears away what the container left as soon
+ * as the container is its to touch, which a command that works on it says
+ * by its lock. A stop clears away all of it itself, and the monitor then
+ * finds nothing; a container that was removed meanwhile ends the monitor at
+ * its lock. Without the monitor this waited for the next lightbox command.
+ */
+static void monitor_cleanup(const char *name, int32_t status, int32_t log_fd) {
+    int signal = status & 0x7f;
+    if (signal && log_fd >= 0) {
+        char digits[16];
+        fmt_int(digits, signal);
+        print_str(log_fd, "lightbox: the container's init was killed by signal ");
+        print_str(log_fd, digits);
+        print_str(log_fd, "; its monitor clears away what it left\n");
+    }
+    container_lock(name);
+    (void)reconcile(name);
+}
+
+/* init_spawn with a monitor between the command and init: init is the
+ * monitor's child, and link has its pidfd and the control pipe's end. */
+static const char *init_spawn_monitored(struct init_link *link, struct child_args *ca, int flags, int (*fn)(void *),
+                                        init_ended_fn ended) {
+    int32_t go[2], report[2], pids[2], control[2];
+    if (lc_kernel_create_pipe(go, O_CLOEXEC) < 0)
+        return "failed to create the pipe to the container's init";
+    if (lc_kernel_create_pipe(report, O_CLOEXEC) < 0) {
+        lc_kernel_close_file(go[0]);
+        lc_kernel_close_file(go[1]);
+        return "failed to create the pipe from the container's init";
+    }
+    if (lc_kernel_create_pipe(pids, O_CLOEXEC) < 0 || lc_kernel_create_pipe(control, O_CLOEXEC) < 0) {
+        for (int i = 0; i < 2; i++) {
+            lc_kernel_close_file(go[i]);
+            lc_kernel_close_file(report[i]);
+        }
+        return "failed to create the pipes of the container's monitor";
+    }
+    link->go_wr = go[1];
+    link->report_rd = report[0];
+    ca->go_rd = go[0];
+    ca->go_wr = go[1];
+    ca->report_rd = report[0];
+    ca->report_wr = report[1];
+
+    lc_sysret monitor = lc_kernel_fork();
+    if (monitor == 0) {
+        lc_kernel_close_file(pids[0]);
+        lc_kernel_close_file(control[1]);
+        const int32_t ends[4] = { go[0], go[1], report[0], report[1] };
+        monitor_main(ca, flags, fn, ended, pids[1], control[0], ends);
+    }
+    /* init's ends are init's and the monitor's */
+    lc_kernel_close_file(go[0]);
+    lc_kernel_close_file(report[1]);
+    lc_kernel_close_file(pids[1]);
+    lc_kernel_close_file(control[0]);
+    link->control_wr = control[1];
+    if (monitor < 0) {
+        lc_kernel_close_file(pids[0]);
+        return "failed to fork the container's monitor";
+    }
+    int32_t pid = -1;
+    lc_sysret got = lc_kernel_read_retry(pids[0], &pid, sizeof(pid));
+    lc_kernel_close_file(pids[0]);
+    if (got != (lc_sysret)sizeof(pid) || pid <= 0)
+        return "clone failed";
+    link->pid = pid;
+    lc_sysret pidfd = lb_sys_pidfd_open(pid, 0);
+    if (pidfd < 0) {
+        link->pid = -1;
+        return "cannot open the pidfd of the container's init";
+    }
+    link->pidfd = (int32_t)pidfd;
+    return NULL;
+}
+
 /* One byte for init to go on with. */
 static bool init_go(const struct init_link *link) {
     return lc_kernel_write_bytes(link->go_wr, "x", 1) == 1;
@@ -4091,6 +4229,15 @@ static bool init_go(const struct init_link *link) {
 /* Close the command's ends of the pipes and free the stack init was cloned
  * on. Each is marked, so this can be called at any point, and again. */
 static void init_link_close(struct init_link *link) {
+    /* the monitor's: from here on init is its own to wait for */
+    if (link->control_wr >= 0) {
+        lc_kernel_close_file(link->control_wr);
+        link->control_wr = -1;
+    }
+    if (link->pidfd >= 0) {
+        lc_kernel_close_file(link->pidfd);
+        link->pidfd = -1;
+    }
     if (link->go_wr >= 0) {
         lc_kernel_close_file(link->go_wr);
         link->go_wr = -1;
@@ -4112,7 +4259,17 @@ static void init_link_close(struct init_link *link) {
  * to go on.
  */
 static void init_abandon(struct init_link *link) {
-    if (link->pid > 0) {
+    if (link->pid > 0 && link->pidfd >= 0) {
+        /* the monitor's child, which it reaps only once the control pipe
+         * closes, so that the pid is init's until then: ended through its
+         * pidfd, and seen to end there */
+        (void)lb_sys_pidfd_send_signal(link->pidfd, SIGKILL, NULL, 0);
+        struct lb_pollfd one = { .fd = link->pidfd, .events = LB_POLLIN, .revents = 0 };
+        lc_timespec limit = { .seconds = 10, .nanoseconds = 0 };
+        while (lb_sys_ppoll(&one, 1, &limit) == -LB_EINTR)
+            ;
+        link->pid = -1;
+    } else if (link->pid > 0) {
         int32_t status;
         lc_kernel_send_signal(link->pid, SIGKILL);
         (void)wait_child(link->pid, &status);
@@ -5199,7 +5356,7 @@ static void start_one(const char *name, int hook_wait) {
     int clone_flags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET |
                       (config.userns ? CLONE_NEWUSER : 0);
 
-    start_err = init_spawn(&init, &ca, clone_flags, container_child);
+    start_err = init_spawn_monitored(&init, &ca, clone_flags, container_child, monitor_cleanup);
     close_container_streams(&null_fd, &log_fd);     /* init has its own copies */
     close_volumes(userns_volumes, nuserns_volumes);
     lc_kernel_close_file(exit_fd);

@@ -262,6 +262,17 @@ start() { # name
 
 up() { box "$@" && start "$1"; }
 
+# A container's monitor (ROADMAP M.1), init's parent; and the end of it, for
+# a case of what a command clears away where no monitor is, as one that was
+# killed leaves it.
+monitor_of() { awk '/^PPid:/ { print $2 }' "/proc/$(pid_of "$1")/status"; }    # name
+unmonitor() { # name
+    local m
+    m=$(monitor_of "$1") && [ "$(cat "/proc/$m/comm" 2>/dev/null)" = lightbox-mon ] ||
+        { echo "the parent of the init of $1 is no monitor"; return 1; }
+    kill -TERM "$m" && wait_until 5 gone "$m" || { echo "the monitor $m of $1 did not end"; return 1; }
+}
+
 sh_in()     { lb exec "$1" /bin/sh -c "$2" </dev/null; }   # name script
 script_in() { lb exec "$1" /bin/sh; }                      # name, the script on standard input
 hook()      { cat > "$C/$1/rootfs/init.sh"; }              # name, the init hook on standard input
@@ -1243,6 +1254,7 @@ $KIT setsid sleep 1101 >/dev/null 2>&1 </dev/null &
 EOF
     began=$(date +%s%N)
     start ttlbox || return 1
+    unmonitor ttlbox || return 1        # what init keeps of the lifetime itself, and what a command clears away
     sh_in ttlbox "$KIT setsid sleep 1102 >/dev/null 2>&1 </dev/null &" || return 1
     wait_until 5 running_cmd 'sleep 1101' && wait_until 5 running_cmd 'sleep 1102' ||
         { echo "what the hook and the exec started is not running"; return 1; }
@@ -1371,6 +1383,7 @@ t_exec_cgroup_of_a_dead_init() {
     sh_in exdead "$KIT setsid sleep 1076 >/dev/null 2>&1 </dev/null &" || return 1
     wait_until 5 running_cmd 'sleep 1076' || { echo "what it started is not running"; return 1; }
     [ -n "$(exec_cgroups exdead)" ] || { echo "no cgroup was left"; return 1; }
+    unmonitor exdead || return 1       # what stop clears away where no monitor did
     pid=$(pid_of exdead)
     kill -KILL "$pid"
     wait_until 5 gone "$pid" || return 1
@@ -1424,17 +1437,58 @@ t_start_after_init_died() {
     kill -KILL "$pid"
     wait_until 5 gone "$pid" || { echo "init $pid survived SIGKILL"; return 1; }
     lb ls
-    lb ls | grep -Eq '^crash +[0-9.]+ +exited' || { echo "ls does not show it as exited"; return 1; }
+    # failed where its monitor cleared it away, as an init killed says nothing of its end (ROADMAP M.1)
+    lb ls | grep -Eq '^crash +[0-9.]+ +(exited|failed)' || { echo "ls does not show it as ended"; return 1; }
     # the kernel removes the dead container's interface a moment later
     wait_until 5 no_link "$(port_of crash)" || { echo "$(port_of crash) did not go away"; return 1; }
     start crash || return 1
     [ "$(sh_in crash 'echo back')" = back ]
 }
 
+# A container's monitor clears away what its container leaves, with no
+# command run (ROADMAP M.1). Init is its child, and it holds nothing of the
+# command's but the container's log and /dev/null. Init killed: within a
+# second its records, interface, cgroup and rules are gone, the state is
+# failed and the log says what ended it, and the monitor has ended. Stopped
+# from inside: exited. At the end of its --ttl: expired. A stop after any of
+# them finds nothing to stop.
+t_monitor_clears_away() {
+    local pid mon fds began ms said
+    quietly_cleared() { nothing_left "$1" >/dev/null 2>&1 && [ "$(state_of "$1")" = "$2" ]; }    # name, state
+    up mon1 || return 1
+    pid=$(pid_of mon1)
+    mon=$(monitor_of mon1)
+    [ "$(cat "/proc/$mon/comm")" = lightbox-mon ] || { echo "the parent of init is $(cat "/proc/$mon/comm")"; return 1; }
+    fds=$(for f in /proc/"$mon"/fd/*; do readlink "$f"; done | sort | paste -sd'|')
+    echo "the monitor's descriptors: $fds"
+    [ "$fds" = "$C/mon1/console.log|/dev/null|/dev/null|/dev/null" ] || { echo "the monitor holds more"; return 1; }
+    began=$(date +%s%N)
+    kill -KILL "$pid"
+    wait_until 3 quietly_cleared mon1 failed || { nothing_left mon1; echo "state: $(state_of mon1)"; return 1; }
+    ms=$(( ($(date +%s%N) - began) / 1000000 ))
+    echo "cleared away $ms ms after init was killed, with no command run"
+    [ "$ms" -lt 1000 ] || { echo "not within a second"; return 1; }
+    grep -q 'init was killed by signal 9; its monitor clears away what it left' "$C/mon1/console.log" ||
+        { echo "the log does not say what ended init"; return 1; }
+    wait_until 5 gone "$mon" || { echo "the monitor did not end"; return 1; }
+    said=$(lb stop mon1 2>&1)
+    printf '%s\n' "$said"
+    case $said in *"had ended without a stop"*) echo "stop found something to clear away"; return 1 ;; esac
+    # stopped from inside: as it ended well
+    up mon2 || return 1
+    sh_in mon2 'kill -TERM 1' >/dev/null 2>&1
+    wait_until 15 quietly_cleared mon2 exited || { nothing_left mon2; echo "state: $(state_of mon2)"; return 1; }
+    # the end of its lifetime
+    box mon3 --ttl 2s && start mon3 || return 1
+    wait_until 8 quietly_cleared mon3 expired || { nothing_left mon3; echo "state: $(state_of mon3)"; return 1; }
+    echo "mon2: $(state_of mon2), mon3: $(state_of mon3), with no command run"
+}
+
 # stop is a command that changes a container, so it is where the record of a
 # dead init gets cleaned up, as start is.
 t_stop_of_a_dead_container_cleans_up() {
     up dead || return 1
+    unmonitor dead || return 1          # as a monitor that was killed leaves it
     pid=$(pid_of dead)
     kill -KILL "$pid"
     wait_until 5 gone "$pid" || { echo "init $pid survived SIGKILL"; return 1; }
@@ -1452,6 +1506,7 @@ t_stop_of_a_dead_container_cleans_up() {
 # it: the next one that changes it does, and records that it ended well.
 t_stopped_from_inside_is_exited() {
     up inside || return 1
+    unmonitor inside || return 1        # the next command's clearing away, where no monitor is
     pid=$(pid_of inside)
     sh_in inside 'kill -TERM 1' >/dev/null 2>&1     # the shell that says it ends with the container
     wait_until 15 gone "$pid" || { echo "init $pid did not end when a process in the container sent it SIGTERM"; return 1; }
@@ -1500,7 +1555,8 @@ t_after_a_reboot() {
     pid=$(pid_of was-up)
     echo "run_dir is mode $(stat -c %a "$RUN"), a container's records $(stat -c %a "$RUN/was-up"), its PID record $(stat -c %a "$RUN/was-up/pid")"
     [ "$(stat -c %a "$RUN")" = 700 ] && [ "$(stat -c %a "$RUN/was-up")" = 700 ] && [ "$(stat -c %a "$RUN/was-up/pid")" = 600 ] || return 1
-    # what a reboot does to it, as far as that can be done here
+    # what a reboot does to it, as far as that can be done here: its monitor ends with it
+    unmonitor was-up || return 1
     kill -KILL "$pid"
     wait_until 5 gone "$pid" || return 1
     wait_until 5 no_link "$(port_of was-up)" || return 1
@@ -4963,6 +5019,7 @@ if [ "$MODE" = inside ]; then
     check 'a stopped container starts again and keeps its files'          t_restart_keeps_files
     check 'a container whose init died starts again'                      t_start_after_init_died
     check 'stop of a container whose init died clears it away, as failed' t_stop_of_a_dead_container_cleans_up
+    check "a container's monitor clears away what it leaves within a second, with no command run" t_monitor_clears_away
     check 'a container stopped from inside is exited, and cleared away by the next command' t_stopped_from_inside_is_exited
     check 'after a reboot containers are stopped, and start'              t_after_a_reboot
     check 'a container started before the upgrade is seen, and stopped'   t_container_started_before_the_upgrade

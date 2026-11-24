@@ -148,6 +148,10 @@
  *                                             "refused" and status 1
  *   unit overlay-whole <dir>                  overlay_upper_whole: "whole", "not whole: <path>"
  *                                             with status 1, or "cannot read" with status 2
+ *   unit monitor <record>                     init_spawn_monitored with a child that waits to be
+ *                                             killed, which it then is: whether it is the
+ *                                             command's child, a zombie until the command is done,
+ *                                             what the monitor wrote to record, whether it reaped
  *   unit gpu <root>                           gpu_devices under root: "<host> -> <path>" a line
  *                                             each, or "more than <n>" with status 1
  *   unit nvidia <root>                        nvidia_libraries under root: "version <v>", then
@@ -547,6 +551,46 @@ static void put_own_privileges(void) {
 }
 
 /* What init is in the harness: all of a container's init but the container. */
+/* A child for the monitor to clone: it waits to be killed. */
+static int unit_sleeper(void *arg) {
+    (void)arg;
+    for (;;) {
+        lc_timespec long_time = { .seconds = 3600, .nanoseconds = 0 };
+        lc_kernel_sleep(&long_time);
+    }
+    return 0;
+}
+
+/* What the monitor saw, into the file that the name is (ROADMAP M.1): the
+ * exit code of its child, and the descriptors it holds. */
+static void unit_monitor_ended(const char *record, int32_t status, int32_t log_fd) {
+    (void)log_fd;
+    char text[256], digits[16];
+    bool cut = false;
+    fmt_int(digits, exit_code_from_status(status));
+    size_t pos = str_append(text, 0, "status ", sizeof(text), &cut);
+    pos = str_append(text, pos, digits, sizeof(text), &cut);
+    pos = str_append(text, pos, " fds", sizeof(text), &cut);
+    lc_sysret dir = lc_kernel_open_file("/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+    char buf[2048];
+    lc_sysret n = dir < 0 ? -1 : lc_kernel_read_directory((int32_t)dir, buf, sizeof(buf));
+    for (lc_sysret at = 0; n > 0 && at < n; ) {
+        uint16_t reclen;
+        lc_bytes_copy(&reclen, buf + at + 16, sizeof(reclen));
+        if (reclen == 0)
+            break;
+        const char *entry = buf + at + 19;
+        at += reclen;
+        int fd;
+        if (entry[0] == '.' || !parse_int_in(entry, 0, 1 << 20, &fd) || fd == (int)dir)
+            continue;
+        pos = str_append(text, pos, " ", sizeof(text), &cut);
+        pos = str_append(text, pos, entry, sizeof(text), &cut);
+    }
+    str_append(text, pos, "\n", sizeof(text), &cut);
+    (void)write_file(record, text);
+}
+
 static int unit_init_child(void *arg) {
     const struct child_args *ca = (const struct child_args *)arg;
     init_begin(ca);
@@ -1631,6 +1675,43 @@ int main(int argc, char **argv, char **envp) {
         int len = fmt_int(digits, (int)fd);
         lc_kernel_write_bytes((int32_t)fd, digits, (size_t)len);
         lc_kernel_close_file((int32_t)fd);
+        return 0;
+    }
+    if (argc == 3 && streq(argv[1], "monitor")) {
+        /* init_spawn_monitored with a child that waits to be killed */
+        struct init_link link = INIT_LINK_NONE;
+        struct child_args ca = { .null_fd = -1, .log_fd = -1, .exit_fd = -1, .starter_signals = -1, .name = argv[2] };
+        const char *failed = init_spawn_monitored(&link, &ca, 0, unit_sleeper, unit_monitor_ended);
+        if (failed)
+            die2("unit: ", failed);
+        int32_t status;
+        put(lc_kernel_wait_for_child(link.pid, &status, WNOHANG) == -10 /* ECHILD */ ? "not the command's child\n"
+                                                                                   : "the command's child\n");
+        (void)lb_sys_pidfd_send_signal(link.pidfd, SIGKILL, NULL, 0);
+        struct lb_pollfd one = { .fd = link.pidfd, .events = LB_POLLIN, .revents = 0 };
+        lc_timespec limit = { .seconds = 5, .nanoseconds = 0 };
+        put(lb_sys_ppoll(&one, 1, &limit) == 1 ? "ended, as its pidfd says\n" : "not ended\n");
+        /* not reaped while the command holds the control pipe: the pid is still init's */
+        char path[64], stat[256];
+        if (proc_pid_path(path, sizeof(path), link.pid, "/stat") && read_file(path, stat, sizeof(stat)) > 0) {
+            const char *paren = stat;
+            for (const char *p = stat; *p; p++)
+                if (*p == ')')
+                    paren = p;
+            put(paren[1] == ' ' && paren[2] == 'Z' ? "a zombie until the command is done\n" : "not a zombie\n");
+        } else {
+            put("gone before the command was done\n");
+        }
+        int32_t pid = link.pid;
+        link.pid = -1;
+        init_link_close(&link);
+        for (int i = 0; i < 50 && !path_exists(argv[2]); i++) {
+            lc_timespec tenth = { .seconds = 0, .nanoseconds = 100000000 };
+            lc_kernel_sleep(&tenth);
+        }
+        static char text[256];
+        put(read_file(argv[2], text, sizeof(text)) > 0 ? text : "the monitor said nothing\n");
+        put(proc_pid_path(path, sizeof(path), pid, "/stat") && path_exists(path) ? "still there\n" : "reaped\n");
         return 0;
     }
     if ((argc == 7 || argc == 8) && streq(argv[1], "init")) {
