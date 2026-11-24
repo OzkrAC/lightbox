@@ -150,6 +150,10 @@
  *                                             with status 1, or "cannot read" with status 2
  *   unit gpu <root>                           gpu_devices under root: "<host> -> <path>" a line
  *                                             each, or "more than <n>" with status 1
+ *   unit nvidia <root>                        nvidia_libraries under root: "version <v>", then
+ *                                             "file <host> <name>[ bin]" and "link <name> <target>"
+ *                                             lines; "none", or "missing <name>" with status 1
+ *   unit musl <rootfs>                        root_has_musl: "musl" or "not musl"
  *   unit gidmap <gid_start> [<group>...]      userns_gid_map_text: the gid map of a container of
  *                                             --userns with its devices' groups, or "refused"
  *   unit devgroups <file>                     gid_map_device_groups of a gid_map's text: the gids
@@ -1977,6 +1981,36 @@ int main(int argc, char **argv, char **envp) {
             put(found[i].host);
             put_line(" -> ", found[i].path);
         }
+        return 0;
+    }
+    if (argc == 3 && streq(argv[1], "nvidia")) {
+        static nvidia_files nv;
+        int rc = nvidia_libraries(argv[2], &nv);
+        if (rc == 0) {
+            put("none\n");
+            return 0;
+        }
+        put_line("version ", nv.version);
+        if (rc < 0) {
+            put_line("missing ", nv.missing);
+            return 1;
+        }
+        for (int i = 0; i < nv.nfiles; i++) {
+            put("file ");
+            put(nv.files[i].host);
+            put(" ");
+            put(nv.files[i].name);
+            put(nv.files[i].bin ? " bin\n" : "\n");
+        }
+        for (int i = 0; i < nv.nlinks; i++) {
+            put("link ");
+            put(nv.links[i].name);
+            put_line(" ", nv.links[i].target);
+        }
+        return 0;
+    }
+    if (argc == 3 && streq(argv[1], "musl")) {
+        put(root_has_musl(argv[2]) ? "musl\n" : "not musl\n");
         return 0;
     }
     if (argc >= 3 && streq(argv[1], "gidmap")) {

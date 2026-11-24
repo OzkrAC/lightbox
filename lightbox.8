@@ -177,6 +177,18 @@ each given as
 .B \-\-device
 gives one.
 A start that finds none ends and says so.
+Where NVIDIA's kernel module is loaded, also NVIDIA's libraries of its version
+that a CUDA program and nvidia\-smi load, read-only at
+.IR /run/lightbox/gpu/lib ,
+and nvidia\-smi at
+.IR /run/lightbox/gpu/bin ,
+which
+.B LD_LIBRARY_PATH
+and
+.B PATH
+name for the hook and
+.BR exec ;
+not to a container whose root has musl's loader.
 .TP
 .BI \-\-device " host" \fR[\fB:\fIpath\fR][\fB:ro\fR]
 A character device of the host's in the container, at

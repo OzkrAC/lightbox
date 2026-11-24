@@ -2178,6 +2178,9 @@ struct child_args {
     const struct lb_dev_row *dev_rows;      /* the numbers of config's devices, as start found them */
     const int32_t *dev_trees;               /* and their nodes' mounts, cloned, attached nowhere yet */
     int          ndev_groups;               /* with --userns: how many devices' groups its gid map has */
+    const nvidia_files *nvidia;             /* --gpu: NVIDIA's libraries, with nnvidia of them taken */
+    const int32_t *nvidia_trees;            /* and their files' mounts, cloned, attached nowhere yet */
+    int          nnvidia;
     const char  *root;
     const char  *overlay;                   /* the options of the overlay init mounts; NULL: none */
     bool         userns;                    /* in a user namespace of its own, whose maps the command writes */
@@ -2285,13 +2288,15 @@ static void init_begin(const struct child_args *ca) {
     if (ca->starter_signals >= 0)
         lc_kernel_close_file(ca->starter_signals);
     /* and the volumes the command took, which build_container attaches */
-    int32_t keep[5 + MAX_VOLS + MAX_DEVICES] = { ca->go_rd, ca->report_wr, ca->null_fd, ca->log_fd, ca->exit_fd };
+    int32_t keep[5 + MAX_VOLS + MAX_DEVICES + NVIDIA_FILES_MAX] = { ca->go_rd, ca->report_wr, ca->null_fd, ca->log_fd, ca->exit_fd };
     size_t nkeep = 5;
     for (int i = 0; ca->volumes && i < ca->nvolumes; i++)
         keep[nkeep++] = ca->volumes[i].tree;
     /* and the devices', which build_container attaches */
     for (int i = 0; ca->config && ca->dev_trees && i < ca->config->ndevs; i++)
         keep[nkeep++] = ca->dev_trees[i];
+    for (int i = 0; ca->nvidia_trees && i < ca->nnvidia; i++)
+        keep[nkeep++] = ca->nvidia_trees[i];
     close_all_but(keep, nkeep);
 
     if (!go_received(ca->go_rd))
@@ -2354,6 +2359,18 @@ static int proxy_environment(const container_config *config, uint32_t gateway,
 }
 
 /*
+ * --gpu with NVIDIA's libraries (ROADMAP G.3): where they are, for the
+ * programs of the hook and of exec, as LD_LIBRARY_PATH, and nvidia-smi at
+ * the end of PATH; where the start gave them, as NVIDIA_DIR/lib is there.
+ */
+#define BOX_PATH_ENV     "PATH=/usr/bin:/bin:/usr/sbin:/sbin"
+#define NVIDIA_PATH_ENV  BOX_PATH_ENV ":" NVIDIA_DIR "/bin"
+#define NVIDIA_LIB_ENV   "LD_LIBRARY_PATH=" NVIDIA_DIR "/lib"
+static bool nvidia_given(bool gpu) {
+    return gpu && path_is_directory(NVIDIA_DIR "/lib");
+}
+
+/*
  * Run the image's hook as a child of init: its PID, or -1 once the failure
  * has been reported. Like every program lightbox starts it begins with no
  * signal blocked. Init's own descriptors are close-on-exec and do not reach
@@ -2372,11 +2389,15 @@ static int32_t start_hook(const char *script, const container_config *config, ui
 
         const char *a[] = { "/bin/sh", script, NULL };
         static char proxy[PROXY_ENV_COUNT][PROXY_VAR_MAX];
-        const char *e[3 + PROXY_ENV_COUNT + 1] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "HOME=/root", "TERM=xterm" };
-        int n = proxy_environment(config, gateway, proxy);
-        for (int i = 0; i < n; i++)
-            e[3 + i] = proxy[i];
-        e[3 + n] = NULL;
+        bool nvidia = nvidia_given(config && config->gpu);
+        const char *e[4 + PROXY_ENV_COUNT + 1] = { nvidia ? NVIDIA_PATH_ENV : BOX_PATH_ENV, "HOME=/root", "TERM=xterm" };
+        int n = 3;
+        if (nvidia)
+            e[n++] = NVIDIA_LIB_ENV;
+        int nproxy = proxy_environment(config, gateway, proxy);
+        for (int i = 0; i < nproxy; i++)
+            e[n++] = proxy[i];
+        e[n] = NULL;
         lc_sysret failed = exec_program("/bin/sh", a, e);
         say_with_number("Error: cannot execute /bin/sh for the init hook (errno ", (int)-failed, ")\n");
         lc_kernel_exit(127);
@@ -2650,6 +2671,7 @@ struct exec_request {
     const char  *term;                  /* the caller's TERM, or NULL */
     const char  *proxy[PROXY_ENV_COUNT];    /* --net proxy: where its proxy is */
     int          nproxy;
+    bool         gpu;                       /* --gpu: NVIDIA's libraries named where the start gave them */
     const char *const *argv;            /* the command, NULL at its end */
 };
 
@@ -3054,9 +3076,12 @@ static bool same_variable(const char *a, const char *b) {
     if (cut)
         die("Error: the command's environment does not fit");
 
-    const char *base[5 + PROXY_ENV_COUNT];
+    const char *base[6 + PROXY_ENV_COUNT];
     int nbase = 0;
-    base[nbase++] = "PATH=/usr/bin:/bin:/usr/sbin:/sbin";
+    bool nvidia = nvidia_given(req->gpu);
+    base[nbase++] = nvidia ? NVIDIA_PATH_ENV : BOX_PATH_ENV;
+    if (nvidia)
+        base[nbase++] = NVIDIA_LIB_ENV;
     base[nbase++] = home_env;
     base[nbase++] = term_env;
     if (name[0]) {
@@ -3066,7 +3091,7 @@ static bool same_variable(const char *a, const char *b) {
     for (int i = 0; i < req->nproxy; i++)
         base[nbase++] = req->proxy[i];
 
-    const char *envp[5 + PROXY_ENV_COUNT + MAX_EXEC_ENV + 1];
+    const char *envp[6 + PROXY_ENV_COUNT + MAX_EXEC_ENV + 1];
     int n = 0;
     for (int i = 0; i < nbase; i++) {
         bool replaced = false;
@@ -4587,6 +4612,33 @@ static void build_container(const struct child_args *ca) {
      * share with them. */
     require_mount("tmpfs", "/tmp", "tmpfs", MS_NOSUID | MS_NODEV, NULL);
     require_mount("tmpfs", "/run", "tmpfs", MS_NOSUID | MS_NODEV, "mode=755");
+    /* NVIDIA's libraries of its module's version, where start took them
+     * (ROADMAP G.3): read-only at NVIDIA_DIR/lib with the host's links to
+     * them, and nvidia-smi at NVIDIA_DIR/bin; not noexec, as a library is
+     * mapped to be run. */
+    if (ca->nnvidia > 0) {
+        static const char *const dirs[] = { "/run/lightbox", NVIDIA_DIR, NVIDIA_DIR "/lib", NVIDIA_DIR "/bin" };
+        for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++)
+            if (lc_kernel_mkdirat(AT_FDCWD, dirs[i], 0755) < 0 && !path_is_directory(dirs[i]))
+                die2("Error: cannot make the directory of NVIDIA's libraries: ", dirs[i]);
+        for (int i = 0; i < ca->nnvidia; i++) {
+            char at[MAX_PATH];
+            path_join_or_die(at, sizeof(at), ca->nvidia->files[i].bin ? NVIDIA_DIR "/bin" : NVIDIA_DIR "/lib",
+                             ca->nvidia->files[i].name);
+            lc_sysret fd = lc_kernel_open_file(at, O_WRONLY | O_CREAT | O_CLOEXEC, ca->nvidia->files[i].bin ? 0755 : 0644);
+            if (fd < 0 || attach_tree(ca->nvidia_trees[i], at) < 0)
+                die2("Error: cannot put one of NVIDIA's libraries in the container: ", at);
+            lc_kernel_close_file((int32_t)fd);
+            lc_kernel_close_file(ca->nvidia_trees[i]);
+            require_mount(NULL, at, NULL, MS_REMOUNT | MS_BIND | MS_RDONLY | MS_NOSUID | MS_NODEV, NULL);
+        }
+        for (int i = 0; i < ca->nvidia->nlinks; i++) {
+            char at[MAX_PATH];
+            path_join_or_die(at, sizeof(at), NVIDIA_DIR "/lib", ca->nvidia->links[i].name);
+            if (lc_kernel_symlinkat(ca->nvidia->links[i].target, AT_FDCWD, at) < 0)
+                die2("Error: cannot make a link of NVIDIA's libraries in the container: ", at);
+        }
+    }
     if (ca->read_only)
         require_mount("tmpfs", "/var/tmp", "tmpfs", MS_NOSUID | MS_NODEV, NULL);
 
@@ -4762,6 +4814,14 @@ static void require_upper_whole(const char *name, const char *root) {
         print_str(STDERR, "Warning: could not record that the container's own files are whole; the next start looks again\n");
 }
 
+/* Whether the container's root has musl's loader: its own files, and the
+ * snapshot's under them where it is an overlay of one (ROADMAP G.3). */
+static bool gpu_root_is_musl(const char *name, const container_config *config) {
+    char root[MAX_PATH], base[MAX_PATH];
+    container_root(root, name);
+    return root_has_musl(root) || (config->base[0] && base_rootfs_path(base, config->base) && root_has_musl(base));
+}
+
 static void start_one(const char *name, int hook_wait) {
     require_root("start");
 
@@ -4823,6 +4883,37 @@ static void start_one(const char *name, int hook_wait) {
             print_str(STDOUT, found[i].path);
         }
         lc_print_char(STDOUT, '\n');
+    }
+    /* and NVIDIA's libraries, where its module is loaded (ROADMAP G.3): each
+     * file's mount cloned here, as host root, and attached by init */
+    static nvidia_files nvidia;
+    static int32_t nvidia_trees[NVIDIA_FILES_MAX];
+    int nnvidia = 0;
+    if (config.gpu) {
+        int found = nvidia_libraries("", &nvidia);
+        if (found < 0) {
+            print_str(STDERR, "Warning: NVIDIA's kernel module ");
+            print_str(STDERR, nvidia.version);
+            print_str(STDERR, " is loaded, and its ");
+            print_str(STDERR, nvidia.missing);
+            print_str(STDERR, " is in none of the host's directories of libraries: the container has the GPU's nodes, "
+                              "and not NVIDIA's libraries\n");
+        } else if (found > 0 && gpu_root_is_musl(name, &config)) {
+            print_str(STDOUT, "Note: NVIDIA's libraries are built for glibc, and the container's root has musl's loader: "
+                              "it has the GPU's nodes, and not NVIDIA's libraries\n");
+        } else if (found > 0) {
+            for (int i = 0; i < nvidia.nfiles; i++) {
+                lc_sysret tree = lb_sys_open_tree(AT_FDCWD, nvidia.files[i].host, LB_OPEN_TREE_CLONE | LB_OPEN_TREE_CLOEXEC);
+                struct lb_statx stx;
+                if (tree < 0 || lb_sys_statx((int32_t)tree, "", LB_AT_EMPTY_PATH, LB_STATX_TYPE, &stx) < 0 ||
+                    (stx.stx_mode & LB_S_IFMT) != LB_S_IFREG)
+                    die2("Error: cannot take one of NVIDIA's libraries: ", nvidia.files[i].host);
+                nvidia_trees[nnvidia++] = (int32_t)tree;
+            }
+            print_str(STDOUT, "NVIDIA's libraries of ");
+            print_str(STDOUT, nvidia.version);
+            print_str(STDOUT, ": at " NVIDIA_DIR "/lib, and LD_LIBRARY_PATH names them\n");
+        }
     }
     static struct lb_dev_row dev_rows[MAX_DEVICES];
     static int32_t dev_trees[MAX_DEVICES];
@@ -5082,6 +5173,9 @@ static void start_one(const char *name, int hook_wait) {
         .dev_rows = dev_rows,
         .dev_trees = dev_trees,
         .ndev_groups = ndev_groups,
+        .nvidia = &nvidia,
+        .nvidia_trees = nvidia_trees,
+        .nnvidia = nnvidia,
         .root = start_root,
         .overlay = config.base[0] && !config.userns ? overlay : NULL,
         .userns = config.userns,
@@ -6067,6 +6161,7 @@ static void cmd_exec(int argc, char **argv) {
         req.workdir = config.workdir;
     int pid = get_container_pid(name);
     bool privileged = config.privileged;
+    req.gpu = config.gpu;
     /* where its proxy is: the gateway that it started with, as lightbox.conf
      * has it, which start sees to */
     static char proxy[PROXY_ENV_COUNT][PROXY_VAR_MAX];

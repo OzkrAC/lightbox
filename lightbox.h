@@ -276,6 +276,30 @@ struct lb_statx;
  * for the host itself, each at its own path, in the order of their names:
  * how many, or -1 for more than max. */
 [[nodiscard]] int gpu_devices(const char *root, device_spec *out, int max);
+/*
+ * NVIDIA's libraries for a box of --gpu (ROADMAP G.3): where root has
+ * NVIDIA's kernel module loaded, the version it says in
+ * /proc/driver/nvidia/version, the files of that version that a CUDA program
+ * and nvidia-smi load, found in the host's directories of libraries under
+ * root, and the host's links to them. 1 with them; 0 with no module; -1 with
+ * the module and no libcuda of its version, which missing names.
+ * root_has_musl: whether a root filesystem has musl's loader in /lib.
+ */
+#define NVIDIA_VERSION_MAX 32
+#define NVIDIA_NAME_MAX    96
+#define NVIDIA_FILES_MAX   8
+#define NVIDIA_LINKS_MAX   24
+#define NVIDIA_DIR         "/run/lightbox/gpu"
+typedef struct {
+    char version[NVIDIA_VERSION_MAX];
+    int  nfiles;
+    struct { char host[MAX_PATH]; char name[NVIDIA_NAME_MAX]; bool bin; } files[NVIDIA_FILES_MAX];
+    int  nlinks;
+    struct { char name[NVIDIA_NAME_MAX]; char target[NVIDIA_NAME_MAX]; } links[NVIDIA_LINKS_MAX];
+    char missing[NVIDIA_NAME_MAX];
+} nvidia_files;
+[[nodiscard]] int nvidia_libraries(const char *root, nvidia_files *out);
+[[nodiscard]] bool root_has_musl(const char *rootfs);
 /* Take out every volume at a destination: how many there were. */
 int config_remove_volumes_at(container_config *config, const char *dst);
 

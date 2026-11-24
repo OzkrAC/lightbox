@@ -4985,6 +4985,54 @@ $r/dev/nvidiactl -> /dev/nvidiactl" ] || { echo "not what --gpu gives"; bad=1; }
     return $bad
 }
 check 'what --gpu finds of a host'"'"'s: render nodes, NVIDIA'"'"'s and kfd, and not a display'"'"'s' t_gpu_devices
+
+# NVIDIA's libraries for a box of --gpu (ROADMAP G.3), in a tree of the case's
+# own that stands for a host with NVIDIA's driver: the version the module says,
+# each library of that version from the first directory that has it, the
+# host's links that lead to it and no other, and nvidia-smi; not a library of
+# another version, a link to one, or a link out of the directory. A host
+# without the module has none, and one without its libcuda is said so. A
+# root with musl's loader in /lib is told from one without.
+t_nvidia_libraries() {
+    local r said bad=0 lib v=550.54.14
+    case $(uname -m) in
+        x86_64) lib=usr/lib/x86_64-linux-gnu ;;
+        aarch64) lib=usr/lib/aarch64-linux-gnu ;;
+        *) echo "no directory of libraries is known here for $(uname -m)"; return 77 ;;
+    esac
+    r=$(mktemp -d "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    mkdir -p "$r/proc/driver/nvidia" "$r/$lib" "$r/usr/lib64" "$r/usr/bin" "$r/none" "$r/nocuda/proc/driver/nvidia" || return 1
+    printf 'NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  %s  Release Build  (dvs-builder@U16)  Thu Feb 22 2024\nGCC version:  gcc 12.2.0\n' \
+        "$v" > "$r/proc/driver/nvidia/version"
+    cp "$r/proc/driver/nvidia/version" "$r/nocuda/proc/driver/nvidia/version"
+    for f in libcuda libnvidia-ml libnvidia-ptxjitcompiler; do : > "$r/$lib/$f.so.$v"; done
+    : > "$r/$lib/libcuda.so.535.104.05"
+    : > "$r/usr/lib64/libnvidia-nvvm.so.$v"
+    ln -s "libcuda.so.$v" "$r/$lib/libcuda.so.1"
+    ln -s libcuda.so.1 "$r/$lib/libcuda.so"
+    ln -s libcuda.so.535.104.05 "$r/$lib/libcuda.so.2"
+    ln -s "/elsewhere/libnvidia-ml.so.$v" "$r/$lib/libnvidia-ml.so.2"
+    ln -s "libnvidia-ml.so.$v" "$r/$lib/libnvidia-ml.so.1"
+    ln -s "libnvidia-nvvm.so.$v" "$r/usr/lib64/libnvidia-nvvm.so.4"
+    : > "$r/usr/bin/nvidia-smi"
+    said=$("$UNIT" nvidia "$r" | sed "s#$r#<r>#g" | sort)
+    printf '%s\n' "$said"
+    [ "$said" = "$(printf '%s\n' "file <r>/$lib/libcuda.so.$v libcuda.so.$v" "file <r>/$lib/libnvidia-ml.so.$v libnvidia-ml.so.$v" \
+        "file <r>/$lib/libnvidia-ptxjitcompiler.so.$v libnvidia-ptxjitcompiler.so.$v" \
+        "file <r>/usr/bin/nvidia-smi nvidia-smi bin" "file <r>/usr/lib64/libnvidia-nvvm.so.$v libnvidia-nvvm.so.$v" \
+        "link libcuda.so libcuda.so.1" "link libcuda.so.1 libcuda.so.$v" "link libnvidia-ml.so.1 libnvidia-ml.so.$v" \
+        "link libnvidia-nvvm.so.4 libnvidia-nvvm.so.$v" "version $v" | sort)" ] || { echo "not what a box of --gpu is given"; bad=1; }
+    [ "$("$UNIT" nvidia "$r/none")" = none ] || { echo "a host without the module has libraries"; bad=1; }
+    said=$("$UNIT" nvidia "$r/nocuda") && { echo "a host without libcuda gave libraries"; bad=1; }
+    [ "$said" = "version $v
+missing libcuda.so.$v" ] || { echo "$said"; bad=1; }
+    mkdir -p "$r/alpine/lib" "$r/debian/lib" && : > "$r/alpine/lib/ld-musl-x86_64.so.1" && : > "$r/debian/lib/ld-linux.so.2" || bad=1
+    [ "$("$UNIT" musl "$r/alpine")" = musl ] && [ "$("$UNIT" musl "$r/debian")" = 'not musl' ] &&
+        [ "$("$UNIT" musl "$r/none")" = 'not musl' ] || { echo "musl is not told from glibc"; bad=1; }
+    rm -rf -- "$r"
+    return $bad
+}
+check 'NVIDIA'"'"'s libraries of the module'"'"'s version, with the host'"'"'s links to them, and musl told from glibc' t_nvidia_libraries
 check 'a host tool that reads an image runs as nobody, with no capability and no network' t_tool_sandbox
 check 'where nobody has no id the tool keeps its own, and where it cannot be confined it is not run' t_tool_sandbox_without_ids
 
