@@ -1461,7 +1461,8 @@ t_monitor_clears_away() {
     [ "$(cat "/proc/$mon/comm")" = lightbox-mon ] || { echo "the parent of init is $(cat "/proc/$mon/comm")"; return 1; }
     fds=$(for f in /proc/"$mon"/fd/*; do readlink "$f"; done | sort | paste -sd'|')
     echo "the monitor's descriptors: $fds"
-    [ "$fds" = "$C/mon1/console.log|/dev/null|/dev/null|/dev/null" ] || { echo "the monitor holds more"; return 1; }
+    [ "$fds" = "$(printf '%s\n' "$C/mon1/console.log" /dev/null /dev/null /dev/null | sort | paste -sd'|')" ] ||
+        { echo "the monitor holds more"; return 1; }
     began=$(date +%s%N)
     kill -KILL "$pid"
     wait_until 3 quietly_cleared mon1 failed || { nothing_left mon1; echo "state: $(state_of mon1)"; return 1; }
@@ -2279,6 +2280,7 @@ t_past_the_memory_limit() {
     chroot "$BASE" /bin/sh -c 'command -v dd' >/dev/null 2>&1 || { echo "this image has no dd to fill memory with"; return 77; }
     echo "swap on this host: $(awk 'NR > 1 { n++; k += $3 } END { print n + 0 " areas, " k + 0 " KiB" }' /proc/swaps)"
     up hungry --mem 32M || return 1
+    unmonitor hungry || return 1        # the cgroup and its events stay for this case to read
     pid=$(pid_of hungry)
     # 64 MiB in one buffer, which dd fills from /dev/zero
     sh_in hungry 'dd if=/dev/zero of=/dev/null bs=67108864 count=1' >"$OUT/hungry.dd" 2>&1
@@ -2913,14 +2915,17 @@ t_killed_start_leaves_no_container() {
     echo "$starter" >> "$T/background"
     wait_until 10 test -e "$T/restore.reached" ||
         { echo "start did not reach the firewall transaction:"; cat "$OUT/orphan.start"; return 1; }
-    init=$(children_of "$starter" "$(basename "$LB" | cut -c1-15)")
-    [ -n "$init" ] || { echo "the starter has no cloned child"; return 1; }
+    # init is the child of the start's monitor (ROADMAP M.1), which is the start's
+    mon=$(children_of "$starter" lightbox-mon)
+    [ -n "$mon" ] || { echo "the starter has no monitor"; return 1; }
+    init=$(children_of "$mon" "$(basename "$LB" | cut -c1-15)")
+    [ -n "$init" ] || { echo "the monitor has no cloned child"; return 1; }
     kill -KILL "$starter"
     wait "$starter" 2>/dev/null
     sleep 2
-    for p in $init; do
+    for p in $init $mon; do
         if alive "$p"; then
-            echo "pid $p, the child of the killed start, is still running"
+            echo "pid $p, the init or the monitor of the killed start, is still running"
             return 1
         fi
     done

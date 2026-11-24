@@ -4099,7 +4099,7 @@ static void close_container_streams(int32_t *null_fd, int32_t *log_fd) {
  * container then goes on, and the next command clears away what it leaves,
  * as before the monitor.
  */
-typedef void (*init_ended_fn)(const char *name, int32_t status, int32_t log_fd);
+typedef void (*init_ended_fn)(const char *name, int32_t pid, const char *started, int32_t status, int32_t log_fd);
 
 [[noreturn]] static void monitor_main(struct child_args *ca, int flags, int (*fn)(void *), init_ended_fn ended,
                                       int32_t pid_wr, int32_t control_rd, const int32_t ends[4]) {
@@ -4111,6 +4111,10 @@ typedef void (*init_ended_fn)(const char *name, int32_t status, int32_t log_fd);
     (void)lc_kernel_write_all(pid_wr, &said, sizeof(said));
     if (pid < 0)
         lc_kernel_exit(failure_status);
+    /* its start time, which with its pid is the identity of init on record */
+    static char started[32];
+    if (proc_starttime((int)pid, started, sizeof(started)) < 0)
+        started[0] = '\0';
 
     /* its standard streams nobody's, and of start's descriptors the control
      * pipe and the container's log alone */
@@ -4135,7 +4139,7 @@ typedef void (*init_ended_fn)(const char *name, int32_t status, int32_t log_fd);
     int32_t status = 0;
     if (wait_child((int32_t)pid, &status) != 0)
         lc_kernel_exit(failure_status);
-    ended(ca->name, status, ca->log_fd);
+    ended(ca->name, (int32_t)pid, started, status, ca->log_fd);
     lc_kernel_exit(0);
 }
 
@@ -4150,7 +4154,7 @@ static bool reconcile(const char *name);
  * finds nothing; a container that was removed meanwhile ends the monitor at
  * its lock. Without the monitor this waited for the next lightbox command.
  */
-static void monitor_cleanup(const char *name, int32_t status, int32_t log_fd) {
+static void monitor_cleanup(const char *name, int32_t pid, const char *started, int32_t status, int32_t log_fd) {
     int signal = status & 0x7f;
     if (signal && log_fd >= 0) {
         char digits[16];
@@ -4159,8 +4163,32 @@ static void monitor_cleanup(const char *name, int32_t status, int32_t log_fd) {
         print_str(log_fd, digits);
         print_str(log_fd, "; its monitor clears away what it left\n");
     }
-    container_lock(name);
-    (void)reconcile(name);
+    /* Only while the record says this init and no command has cleared it
+     * away: a stop, an rm or a start after it does, under the lock, and then
+     * the monitor takes none, which the next command would find taken and
+     * wait for. A start that was cut short before init was on record left
+     * its state at starting. The lock is tried, and the record looked at
+     * again, until one of the two settles it. */
+    for (;;) {
+        char recorded[32], state[32];
+        int on_record = get_container_pid(name);
+        if (on_record > 0 && (on_record != pid || get_container_pid_starttime(name, recorded, sizeof(recorded)) < 0 ||
+                              !streq(recorded, started)))
+            return;                     /* another init's, since */
+        if (on_record <= 0) {
+            get_container_state(name, state, sizeof(state));
+            if (!streq(state, "starting") && !streq(state, "running") && !streq(state, "stopping"))
+                return;                 /* cleared away by a command */
+        }
+        int32_t lock = container_lock_try(name);
+        if (lock >= 0) {
+            (void)reconcile(name);
+            lc_kernel_close_file(lock);
+            return;
+        }
+        lc_timespec moment = { .seconds = 0, .nanoseconds = 20000000 };
+        lc_kernel_sleep(&moment);
+    }
 }
 
 /* init_spawn with a monitor between the command and init: init is the

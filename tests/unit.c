@@ -563,8 +563,10 @@ static int unit_sleeper(void *arg) {
 
 /* What the monitor saw, into the file that the name is (ROADMAP M.1): the
  * exit code of its child, and the descriptors it holds. */
-static void unit_monitor_ended(const char *record, int32_t status, int32_t log_fd) {
+static void unit_monitor_ended(const char *record, int32_t pid, const char *started, int32_t status, int32_t log_fd) {
     (void)log_fd;
+    (void)pid;
+    (void)started;
     char text[256], digits[16];
     bool cut = false;
     fmt_int(digits, exit_code_from_status(status));

@@ -9,7 +9,7 @@ lightbox runs what you put in a container on the kernel of the host, and keeps i
 - **The audit log:** a way for a container to change or remove what `exec` and `run` recorded of it.
 - **The files of a release:** a package or a source archive that is not what its checksum and the record of its build say.
 
-Out of scope, as the page says where lightbox stops: a flaw in the kernel itself, though a system call that the allow-list should not let through is a report worth making; a container created with `--privileged`; the host and its networks as a container of `--net nat` reaches them; what a host's own firewall does, and the absence of rules with `firewall = false`; what someone who may run lightbox, and so is root, does with it; and a base that does harm inside its own container. lightc, the runtime lightbox is linked with, has its own repository, [github.com/OscarAC/lightc](https://github.com/OscarAC/lightc); a flaw there that shows in lightbox can be reported here.
+Out of scope, as the page says where lightbox stops: a flaw in the kernel itself, though a system call that the allow-list should not let through is a report worth making; a container created with `--privileged`; the host and its networks as a container of `--net nat` reaches them; what a host's own firewall does, and the absence of rules with `firewall = false`; what someone who may run lightbox, and so is root, does with it; and a base that does harm inside its own container. lightc, the runtime lightbox is linked with, has its own repository, [github.com/OzkrAC/lightc](https://github.com/OzkrAC/lightc); a flaw there that shows in lightbox can be reported here.
 
 ## Reporting
 
