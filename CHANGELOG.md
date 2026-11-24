@@ -15,6 +15,7 @@ Not tagged yet: what is written of the next release so far.
 
 ### Changed
 
+- **The hook and `exec` have Docker's `PATH`,** `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`, where they had `/usr/bin:/bin:/usr/sbin:/sbin`. What is installed under `/usr/local`, from an archive or by `pip` or `npm -g`, as `node` is in an image made for Docker, was not found by its name; it is now, before what is in `/usr`. `--env PATH=...` still sets another. The host's tools keep a `PATH` of their own.
 - **A container has a cgroup namespace of its own, and sees its cgroup at `/sys/fs/cgroup`.** Its processes saw the host's path of their cgroup in `/proc/self/cgroup`, such as `0::/lightbox/web`, and an empty `/sys/fs/cgroup`. Init now makes a cgroup namespace once `start` has put it in the container's cgroup, so that `/proc/self/cgroup` says `0::/`, and a command that `exec` runs, in the exec's own cgroup below, `0::/exec-<numbers>`; and `/sys/fs/cgroup` is that cgroup and what is below it, read-only, where a program reads its limits and its use and changes none of them. A privileged container has it read-write. `exec` joins the namespace before the user namespace, as host root, and so joins a container that an older lightbox started, which has none of its own. The time namespace of the same roadmap item is left out: a process in one reads the offsets of its clocks from `/proc/self/timens_offsets`, which anyone may read, so that it would hide nothing of the host's uptime.
 
 ### Fixed

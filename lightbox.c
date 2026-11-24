@@ -2359,11 +2359,17 @@ static int proxy_environment(const container_config *config, uint32_t gateway,
 }
 
 /*
+ * The PATH of the programs of the hook and of exec: Docker's, in its order,
+ * with /usr/local, where what is installed from an archive, by pip or by
+ * npm -g lands, so that an image made for Docker finds its programs here as
+ * it does there (ROADMAP R.6). The host's tools have TOOL_ENV's, which
+ * nothing of a container's is in.
+ *
  * --gpu with NVIDIA's libraries (ROADMAP G.3): where they are, for the
  * programs of the hook and of exec, as LD_LIBRARY_PATH, and nvidia-smi at
  * the end of PATH; where the start gave them, as NVIDIA_DIR/lib is there.
  */
-#define BOX_PATH_ENV     "PATH=/usr/bin:/bin:/usr/sbin:/sbin"
+#define BOX_PATH_ENV     "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 #define NVIDIA_PATH_ENV  BOX_PATH_ENV ":" NVIDIA_DIR "/bin"
 #define NVIDIA_LIB_ENV   "LD_LIBRARY_PATH=" NVIDIA_DIR "/lib"
 static bool nvidia_given(bool gpu) {

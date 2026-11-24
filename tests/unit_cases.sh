@@ -1537,18 +1537,18 @@ t_command_environment() {
         run() { env -i "$@"; }          # the harness with exactly this environment
         got=$(run TERM=vt220 "$UNIT" command "$P" "$G" --user lbuser /usr/bin/env | sort | paste -sd' ' -)
         echo "as lbuser: $got"
-        [ "$got" = "HOME=/home/lbuser LOGNAME=lbuser PATH=/usr/bin:/bin:/usr/sbin:/sbin TERM=vt220 USER=lbuser" ] || exit 1
+        [ "$got" = "HOME=/home/lbuser LOGNAME=lbuser PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin TERM=vt220 USER=lbuser" ] || exit 1
         # a uid without an account has no name to give, and a TERM that is not a plain name is not passed on
         got=$(run 'TERM=x$(reboot)' "$UNIT" command "$P" "$G" --user 1234 /usr/bin/env | sort | paste -sd' ' -)
         echo "as 1234: $got"
-        [ "$got" = "HOME=/ PATH=/usr/bin:/bin:/usr/sbin:/sbin TERM=xterm" ] || exit 1
+        [ "$got" = "HOME=/ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin TERM=xterm" ] || exit 1
         got=$(run "$UNIT" command "$P" "$G" /usr/bin/env | sort | paste -sd' ' -)
         echo "as root: $got"
-        [ "$got" = "HOME=/root LOGNAME=root PATH=/usr/bin:/bin:/usr/sbin:/sbin TERM=xterm USER=root" ] || exit 1
+        [ "$got" = "HOME=/root LOGNAME=root PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin TERM=xterm USER=root" ] || exit 1
         # --env adds, replaces what is there, and the later of two wins; nothing else of the caller's gets in
         got=$(run SECRET=1 "$UNIT" command "$P" "$G" --env A=1 --env HOME=/elsewhere -e A=2 --env B= /usr/bin/env | sort | paste -sd' ' -)
         echo "with --env: $got"
-        [ "$got" = "A=2 B= HOME=/elsewhere LOGNAME=root PATH=/usr/bin:/bin:/usr/sbin:/sbin TERM=xterm USER=root" ]
+        [ "$got" = "A=2 B= HOME=/elsewhere LOGNAME=root PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin TERM=xterm USER=root" ]
     )
     rc=$?
     rm -rf -- "$A"

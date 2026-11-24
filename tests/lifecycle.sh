@@ -1771,7 +1771,12 @@ t_exec_environment() {
     said=$(TERM=vt220 timeout -k 5 60 "$LB" exec envs --env GREETING=hello --env GREETING=hi --workdir /tmp -- \
                /bin/sh -c 'echo "$GREETING $TERM $(pwd) $PATH"' </dev/null)
     echo "$said"
-    [ "$said" = "hi vt220 /tmp /usr/bin:/bin:/usr/sbin:/sbin" ] || return 1
+    [ "$said" = "hi vt220 /tmp /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" ] || return 1
+    # Docker's PATH (ROADMAP R.6): what is installed under /usr/local, as by pip or npm -g, is found by its name
+    sh_in envs 'mkdir -p /usr/local/bin && printf "#!/bin/sh\necho from /usr/local/bin\n" > /usr/local/bin/lbt-local &&
+                chmod 755 /usr/local/bin/lbt-local' || return 1
+    said=$(lb exec envs lbt-local </dev/null)
+    [ "$said" = 'from /usr/local/bin' ] || { echo "a program in /usr/local/bin is not found by its name: $said"; return 1; }
     # nothing else of the caller's environment goes in
     said=$(NOT_FOR_THE_CONTAINER=1 timeout -k 5 60 "$LB" exec envs /bin/sh -c 'env | sort' </dev/null | tr '\n' ' ')
     echo "the environment of a command: $said"

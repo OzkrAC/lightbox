@@ -124,7 +124,7 @@ What an image has to contain:
 
 - Nothing, for a container to run: lightbox makes `/dev`, `/proc`, `/sys`, `/tmp` and `/run` and the container's network itself, and `create` writes `/etc/resolv.conf`, `/etc/hostname` and a line of `/etc/hosts`, making `/etc` where there is none. A single static binary is an image too.
 - `/bin/sh`, for an `/init.sh` hook and for `exec` without a command.
-- The programs that `exec` runs, found on `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, with their libraries where they are linked dynamically: nothing of the host is in a container.
+- The programs that `exec` runs, found on `PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`, with their libraries where they are linked dynamically: nothing of the host is in a container.
 - `/etc/passwd` and `/etc/group`, for `exec --user <name>` and for the groups of the user a command runs as.
 
 An empty image is refused. A container does not copy its image: see [Storage](#storage).
@@ -258,7 +258,7 @@ If the image has an `/init.sh`, the container's init runs it once the container 
 
 What the hook gets:
 
-- It runs as `/bin/sh /init.sh`, as root, in `/`, with `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, `HOME=/root` and `TERM=xterm` and nothing else of the environment `start` was given. The container is complete by then: its mounts, its `/dev`, its address and default route, its cgroup and limits, and the container is on record, so `stop` and `ls` find it.
+- It runs as `/bin/sh /init.sh`, as root, in `/`, with `PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`, `HOME=/root` and `TERM=xterm` and nothing else of the environment `start` was given. The container is complete by then: its mounts, its `/dev`, its address and default route, its cgroup and limits, and the container is on record, so `stop` and `ls` find it.
 - It has the container's sandbox: 11 capabilities, the seccomp filter and no_new_privs, the masked and read-only parts of `/proc`. A hook that mounts filesystems or configures the network needs `--privileged`. Its root is the host's root (see [Threat model](#threat-model)).
 - The hook and everything it starts read from `/dev/null` and write to the container's log, not to the terminal `start` was typed on. `lightbox logs <name>` shows the log, and `logs -f` follows it until the container stops.
 - A hook that exits with a status other than 0 fails the start: `start` says which status it was, and the container is stopped and cleaned up. A hook that fails after `start` has returned stops the container as well.
@@ -576,7 +576,7 @@ What the command gets as its standard streams depends on what `exec` itself was 
 
 In every case the command leads a session of its own and is given nothing else that was open where `exec` was run. SIGINT, SIGTERM, SIGHUP and SIGQUIT sent to `exec` are passed on to the command.
 
-The command is found as a shell finds it: a name without a slash is looked for in the directories of `PATH`. Its environment is `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, `HOME`, `USER` and `LOGNAME` for its user, and the `TERM` of the terminal `exec` was typed on; nothing else of your environment goes into the container. Its groups are the ones the container's `/etc/group` lists for its user, and none for a uid the container has no account for.
+The command is found as a shell finds it: a name without a slash is looked for in the directories of `PATH`. Its environment is `PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`, `HOME`, `USER` and `LOGNAME` for its user, and the `TERM` of the terminal `exec` was typed on; nothing else of your environment goes into the container. Its groups are the ones the container's `/etc/group` lists for its user, and none for a uid the container has no account for.
 
 `exec` exits with the command's status, or 128 plus the number of the signal that ended it. Its own statuses are those of `env` and `timeout`, so that a program that drives a container can tell what the command did from what lightbox did: 124 when `--timeout` ended the command, 125 when lightbox failed before the command ran, such as for an option it does not take or a container that is not running, 126 when the command could not be run, as a file that is not executable or a `--workdir` that is not there, and 127 when it is not there. A command can return those numbers too; every other command of lightbox's fails with 1.
 
