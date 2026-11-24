@@ -2946,12 +2946,15 @@ t_killed_start_leaves_no_container() {
     kill -KILL "$starter"
     wait "$starter" 2>/dev/null
     sleep 2
-    for p in $init $mon; do
+    for p in $init; do
         if alive "$p"; then
-            echo "pid $p, the init or the monitor of the killed start, is still running"
+            echo "pid $p, the init of the killed start, is still running"
             return 1
         fi
     done
+    # and its monitor clears away what the start left, which the stand-in of
+    # iptables-restore, still in place, holds up for its 5 s
+    wait_until 15 gone "$mon" || { echo "the monitor $mon of the killed start did not end"; return 1; }
 }
 
 t_stale_pid_start() {
