@@ -1693,12 +1693,17 @@ assert d == want, d
     # may is refused, and one that only its group may, of a group other than
     # 0, is taken and ends at the root that --userns needs
     local node
-    node=$(find /dev -maxdepth 2 -type c -perm 0600 -user 0 2>/dev/null | head -n 1)
+    # a node of the host's that no rule of its own refuses, as /dev/vcsa6 of a runner, 0660, is refused
+    # for what it is before its group is looked at
+    candidate() { find /dev -maxdepth 2 -type c "$@" ! -name mem ! -name kmem ! -name port ! -name kmsg ! -name 'tty*' \
+                      ! -name console ! -name 'vcs*' ! -name uinput ! -name 'watchdog*' ! -path '*/input/*' \
+                      ! -path '*/cpu/*' 2>/dev/null | head -n 1; }
+    node=$(candidate -perm 0600 -user 0)
     [ -n "$node" ] && no 'is read and written by its owner alone, whom no container of --userns stands for' \
         --userns --device "$node:/dev/own"
-    node=$(find /dev -maxdepth 2 -type c -perm 0660 -group 0 2>/dev/null | head -n 1)
+    node=$(candidate -perm 0660 -group 0)
     [ -n "$node" ] && no 'which is root'"'"'s, gid 0, and that a container of --userns never holds' --userns --device "$node:/dev/grp0"
-    node=$(find /dev -maxdepth 2 -type c -perm 0660 ! -group 0 2>/dev/null | head -n 1)
+    node=$(candidate -perm 0660 ! -group 0)
     [ -n "$node" ] && no 'create --userns must be run as root' --userns --device "$node:/dev/grp"
     [ "$before" = "$(ls "$C")" ] || { echo "a refused create left something in the store"; bad=1; }
     # what a .conf of the container's says, read back
