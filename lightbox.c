@@ -4169,10 +4169,13 @@ typedef void (*init_ended_fn)(const char *name, int32_t pid, const char *started
             break;                      /* init ended, or the wait cannot go on: it is waited for below */
     }
 
+    /* init's pidfd is held until init is reaped, with a --ttl or not: what
+     * the monitor holds is the same for all of init's life */
+    int32_t status = 0;
+    int waited = wait_child((int32_t)pid, &status);
     if (pidfd >= 0)
         lc_kernel_close_file((int32_t)pidfd);
-    int32_t status = 0;
-    if (wait_child((int32_t)pid, &status) != 0)
+    if (waited != 0)
         lc_kernel_exit(failure_status);
     ended(ca->name, (int32_t)pid, started, status, expired, ca->log_fd);
     lc_kernel_exit(0);
@@ -6470,6 +6473,380 @@ static void cmd_exec(int argc, char **argv) {
     lc_kernel_exit(code);
 }
 
+/* ─── cmd_cp (ROADMAP C.1) ──────────────────────────────────────────────── */
+
+/*
+ * lightbox cp: a file, a link or a tree between the host and a running box,
+ * as a tar archive that I.2's writer writes and I.3's reader unpacks, in a
+ * process of its own whose root is the directory it unpacks into. Nothing of
+ * the box's is resolved on the host: the box's side of a copy is a process
+ * that joins the box as exec does, its cgroup, user and mount namespaces and
+ * its root, and finds names there, where a link of the box's leads nowhere
+ * but into the box. Into a box what is copied is its root's, with -a its
+ * owners'; out of one it is the owner's of the directory it goes into; no
+ * setuid or setgid bit goes either way, and no device is made.
+ */
+struct cp_end {
+    bool in_box;
+    char box[NAME_MAX_LEN + 1];
+    char path[MAX_PATH];        /* as given, with no slash at its end */
+    bool contents;              /* <dir>/.: what is in it, and not it */
+    char dir[MAX_PATH];         /* the directory the entry is in; with contents, the directory itself */
+    char name[MAX_PATH];        /* the entry's name in dir; empty with contents */
+};
+
+static void cp_end_parse(const char *arg, struct cp_end *e) {
+    *e = (struct cp_end){ 0 };
+    const char *path = arg;
+    const char *colon = NULL;
+    for (const char *c = arg; *c && !colon; c++)
+        if (*c == ':')
+            colon = c;
+    if (colon && colon > arg && (size_t)(colon - arg) <= NAME_MAX_LEN && colon[1] == '/') {
+        char box[NAME_MAX_LEN + 1];
+        lc_bytes_copy(box, arg, (size_t)(colon - arg));
+        box[colon - arg] = '\0';
+        if (name_is_valid(box)) {
+            e->in_box = true;
+            lc_bytes_copy(e->box, box, sizeof(box));
+            path = colon + 1;
+        }
+    }
+    if (!path[0] || has_control_chars(path) || !str_copy(e->path, path, sizeof(e->path)))
+        die2("Error: cp takes a path of the host's, or <box>:<absolute path>, not: ", arg);
+    size_t len = lc_string_length(e->path);
+    while (len > 1 && e->path[len - 1] == '/')
+        e->path[--len] = '\0';
+    /* <dir>/., and / itself: what is in it */
+    if (streq(e->path, "/") || streq(e->path, ".") || (len >= 2 && streq(e->path + len - 2, "/."))) {
+        e->contents = true;
+        if (len >= 2 && streq(e->path + len - 2, "/."))
+            e->path[len - 2 == 0 ? 1 : len - 2] = '\0';
+        str_copy_or_die(e->dir, e->path, sizeof(e->dir), "a path of cp");
+        return;
+    }
+    const char *slash = NULL;
+    for (const char *c = e->path; *c; c++)
+        if (*c == '/')
+            slash = c;
+    const char *base = slash ? slash + 1 : e->path;
+    if (streq(base, ".") || streq(base, ".."))
+        die2("Error: cp takes a file, a link or a directory by its name, or <dir>/. for what is in it, not: ", arg);
+    str_copy_or_die(e->name, base, sizeof(e->name), "a path of cp");
+    if (!slash)
+        str_copy_or_die(e->dir, ".", sizeof(e->dir), "a path of cp");
+    else if (slash == e->path)
+        str_copy_or_die(e->dir, "/", sizeof(e->dir), "a path of cp");
+    else {
+        size_t dlen = (size_t)(slash - e->path);
+        lc_bytes_copy(e->dir, e->path, dlen);
+        e->dir[dlen] = '\0';
+    }
+}
+
+/* Where a copy goes, in the namespace this process is in: into dst where
+ * it is a directory, under the source's name, which *top then is; else as
+ * dst, in the directory above it, under dst's own name. With contents, into
+ * dst, made where it is not there. The directory's descriptor, or -1 once
+ * said; st has what that directory is. */
+static int32_t cp_target(const struct cp_end *dst, const struct cp_end *src, const char **top, struct lb_statx *st) {
+    struct lb_statx at;
+    bool is_dir = lb_sys_statx(AT_FDCWD, dst->path, 0, LB_STATX_TYPE, &at) == 0 && (at.stx_mode & LB_S_IFMT) == LB_S_IFDIR;
+    const char *into = dst->path;
+    *top = src->name;
+    if (src->contents && !is_dir && !dst->contents) {
+        /* made as its parent's owner's, as what goes into it will be */
+        struct lb_statx parent;
+        if (lb_sys_statx(AT_FDCWD, dst->dir, 0, LB_STATX_TYPE | LB_STATX_UID | LB_STATX_GID, &parent) < 0 ||
+            (parent.stx_mode & LB_S_IFMT) != LB_S_IFDIR || lc_kernel_mkdirat(AT_FDCWD, dst->path, 0755) < 0 ||
+            lc_kernel_fchownat(AT_FDCWD, dst->path, parent.stx_uid, parent.stx_gid, AT_SYMLINK_NOFOLLOW) < 0) {
+            print_str(STDERR, "Error: cp cannot make the directory to copy into: ");
+            print_str(STDERR, dst->path);
+            lc_print_char(STDERR, '\n');
+            return -1;
+        }
+    } else if (!is_dir) {
+        if (dst->contents) {
+            print_str(STDERR, "Error: cp copies into a directory that is there: ");
+            print_str(STDERR, dst->path);
+            lc_print_char(STDERR, '\n');
+            return -1;
+        }
+        into = dst->dir;
+        *top = dst->name;
+    }
+    lc_sysret fd = lc_kernel_open_file(into, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+    if (fd < 0 || lb_sys_statx((int32_t)fd, "", LB_AT_EMPTY_PATH, LB_STATX_TYPE | LB_STATX_UID | LB_STATX_GID, st) < 0) {
+        print_str(STDERR, "Error: cp has no directory to copy into: ");
+        print_str(STDERR, into);
+        lc_print_char(STDERR, '\n');
+        if (fd >= 0)
+            lc_kernel_close_file((int32_t)fd);
+        return -1;
+    }
+    return (int32_t)fd;
+}
+
+/* The directory a source entry is in, and that the entry is there: its
+ * descriptor, or -1 once said. */
+static int32_t cp_source_dir(const struct cp_end *src) {
+    lc_sysret fd = lc_kernel_open_file(src->dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+    struct lb_statx st;
+    if (fd < 0 || (!src->contents && lb_sys_statx((int32_t)fd, src->name, AT_SYMLINK_NOFOLLOW, LB_STATX_TYPE, &st) < 0)) {
+        print_str(STDERR, "Error: cp has nothing to copy at ");
+        print_str(STDERR, src->path);
+        lc_print_char(STDERR, '\n');
+        if (fd >= 0)
+            lc_kernel_close_file((int32_t)fd);
+        return -1;
+    }
+    return (int32_t)fd;
+}
+
+/* This process into a running box, as exec's worker goes into one: the
+ * exec's cgroup, the box's cgroup, user and mount namespaces, as its root,
+ * and the box's root as its own. Ends the process when it cannot. */
+static void cp_join(const char *cg, int target_pid, bool userns) {
+    if (lc_kernel_prctl(LB_PR_SET_DUMPABLE, 0, 0, 0, 0) < 0)
+        die("Error: failed to close the copy to the box's processes");
+    int rootfd = open_target_path(target_pid, "/root");
+    int userfd = userns ? open_target_path(target_pid, "/ns/user") : -1;
+    int mntfd = open_target_path(target_pid, "/ns/mnt");
+    int cgroupfd = open_target_path(target_pid, "/ns/cgroup");
+    if (rootfd < 0 || mntfd < 0 || cgroupfd < 0 || (userns && userfd < 0))
+        die("Error: failed to open the box's root and namespaces");
+    cgroup_join_self(cg);
+    require_setns_fd(cgroupfd, LB_CLONE_NEWCGROUP, "cgroup");
+    if (userns) {
+        require_setns_fd(userfd, CLONE_NEWUSER, "user");
+        if (lc_kernel_setgroups(0, NULL) < 0 || lc_kernel_setgid(0) < 0 || lc_kernel_setuid(0) < 0)
+            die("Error: failed to become the root of the box's user namespace");
+    }
+    require_setns_fd(mntfd, CLONE_NEWNS, "mount");
+    if (lb_sys_fchdir(rootfd) < 0 || lb_sys_chroot(".") < 0 || lc_kernel_chdir("/") < 0)
+        die("Error: failed to take the box's root as the copy's");
+    lc_kernel_close_file(rootfd);
+    lc_kernel_close_file(mntfd);
+    lc_kernel_close_file(cgroupfd);
+    if (userfd >= 0)
+        lc_kernel_close_file(userfd);
+}
+
+/* When one side of a copy fails the other does too, the writer at a pipe
+ * with no reader and the reader at an archive cut short: the side that
+ * failed first says why, and the other says nothing. */
+static bool cp_pipe_broke;
+
+static int cp_sink(void *to, const void *data, size_t len) {
+    if (lc_kernel_write_all(*(const int32_t *)to, data, len) == (lc_sysret)len)
+        return 0;
+    cp_pipe_broke = true;
+    return -1;
+}
+
+static int64_t cp_source(void *from, void *data, size_t len) {
+    return lc_kernel_read_retry(*(const int32_t *)from, data, len);
+}
+
+/* A tar archive of the source, in dirfd, into fd: 0; 1 once said; or
+ * CP_PIPE_BROKE, said by nobody, where the reader went away first. dirfd is
+ * closed. */
+#define CP_PIPE_BROKE 2
+static int cp_write(int32_t fd, int32_t dirfd, const struct cp_end *src, const char *top, bool owners_root) {
+    static int32_t sink_fd;
+    sink_fd = fd;
+    static tar_writer w;
+    w = (tar_writer){ .sink = cp_sink, .to = &sink_fd, .plain = true, .owners_root = owners_root, .no_setid = true };
+    int rc = src->contents ? tar_write_tree(&w, dirfd) : tar_write_one(&w, dirfd, src->name, top);
+    lc_kernel_close_file(dirfd);
+    if (rc != 0 && cp_pipe_broke)
+        return CP_PIPE_BROKE;
+    if (rc != 0) {
+        print_str(STDERR, "Error: cp could not send what is at ");
+        print_str(STDERR, w.failed_at[0] ? w.failed_at : src->path);
+        print_str(STDERR, ": it ");
+        print_str(STDERR, w.failure ? w.failure : "failed");
+        lc_print_char(STDERR, '\n');
+        return 1;
+    }
+    return 0;
+}
+
+/* The archive on fd unpacked into dirfd: 0, or 1, said where say is. */
+static tar_reader cp_reader;
+
+static void cp_say_read(void) {
+    print_str(STDERR, "Error: cp could not make ");
+    print_str(STDERR, cp_reader.failed_at[0] ? cp_reader.failed_at : "what it was sent");
+    print_str(STDERR, ": ");
+    print_str(STDERR, cp_reader.failure ? cp_reader.failure : "it failed");
+    lc_print_char(STDERR, '\n');
+}
+
+static int cp_read(int32_t fd, int32_t dirfd, bool owner_given, uint32_t uid, uint32_t gid, bool say) {
+    static int32_t source_fd;
+    source_fd = fd;
+    tar_reader *r = &cp_reader;
+    *r = (tar_reader){ .source = cp_source, .from = &source_fd, .source_fd = fd, .into = TAR_INTO_COPY, .no_setid = true,
+                      .owner_given = owner_given, .owner_uid = uid, .owner_gid = gid };
+    if (tar_read_tree(r, dirfd) != 0) {
+        if (say)
+            cp_say_read();
+        return 1;
+    }
+    if (r->devices)
+        say_with_number("Note: cp made none of the ", (int)r->devices, " devices it was sent; a box's devices are lightbox's to give\n");
+    return 0;
+}
+
+static void cmd_cp(int argc, char **argv) {
+    bool archive = false;
+    const char *args[2];
+    int nargs = 0;
+    for (int i = 0; i < argc; i++) {
+        if (streq(argv[i], "-a") || streq(argv[i], "--archive"))
+            archive = true;
+        else if (argv[i][0] == '-' && argv[i][1])
+            die2("Error: unknown option: ", argv[i]);
+        else if (nargs < 2)
+            args[nargs++] = argv[i];
+        else
+            die2("Error: unexpected argument: ", argv[i]);
+    }
+    if (nargs != 2)
+        die("Usage: lightbox cp [-a] <host path> <box>:<path> | lightbox cp [-a] <box>:<path> <host path>");
+    static struct cp_end src, dst;
+    cp_end_parse(args[0], &src);
+    cp_end_parse(args[1], &dst);
+    if (src.in_box == dst.in_box)
+        die("Error: cp copies between the host and a box: one of the two is <box>:<path>");
+    const struct cp_end *box_end = src.in_box ? &src : &dst;
+    if (box_end->path[0] != '/')
+        die2("Error: a path in a box is absolute: ", box_end->path);
+    const char *name = box_end->box;
+    require_root("cp");
+    if (!is_running(name))
+        die2("Error: cp copies into and out of a running box, and this one is not running: ", name);
+    static container_config config;
+    container_config_load_or_die(name, &config);
+    int pid = get_container_pid(name);
+
+    /* out of the box: where it goes is the host's, and settled first */
+    const char *top = src.name;
+    int32_t target = -1;
+    struct lb_statx owner;
+    if (dst.in_box == false && (target = cp_target(&dst, &src, &top, &owner)) < 0)
+        lc_kernel_exit(failure_status);
+    /* into it: what is copied is the host's, and there before anything */
+    int32_t source = -1;
+    if (!src.in_box && (source = cp_source_dir(&src)) < 0)
+        lc_kernel_exit(failure_status);
+
+    /* the archive; where the copy goes, from the box's side of a copy into
+     * it; and from the host's side, whether it was what failed first */
+    int32_t data[2], answer[2], verdict[2];
+    if (lc_kernel_create_pipe(data, O_CLOEXEC) < 0 || lc_kernel_create_pipe(answer, O_CLOEXEC) < 0 ||
+        lc_kernel_create_pipe(verdict, O_CLOEXEC) < 0)
+        die("Error: cp cannot make its pipes");
+    /* a reader that ends early ends the writing with EPIPE, not the command */
+    uint64_t pipe_signal = sigmask_from_signal(LB_SIGPIPE);
+    lc_kernel_set_signal_mask(LC_SIG_BLOCK, &pipe_signal, NULL);
+
+    static char cg[MAX_PATH];
+    exec_cgroup_make(name, cg);
+    exec_via = "cp";
+    const char *words[] = { "cp", args[0], args[1], NULL };
+    struct exec_request req = { .argv = words };
+    if (!exec_audit_start(name, &config, cg, &req, monotonic_ms())) {
+        exec_cgroup_end(name, cg, true);
+        lc_kernel_exit(failure_status);
+    }
+
+    lc_sysret helper = lc_kernel_fork();
+    if (helper < 0) {
+        print_str(STDERR, "Error: cp cannot fork the process that goes into the box\n");
+        exec_cgroup_end(name, cg, true);
+        exec_audit_end(failure_status, false);
+        lc_kernel_exit(failure_status);
+    }
+    if (helper == 0) {
+        on_failure(NULL);
+        lc_kernel_close_file(answer[0]);
+        lc_kernel_close_file(verdict[1]);
+        /* nothing of the host's goes into the box but the pipes */
+        if (source >= 0)
+            lc_kernel_close_file(source);
+        if (target >= 0)
+            lc_kernel_close_file(target);
+        cp_join(cg, pid, config.userns);
+        if (src.in_box) {
+            /* out: the box's side writes */
+            lc_kernel_close_file(data[0]);
+            int32_t from = cp_source_dir(&src);
+            lc_kernel_exit(from < 0 ? failure_status : cp_write(data[1], from, &src, top, false));
+        }
+        /* in: the box's side settles where it goes, says it, and unpacks */
+        lc_kernel_close_file(data[1]);
+        struct lb_statx at;
+        int32_t into = cp_target(&dst, &src, &top, &at);
+        char said = into < 0 ? 'E' : top == src.name ? 'S' : 'D';
+        (void)lc_kernel_write_all(answer[1], &said, 1);
+        lc_kernel_close_file(answer[1]);
+        if (into < 0)
+            lc_kernel_exit(failure_status);
+        if (cp_read(data[0], into, false, 0, 0, false) == 0)
+            lc_kernel_exit(0);
+        /* the host's writer let go of first, then its word on what failed */
+        lc_kernel_close_file(data[0]);
+        char word = 0;
+        if (lc_kernel_read_retry(verdict[0], &word, 1) != 1 || word != 'W')
+            cp_say_read();
+        lc_kernel_exit(failure_status);
+    }
+
+    lc_kernel_close_file(answer[1]);
+    lc_kernel_close_file(verdict[0]);
+    int rc = 0;
+    if (src.in_box) {
+        lc_kernel_close_file(data[1]);
+        lc_kernel_close_file(answer[0]);
+        rc = cp_read(data[0], target, true, owner.stx_uid, owner.stx_gid, false);
+        lc_kernel_close_file(data[0]);
+        lc_kernel_close_file(target);
+    } else {
+        lc_kernel_close_file(data[0]);
+        char said = 'E';
+        if (lc_kernel_read_retry(answer[0], &said, 1) != 1)
+            said = 'E';
+        lc_kernel_close_file(answer[0]);
+        if (said != 'E')
+            rc = cp_write(data[1], source, &src, said == 'S' ? src.name : dst.name, !archive);
+        else
+            lc_kernel_close_file(source);
+        if (rc != 0 && !cp_pipe_broke)
+            (void)lc_kernel_write_all(verdict[1], "W", 1);
+        lc_kernel_close_file(data[1]);
+    }
+    lc_kernel_close_file(verdict[1]);
+    int32_t status = 0;
+    int helper_code = wait_child((int32_t)helper, &status) == 0 ? exit_code_from_status(status) : failure_status;
+    /* out of it: the host's reader says why where it failed first */
+    if (src.in_box && rc != 0 && (helper_code == 0 || helper_code == CP_PIPE_BROKE))
+        cp_say_read();
+    int code = rc != 0 || helper_code != 0 ? failure_status : 0;
+    /* nothing of a copy outlives it */
+    exec_cgroup_end(name, cg, true);
+    exec_audit_end(code, false);
+    if (code == 0) {
+        print_str(STDOUT, "Copied ");
+        print_str(STDOUT, args[0]);
+        print_str(STDOUT, " to ");
+        print_str(STDOUT, args[1]);
+        lc_print_char(STDOUT, '\n');
+    }
+    lc_kernel_exit(code);
+}
+
 /* ─── run ───────────────────────────────────────────────────────────────── */
 
 /*
@@ -6895,6 +7272,13 @@ static const struct { const char *name; const char *text; } command_help[] = {
         "                                 5m or 1.5h; exec then exits with 124\n"
         "         exec exits with the command's status, or 128 plus the signal that ended it; with\n"
         "         125 when lightbox failed, 126 when the command could not be run, 127 when not found\n" },
+    { "cp",
+        "  cp     [-a] <host path> <box>:<path>  Copy a file, a link or a directory into a running box,\n"
+        "  cp     [-a] <box>:<path> <host path>  or out of one: into <path> where it is a directory, and\n"
+        "                                else as <path>; <dir>/. copies what is in <dir>. What goes in\n"
+        "                                is the box's root's, with -a its owners'; what comes out is\n"
+        "                                the owner's of the directory it goes into. No setuid or setgid\n"
+        "                                bit and no device either way\n" },
     { "run",
         "  run    [create options] [exec options] [--] [cmd [args...]]\n"
         "                                Create a box, start it, run a command in it as exec runs it,\n"
@@ -7082,6 +7466,7 @@ int main(int argc, char **argv, char **envp) {
     else if (streq(cmd, "rm-vol")) cmd_rm_vol(sub_argc, sub_argv);
     else if (streq(cmd, "rm"))     cmd_rm(sub_argc, sub_argv);
     else if (streq(cmd, "exec"))   cmd_exec(sub_argc, sub_argv);
+    else if (streq(cmd, "cp"))     cmd_cp(sub_argc, sub_argv);
     else if (streq(cmd, "run"))    cmd_run(sub_argc, sub_argv);
     else if (streq(cmd, "logs"))   cmd_logs(sub_argc, sub_argv);
     else if (streq(cmd, "inspect")) cmd_inspect(sub_argc, sub_argv);

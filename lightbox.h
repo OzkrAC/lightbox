@@ -630,6 +630,13 @@ typedef struct {
     /* The tree is an overlay's upper directory: what it marks as taken out
      * of its base is written as an image marks it. */
     bool        overlay;
+    /* For lightbox cp (ROADMAP C.1): names are taken as they are, one that
+     * begins with .wh. too, which nothing reads as a mark then; every owner
+     * is written as 0 with owners_root; and no setuid or setgid bit with
+     * no_setid. */
+    bool        plain;
+    bool        owners_root;
+    bool        no_setid;
 
     uint64_t    entries;            /* written */
     uint64_t    sockets;            /* left out: a socket is of a process that is gone */
@@ -641,6 +648,9 @@ typedef struct {
 /* The tree under a directory, which is not an entry itself, and the
  * archive's end: 0, or -1 with failure and failed_at set. */
 [[nodiscard]] int tar_write_tree(tar_writer *w, int32_t dirfd);
+/* One entry of a directory, name, and what is in it where it is one, at the
+ * archive's top as as, and the archive's end: what lightbox cp sends. */
+[[nodiscard]] int tar_write_one(tar_writer *w, int32_t dirfd, const char *name, const char *as);
 
 /* Where an archive's bytes come from, in order: how many were put at data,
  * at most len, 0 at the archive's end, or less than 0 to end the reading.
@@ -653,6 +663,7 @@ typedef enum {
     TAR_INTO_TREE,              /* one tree for all layers: a mark takes out what it names */
     TAR_INTO_UPPER,             /* an overlay's upper directory: a mark becomes the overlay's own */
     TAR_INTO_UPPER_USERXATTR,   /* the same, for an overlay mounted with userxattr */
+    TAR_INTO_COPY,              /* lightbox cp (ROADMAP C.1): a name is a name, and no mark */
 } tar_into;
 
 /*
@@ -673,6 +684,13 @@ typedef struct {
     uint32_t    uid_start;
     uint32_t    gid_start;
     tar_into    into;
+    /* For lightbox cp (ROADMAP C.1): no setuid or setgid bit is made with
+     * no_setid; and with owner_given every entry is owner_uid's and
+     * owner_gid's, whatever the archive says. */
+    bool        no_setid;
+    bool        owner_given;
+    uint32_t    owner_uid;
+    uint32_t    owner_gid;
 
     uint64_t    entries;            /* made, or taken out by a mark */
     uint64_t    devices;            /* not made: a container's devices are lightbox's to give */

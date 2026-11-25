@@ -479,6 +479,12 @@ Commands:
                                  5m or 1.5h; exec then exits with 124
          exec exits with the command's status, or 128 plus the signal that ended it; with
          125 when lightbox failed, 126 when the command could not be run, 127 when not found
+  cp     [-a] <host path> <box>:<path>  Copy a file, a link or a directory into a running box,
+  cp     [-a] <box>:<path> <host path>  or out of one: into <path> where it is a directory, and
+                                else as <path>; <dir>/. copies what is in <dir>. What goes in
+                                is the box's root's, with -a its owners'; what comes out is
+                                the owner's of the directory it goes into. No setuid or setgid
+                                bit and no device either way
   run    [create options] [exec options] [--] [cmd [args...]]
                                 Create a box, start it, run a command in it as exec runs it,
                                 and remove it; run exits as exec does. A box whose run was

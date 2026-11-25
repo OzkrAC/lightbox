@@ -344,6 +344,21 @@ End the command, and all it started, after this long.
 then exits with 124.
 .RE
 .TP
+.BR cp " [" \-a "] \fIhost-path box\fB:\fIpath\fR, " cp " [" \-a "] \fIbox\fB:\fIpath host-path\fR"
+Copy a file, a link or a directory into a running box, or out of one,
+through the box's own root, where no link of the box's leads out of it.
+Where the destination is a directory the source goes into it under its own name,
+and otherwise it is the destination;
+.IB dir /.
+copies what is in
+.IR dir .
+What goes in is owned by the box's root, and with
+.B \-a
+by the owners it has;
+what comes out is owned by the owner of the directory it goes into.
+No setuid or setgid bit and no device is made either way.
+Each copy is two lines in the audit log.
+.TP
 .BR run " [\fIcreate options\fR] [\fIexec options\fR] [" \-\- "] [\fIcommand\fR [\fIarguments\fR]]"
 Create a box, start it, run a command in it as
 .B exec

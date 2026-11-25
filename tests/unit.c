@@ -114,6 +114,12 @@
  *                                             "entries <n>", "sockets <n>", "attributes-left <n>",
  *                                             "bytes <n>" and "sha256 <digest>" of the archive;
  *                                             or "failed: <entry>: <why>" and status 1
+ *   unit tar-one <dir> <name> <as> <archive> [plain] [root] [nosetid]
+ *                                             tar_write_one of <name> in <dir>, as <as>, with
+ *                                             lightbox cp's options: "entries <n>", or "failed: ..."
+ *   unit untar-copy <archive> <dir> [nosetid] [owner <uid> <gid>]
+ *                                             tar_read_tree into <dir> as lightbox cp unpacks:
+ *                                             "entries <n>" and "devices <n>", or "failed: ..."
  *   unit untar <archive> <dir> [tree|upper|upper-user [<uid_start> <gid_start> [<piece>]]]
  *                                             tar_read_tree of the file <archive> into <dir>: as
  *                                             one tree, or as an overlay's upper directory, root's
@@ -1955,6 +1961,75 @@ int main(int argc, char **argv, char **envp) {
         again[0] = argv[0], again[1] = "untar", again[2] = argv[3], again[3] = argv[4], again[4] = NULL;
         argv = again;
         argc = 4;
+    }
+    if (argc >= 6 && streq(argv[1], "tar-one")) {
+        static tar_writer w;
+        static struct unit_tar_sink to;
+        for (int i = 6; i < argc; i++) {
+            if (streq(argv[i], "plain"))
+                w.plain = true;
+            else if (streq(argv[i], "root"))
+                w.owners_root = true;
+            else if (streq(argv[i], "nosetid"))
+                w.no_setid = true;
+            else
+                die("usage: unit tar-one <dir> <name> <as> <archive> [plain] [root] [nosetid]");
+        }
+        lc_sysret dirfd = lc_kernel_open_file(argv[2], O_RDONLY | O_DIRECTORY, 0);
+        lc_sysret out = lc_kernel_open_file(argv[5], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (dirfd < 0 || out < 0)
+            die("unit: cannot open the directory or the archive");
+        to.fd = (int32_t)out;
+        sha256_init(&to.hash);
+        w.sink = unit_tar_write;
+        w.to = &to;
+        if (tar_write_one(&w, (int32_t)dirfd, argv[3], argv[4]) != 0) {
+            put("failed: ");
+            put(w.failed_at);
+            put(": ");
+            put(w.failure ? w.failure : "(no reason given)");
+            put("\n");
+            return 1;
+        }
+        put("entries ");
+        put_int64((int64_t)w.entries);
+        return 0;
+    }
+    if (argc >= 4 && streq(argv[1], "untar-copy")) {
+        static tar_reader r;
+        static struct unit_tar_source source;
+        r.into = TAR_INTO_COPY;
+        for (int i = 4; i < argc; i++) {
+            if (streq(argv[i], "nosetid"))
+                r.no_setid = true;
+            else if (streq(argv[i], "owner") && i + 2 < argc && parse_u32_text(argv[i + 1], &r.owner_uid) &&
+                     parse_u32_text(argv[i + 2], &r.owner_gid)) {
+                r.owner_given = true;
+                i += 2;
+            } else
+                die("usage: unit untar-copy <archive> <dir> [nosetid] [owner <uid> <gid>]");
+        }
+        lc_sysret in = lc_kernel_open_file(argv[2], O_RDONLY, 0);
+        lc_sysret dirfd = lc_kernel_open_file(argv[3], O_RDONLY | O_DIRECTORY, 0);
+        if (in < 0 || dirfd < 0)
+            die("unit: cannot open the archive or the directory");
+        source.fd = (int32_t)in;
+        r.source = unit_tar_read;
+        r.from = &source;
+        r.source_fd = (int32_t)in;
+        if (tar_read_tree(&r, (int32_t)dirfd) != 0) {
+            put("failed: ");
+            put(r.failed_at);
+            put(": ");
+            put(r.failure ? r.failure : "(no reason given)");
+            put("\n");
+            return 1;
+        }
+        put("entries ");
+        put_int64((int64_t)r.entries);
+        put("devices ");
+        put_int64((int64_t)r.devices);
+        return 0;
     }
     if (argc >= 4 && argc <= 8 && streq(argv[1], "untar")) {
         static tar_reader r;

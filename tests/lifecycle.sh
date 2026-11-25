@@ -2516,6 +2516,58 @@ t_gpu_none() {
     [ "$(state_of nogpu)" = stopped ] && [ ! -d "$CG/nogpu" ] && nothing_left nogpu
 }
 
+# lightbox cp (ROADMAP C.1) of a running box. Into it: a file into a
+# directory under its own name, and as a name of its own, the box's root's,
+# and with -a its owner's; a tree, its link a link, and no setuid bit; what
+# is in a directory, with <dir>/., into a directory that is made. Out of it,
+# into a directory of the host's: the directory's owner's, its link a link.
+# A link in the box that names a host path leads nowhere out of the box: a
+# copy onto it replaces it in the box, and one of it is a link. A box that
+# does not run is refused.
+t_cp() {
+    local d=$T/cpsrc o=$T/cpout said
+    mkdir -p "$d/tree/sub" "$o" && echo one > "$d/file" && chmod 640 "$d/file" && chown 1000:1000 "$d/file" &&
+        echo two > "$d/tree/sub/x" && ln -s /etc/passwd "$d/tree/link" && echo s > "$d/tree/setuid" &&
+        chmod 4755 "$d/tree/setuid" && echo host > "$T/victim" || return 1
+    up cpbox || return 1
+    # what the copies go into, on every root the suite runs on
+    sh_in cpbox 'mkdir -p /tmp /opt /srv' || return 1
+    lb cp "$d/file" cpbox:/tmp >/dev/null || return 1
+    said=$(sh_in cpbox 'cat /tmp/file; stat -c "%a %u:%g" /tmp/file')
+    echo "into /tmp: $(printf '%s\n' "$said" | paste -sd' ')"
+    [ "$said" = "one
+640 0:0" ] || { echo "the file is not the box root's, as it was"; return 1; }
+    lb cp -a "$d/file" cpbox:/tmp/named >/dev/null || return 1
+    [ "$(sh_in cpbox 'stat -c "%u:%g" /tmp/named; cat /tmp/named' | paste -sd' ')" = '1000:1000 one' ] ||
+        { echo "-a did not keep the owner, or the name"; return 1; }
+    lb cp "$d/tree" cpbox:/opt >/dev/null || return 1
+    said=$(sh_in cpbox 'cat /opt/tree/sub/x; readlink /opt/tree/link; stat -c %a /opt/tree/setuid' | paste -sd' ')
+    echo "a tree: $said"
+    [ "$said" = 'two /etc/passwd 755' ] || { echo "the tree is not what it was, or kept its setuid bit"; return 1; }
+    lb cp "$d/tree/." cpbox:/srv/contents >/dev/null || return 1
+    [ "$(sh_in cpbox 'cat /srv/contents/sub/x')" = two ] || { echo "<dir>/. did not copy what is in it"; return 1; }
+    # out, into a directory of the host's that is 1234's
+    chown 1234:1234 "$o" || return 1
+    lb cp cpbox:/opt/tree "$o" >/dev/null || return 1
+    said=$(stat -c '%u:%g' "$o/tree" "$o/tree/sub/x" "$o/tree/setuid" | sort -u | paste -sd' ')
+    echo "out: $said, $(cat "$o/tree/sub/x"), link $(readlink "$o/tree/link")"
+    [ "$said" = 1234:1234 ] && [ "$(cat "$o/tree/sub/x")" = two ] && [ -L "$o/tree/link" ] ||
+        { echo "what came out is not the directory owner's, or not what it was"; return 1; }
+    # links of the box's that name host paths
+    sh_in cpbox "ln -s '$T/victim' /tmp/escape && ln -s '$T' /tmp/hostdir && ln -s /etc /tmp/shadow" || return 1
+    lb cp "$d/file" cpbox:/tmp/escape >/dev/null && lb cp "$d/file" cpbox:/tmp/hostdir >/dev/null || return 1
+    [ "$(cat "$T/victim")" = host ] && [ ! -e "$T/file" ] || { echo "a copy into the box wrote on the host"; return 1; }
+    [ "$(sh_in cpbox 'cat /tmp/escape /tmp/hostdir' | paste -sd' ')" = 'one one' ] ||
+        { echo "the copies are not in the box, in the place of its links"; return 1; }
+    lb cp cpbox:/tmp/shadow "$o" >/dev/null || return 1
+    [ -L "$o/shadow" ] && [ "$(readlink "$o/shadow")" = /etc ] || { echo "a link of the box's came out as what it names"; return 1; }
+    # a box that does not run
+    lb stop cpbox >/dev/null || return 1
+    said=$(lb cp "$d/file" cpbox:/tmp 2>&1) && { echo "a copy into a stopped box succeeded"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *"this one is not running: cpbox"*) ;; *) return 1 ;; esac
+}
+
 # ─── Cases: the init hook, starting and stopping ────────────────────────────
 
 t_hook_runs() {
@@ -5103,6 +5155,7 @@ if [ "$MODE" = inside ]; then
     check "create --device: a node of the host's opens in the container as it is given, and its numbers are read at each start" t_device
     check "a device that only its group may open: its group is in a box's gid map, held by root and by another user" t_device_group
     check '--gpu on a host without a GPU: the start says so, and leaves nothing' t_gpu_none
+    check 'cp copies into a running box and out of it, through the box'"'"'s own root' t_cp
 
     check 'the init hook runs with /tmp and /run mounted'                 t_hook_runs
     check 'a service the hook starts outlives the start command'          t_service_outlives_start

@@ -3867,6 +3867,44 @@ check "an overlay's marks are written the way an image has them" t_tar_overlay
 check "ids are written less the start of a container's range, and none from outside it" t_tar_ids
 check 'what an archive cannot hold ends the writing, with the entry named' t_tar_refusals
 
+# What lightbox cp sends and makes (ROADMAP C.1), as root of a user namespace
+# with ids: one entry of a directory under another name at the archive's top;
+# a name that begins with .wh. taken as a name, which an image would read as
+# a mark; no setuid bit made; every entry the owner's that is given, or root's
+# where the archive says nothing else; a link made as a link and not followed,
+# and a link in the way of the copy replaced and not written through.
+t_tar_copy() {
+    in_namespace_with_ids '
+        mkdir -p "$D/src/d/sub" "$D/out1" "$D/out2" "$D/out3" "$D/elsewhere" || exit 1
+        echo a > "$D/src/d/file" && chmod 4755 "$D/src/d/file" && chown 5:6 "$D/src/d/file" &&
+            echo b > "$D/src/d/sub/x" && ln -s /etc/passwd "$D/src/d/link" && echo w > "$D/src/d/.wh.kept" &&
+            echo s > "$D/src/single" && chown 9:9 "$D/src/single" && chmod 2755 "$D/src/single" || exit 1
+        out=$("$UNIT" tar-one "$D/src" d renamed "$D/a1" plain); echo "a tree as renamed: $out"
+        [ "$out" = "entries 6" ] || exit 1
+        out=$("$UNIT" untar-copy "$D/a1" "$D/out1" nosetid owner 7 8); echo "unpacked: $out"
+        [ "$out" = "entries 6
+devices 0" ] || exit 1
+        got=$(stat -c "%n %a %u:%g" "$D/out1/renamed" "$D/out1/renamed/file" "$D/out1/renamed/.wh.kept" | sed "s#$D/##" | paste -sd"|")
+        echo "$got"
+        [ "$got" = "out1/renamed 755 7:8|out1/renamed/file 755 7:8|out1/renamed/.wh.kept 644 7:8" ] || exit 1
+        [ -L "$D/out1/renamed/link" ] && [ "$(readlink "$D/out1/renamed/link")" = /etc/passwd ] &&
+            [ "$(cat "$D/out1/renamed/sub/x")" = b ] || { echo "the link or the file below is not what it was"; exit 1; }
+        # a file of its own, every owner root and no set-id bit in the archive
+        out=$("$UNIT" tar-one "$D/src" single one "$D/a2" plain root nosetid) && [ "$out" = "entries 1" ] || exit 1
+        "$UNIT" untar-copy "$D/a2" "$D/out2" >/dev/null || exit 1
+        got=$(stat -c "%a %u:%g" "$D/out2/one"); echo "one: $got, $(cat "$D/out2/one")"
+        [ "$got" = "755 0:0" ] && [ "$(cat "$D/out2/one")" = s ] || exit 1
+        # without plain a .wh. name is refused, as an image would take it for a mark
+        out=$("$UNIT" tar-one "$D/src" d renamed "$D/a3") && { echo "a .wh. name was written as an image writes"; exit 1; }
+        case $out in *".wh."*) ;; *) echo "$out"; exit 1 ;; esac
+        # a link where the copy goes: taken away, and nothing made where it led
+        ln -s "$D/elsewhere" "$D/out3/renamed" || exit 1
+        "$UNIT" untar-copy "$D/a1" "$D/out3" nosetid >/dev/null || exit 1
+        [ -d "$D/out3/renamed" ] && [ ! -L "$D/out3/renamed" ] && [ -z "$(ls -A "$D/elsewhere")" ] ||
+            { echo "the link in the way was written through: $(ls -A "$D/elsewhere")"; exit 1; }'
+}
+check 'what lightbox cp sends and makes: one entry renamed, names as names, no set-id bit, owners given' t_tar_copy
+
 # I.3: an archive unpacked into a directory, by a process whose root that
 # directory is. The cases run as the root of a user namespace, as I.2's do:
 # only a root makes a directory its root and gives files to other ids.

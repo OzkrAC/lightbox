@@ -1713,6 +1713,29 @@ assert d == want, d
     return $bad
 }
 
+# lightbox cp (ROADMAP C.1): what it refuses before anything, which an
+# ordinary user is told too, and root then.
+t_cp_arguments() {
+    local bad=0 said
+    no() { # what it says, cp's words
+        local want=$1
+        shift
+        said=$(lb cp "$@" 2>&1) && { echo "cp $*: succeeded"; bad=1; return; }
+        case $said in *"$want"*) ;; *) echo "cp $*: $said"; bad=1 ;; esac
+    }
+    no 'Usage: lightbox cp [-a] <host path> <box>:<path>'
+    no 'Usage: lightbox cp [-a] <host path> <box>:<path>' /etc/hostname
+    no 'Error: unexpected argument: three' /a web:/b three
+    no 'Error: unknown option: -x' -x /a web:/b
+    no 'one of the two is <box>:<path>' /a /b
+    no 'one of the two is <box>:<path>' web:/a web:/b
+    no 'one of the two is <box>:<path>' web:relative /b
+    no 'or <dir>/. for what is in it, not: /a/..' /a/.. web:/b
+    no 'lightbox cp must be run as root' /etc/hostname web:/tmp
+    no 'lightbox cp must be run as root' -a web:/etc/hostname "$W"
+    return $bad
+}
+
 # A carriage return at the end of a line is no part of the value, as a file
 # written on Windows has it, and neither is a # after a space: the rest of
 # the line is a comment. A # with no space before it is part of the value.
@@ -2518,6 +2541,7 @@ check 'ls lists only directories with a container name'       t_ls_lists_only_co
 check 'inspect shows volumes, links and the log'                       t_inspect_shows_volumes_and_links
 check 'inspect --json is one JSON object, typed, or nothing'             t_inspect_json
 check 'create --device keeps a character device of the host'"'"'s, and refuses what gives the host away' t_create_device
+check 'cp refuses what it cannot copy, before it asks for root'      t_cp_arguments
 check 'configuration: carriage returns are stripped'                   t_config_strips_carriage_returns
 check 'configuration: inline comments are stripped'                    t_config_strips_inline_comments
 check 'configuration: unknown keys and lines that are no setting are said, with the line' t_config_reports_unknown_keys
