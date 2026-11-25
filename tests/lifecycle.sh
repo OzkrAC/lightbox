@@ -1485,6 +1485,38 @@ t_monitor_clears_away() {
     echo "mon2: $(state_of mon2), mon3: $(state_of mon3), with no command run"
 }
 
+# The monitor goes into a cgroup of lightbox's own beside the containers',
+# lightbox.monitors in cgroup_base, before it clones init (ROADMAP M.1): out
+# of the cgroup of what ran start, a login session that logind ends at a
+# logout where it ends a user's processes, or a service that is stopped.
+# Here start runs from a cgroup of the case's own, which is then killed
+# whole and taken away: the monitor and init go on, and the monitor still
+# clears the box away within a second of init's kill -9, with no command run.
+t_monitor_outlives_its_caller() {
+    local caller=$CG/the-caller pid mon was began ms
+    quietly_cleared() { nothing_left "$1" >/dev/null 2>&1 && [ "$(state_of "$1")" = "$2" ]; }    # name, state
+    box monc && mkdir "$caller" || return 1
+    ( echo "$BASHPID" > "$caller/cgroup.procs" && exec timeout -k 5 60 "$LB" start monc ) >"$OUT/monc.start" 2>&1 </dev/null ||
+        { cat "$OUT/monc.start"; return 1; }
+    settled monc || return 1
+    pid=$(pid_of monc)
+    mon=$(monitor_of monc)
+    [ "$(cat "/proc/$mon/comm")" = lightbox-mon ] || { echo "the parent of init is $(cat "/proc/$mon/comm")"; return 1; }
+    was=$(sed -n 's/^0:://p' "/proc/$mon/cgroup")
+    echo "the monitor's cgroup: $was"
+    [ "$was" = "${CG#/sys/fs/cgroup}/lightbox.monitors" ] || { echo "the monitor is not in lightbox.monitors"; return 1; }
+    # the caller's cgroup, killed whole and taken away, as logind ends a session
+    kill_cgroup "$caller" || { echo "the cgroup of what ran start could not be taken away"; return 1; }
+    alive "$mon" && alive "$pid" || { echo "the monitor or init ended with the cgroup of what ran start"; return 1; }
+    began=$(date +%s%N)
+    kill -KILL "$pid"
+    wait_until 3 quietly_cleared monc failed || { nothing_left monc; echo "state: $(state_of monc)"; return 1; }
+    ms=$(( ($(date +%s%N) - began) / 1000000 ))
+    echo "cleared away $ms ms after init was killed, with the cgroup of what ran start gone"
+    [ "$ms" -lt 1000 ] || { echo "not within a second"; return 1; }
+    wait_until 5 gone "$mon" || { echo "the monitor did not end"; return 1; }
+}
+
 # A --ttl is kept from the host too (ROADMAP M.1): an init that something
 # stopped, here with SIGSTOP, does not end its container at the deadline,
 # and its monitor ends it from the host its grace and a margin later, 2 s,
@@ -5103,6 +5135,7 @@ if [ "$MODE" = inside ]; then
     check 'a container whose init died starts again'                      t_start_after_init_died
     check 'stop of a container whose init died clears it away, as failed' t_stop_of_a_dead_container_cleans_up
     check "a container's monitor clears away what it leaves within a second, with no command run" t_monitor_clears_away
+    check "a container's monitor is in a cgroup of lightbox's, and outlives the cgroup of what ran start" t_monitor_outlives_its_caller
     check 'a --ttl that init does not keep, as it was stopped, is kept by its monitor from the host' t_monitor_keeps_the_ttl
     check 'a container stopped from inside is exited, and cleared away by the next command' t_stopped_from_inside_is_exited
     check 'after a reboot containers are stopped, and start'              t_after_a_reboot

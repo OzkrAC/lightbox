@@ -160,6 +160,9 @@
  *                                             what the monitor wrote to record, whether it reaped
  *   unit monitor-ttl <record> <duration>      the same with that --ttl and no grace, and a child
  *                                             that never ends: what the monitor wrote, and when
+ *   unit monitor-cgroup <record> <dir>        the same with <dir> as the monitor's cgroup: what
+ *                                             init_spawn_monitored said, and how the monitor
+ *                                             ended, its status or "not the command's child"
  *   unit gpu <root>                           gpu_devices under root: "<host> -> <path>" a line
  *                                             each, or "more than <n>" with status 1
  *   unit nvidia <root>                        nvidia_libraries under root: "version <v>", then
@@ -1700,7 +1703,7 @@ int main(int argc, char **argv, char **envp) {
         struct child_args ca = { .null_fd = -1, .log_fd = -1, .exit_fd = -1, .starter_signals = -1, .name = argv[2],
                                  .config = &config, .stop_grace = 0 };
         int64_t began = boottime_ms();
-        const char *failed = init_spawn_monitored(&link, &ca, 0, unit_sleeper, unit_monitor_ended);
+        const char *failed = init_spawn_monitored(&link, &ca, 0, unit_sleeper, unit_monitor_ended, NULL);
         if (failed)
             die2("unit: ", failed);
         link.pid = -1;
@@ -1716,11 +1719,28 @@ int main(int argc, char **argv, char **envp) {
         put_line("after ms ", ms);
         return 0;
     }
+    if (argc == 4 && streq(argv[1], "monitor-cgroup")) {
+        /* a cgroup the monitor cannot go into: start is told, and no init is cloned */
+        struct init_link link = INIT_LINK_NONE;
+        struct child_args ca = { .null_fd = -1, .log_fd = -1, .exit_fd = -1, .starter_signals = -1, .name = argv[2] };
+        const char *failed = init_spawn_monitored(&link, &ca, 0, unit_sleeper, unit_monitor_ended, argv[3]);
+        put_line("said ", failed ? failed : "nothing: init was cloned");
+        int32_t status = 0;
+        lc_sysret waited = lc_kernel_wait_for_child(-1, &status, 0);
+        if (waited < 0) {
+            put("the monitor is not the command's child\n");
+        } else {
+            char digits[16];
+            fmt_int(digits, exit_code_from_status(status));
+            put_line("the monitor ended with status ", digits);
+        }
+        return failed ? 0 : 1;
+    }
     if (argc == 3 && streq(argv[1], "monitor")) {
         /* init_spawn_monitored with a child that waits to be killed */
         struct init_link link = INIT_LINK_NONE;
         struct child_args ca = { .null_fd = -1, .log_fd = -1, .exit_fd = -1, .starter_signals = -1, .name = argv[2] };
-        const char *failed = init_spawn_monitored(&link, &ca, 0, unit_sleeper, unit_monitor_ended);
+        const char *failed = init_spawn_monitored(&link, &ca, 0, unit_sleeper, unit_monitor_ended, NULL);
         if (failed)
             die2("unit: ", failed);
         int32_t status;

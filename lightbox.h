@@ -1197,6 +1197,9 @@ void ensure_host_network(const char *starting);
  * mounts it where a reboot took the mount (ROADMAP F.5), under the store's
  * lock; and refused as setup refuses it where that cannot be done. */
 void ensure_cgroup2_for_start(void);
+/* The cgroup of the containers' monitors in cgroup_base (ROADMAP M.1): a
+ * name with a dot, which no container's name has. */
+#define MONITOR_CGROUP "lightbox.monitors"
 /* What of it is not there, as "the bridge, the firewall rules", or NULL
  * when all of it is. The firewall is looked at only by root. */
 const char *host_network_missing(void);

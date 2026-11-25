@@ -2348,6 +2348,17 @@ void teardown_host(void) {
         lc_print_char(STDOUT, '\n');
     }
 
+    /* the monitors' cgroup in it (ROADMAP M.1). No container runs, but the
+     * monitor of one that was just stopped ends a moment after the stop, as
+     * it sees init's end: busy is waited out for up to 5 s, after which
+     * cgroup_base is said to be left, as before */
+    char monitors[MAX_PATH];
+    if (path_join(monitors, sizeof(monitors), cfg_global.cgroup_base, MONITOR_CGROUP)) {
+        for (int tries = 0; lc_kernel_unlinkat(AT_FDCWD, monitors, AT_REMOVEDIR) == -LB_EBUSY && tries < 500; tries++) {
+            lc_timespec moment = { .seconds = 0, .nanoseconds = 10000000 };
+            lc_kernel_sleep(&moment);
+        }
+    }
     /* cgroup_base, which start made; never the hierarchy itself */
     if (!streq(cfg_global.cgroup_base, cfg_global.cgroup_root) && path_exists(cfg_global.cgroup_base)) {
         if (lc_kernel_unlinkat(AT_FDCWD, cfg_global.cgroup_base, AT_REMOVEDIR) == 0) {

@@ -700,6 +700,50 @@ static void exec_cgroup_end(const char *name, const char *cg, bool limited) {
         each_cgroup_below(container_cg, 1, remove_exec_cgroup_left);
 }
 
+/*
+ * The cgroup of the containers' monitors (ROADMAP M.1), beside the
+ * containers' own in cgroup_base. A monitor that stayed in the cgroup of
+ * what ran start, a login session or a service, would be ended with it: by
+ * logind at a logout where it ends a user's processes, or by the service's
+ * stop, and its container would then be cleared away by the next command
+ * alone. Here it is out of their reach, and out of its container's limits,
+ * its device filter and the kill of its stop. The first start makes it, and
+ * it is kept as the monitors come and go; setup --teardown takes it away.
+ */
+static void monitor_cgroup_make(char cg[MAX_PATH]) {
+    if (!path_join(cg, MAX_PATH, cfg_global.cgroup_base, MONITOR_CGROUP))
+        die("Error: the path of the containers' monitors' cgroup is too long");
+    (void)lc_kernel_mkdirat(AT_FDCWD, cfg_global.cgroup_base, 0755);
+    lc_sysret rc = lc_kernel_mkdirat(AT_FDCWD, cg, 0755);
+    if (rc < 0 && rc != -LB_EEXIST) {
+        char digits[16];
+        fmt_int(digits, (int)-rc);
+        print_str(STDERR, "Error: cannot make the cgroup of the containers' monitors ");
+        print_str(STDERR, cg);
+        print_str(STDERR, " (errno ");
+        print_str(STDERR, digits);
+        print_str(STDERR, ")\n");
+        lc_kernel_exit(failure_status);
+    }
+}
+
+/* Move this process into a cgroup that is there: 0, or the negative errno.
+ * Nothing is made, as write_file would make it: a path that is no cgroup
+ * has no cgroup.procs to write to. */
+static lc_sysret cgroup_enter(const char *cg) {
+    char path[MAX_PATH], self[16];
+    if (!path_join(path, sizeof(path), cg, "cgroup.procs"))
+        return -LB_ENAMETOOLONG;
+    lc_sysret fd = lc_kernel_open_file(path, O_WRONLY | O_CLOEXEC, 0);
+    if (fd < 0)
+        return fd;
+    fmt_int(self, lc_kernel_get_process_id());
+    size_t len = lc_string_length(self);
+    lc_sysret n = lc_kernel_write_bytes((int32_t)fd, self, len);
+    lc_kernel_close_file((int32_t)fd);
+    return n == (lc_sysret)len ? 0 : n < 0 ? n : -LB_EIO;
+}
+
 /* Move this process into a cgroup, the one of its exec. */
 static void cgroup_join_self(const char *cg) {
     char pidbuf[16];
@@ -4106,9 +4150,20 @@ typedef void (*init_ended_fn)(const char *name, int32_t pid, const char *started
  * it ends it from the host; init ends the container at the deadline itself. */
 #define MONITOR_TTL_MARGIN_MS 3000
 
+/* What the monitor says in the place of init's pid where it could not go
+ * into its cgroup, followed by the errno. */
+#define MONITOR_NO_CGROUP 0
+
 [[noreturn]] static void monitor_main(struct child_args *ca, int flags, int (*fn)(void *), init_ended_fn ended,
-                                      int32_t pid_wr, int32_t control_rd, const int32_t ends[4]) {
+                                      const char *cgroup, int32_t pid_wr, int32_t control_rd, const int32_t ends[4]) {
     (void)lc_kernel_create_session();
+    /* out of the cgroup of what ran start, before init is cloned there */
+    lc_sysret entered = cgroup ? cgroup_enter(cgroup) : 0;
+    if (entered < 0) {
+        const int32_t said[2] = { MONITOR_NO_CGROUP, (int32_t)-entered };
+        (void)lc_kernel_write_all(pid_wr, said, sizeof(said));
+        lc_kernel_exit(failure_status);
+    }
     void *stack = lc_kernel_map_memory(NULL, CHILD_STACK_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     lc_sysret pid = stack == MAP_FAILED ? -LB_ENOMEM
                                         : lc_kernel_clone(flags | SIGCHLD, (char *)stack + CHILD_STACK_SIZE, fn, ca);
@@ -4240,9 +4295,10 @@ static void monitor_cleanup(const char *name, int32_t pid, const char *started, 
 }
 
 /* init_spawn with a monitor between the command and init: init is the
- * monitor's child, and link has its pidfd and the control pipe's end. */
+ * monitor's child, and link has its pidfd and the control pipe's end. The
+ * monitor goes into cgroup first, where one is given. */
 static const char *init_spawn_monitored(struct init_link *link, struct child_args *ca, int flags, int (*fn)(void *),
-                                        init_ended_fn ended) {
+                                        init_ended_fn ended, const char *cgroup) {
     int32_t go[2], report[2], pids[2], control[2];
     if (lc_kernel_create_pipe(go, O_CLOEXEC) < 0)
         return "failed to create the pipe to the container's init";
@@ -4270,7 +4326,7 @@ static const char *init_spawn_monitored(struct init_link *link, struct child_arg
         lc_kernel_close_file(pids[0]);
         lc_kernel_close_file(control[1]);
         const int32_t ends[4] = { go[0], go[1], report[0], report[1] };
-        monitor_main(ca, flags, fn, ended, pids[1], control[0], ends);
+        monitor_main(ca, flags, fn, ended, cgroup, pids[1], control[0], ends);
     }
     /* init's ends are init's and the monitor's */
     lc_kernel_close_file(go[0]);
@@ -4282,8 +4338,22 @@ static const char *init_spawn_monitored(struct init_link *link, struct child_arg
         lc_kernel_close_file(pids[0]);
         return "failed to fork the container's monitor";
     }
-    int32_t pid = -1;
+    int32_t pid = -1, err = 0;
     lc_sysret got = lc_kernel_read_retry(pids[0], &pid, sizeof(pid));
+    if (got == (lc_sysret)sizeof(pid) && pid == MONITOR_NO_CGROUP && cgroup &&
+        lc_kernel_read_retry(pids[0], &err, sizeof(err)) == (lc_sysret)sizeof(err)) {
+        lc_kernel_close_file(pids[0]);
+        static char failed[MAX_PATH + 96];
+        char digits[16];
+        fmt_int(digits, err);
+        bool cut = false;
+        size_t at = str_append(failed, 0, "the container's monitor cannot go into the cgroup ", sizeof(failed), &cut);
+        at = str_append(failed, at, cgroup, sizeof(failed), &cut);
+        at = str_append(failed, at, " (errno ", sizeof(failed), &cut);
+        at = str_append(failed, at, digits, sizeof(failed), &cut);
+        (void)str_append(failed, at, ")", sizeof(failed), &cut);
+        return failed;
+    }
     lc_kernel_close_file(pids[0]);
     if (got != (lc_sysret)sizeof(pid) || pid <= 0)
         return "clone failed";
@@ -5085,6 +5155,8 @@ static void start_one(const char *name, int hook_wait) {
      * a container of any network needs it, and so does what reconcile
      * clears away */
     ensure_cgroup2_for_start();
+    static char monitor_cg[MAX_PATH];
+    monitor_cgroup_make(monitor_cg);
     (void)reconcile(name);          /* an earlier run that ended without a stop */
     container_forget_pid(name);     /* and whatever else one left on record */
 
@@ -5432,7 +5504,7 @@ static void start_one(const char *name, int hook_wait) {
     int clone_flags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET |
                       (config.userns ? CLONE_NEWUSER : 0);
 
-    start_err = init_spawn_monitored(&init, &ca, clone_flags, container_child, monitor_cleanup);
+    start_err = init_spawn_monitored(&init, &ca, clone_flags, container_child, monitor_cleanup, monitor_cg);
     close_container_streams(&null_fd, &log_fd);     /* init has its own copies */
     close_volumes(userns_volumes, nuserns_volumes);
     lc_kernel_close_file(exit_fd);

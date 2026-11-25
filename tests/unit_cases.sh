@@ -5092,6 +5092,24 @@ reaped" ]
 }
 check 'a monitor is init'"'"'s parent, reaps it once the command is done, and holds nothing of the command'"'"'s' t_monitor
 
+# The monitor goes into a cgroup of lightbox's own before it clones init
+# (ROADMAP M.1). Given a directory that is no cgroup it says so to start,
+# with the errno, ends, and clones nothing; and it makes no cgroup.procs
+# there, as a write that made the file would have joined nothing and said
+# nothing.
+t_monitor_cgroup() {
+    local d said
+    d=$(mktemp -d "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    said=$(timeout -k 5 30 "$UNIT" monitor-cgroup "$d/record" "$d")
+    printf '%s\n' "$said"
+    [ "$said" = "said the container's monitor cannot go into the cgroup $d (errno 2)
+the monitor ended with status 1" ] && [ -z "$(ls -A "$d")" ]
+    local rc=$?
+    rmdir -- "$d"
+    return $rc
+}
+check 'a monitor that cannot go into its cgroup says so to start, clones nothing and makes no file' t_monitor_cgroup
+
 # The monitor keeps a --ttl from the host as well (ROADMAP M.1): a child that
 # never ends by itself, as an init that something stopped would not, is ended
 # by the monitor its grace and a margin of 3 s past the deadline, which here

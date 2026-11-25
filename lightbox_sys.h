@@ -118,6 +118,7 @@
 #define LB_ENOTDIR                20
 #define LB_EISDIR                 21
 #define LB_ERANGE                 34
+#define LB_ENAMETOOLONG           36
 #define LB_ENOTEMPTY              39
 #define LB_ELOOP                  40
 #define LB_ENODATA                61
