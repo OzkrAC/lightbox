@@ -26,15 +26,15 @@ The sandbox covers everything that runs in a container: its init, the `/init.sh`
 {.ref}
 | Defence | What a container has | Changed by | More |
 |---|---|---|---|
-| Namespaces | Its own PID, mount, UTS, IPC and network namespaces | nothing | [Threat model](#threat-model) |
+| Namespaces | Its own PID, mount, UTS, IPC, network and cgroup namespaces | nothing | [Threat model](#threat-model) |
 | User namespace | None: its root is the host's root. With `--userns`, an unprivileged uid of the host's | `--userns` | [User namespaces](#userns) |
 | Capabilities | 11, in every set that counts | `--privileged` | [Capabilities](#capabilities) |
 | Seccomp | The allow-list filter, which answers a system call it does not name with `ENOSYS` | `--seccomp deny`, `--privileged` | [Seccomp](#seccomp) |
 | `no_new_privs` | Set: no program gains rights when it is executed | `--privileged` | [no_new_privs](#no-new-privs) |
 | `/proc` and `/sys` | The paths that show or change the host are masked or read-only | `--privileged` | [/proc and /sys](#proc) |
 | Root filesystem | `nodev` and `nosuid`, and no file can be given a setuid or setgid bit or a file capability | `--read-only`, `--privileged` | [The root filesystem](#rootfs) |
-| Devices | The eight kinds of device of its own `/dev`, and no other | `--privileged` | [Devices](#devices) |
-| Network | The internet and its name servers; nothing of the host, of a private network or of another container | `--net`, `--link` | [Network](#network) |
+| Devices | The eight kinds of device of its own `/dev`, those that `--device` and `--gpu` give it, and no other | `--device`, `--gpu`, `--privileged` | [Devices](#devices) |
+| Network | The internet and its name servers; nothing of the host, of a private network or of another container; no port of the host's but those `-p` publishes | `--net`, `--link`, `-p` | [Network](#network) |
 | `exec` | A terminal of the container's, a sealed copy of the binary, a worker that the container cannot look into | nothing | [exec](#exec) |
 | Limits | 256M of memory, no swap, 128 processes, one CPU, and an OOM score of 500 | `--mem`, `--swap`, `--pids`, `--cpu`, `--io-max`, `--oom-score`, `--ttl` | [Limits](#limits) |
 
@@ -221,6 +221,12 @@ A container has a `/proc` of its own PID namespace, which shows its processes an
 - **`/proc/sys` is read-only,** so nothing in a container changes a kernel setting, the ones of its own network namespace included.
 - **A privileged container has none of the covers,** and sees `/proc` as it is.
 
+### Its cgroup {#cgroup-ns}
+
+A container has a cgroup namespace of its own, since 0.11, whose root is its own cgroup. `/proc/self/cgroup` says `0::/`, and a command of `exec`, in the exec's cgroup below, `0::/exec-<numbers>`, where it said the host's path, such as `0::/lightbox/web`. `/sys/fs/cgroup` is that cgroup and what is below it, read-only: a program reads its limits and its use there, and changes none of them. A privileged container has it read-write, as Docker gives it.
+
+There is no time namespace. A process in one reads the offsets of its clocks from `/proc/self/timens_offsets`, which anyone may read, so it would hide nothing of the host's uptime.
+
 ## The root filesystem {#rootfs}
 
 What init mounts for a container, and how:
@@ -278,7 +284,19 @@ What holds a container to the table is not the content of `/dev` but a program i
 
 A container that is not privileged does not start without the program. `start` says that the kernel did not load it, and [`doctor`](troubleshooting.html#checks) has a check, `device_filter`, that loads it and lets it go, with its fix: a kernel with `CONFIG_CGROUP_BPF` and `CONFIG_BPF_SYSCALL`.
 
-A program that needs another device, a disk, `/dev/fuse`, `/dev/kvm`, `/dev/net/tun` or a GPU, does not find it in a container. A privileged container has no device program and holds `CAP_MKNOD`, so it opens any device it has a node of in its `/dev` or makes one there: give that only to what you trust with the host's devices.
+### A device of the host's {#devices-given}
+
+[`--device`](commands.html#create-devices) gives a container a character device of the host's, and [`--gpu`](commands.html#create-devices) the host's GPUs as devices of that kind. Each is one more row of the device program, by its numbers, which `start` reads again each time, as the kernel may give a node others after a boot. With `:ro` the program refuses a write, whatever a mount says.
+
+- **What is never given.** A block device, and a device that gives the host away: its memory and I/O ports, the kernel's log, its consoles and what they show, its input devices and `uinput`, the watchdog, and a CPU's model-specific registers and `cpuid`. Nor a node on a mount of the host's with `nodev`, which is not lifted for a container. `create` refuses each, and so does a `start` that finds a node gone or changed into one of them, before anything of the container is made.
+- **The node is taken as host root.** `start` takes a clone of the node's mount, which a container of `--userns` could not reach by its path, and init puts that very mount in place.
+- **A node of a group, in a container of `--userns`.** Ubuntu's render node is mode 0660, of the group `render`. The node's host group, and no other id of the host's, is one more line of the container's gid map, at gid 65536, which init, what it starts and every command of `exec` hold, whoever they run as. A node that only its owner may open, or of the host's group 0, is refused for such a container, as none stands for host root.
+- **An agent's box** is given a GPU's compute nodes alone: render nodes, NVIDIA's but `nvidia-modeset`, and AMD's `/dev/kfd`. A card node, a display's, is given to no container by `--gpu`.
+- **NVIDIA's libraries are the host's, read-only,** at `/run/lightbox/gpu/lib`: those of the loaded module's version, found by a list of their names. Nothing of NVIDIA's container toolkit runs, and no program of the image is run to find them.
+
+A GPU in a container is the host's GPU. Its driver is a large part of the kernel that the container now reaches, and memory on the GPU is not limited by the container's cgroup. Give one to a container that needs it.
+
+A program that needs another device, a disk, `/dev/fuse`, `/dev/kvm` or `/dev/net/tun`, does not find it unless `--device` gives it. A privileged container has no device program and holds `CAP_MKNOD`, so it opens any device it has a node of in its `/dev` or makes one there: give that only to what you trust with the host's devices.
 
 ## Network {#network}
 
@@ -288,6 +306,7 @@ What a container may reach is decided on the host, by firewall rules and a bridg
 - **Containers do not reach each other.** A container without `--link` is on an isolated port of the bridge, and an isolated port does not reach another, whatever the firewall does. One with `--link` is kept to its links by rules that name the two ports of each (see [Links](networking.html#links)).
 - **The rules hold a container by its address,** which nothing in a container that is not privileged can change, as it has no `CAP_NET_ADMIN`. A privileged container can.
 - **IPv6 is off** in every container, so no rule is missing for it (see [IPv6](networking.html#ipv6)).
+- **A port of the host's reaches a container only where `-p` publishes it,** on `127.0.0.1` unless another address is given. No rule is made for it, so the host's own firewall says who connects, and `route_localnet` stays off. A relay of the container's connects on the container's loopback: it runs as nobody, with no capability and a seccomp filter of the calls it makes, in the container's network namespace and in a cgroup below the container's. A relay that something made do otherwise reaches what the container reaches, and no more (see [Published ports](networking.html#ports)).
 - **The rules are lightbox's firewall rules.** With `firewall = false` in `lightbox.conf` there are none, and `create` refuses `--net outside` and `--net proxy`, which would mean nothing without them.
 - **The filter keeps sockets to the families a container uses** (see [What both refuse](#seccomp-both)), and without `CAP_NET_RAW` there is no raw socket.
 
@@ -354,6 +373,19 @@ The kernel is still the host's, and a container still makes the system calls its
 - **The command's user is looked up inside.** `--user <name>` is read from the container's `/etc/passwd` and `/etc/group` once the worker's root is the container's root, where no path in them leads out.
 - **Every `exec` runs in a cgroup of its own** below the container's, so the container's limits and its device program hold for it. Nothing in a container can reach cgroupfs to leave it, and `--timeout` ends everything in it at once (see [The cgroup of an exec](commands.html#exec-cgroup)).
 - **Every `exec` is on record** in the audit log of the host, which no container has mounted (see [The audit log](commands.html#audit-log)).
+
+## cp {#cp}
+
+Copying between a host and a container as root is where container runtimes have had their flaws: a root that follows a link of a container's path on the host writes the host's files. [`cp`](commands.html#cp) looks nothing of the container's up on the host.
+
+- **The container's side is a process in the container.** It joins the container as `exec` does, its cgroup, cgroup namespace, user namespace as its root, and mount namespace, and takes the container's root as its own, so that a link of the container's leads nowhere but into it. It is not dumpable, and nothing of the host's but the pipes goes in with it.
+- **The tree goes as a tar archive,** which lightbox's own reader unpacks in a process of its own whose root is the directory it unpacks into, under the seccomp filter of an import (see [What an import trusts](#import)). A link is made as a link and never followed, and one in the way of the copy is taken away first.
+- **No setuid or setgid bit, and no device,** either way. What goes in is the container's root's, with `-a` the owners it has; what comes out is the owner's of the directory it goes into.
+- **On record.** Each copy is two lines in the audit log, with `cp` for its `via`.
+
+## The monitor {#monitor}
+
+Every container has a monitor on the host, `lightbox-mon`, which `start` forks and which clones init, so that the kernel tells it how init ended ([How it works](internals.html#monitor)). It holds nothing of `start`'s but the container's log: no lock, no terminal, no descriptor of the command that ran it. It is a session of its own and not dumpable, so no process of the container can trace it, and it is in a cgroup of lightbox's own, `lightbox.monitors`, beside the containers' and outside their limits. It keeps a `--ttl` from the host as well: where init has not ended its container its grace and 3 s past the deadline, the monitor ends it.
 
 ## Limits {#limits}
 
@@ -429,14 +461,14 @@ What an import does not do:
 
 lightbox keeps what runs in a container away from the host and from the other containers, as far as the kernel's namespaces, the sandbox and the firewall can:
 
-- **The host from a container's processes.** Their own PID, mount, UTS, IPC and network namespaces, and with `--userns` a user namespace in which root is an unprivileged uid of the host's; 11 capabilities and a seccomp filter, with `no_new_privs`; the paths of `/proc` and `/sys` that reach the host masked or read-only; a root filesystem that is `nodev` and `nosuid`, and a device program that lets them open the devices of the container's `/dev` and no other; and limits on memory, swap, processes, CPU and, with `--io-max`, I/O.
+- **The host from a container's processes.** Their own PID, mount, UTS, IPC, network and cgroup namespaces, and with `--userns` a user namespace in which root is an unprivileged uid of the host's; 11 capabilities and a seccomp filter, with `no_new_privs`; the paths of `/proc` and `/sys` that reach the host masked or read-only; a root filesystem that is `nodev` and `nosuid`, and a device program that lets them open the devices of the container's `/dev`, and those `--device` and `--gpu` give it, and no other; and limits on memory, swap, processes, CPU and, with `--io-max`, I/O.
 - **The host from what a container leaves in a volume.** Nothing in a container that is not privileged gives a file the setuid or the setgid bit or a file capability, so no program it leaves in a volume, or in its own files, runs on the host with the rights of its owner, of the volume's owner or of root.
 - **Containers from each other.** Each is on an isolated port of the bridge, and with `--link` is kept to its links by firewall rules that lightbox owns and takes away with the container. Each has its own PID and IPC namespace and its own files: containers of one base share a snapshot that none of them writes to.
 - **The host, its networks and the clouds' metadata from a container's traffic.** With `--net outside`, the default, a container reaches the internet and its name servers and nothing of the host's, of a private network or of the metadata services; with `--net proxy:<port>`, its proxy's port and nothing else; with `--net none`, nothing.
 - **The host's terminal and the installed binary from a container.** `exec` gives a command a terminal of the container's, not yours, and enters from a sealed copy of itself.
-- **The record from the container.** What `exec` and `run` asked of a container is in the audit log of the host, mode 0600 in a directory that no container has mounted.
+- **The record from the container.** What `exec`, `run` and `cp` asked of a container is in the audit log of the host, mode 0600 in a directory that no container has mounted.
 
-A container has no cgroup namespace and no time namespace of its own: it sees the path of its cgroup on the host and the host's clocks. It can change neither.
+A container has no time namespace of its own: it sees the host's clocks, and can change none of them ([Its cgroup](#cgroup-ns) says why).
 
 ## What it does not keep out {#not-covered}
 
@@ -446,7 +478,8 @@ A container has no cgroup namespace and no time namespace of its own: it sees th
 - **With `--net nat` the host itself is in reach,** as it was for every container before 0.8, and still is for a container created then: services of the host that listen on the bridge's address, or on all addresses, answer such a container, and so do the host's networks. Give a container `--net outside`, the default, unless it needs them, or keep the services to the addresses they are for.
 - **What a container writes in a volume comes back untrusted.** A file there cannot be setuid, but it can be a script, a Makefile, a git hook or a configuration that names a command, and it runs with your rights when you run it. Read what changed before anything on the host builds, opens or runs it, and mount `:ro` what a container only has to read.
 - **Disk is not limited.** A container's files, its `console.log`, which is not rotated, the audit log, and what an image unpacks to take what the disk has. Keep `lightbox_dir` and `container_dir` on a filesystem of their own if a full disk there must not be a full disk for the host.
-- **A lifetime is kept inside the container.** `--ttl` ends a container that is forgotten, and does not hold one that has got past its sandbox (see [Limits](#limits)).
+- **A lifetime is kept inside the container, and its monitor's from the host.** `--ttl` ends a container that is forgotten, and its monitor ends one whose init does not; neither holds a container that has got past its sandbox (see [Limits](#limits)).
+- **A published port is a way in.** `-p 0.0.0.0:...` makes a container's service reachable by whoever reaches the host, and what it serves is what they get. Keep a port on `127.0.0.1` unless others need it.
 - **Whoever runs lightbox is root.** lightbox does not decide who may use it: giving someone `sudo lightbox` is giving them root, as a volume can be any directory of the host.
 - **Images are trusted as files.** `create` takes a base as it is, and `import` an image as its digests say. What either contains runs in the sandbox, with the container's root, and no signature is checked: take a base or an image from where you trust, and check what you download (see [What an import trusts](#import)).
 - **The network rules are the firewall's.** A reload or flush of the host's firewall takes them until `lightbox reload` or the next `start` puts them back (see [After a firewall's reload](networking.html#reload)).
@@ -479,4 +512,4 @@ What no option does for you:
 - **Run `lightbox doctor`** after a change of kernel or of host, and `doctor --profile agent` before the first box: each check that fails says how to fix it.
 
 {.source}
-Source: `lightbox_seccomp.h` for the two profiles and the filters of the process that unpacks and of `gzip`, `lightbox_tar.c` for the reader of a layer, `lightbox_image.c` and `lightbox_json.c` for the reading of an image, `lightbox_devices.h` for the devices and their program, `lightbox_userns.c` for ranges and idmapped mounts, and `lightbox.c` for capabilities, the masks, the mounts of a container and `exec`. `tests/seccomp_cases.sh`, `tests/devices_filter.c` and the sandbox cases of `tests/lifecycle.sh` check each of them.
+Source: `lightbox_seccomp.h` for the two profiles and the filters of the process that unpacks, of `gzip` and of the relay of published ports, `lightbox_tar.c` for the reader of a layer and of `cp`, `lightbox_relay.c` for the relay, `lightbox_gpu.c` for the GPUs and NVIDIA's libraries, `lightbox_image.c` and `lightbox_json.c` for the reading of an image, `lightbox_devices.h` for the devices and their program, `lightbox_userns.c` for ranges and idmapped mounts, and `lightbox.c` for capabilities, the masks, the mounts of a container, `exec`, `cp` and the monitor. `tests/seccomp_cases.sh`, `tests/devices_filter.c` and the sandbox cases of `tests/lifecycle.sh` check each of them.

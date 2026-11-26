@@ -18,7 +18,7 @@ A minimal, secure container runtime for Linux: one static binary with no libc an
 ::toc
 
 :::div{.facts cols="1 1 1 1"}
-**330 KB**
+**380 KB**
 one static binary, no libc
 +++
 **0**
@@ -47,13 +47,14 @@ lightbox runs on Linux. On macOS it runs in a Linux virtual machine, and on Wind
 
 | It has | Which is |
 |---|---|
-| Namespaces | Its own PID, mount, UTS, IPC and network namespaces, and with `--userns` a user namespace in which root is an unprivileged uid of the host's |
+| Namespaces | Its own PID, mount, UTS, IPC, network and cgroup namespaces, and with `--userns` a user namespace in which root is an unprivileged uid of the host's |
 | A root filesystem | An overlay of a snapshot of its base, which containers of that base share, with the container's own files on top; or a full copy with `--copy` |
 | Limits | Memory, swap, processes, CPU and I/O through cgroup v2, and with `--ttl` a lifetime |
-| A network | `eth0`, one end of a veth pair on a bridge of the host, with an address of the bridge's subnet; or loopback alone with `--net none` |
+| A network | `eth0`, one end of a veth pair on a bridge of the host, with an address of the bridge's subnet; or loopback alone with `--net none`; and the host's ports that `-p` publishes |
+| Devices | Its own `/dev`, and the host's devices and GPUs that `--device` and `--gpu` give it |
 | A sandbox | Capabilities, seccomp, `no_new_privs`, a device filter, and the masked and read-only parts of `/proc` and `/sys`, for init, the hook and every `exec` alike |
-| An init | lightbox, as PID 1, which runs the image's `/init.sh` if there is one |
-| A log | Everything its services print, in `console.log`, and what `exec` and `run` asked of it, in the audit log of the host |
+| An init | lightbox, as PID 1, which runs the image's `/init.sh` if there is one; and on the host a monitor, its parent, which clears the container away when it ends |
+| A log | Everything its services print, in `console.log`, and what `exec`, `run` and `cp` asked of it, in the audit log of the host |
 
 A container with `--profile agent` is a *box*: a container set up to hold an AI agent's working session, in which every command is taken for possibly hostile. [Agent boxes](agents.html) is about those.
 

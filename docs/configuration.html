@@ -151,7 +151,7 @@ Where cgroup v2 is mounted. `setup` looks at it before it changes anything on th
 ```ini
 cgroup_base = /sys/fs/cgroup/lightbox
 ```
-The cgroup that holds the containers': a container's is `<cgroup_base>/<name>`, and the cgroup of each `exec` is below that. It is `<cgroup_root>/lightbox` unless it is set, and there is rarely a reason to set it.
+The cgroup that holds the containers': a container's is `<cgroup_base>/<name>`, and the cgroup of each `exec`, and of the relay of its published ports, `lightbox.relay`, is below that. Every container's monitor is in `<cgroup_base>/lightbox.monitors`, beside them. It is `<cgroup_root>/lightbox` unless it is set, and there is rarely a reason to set it.
 
 The first `start` makes it. `setup --teardown` removes it, unless it is `cgroup_root` itself.
 :::
@@ -424,6 +424,7 @@ The keys, in the order the file has them:
 | `oom_score` | Always: -1000 to 1000 |
 | `privileged` | With `--privileged`: `1` |
 | `readonly` | With `--read-only`: `1` |
+| `gpu` | With `--gpu`: `1`. The GPUs are found at each start and are not in the file, as the kernel may number them otherwise after a boot |
 | `seccomp` | For the allow-list: `allow`. Without the line the container has the deny-list: `create --seccomp deny` makes that, and every container from before 0.8 has it |
 | `net` | Unless it is `nat`: `outside`, `none` or `proxy:<port>`. Without the line the container has `nat`: `create --net nat` makes that, and every container from before 0.8 has it |
 | `dns` | With `--net outside`: the name servers `create` gave the container, with commas between, which are the ones `--net outside` lets it ask |
@@ -435,6 +436,8 @@ The keys, in the order the file has them:
 | `profile` | With `--profile agent`: `agent` |
 | `workdir` | With `--workspace`: `/workspace`, where an `exec` without `--workdir` runs |
 | `vol` | Once for each volume, in the order they are mounted: `<src>:<dst>` or `<src>:<dst>:ro` |
+| `device` | Once for each device of `--device`: `<host>:<path>` or `<host>:<path>:ro`, the path in the container always named |
+| `port` | Once for each port of `-p`: `<address>:<host port>:<box port>`, the address always named, `127.0.0.1` where `-p` gave none |
 | `link` | Once for each link: the name of the container linked to |
 
 What `--profile agent` gave a box is in the file under each setting's own key, with `profile=agent` beside them, so a later change to the `agent_*` settings, or to what the profile means, changes no box that is there.

@@ -53,6 +53,10 @@ An option that would undo the profile ends `create` with the option named, and n
 | `--net nat` | `Error: --profile agent refuses --net nat` |
 | `--seccomp deny` | `Error: --profile agent refuses --seccomp deny` |
 | `--copy` | `Error: --profile agent refuses --copy: its root is an overlay of its base` |
+| `-p` | `Error: --profile agent refuses -p: an agent's box publishes no port; the host reaches one of --net outside or proxy at its address` |
+| `--device` of anything but a GPU's compute node | `Error: --device:`, its path, and `is not a GPU's compute node: a box of --profile agent is given render nodes, NVIDIA's and AMD's kfd, and nothing else` |
+
+An agent's box is no server for the network: what an agent that a prompt has turned can read, it would give whoever connects, past every rule of what leaves the box. A server that the agent runs in a box of `--net outside` or `--net proxy:<port>` is reached from this host at the box's address, which `inspect` shows; one of `--net none` is reached by nothing. `--gpu` is taken, and gives the box a GPU's compute nodes alone.
 
 Every other option of `create` is taken as it is given. `--read-only` and a `--vol` are the box's as they are any container's, and `--mem`, `--pids`, `--cpu` and `--ttl` replace the profile's own values, whether they are smaller or larger. A box with `--net none` has no address, so an address on the command line is refused, as it is for any container without a network.
 

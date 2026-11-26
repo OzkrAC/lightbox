@@ -4,7 +4,13 @@ What changed for someone who uses lightbox, newest first. `ROADMAP.md` has the r
 
 ## 0.11.0
 
-Not tagged yet: what is written of the next release so far.
+Devices, supervision and the network. A container can be given a character device of the host's, and with `--gpu` the host's GPUs, NVIDIA's libraries with them. Every container has a monitor on the host, which clears it away the moment it ends and keeps its `--ttl` from the host. `lightbox cp` copies files into a running box and out of one, through the box's own root, and `create -p` publishes a TCP port, on `127.0.0.1` unless told otherwise, through a relay of the box's and with no firewall rule. A container has a cgroup namespace of its own, and `doctor` says what the firewall's rules need of the kernel.
+
+### Changes you may have to act on
+
+- **`exec` and the hook look in `/usr/local` first.** Their `PATH` is Docker's now, so a program of the same name in `/usr/local/bin` runs in the place of the one in `/usr/bin`. `--env PATH=...` sets another.
+- **A container sees `0::/` in `/proc/self/cgroup`,** and its own cgroup, read-only, at `/sys/fs/cgroup`, where it saw the host's path and an empty directory. A program that read the host's path there no longer finds it.
+- **`doctor` counts `firewall_kernel`.** A host whose kernel lacks a part of what the firewall's rules need is `degraded` now, where `setup` failed on it before; the check names what to add.
 
 ### Added
 

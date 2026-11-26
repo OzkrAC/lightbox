@@ -7462,8 +7462,8 @@ static const struct { const char *name; const char *text; } command_help[] = {
         "         --profile <name>       agent: a user namespace, the allow-list, an overlay, and the\n"
         "                                network of --net none unless --net outside or proxy:<port> is\n"
         "                                given, with the limits and lifetime of the agent_* settings. As\n"
-        "                                root; it refuses --privileged, --link, --net nat, --seccomp deny\n"
-        "                                and --copy\n"
+        "                                root; it refuses --privileged, --link, --net nat, --seccomp deny,\n"
+        "                                --copy and -p\n"
         "         --workspace <dir>      The directory at /workspace, where every exec runs\n" },
     { "start",
         "  start  <name>... [-t <seconds>]  Start stopped containers, one after the other\n"

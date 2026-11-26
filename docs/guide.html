@@ -44,13 +44,13 @@ Once lightbox is installed or built, `lightbox doctor` checks all of this on the
 A [release](https://github.com/OzkrAC/lightbox/releases) of lightbox holds it as a package for Debian and Ubuntu and for Void Linux, each for x86_64 and aarch64. With one of these the next two sections, on building, are not needed.
 
 {.ref}
-| For | The file of release 0.9.0 |
+| For | The file of release 0.11.0 |
 |---|---|
-| Debian and Ubuntu, x86_64 | `lightbox_0.9.0-1_amd64.deb` |
-| Debian and Ubuntu, aarch64 | `lightbox_0.9.0-1_arm64.deb` |
-| Void Linux with glibc | `lightbox-0.9.0_1.x86_64.xbps`, `lightbox-0.9.0_1.aarch64.xbps` |
-| Void Linux with musl | `lightbox-0.9.0_1.x86_64-musl.xbps`, `lightbox-0.9.0_1.aarch64-musl.xbps` |
-| Building it yourself | `lightbox-0.9.0.tar.gz`, the source with lightc's inside, which builds with `make` and no network |
+| Debian and Ubuntu, x86_64 | `lightbox_0.11.0-1_amd64.deb` |
+| Debian and Ubuntu, aarch64 | `lightbox_0.11.0-1_arm64.deb` |
+| Void Linux with glibc | `lightbox-0.11.0_1.x86_64.xbps`, `lightbox-0.11.0_1.aarch64.xbps` |
+| Void Linux with musl | `lightbox-0.11.0_1.x86_64-musl.xbps`, `lightbox-0.11.0_1.aarch64-musl.xbps` |
+| Building it yourself | `lightbox-0.11.0.tar.gz`, the source with lightc's inside, which builds with `make` and no network |
 
 The release has `SHA256SUMS` too, with the SHA-256 of each of its files. Check what you downloaded, in the directory it is in:
 
@@ -63,13 +63,13 @@ GitHub also keeps a signed record of the run that built each file, and its comma
 On Debian and Ubuntu, `apt` installs the file, and `iptables` with it where neither that nor `nftables` is installed:
 
 ```sh
-sudo apt install ./lightbox_0.9.0-1_amd64.deb
+sudo apt install ./lightbox_0.11.0-1_amd64.deb
 ```
 
 On Void Linux, xbps installs from a repository, and a directory with an index is one:
 
 ```sh
-xbps-rindex -a lightbox-0.9.0_1.*.xbps
+xbps-rindex -a lightbox-0.11.0_1.*.xbps
 sudo xbps-install --repository="$PWD" lightbox
 ```
 
@@ -171,7 +171,7 @@ What a base has to contain:
 
 - **Nothing, for a container to run.** lightbox makes `/dev`, `/proc`, `/sys`, `/tmp` and `/run` and the container's network itself, and `create` writes `/etc/resolv.conf`, `/etc/hostname` and a line of `/etc/hosts`, making `/etc` where there is none. A single static binary is a base too. Only an empty directory is refused.
 - **`/bin/sh`**, for an `/init.sh` hook and for `exec` without a command.
-- **The programs that `exec` runs**, found on `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, with their libraries where they are linked dynamically. Nothing of the host is in a container.
+- **The programs that `exec` runs**, found on `PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`, Docker's, with their libraries where they are linked dynamically. Nothing of the host is in a container but the devices and NVIDIA's libraries that `--device` and `--gpu` give one.
 - **`/etc/passwd` and `/etc/group`**, for `exec --user <name>` and for the groups of the user a command runs as.
 
 A container does not copy its base. The first `create` from a base takes a snapshot of it, and every container of that base is an overlay of the snapshot, so changing the directory afterwards changes no container ([Storage](storage.html#bases)).
@@ -212,7 +212,7 @@ It makes:
 
 It also restricts `lightbox_dir` and `container_dir` to their owner, mode 0700, and says so when it had to.
 
-The bridge, the firewall rules and forwarding live in the kernel only, and a reboot takes them. You do not have to run `setup` again: every `start` looks for them, and makes them again as `setup` does when they are not all there, saying that it did. [Networking](networking.html#setup) has what `setup` does in full, what a firewall's reload does to it, and `setup --teardown`, which takes lightbox off the host's network again.
+The bridge, the firewall rules and forwarding live in the kernel only, and a reboot takes them. You do not have to run `setup` again: every `start` looks for them, and makes them again as `setup` does when they are not all there, saying that it did; and where `cgroup_root` is a directory of its own, it mounts cgroup v2 there again too. [Networking](networking.html#setup) has what `setup` does in full, what a firewall's reload does to it, and `setup --teardown`, which takes lightbox off the host's network again.
 
 Then let `doctor` look at the host:
 
@@ -309,6 +309,9 @@ lightbox create legacy --net nat
 # Two containers that may talk to each other; the one linked to comes first
 lightbox create db
 lightbox create api --link db
+
+# A service reached on port 8080 of this host, and from no other machine
+lightbox create web -p 8080:80
 ```
 
 Some of it can change later:
@@ -326,10 +329,12 @@ lightbox restart app
 lightbox rm -f app
 ```
 
-And a command can be run as someone else, with a variable set, in a directory, and with a time limit:
+And a command can be run as someone else, with a variable set, in a directory, and with a time limit; and files copied in and out of a container that runs:
 
 ```sh
 lightbox exec site --user nobody --env MODE=debug --workdir /var/www --timeout 30s -- ls -la
+lightbox cp ./public/. site:/var/www
+lightbox cp site:/var/log/app.log .
 ```
 
 {.ref}
@@ -337,9 +342,22 @@ lightbox exec site --user nobody --env MODE=debug --workdir /var/www --timeout 3
 |---|---|
 | Limits, and what happens at each | [create](commands.html#create-options) |
 | Volumes, bases, overlays and copies | [Storage](storage.html) |
-| `--net`, `--link` and `--dns` | [Networking](networking.html) |
+| `--net`, `--link`, `--dns` and `-p` | [Networking](networking.html) |
+| `--device` and `--gpu` | [create](commands.html#create-devices), [Security](security.html#devices) |
 | `--userns`, `--seccomp`, `--read-only` and `--privileged` | [Security](security.html) |
 | `--profile agent` and `--workspace` | [Agent boxes](agents.html) |
+
+## A GPU in a box {#gpu}
+
+`--gpu` gives a container the host's GPUs, for compute: the render nodes of `/dev/dri`, NVIDIA's nodes and AMD's `/dev/kfd`, found at each start. Where NVIDIA's kernel module is loaded, the container is given NVIDIA's own libraries of the module's version too, read-only, so that the image need not carry a driver that matches the host's.
+
+```sh
+lightbox create ml --gpu --userns
+lightbox start ml
+lightbox exec ml -- nvidia-smi
+```
+
+`start` names the nodes it gave, and ends when there is none. A box of `--profile agent` takes `--gpu` as well, and is given a GPU's compute nodes alone. NVIDIA's libraries are built for glibc: on an Alpine base, whose loader is musl's, the box gets the nodes and not the libraries. One device of the host's at a time is `--device`, such as `--device /dev/dri/renderD128`. [create](commands.html#create-devices) has the details, and [Security](security.html#devices-given) what a device gives a container.
 
 ## Services: the init hook {#init}
 
@@ -352,7 +370,7 @@ A container's PID 1 is lightbox itself. If the base has an `/init.sh`, init runs
 
 What the hook gets:
 
-- **A shell, and little else.** It runs as `/bin/sh /init.sh`, as root, in `/`, with `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, `HOME=/root` and `TERM=xterm`, and nothing else of the environment that `start` was given. A container with `--net proxy:<port>` has the proxy's variables as well.
+- **A shell, and little else.** It runs as `/bin/sh /init.sh`, as root, in `/`, with `PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`, `HOME=/root` and `TERM=xterm`, and nothing else of the environment that `start` was given. A container with `--net proxy:<port>` has the proxy's variables as well.
 - **A complete container.** Its mounts, its `/dev`, its address and default route, its cgroup and limits are there, and the container is on record, so `stop` and `ls` find it.
 - **The sandbox.** The hook and all it starts have the container's capabilities, seccomp filter and `no_new_privs`, and the masked and read-only parts of `/proc`. A hook that mounts filesystems or configures the network needs a container created with `--privileged`.
 - **The log, and no terminal.** The hook and everything it starts read from `/dev/null` and write to the container's log, not to the terminal `start` was typed on. `lightbox logs web` shows it.
