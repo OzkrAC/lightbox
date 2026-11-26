@@ -160,6 +160,11 @@
  *                                             what the monitor wrote to record, whether it reaped
  *   unit monitor-ttl <record> <duration>      the same with that --ttl and no grace, and a child
  *                                             that never ends: what the monitor wrote, and when
+ *   unit portspec <text>                      parse_port_spec: "port <text it is kept as>", or
+ *                                             "refused: <why>" with status 1
+ *   unit relay                                relay_run between two listeners of loopback's, the
+ *                                             second standing for the box's port: a line for each
+ *                                             thing it was seen to do, as t_relay lists them
  *   unit monitor-cgroup <record> <dir>        the same with <dir> as the monitor's cgroup: what
  *                                             init_spawn_monitored said, and how the monitor
  *                                             ended, its status or "not the command's child"
@@ -269,6 +274,7 @@
 
 #define main lightbox_main
 #include "../lightbox.c"
+#include <lightc/socket.h>
 #undef main
 
 static void put(const char *s) { print_str(STDOUT, s); }
@@ -562,6 +568,181 @@ static void put_own_privileges(void) {
 }
 
 /* What init is in the harness: all of a container's init but the container. */
+/* ─── The relay of a box's ports (ROADMAP N.1) ─────────────────────────── */
+
+/* Wait up to 5 s for fd to have something to read, or to take a write. */
+static bool unit_ready(int32_t fd, int16_t events) {
+    struct lb_pollfd one = { .fd = fd, .events = events, .revents = 0 };
+    lc_timespec limit = { .seconds = 5, .nanoseconds = 0 };
+    return lb_sys_ppoll(&one, 1, &limit) == 1;
+}
+
+/* A blocking socket connected to that port of loopback's, or -1. */
+static int32_t unit_connect(int port) {
+    lc_result made = lc_socket_create(LC_SOCK_STREAM | LB_SOCK_CLOEXEC);
+    if (made.error)
+        return -1;
+    lc_socket_address to = lc_socket_address_create(127, 0, 0, 1, (uint16_t)port);
+    lc_result connected = lc_socket_connect((int32_t)made.value, &to);
+    if (connected.error) {
+        lc_socket_close((int32_t)made.value);
+        return -1;
+    }
+    return (int32_t)made.value;
+}
+
+/* What fd sends within 5 s, up to len bytes: how many, 0 at its end, -1 on none. */
+static lc_sysret unit_read_some(int32_t fd, char *buf, size_t len) {
+    if (!unit_ready(fd, LB_POLLIN))
+        return -1;
+    return lc_kernel_read_bytes(fd, buf, len);
+}
+
+/* A field of /proc/<pid>/status, such as "Seccomp", into out. */
+static void unit_status_field(int pid, const char *field, char *out, size_t size) {
+    char path[64];
+    static char text[4096];
+    out[0] = '\0';
+    if (!proc_pid_path(path, sizeof(path), pid, "/status") || read_file(path, text, sizeof(text)) <= 0)
+        return;
+    size_t flen = lc_string_length(field);
+    for (const char *line = text; *line; ) {
+        if (lc_string_starts_with(line, lc_string_length(line), field, flen) && line[flen] == ':') {
+            const char *v = line + flen + 1;
+            while (*v == ' ' || *v == '\t')
+                v++;
+            size_t n = 0;
+            while (v[n] && v[n] != '\n' && n + 1 < size) {
+                out[n] = v[n];
+                n++;
+            }
+            out[n] = '\0';
+            return;
+        }
+        while (*line && *line != '\n')
+            line++;
+        if (*line)
+            line++;
+    }
+}
+
+static int unit_relay(void) {
+    lc_sysret box = relay_listen(LC_INADDR_LOOPBACK, 0);
+    lc_sysret front = relay_listen(LC_INADDR_LOOPBACK, 0);
+    int32_t ready[2];
+    if (box < 0 || front < 0 || lc_kernel_create_pipe(ready, O_CLOEXEC) < 0)
+        die("unit: cannot listen on loopback");
+    int box_port = relay_port_of((int32_t)box), front_port = relay_port_of((int32_t)front);
+    lc_sysret pid = lc_kernel_fork();
+    if (pid == 0) {
+        lc_kernel_close_file(ready[0]);
+        lc_kernel_close_file((int32_t)box);
+        int32_t keep[2] = { (int32_t)front, ready[1] };
+        close_all_but(keep, 2);
+        int32_t listener = (int32_t)front;
+        uint16_t to = (uint16_t)box_port;
+        relay_run(&listener, &to, 1, -1, ready[1]);
+    }
+    lc_kernel_close_file(ready[1]);
+    lc_kernel_close_file((int32_t)front);
+    char byte = 0;
+    if (pid < 0 || !unit_ready(ready[0], LB_POLLIN) || lc_kernel_read_bytes(ready[0], &byte, 1) != 1 || byte != 'R') {
+        put("the relay did not say it was ready\n");
+        return 1;
+    }
+    put("ready\n");
+    char seccomp[16], nnp[16];
+    unit_status_field((int)pid, "Seccomp", seccomp, sizeof(seccomp));
+    unit_status_field((int)pid, "NoNewPrivs", nnp, sizeof(nnp));
+    put("seccomp ");
+    put(seccomp);
+    put(", no_new_privs ");
+    put(nnp);
+    put("\n");
+
+    /* one connection, through to the box's port */
+    int32_t client = unit_connect(front_port);
+    lc_sysret server = client >= 0 && unit_ready((int32_t)box, LB_POLLIN) ? lb_sys_accept4((int32_t)box, LB_SOCK_CLOEXEC) : -1;
+    if (server < 0) {
+        put("no connection came through to the box's port\n");
+        return 1;
+    }
+    static char buf[65536];
+    lc_sysret n;
+    if (lc_kernel_write_bytes(client, "ping", 4) == 4 && (n = unit_read_some((int32_t)server, buf, sizeof(buf))) == 4 &&
+        lc_bytes_compare(buf, "ping", 4) == 0)
+        put("ping came through\n");
+    if (lc_kernel_write_bytes((int32_t)server, "pong", 4) == 4 && (n = unit_read_some(client, buf, sizeof(buf))) == 4 &&
+        lc_bytes_compare(buf, "pong", 4) == 0)
+        put("pong came back\n");
+
+    /* a megabyte, written as it is taken and read as it comes, in a pattern
+     * that a byte out of its place breaks */
+    const size_t total = 1048576;
+    size_t sent = 0, got = 0;
+    bool same = true;
+    while (got < total) {
+        struct lb_pollfd two[2] = { { .fd = sent < total ? client : -1, .events = LB_POLLOUT, .revents = 0 },
+                                    { .fd = (int32_t)server, .events = LB_POLLIN, .revents = 0 } };
+        lc_timespec limit = { .seconds = 5, .nanoseconds = 0 };
+        if (lb_sys_ppoll(two, 2, &limit) <= 0)
+            break;
+        if (two[0].revents & LB_POLLOUT) {
+            char chunk[4096];
+            size_t len = total - sent < sizeof(chunk) ? total - sent : sizeof(chunk);
+            for (size_t i = 0; i < len; i++)
+                chunk[i] = (char)((sent + i) % 251);
+            lc_sysret w = lc_kernel_write_bytes(client, chunk, len);
+            if (w <= 0)
+                break;
+            sent += (size_t)w;
+        }
+        if (two[1].revents & LB_POLLIN) {
+            lc_sysret r = lc_kernel_read_bytes((int32_t)server, buf, sizeof(buf));
+            if (r <= 0)
+                break;
+            for (lc_sysret i = 0; i < r; i++)
+                if (buf[i] != (char)((got + (size_t)i) % 251))
+                    same = false;
+            got += (size_t)r;
+        }
+    }
+    if (got == total && same) {
+        char digits[24];
+        fmt_int(digits, (int)total);
+        put_line(digits, " bytes came through as they were sent");
+    }
+
+    /* the end of what the client sends, and an answer to it */
+    (void)lc_socket_shutdown(client, LC_SHUT_WRITE);
+    bool ended = unit_read_some((int32_t)server, buf, sizeof(buf)) == 0;
+    bool answered = lc_kernel_write_bytes((int32_t)server, "bye", 3) == 3;
+    lc_kernel_close_file((int32_t)server);
+    answered = answered && unit_read_some(client, buf, sizeof(buf)) == 3 && lc_bytes_compare(buf, "bye", 3) == 0 &&
+               unit_read_some(client, buf, sizeof(buf)) == 0;
+    if (ended && answered)
+        put("the end came through, and the answer to it\n");
+    lc_kernel_close_file(client);
+
+    /* a box's port where nothing listens: the connection is closed */
+    lc_kernel_close_file((int32_t)box);
+    client = unit_connect(front_port);
+    n = client >= 0 ? unit_read_some(client, buf, sizeof(buf)) : -1;
+    if (n == 0 || n == -104 /* ECONNRESET */)
+        put("a port where nothing listens: the connection is closed\n");
+    if (client >= 0)
+        lc_kernel_close_file(client);
+
+    /* the relay still runs, and ends by this kill alone: no call it made was
+     * one its filter has not */
+    (void)lc_kernel_send_signal((int32_t)pid, SIGKILL);
+    int32_t status = 0;
+    if (lc_kernel_wait_for_child((int32_t)pid, &status, 0) == pid)
+        put((status & 0x7f) == SIGKILL ? "ended by SIGKILL, and by nothing before it\n"
+                                       : (status & 0x7f) == LB_SIGSYS ? "ended by its filter\n" : "ended otherwise\n");
+    return 0;
+}
+
 /* A child for the monitor to clone: it waits to be killed. */
 static int unit_sleeper(void *arg) {
     (void)arg;
@@ -1719,6 +1900,20 @@ int main(int argc, char **argv, char **envp) {
         put_line("after ms ", ms);
         return 0;
     }
+    if (argc == 3 && streq(argv[1], "portspec")) {
+        port_spec port;
+        const char *wrong = parse_port_spec(argv[2], &port);
+        if (wrong) {
+            put_line("refused: ", wrong);
+            return 1;
+        }
+        char text[PORT_TEXT_MAX];
+        port_spec_text(text, &port);
+        put_line("port ", text);
+        return 0;
+    }
+    if (argc == 2 && streq(argv[1], "relay"))
+        return unit_relay();
     if (argc == 4 && streq(argv[1], "monitor-cgroup")) {
         /* a cgroup the monitor cannot go into: start is told, and no init is cloned */
         struct init_link link = INIT_LINK_NONE;

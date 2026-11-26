@@ -2541,6 +2541,60 @@ check 'ls lists only directories with a container name'       t_ls_lists_only_co
 check 'inspect shows volumes, links and the log'                       t_inspect_shows_volumes_and_links
 check 'inspect --json is one JSON object, typed, or nothing'             t_inspect_json
 check 'create --device keeps a character device of the host'"'"'s, and refuses what gives the host away' t_create_device
+
+# create -p (ROADMAP N.1), as an ordinary user: a port goes in .conf as
+# port=<address>:<host port>:<box port>, on 127.0.0.1 unless an address is
+# given, and inspect shows it in text and in JSON. Refused, each with its
+# reason and before anything is made: a UDP port, a number that is no port,
+# a second port on one port of the host, on one address or on every address
+# and one of them, a seventeenth port, and -p to a box of --profile agent. A
+# port line of .conf that cannot be read is an error of the configuration.
+t_create_port() {
+    local bad=0 said want many i
+    no() { # what it says, create's options
+        local what=$1
+        shift
+        said=$(lb create pub 10.0.0.4 "$@" 2>&1) && { echo "create $*: succeeded"; lb rm pub >/dev/null 2>&1; bad=1; return; }
+        case $said in *"$what"*) ;; *) echo "create $*: $said"; bad=1 ;; esac
+        [ ! -e "$C/pub" ] || { echo "create $*: the container is there"; bad=1; }
+    }
+    lb create web 10.0.0.2 -p 8080:80 --publish 0.0.0.0:8443:443/tcp -p 10.9.8.7:2222:22 >/dev/null || return 1
+    want='port=127.0.0.1:8080:80
+port=0.0.0.0:8443:443
+port=10.9.8.7:2222:22'
+    [ "$(grep '^port=' "$C/web/.conf")" = "$want" ] || { grep '^port=' "$C/web/.conf"; echo "the .conf does not have them"; return 1; }
+    said=$(lb inspect web | grep '^port: ')
+    [ "$said" = "$(printf '%s\n' "$want" | sed 's/^port=/port: /')" ] || { echo "$said"; echo "inspect does not show them"; return 1; }
+    if command -v python3 >/dev/null 2>&1; then
+        lb inspect web --json | python3 -I -c '
+import json, sys
+d = json.load(sys.stdin)[0]["ports"]
+want = [{"address": "127.0.0.1", "host_port": 8080, "box_port": 80},
+        {"address": "0.0.0.0", "host_port": 8443, "box_port": 443},
+        {"address": "10.9.8.7", "host_port": 2222, "box_port": 22}]
+assert d == want, d
+' || { echo "inspect --json does not have them"; return 1; }
+    fi
+    lb create db 10.0.0.3 >/dev/null && [ "$(lb inspect db | grep '^port')" = 'port: -' ] ||
+        { echo "a container without ports is not shown so"; return 1; }
+    no 'a UDP port is not published' -p 53:53/udp
+    no 'a port is a number from 1 to 65535' -p 0:80
+    no 'the box already has a port on that port of the host' -p 8080:80 -p 8080:81
+    no 'the box already has a port on that port of the host' -p 0.0.0.0:8080:80 -p 127.0.0.1:8080:81
+    many=""
+    for i in $(seq 1 17); do many="$many -p $((9000 + i)):80"; done
+    # shellcheck disable=SC2086  # options of one word each
+    no 'the box already has the maximum of 16 ports' $many
+    no '--profile agent refuses -p' --profile agent -p 8080:80
+    # one port on two addresses is two ports, and two ports may reach one port of the box
+    lb create two 10.0.0.5 -p 127.0.0.1:8080:80 -p 10.9.8.7:8080:80 -p 9090:80 >/dev/null ||
+        { echo "a port on two addresses, or two that reach one port of the box, was refused"; bad=1; }
+    printf 'port=nonsense\n' >> "$C/db/.conf"
+    said=$(lb inspect db 2>&1) && { echo "a .conf with a port that is none was read"; bad=1; }
+    case $said in *"names the host's port and the box's"*) ;; *) echo "$said"; bad=1 ;; esac
+    return $bad
+}
+check 'create -p keeps a port of the host'"'"'s for the box, on 127.0.0.1 unless told, and refuses what is none' t_create_port
 check 'cp refuses what it cannot copy, before it asks for root'      t_cp_arguments
 check 'configuration: carriage returns are stripped'                   t_config_strips_carriage_returns
 check 'configuration: inline comments are stripped'                    t_config_strips_inline_comments

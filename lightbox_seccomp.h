@@ -593,6 +593,34 @@ struct lb_sock_fprog {
     X(write,                     1,   64)
 
 /*
+ * The relay of a box's published ports (ROADMAP N.1), once it holds the
+ * host's sockets that listen, is in the box's network namespace, is nobody
+ * with no capability, and has its buffers: it takes a connection, opens a
+ * TCP socket to the box's port on the box's loopback, copies bytes both ways
+ * and reads none of them, and makes no other call. socket is allowed of
+ * AF_INET and of the one type the relay asks for alone; no open, mmap, kill,
+ * setns or execve is among them. A call that is not here ends the relay.
+ *
+ *   X(name, number on x86_64, number on aarch64)
+ */
+#define LB_SECCOMP_RELAY(X) \
+    X(accept4,                 288,  242) \
+    X(close,                     3,   57) \
+    X(connect,                  42,  203) \
+    X(exit,                     60,   93) \
+    X(exit_group,              231,   94) \
+    X(getsockopt,               55,  209) \
+    X(ppoll,                   271,   73) \
+    X(read,                      0,   63) \
+    X(rt_sigreturn,             15,  139) \
+    X(shutdown,                 48,  210) \
+    X(write,                     1,   64)
+
+/* SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, the same on both targets: the
+ * one type of socket the relay makes */
+#define LB_SECCOMP_RELAY_SOCKET_TYPE (1U | 04000U | 02000000U)
+
+/*
  * The host's gzip that unpacks a compressed layer (ROADMAP I.12), as nobody,
  * with no capability and a network of its own: what a program of a C
  * library's needs to start, to read its standard input and to write its
@@ -746,6 +774,10 @@ static const uint32_t LB_SECCOMP_UNPACK_TABLE[] = {
     LB_SECCOMP_UNPACK(LB_SC_ALLOW_ROW)
 };
 
+static const uint32_t LB_SECCOMP_RELAY_TABLE[] = {
+    LB_SECCOMP_RELAY(LB_SC_ALLOW_ROW)
+};
+
 static const uint32_t LB_SECCOMP_GZIP_TABLE[] = {
     LB_SECCOMP_GZIP(LB_SC_ALLOW_ROW)
     LB_SECCOMP_GZIP_X86_64(LB_SC_ALLOW_ROW_X86_64)
@@ -767,6 +799,7 @@ static const uint32_t LB_SECCOMP_SOCKETPAIR_FAMILY_TABLE[] = { LB_SECCOMP_SOCKET
 #define LB_SECCOMP_MODE_TABLE_LEN (sizeof(LB_SECCOMP_MODE_TABLE) / sizeof(LB_SECCOMP_MODE_TABLE[0]))
 #define LB_SECCOMP_ALLOW_TABLE_LEN (sizeof(LB_SECCOMP_ALLOW_TABLE) / sizeof(LB_SECCOMP_ALLOW_TABLE[0]))
 #define LB_SECCOMP_UNPACK_TABLE_LEN (sizeof(LB_SECCOMP_UNPACK_TABLE) / sizeof(LB_SECCOMP_UNPACK_TABLE[0]))
+#define LB_SECCOMP_RELAY_TABLE_LEN (sizeof(LB_SECCOMP_RELAY_TABLE) / sizeof(LB_SECCOMP_RELAY_TABLE[0]))
 #define LB_SECCOMP_GZIP_TABLE_LEN (sizeof(LB_SECCOMP_GZIP_TABLE) / sizeof(LB_SECCOMP_GZIP_TABLE[0]))
 #define LB_SECCOMP_SOCKET_FAMILY_LEN \
     (sizeof(LB_SECCOMP_SOCKET_FAMILY_TABLE) / sizeof(LB_SECCOMP_SOCKET_FAMILY_TABLE[0]))
@@ -798,6 +831,8 @@ static const uint32_t LB_SECCOMP_SOCKETPAIR_FAMILY_TABLE[] = { LB_SECCOMP_SOCKET
  * and the final kill. That of gzip: the head, two per call, seven for execve,
  * five for ioctl and the final ENOSYS. */
 #define LB_SECCOMP_UNPACK_PROG_LEN (LB_SECCOMP_PROG_HEAD + 2 * LB_SECCOMP_UNPACK_TABLE_LEN + 5 + 1)
+/* That of the relay: the head, two per call, six for socket and the final kill. */
+#define LB_SECCOMP_RELAY_PROG_LEN (LB_SECCOMP_PROG_HEAD + 2 * LB_SECCOMP_RELAY_TABLE_LEN + 6 + 1)
 #define LB_SECCOMP_GZIP_PROG_LEN   (LB_SECCOMP_PROG_HEAD + 2 * LB_SECCOMP_GZIP_TABLE_LEN + 7 + 5 + 1)
 
 _Static_assert(LB_SECCOMP_PROG_LEN <= 4096, "the kernel accepts at most 4096 BPF instructions");
@@ -945,6 +980,25 @@ static inline size_t lb_seccomp_build_unpack(struct lb_sock_filter *prog) {
     prog[n++] = (struct lb_sock_filter){ LB_BPF_LD_W_ABS, 0, 0, LB_SECCOMP_DATA_ARG_LO(2) };
     prog[n++] = (struct lb_sock_filter){ LB_BPF_JSET_K, 0, 1, LB_SECCOMP_PROT_EXEC };
     prog[n++] = (struct lb_sock_filter){ LB_BPF_RET_K, 0, 0, LB_SECCOMP_RET_KILL_PROCESS };
+    prog[n++] = (struct lb_sock_filter){ LB_BPF_RET_K, 0, 0, LB_SECCOMP_RET_ALLOW };
+    prog[n++] = (struct lb_sock_filter){ LB_BPF_RET_K, 0, 0, LB_SECCOMP_RET_KILL_PROCESS };
+    return n;
+}
+
+/* The program of the relay of a box's ports, into prog, which holds
+ * LB_SECCOMP_RELAY_PROG_LEN instructions. */
+static inline size_t lb_seccomp_build_relay(struct lb_sock_filter *prog) {
+    size_t n = lb_seccomp_head(prog);
+    for (size_t i = 0; i < LB_SECCOMP_RELAY_TABLE_LEN; i++) {
+        prog[n++] = (struct lb_sock_filter){ LB_BPF_JEQ_K, 0, 1, LB_SECCOMP_RELAY_TABLE[i] };
+        prog[n++] = (struct lb_sock_filter){ LB_BPF_RET_K, 0, 0, LB_SECCOMP_RET_ALLOW };
+    }
+    /* socket of AF_INET and of the relay's one type: its first two arguments */
+    prog[n++] = (struct lb_sock_filter){ LB_BPF_JEQ_K, 0, 5, LB_SECCOMP_NR_SOCKET };
+    prog[n++] = (struct lb_sock_filter){ LB_BPF_LD_W_ABS, 0, 0, LB_SECCOMP_DATA_ARG_LO(0) };
+    prog[n++] = (struct lb_sock_filter){ LB_BPF_JEQ_K, 0, 3, LB_SECCOMP_AF_INET };
+    prog[n++] = (struct lb_sock_filter){ LB_BPF_LD_W_ABS, 0, 0, LB_SECCOMP_DATA_ARG_LO(1) };
+    prog[n++] = (struct lb_sock_filter){ LB_BPF_JEQ_K, 0, 1, LB_SECCOMP_RELAY_SOCKET_TYPE };
     prog[n++] = (struct lb_sock_filter){ LB_BPF_RET_K, 0, 0, LB_SECCOMP_RET_ALLOW };
     prog[n++] = (struct lb_sock_filter){ LB_BPF_RET_K, 0, 0, LB_SECCOMP_RET_KILL_PROCESS };
     return n;

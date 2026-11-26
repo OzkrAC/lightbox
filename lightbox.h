@@ -26,6 +26,8 @@
 #define MAX_LINKS        8
 #define MAX_DEVICES      16     /* LB_DEV_EXTRA_MAX of lightbox_devices.h (ROADMAP G.1) */
 #define MAX_DNS          3       /* as many as a resolver reads from resolv.conf */
+#define MAX_PORTS        16      /* -p of create (ROADMAP N.1) */
+#define PORT_TEXT_MAX    24      /* "255.255.255.255:65535:65535" and its NUL */
 
 /* What a container may reach (ROADMAP 8.5, 8.6): today's network, the
  * internet and its name servers only, nothing at all, or one port of the
@@ -41,7 +43,7 @@ enum { NET_NAT = 0, NET_OUTSIDE = 1, NET_NONE = 2, NET_PROXY = 3 };
  * error. */
 #define CONF_MAX         40960
 _Static_assert(CONF_MAX > MAX_VOLS * (2 * MAX_PATH + 8) + MAX_DEVICES * (2 * MAX_PATH + 12) +
-                          MAX_LINKS * (NAME_MAX_LEN + 8) + 512,
+                          MAX_LINKS * (NAME_MAX_LEN + 8) + MAX_PORTS * (PORT_TEXT_MAX + 8) + 512,
                "CONF_MAX is too small for the largest legal container config");
 
 /* The limits as text, the way they are given and the way the file has them. */
@@ -140,6 +142,21 @@ typedef struct {
     bool ro;
 } device_spec;
 
+/*
+ * A port of the host's that reaches one of the box's (ROADMAP N.1): TCP on
+ * the host's address addr, which is 127.0.0.1 unless another is given and 0
+ * for every address the host has, and its port host_port, to the box's port
+ * box_port. The relay of the box's ports takes each connection and makes one
+ * to box_port on the box's own loopback, so that what the box serves on its
+ * loopback alone is published too. The address is as parse_ipv4 gives it,
+ * its first number the highest byte.
+ */
+typedef struct {
+    uint32_t addr;
+    uint16_t host_port;
+    uint16_t box_port;
+} port_spec;
+
 /* A box's id (ROADMAP 8.9): 16 lowercase hex digits that create draws and
  * .conf keeps, which the audit log tells a box from a later one of its name
  * by. A box made before boxes had one has none. */
@@ -187,6 +204,8 @@ typedef struct {
     int  ndevs;
     device_spec devs[MAX_DEVICES];
     bool gpu;                   /* --gpu: the host's GPUs, found at each start (ROADMAP G.3) */
+    int  nports;
+    port_spec ports[MAX_PORTS];
     int  nlinks;
     char links[MAX_LINKS][NAME_MAX_LEN + 1];
 } container_config;
@@ -221,6 +240,33 @@ void net_mode_text(char out[NET_MODE_TEXT_MAX], int mode, int proxy_port);
 [[nodiscard]] const char *parse_volume_spec(const char *spec, volume_spec *vol);
 /* The destination alone, in the one spelling it is stored in. */
 [[nodiscard]] const char *parse_volume_destination(const char *text, char dst[MAX_PATH]);
+
+/*
+ * A port as -p and the file give it (ROADMAP N.1): [<address>:]<host
+ * port>:<box port>[/tcp], 127.0.0.1 without an address and 0.0.0.0 for every
+ * address. NULL when it is one, or what is wrong with it. The text it is
+ * kept and shown as is <address>:<host port>:<box port>, the address always
+ * named. config_add_port refuses a second port on the same port of the host.
+ */
+[[nodiscard]] const char *parse_port_spec(const char *spec, port_spec *port);
+void port_spec_text(char out[PORT_TEXT_MAX], const port_spec *port);
+[[nodiscard]] const char *config_add_port(container_config *config, const port_spec *port);
+
+/* nobody's uid and gid, which a host tool and the relay of a box's ports run as */
+#define NOBODY_ID 65534u
+
+/*
+ * The relay of a box's published ports (lightbox_relay.c). relay_listen: a
+ * TCP socket that listens on that address and port of the host's, made as
+ * start makes it, or the negative errno; relay_port_of: the port one listens
+ * on, for a socket that was given port 0. relay_run, in a process of its
+ * own that holds nothing else: listeners[i] relayed to box_ports[i] on the
+ * loopback of the network namespace netns (-1: the one it is in), once it is
+ * confined, which it says by a byte on ready. It ends only with an error.
+ */
+lc_sysret relay_listen(uint32_t addr, uint16_t port);
+int relay_port_of(int32_t fd);
+[[noreturn]] void relay_run(const int32_t *listeners, const uint16_t *box_ports, int n, int32_t netns, int32_t ready);
 
 /* A configuration with nothing in it and no limit given yet. */
 void container_config_init(container_config *config);

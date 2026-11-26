@@ -2600,6 +2600,78 @@ t_cp() {
     case $said in *"this one is not running: cpbox"*) ;; *) return 1 ;; esac
 }
 
+# -p of a box (ROADMAP N.1): a port of the host's reaches the box's port
+# through the relay, which connects on the box's loopback, so that what the
+# box serves on its loopback alone is reached too. On 127.0.0.1 unless told:
+# the host reaches it there, and the namespace that stands for the internet
+# does not; on 0.0.0.0 that namespace does. The relay is nobody, with no
+# capability, under its filter and no_new_privs, in lightbox.relay below the
+# box's cgroup and in the box's network, and in no namespace of the box's
+# processes besides: they cannot see it. A port in use refuses a second
+# box's start, which leaves nothing. A stop ends the relay and frees the port.
+t_publish() {
+    need_nc || return $?
+    need_listeners || return $?
+    local pid relay said near far hp=18080 any=18443 out rc=0
+    box pub -p "$hp:8000" -p "0.0.0.0:$any:8001" && start pub || return 1
+    grep -qx "Port 127.0.0.1:$hp of the host reaches its port 8000" "$OUT/pub.start" &&
+        grep -qx "Port 0.0.0.0:$any of the host reaches its port 8001" "$OUT/pub.start" ||
+        { echo "start does not say what it publishes"; return 1; }
+    pid=$(pid_of pub)
+    # in the box's network: one on its loopback alone, one on every address of it
+    near=$(tcp_listener 127.0.0.1 8000 'from the box' "$pid") || return 1
+    far=$(tcp_listener 0.0.0.0 8001 'from the box, on every address' "$pid") || { kill "$near"; return 1; }
+    listening() { nsenter -t "$pid" -n ss -ltn | grep -q ":$1 "; }
+    wait_until 5 listening 8000 && wait_until 5 listening 8001 || { echo "the listeners in the box did not come up"; rc=1; }
+    out=$(cat "$T/outside")
+    if [ $rc = 0 ]; then
+        said=$("$BB" nc -w 3 127.0.0.1 "$hp" </dev/null 2>&1)
+        echo "the host, 127.0.0.1:$hp: ${said:-no answer}"
+        [ "$said" = 'from the box' ] || rc=1
+        said=$("$BB" nc -w 3 127.0.0.1 "$any" </dev/null 2>&1)
+        echo "the host, 127.0.0.1:$any: ${said:-no answer}"
+        [ "$said" = 'from the box, on every address' ] || rc=1
+        said=$(nsenter -t "$out" -n "$BB" nc -w 3 192.0.2.2 "$hp" </dev/null 2>&1)
+        echo "the outside, 192.0.2.2:$hp: ${said:-no answer}"
+        case $said in *[Rr]efused*) ;; *) echo "a port on 127.0.0.1 was reached from beyond the host"; rc=1 ;; esac
+        said=$(nsenter -t "$out" -n "$BB" nc -w 3 192.0.2.2 "$any" </dev/null 2>&1)
+        echo "the outside, 192.0.2.2:$any: ${said:-no answer}"
+        [ "$said" = 'from the box, on every address' ] || rc=1
+    fi
+    # the relay
+    relay=$(cat "$CG/pub/lightbox.relay/cgroup.procs" 2>/dev/null)
+    if [ "$(printf '%s\n' "$relay" | grep -c .)" != 1 ]; then
+        echo "lightbox.relay holds: ${relay:-nothing}"; rc=1
+    else
+        said="uid $(status_field "$relay" Uid) gid $(status_field "$relay" Gid) seccomp $(status_field "$relay" Seccomp)"
+        said="$said no_new_privs $(status_field "$relay" NoNewPrivs) effective $(status_field "$relay" CapEff)"
+        said="$said bounding $(status_field "$relay" CapBnd)"
+        echo "the relay: $said"
+        [ "$said" = "uid 65534 gid 65534 seccomp 2 no_new_privs 1 effective 0000000000000000 bounding 0000000000000000" ] || rc=1
+        [ "$(readlink "/proc/$relay/ns/net")" = "$(readlink "/proc/$pid/ns/net")" ] || { echo "the relay is not in the box's network"; rc=1; }
+        [ "$(awk '$1 == "NSpid:" { print NF - 1 }' "/proc/$relay/status")" = 1 ] &&
+            [ "$(readlink "/proc/$relay/ns/mnt")" != "$(readlink "/proc/$pid/ns/mnt")" ] ||
+            { echo "the relay is in a namespace of the box's processes"; rc=1; }
+    fi
+    # a second box on that port: refused, and nothing of it is left
+    if box pub2 -p "$hp:9000"; then
+        said=$(lb start pub2 2>&1 </dev/null) && { echo "a second box took the port"; rc=1; }
+        printf '%s\n' "$said"
+        case $said in *"the host's port of -p 127.0.0.1:$hp:9000 is in use"*) ;; *) rc=1 ;; esac
+        nothing_left pub2 >/dev/null || { nothing_left pub2; rc=1; }
+    else
+        rc=1
+    fi
+    kill "$near" "$far" 2>/dev/null
+    # a stop ends the relay, and the port is free
+    lb stop pub >/dev/null || return 1
+    [ -z "$relay" ] || wait_until 5 gone "$relay" || ! alive "$relay" || { echo "the relay $relay outlived its box"; rc=1; }
+    port_free() { ! ss -ltn | grep -q "127.0.0.1:$hp "; }
+    wait_until 5 port_free || { echo "the host's port $hp is still taken"; rc=1; }
+    nothing_left pub >/dev/null || { nothing_left pub; rc=1; }
+    return $rc
+}
+
 # ─── Cases: the init hook, starting and stopping ────────────────────────────
 
 t_hook_runs() {
@@ -5189,6 +5261,7 @@ if [ "$MODE" = inside ]; then
     check "a device that only its group may open: its group is in a box's gid map, held by root and by another user" t_device_group
     check '--gpu on a host without a GPU: the start says so, and leaves nothing' t_gpu_none
     check 'cp copies into a running box and out of it, through the box'"'"'s own root' t_cp
+    check 'a port the box publishes reaches its loopback through a relay of nobody'"'"'s, where it was told to' t_publish
 
     check 'the init hook runs with /tmp and /run mounted'                 t_hook_runs
     check 'a service the hook starts outlives the start command'          t_service_outlives_start

@@ -254,6 +254,17 @@ A name server for the container.
 Repeatable, up to 3.
 The default is the host's.
 .TP
+.BR \-p ", " \-\-publish " [\fIaddress\fB:\fR]\fIhost-port\fB:\fIbox-port\fR"
+A TCP port of the host's that reaches the box's port, relayed to the box's
+own loopback: on 127.0.0.1 unless an address is given, and on every address
+with 0.0.0.0.
+Repeatable, up to 16.
+The relay runs as nobody, with no capability and under its own seccomp
+filter, in the box's network and cgroup, and ends with the box.
+A port that is in use refuses the start.
+.B \-\-profile agent
+refuses it.
+.TP
 .B \-\-profile agent
 A box for an AI agent's session: a user namespace, the allow\-list, an
 overlay, and the network of

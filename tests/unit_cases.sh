@@ -5110,6 +5110,61 @@ the monitor ended with status 1" ] && [ -z "$(ls -A "$d")" ]
 }
 check 'a monitor that cannot go into its cgroup says so to start, clones nothing and makes no file' t_monitor_cgroup
 
+# A port as -p and a box's .conf give it (ROADMAP N.1): 127.0.0.1 unless an
+# address is given, 0.0.0.0 for every address, and kept with its address
+# named; /tcp, which it is without; and what is no port refused, each with
+# its reason: UDP, which is not published, a port without the box's, one
+# out of 1 to 65535 or with a zero in front, an address that is none, a
+# multicast or broadcast address, and too many parts.
+t_port_spec() {
+    local bad=0 t want got
+    while IFS='|' read -r t want; do
+        got=$("$UNIT" portspec "$t")
+        [ "$got" = "$want" ] || { echo "$t: $got, not: $want"; bad=1; }
+    done <<'END'
+8080:80|port 127.0.0.1:8080:80
+127.0.0.1:8080:80|port 127.0.0.1:8080:80
+0.0.0.0:443:8443|port 0.0.0.0:443:8443
+10.1.2.3:22:22/tcp|port 10.1.2.3:22:22
+8080:80/udp|refused: a UDP port is not published: lightbox publishes TCP ports
+8080|refused: a port names the host's port and the box's: <host port>:<box port>
+:80|refused: a port is a number from 1 to 65535
+0:80|refused: a port is a number from 1 to 65535
+80:65536|refused: a port is a number from 1 to 65535
+080:80|refused: a port is a number from 1 to 65535
+1.2.3:80:80|refused: the address of a port is an IPv4 address of the host's, or 0.0.0.0 for all of them
+224.0.0.1:80:80|refused: the address of a port is the host's own, and no multicast or broadcast address
+255.255.255.255:1:1|refused: the address of a port is the host's own, and no multicast or broadcast address
+a:b:c:d|refused: a port is written [<address>:]<host port>:<box port>[/tcp]
+8080:80/sctp|refused: a port is written [<address>:]<host port>:<box port>[/tcp]
+END
+    return $bad
+}
+check 'a port is [<address>:]<host port>:<box port>, on 127.0.0.1 unless an address is given' t_port_spec
+
+# The relay of a box's ports (ROADMAP N.1), between two listeners of
+# loopback's, the second standing for the box's port, as an ordinary user,
+# where it keeps its ids: it says it is ready once its filter is in, which
+# /proc then shows with no_new_privs; bytes go both ways, a megabyte in a
+# pattern that a byte out of place breaks, and each side's end comes through
+# to the other; a connection to a box's port where nothing listens is
+# closed; and it is ended by the case's SIGKILL, and by no call its filter
+# has not, as a relay that made one would have been.
+t_relay() {
+    local said
+    said=$(timeout -k 5 60 "$UNIT" relay)
+    printf '%s\n' "$said"
+    [ "$said" = "ready
+seccomp 2, no_new_privs 1
+ping came through
+pong came back
+1048576 bytes came through as they were sent
+the end came through, and the answer to it
+a port where nothing listens: the connection is closed
+ended by SIGKILL, and by nothing before it" ]
+}
+check 'the relay of a box'"'"'s ports copies both ways under its filter, and passes each end on' t_relay
+
 # The monitor keeps a --ttl from the host as well (ROADMAP M.1): a child that
 # never ends by itself, as an init that something stopped would not, is ended
 # by the monitor its grace and a margin of 3 s past the deadline, which here

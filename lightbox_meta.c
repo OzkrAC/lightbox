@@ -321,6 +321,35 @@ static void report_devices(struct report *r, const container_config *config) {
     lc_print_char(STDOUT, ']');
 }
 
+/* The ports it publishes (ROADMAP N.1): a line each, "<address>:<host
+ * port>:<box port>", or an array of objects. */
+static void report_ports(struct report *r, const container_config *config) {
+    if (!r->json) {
+        if (config->nports == 0)
+            print_kv("port", "-");
+        for (int i = 0; i < config->nports; i++) {
+            char text[PORT_TEXT_MAX];
+            port_spec_text(text, &config->ports[i]);
+            print_kv("port", text);
+        }
+        return;
+    }
+    json_key("ports", r->first);
+    r->first = false;
+    lc_print_char(STDOUT, '[');
+    for (int i = 0; i < config->nports; i++) {
+        char addr[IPV4_TEXT_MAX];
+        format_ipv4(addr, config->ports[i].addr);
+        if (i) lc_print_char(STDOUT, ',');
+        lc_print_char(STDOUT, '{');
+        json_key("address", true);    json_string(addr);
+        json_key("host_port", false); lc_print_unsigned(STDOUT, config->ports[i].host_port);
+        json_key("box_port", false);  lc_print_unsigned(STDOUT, config->ports[i].box_port);
+        lc_print_char(STDOUT, '}');
+    }
+    lc_print_char(STDOUT, ']');
+}
+
 /* The containers it is linked to: a line each, or an array of names. */
 static void report_links(struct report *r, const container_config *config) {
     if (!r->json) {
@@ -441,6 +470,7 @@ void cmd_inspect(int argc, char **argv) {
         report_text(&r, "workdir", config.workdir[0] ? config.workdir : NULL);
         report_volumes(&r, &config);
         report_devices(&r, &config);
+        report_ports(&r, &config);
         report_links(&r, &config);
     }
     if (json)

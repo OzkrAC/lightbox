@@ -869,7 +869,6 @@ static void apply_sandbox(bool allow_list) {
  * user made for a test has none, the ids stay: its root is that user, and
  * the rest is done all the same. Any step that fails ends the process.
  */
-#define NOBODY_ID 65534u
 
 void sandbox_host_tool(const char *program) {
     if (lc_kernel_unshare(CLONE_NEWNET | CLONE_NEWIPC) < 0)
@@ -1423,7 +1422,7 @@ static const char *make_resolv(container_config *cfg, char dns[MAX_DNS][16], int
  */
 static const char *const create_value_options[] = {
     "--mem", "--swap", "--pids", "--cpu", "--io-max", "--vol", "--rootfs", "--base", "--seccomp", "--net",
-    "--oom-score", "--ttl", "--link", "--dns", "--profile", "--workspace", "--device",
+    "--oom-score", "--ttl", "--link", "--dns", "--profile", "--workspace", "--device", "-p", "--publish",
 };
 static const char *const create_flag_options[] = { "--userns", "--read-only", "--copy", "--privileged", "--gpu" };
 
@@ -1446,6 +1445,12 @@ static void agent_profile(container_config *cfg, bool net_given, bool full_copy)
         die("Error: --profile agent refuses --seccomp deny");
     if (full_copy)
         die("Error: --profile agent refuses --copy: its root is an overlay of its base");
+    /* its box is no server for the network: what an agent that a prompt has
+     * turned can read, it would give whoever connects, past every rule of
+     * what leaves it (ROADMAP N.1, by the maintainer's word of 2026-11-25) */
+    if (cfg->nports > 0)
+        die("Error: --profile agent refuses -p: an agent's box publishes no port; the host reaches one of "
+            "--net outside or proxy at its address");
     cfg->profile = PROFILE_AGENT;
     cfg->userns = true;
     if (!net_given)
@@ -1760,6 +1765,14 @@ static void cmd_create(int argc, char **argv) {
                 wrong = config_add_device(&cfg, &dev);
             if (wrong)
                 die_about("Error: --device: ", wrong, value);
+        } else if (streq(opt, "-p") || streq(opt, "--publish")) {
+            const char *value = option_value(argc, argv, &i);
+            port_spec port;
+            const char *wrong = parse_port_spec(value, &port);
+            if (!wrong)
+                wrong = config_add_port(&cfg, &port);
+            if (wrong)
+                die_about("Error: -p: ", wrong, value);
         } else if (streq(opt, "--dns")) {
             const char *value = option_value(argc, argv, &i);
             if (ndns >= MAX_DNS) die("Error: more than " STRINGIFY(MAX_DNS) " --dns options: a resolver reads no more");
@@ -5131,6 +5144,114 @@ static bool gpu_root_is_musl(const char *name, const container_config *config) {
     return root_has_musl(root) || (config->base[0] && base_rootfs_path(base, config->base) && root_has_musl(base));
 }
 
+/* ─── The box's published ports (ROADMAP N.1) ───────────────────────────── */
+
+/* The cgroup of the relay of a box's ports, below the box's: a name with a
+ * dot, which no exec's has. */
+#define RELAY_CGROUP "lightbox.relay"
+/* How long start waits for the relay to say that it is confined. */
+#define RELAY_READY_MS 5000
+
+/* The relay's cgroup, which a start that failed may have left */
+static bool relay_cgroup_made(const char *cg) {
+    lc_sysret rc = lc_kernel_mkdirat(AT_FDCWD, cg, 0755);
+    return rc == 0 || rc == -LB_EEXIST;
+}
+
+/* A socket of the host's that listens on a port the box publishes, as root:
+ * NULL with it in *fd, or why not. */
+static const char *port_listen(const port_spec *port, int32_t *fd) {
+    static char why[PORT_TEXT_MAX + 120];
+    char text[PORT_TEXT_MAX], addr[IPV4_TEXT_MAX], digits[16];
+    port_spec_text(text, port);
+    format_ipv4(addr, port->addr);
+    lc_sysret rc = relay_listen(port->addr, port->host_port);
+    if (rc >= 0) {
+        *fd = (int32_t)rc;
+        return NULL;
+    }
+    bool cut = false;
+    size_t at = 0;
+    if (rc == -LB_EADDRINUSE) {
+        at = str_append(why, at, "the host's port of -p ", sizeof(why), &cut);
+        at = str_append(why, at, text, sizeof(why), &cut);
+        (void)str_append(why, at, " is in use", sizeof(why), &cut);
+    } else if (rc == -LB_EADDRNOTAVAIL) {
+        at = str_append(why, at, addr, sizeof(why), &cut);
+        at = str_append(why, at, ", of -p ", sizeof(why), &cut);
+        at = str_append(why, at, text, sizeof(why), &cut);
+        (void)str_append(why, at, ", is no address of this host", sizeof(why), &cut);
+    } else {
+        fmt_int(digits, (int)-rc);
+        at = str_append(why, at, "cannot listen on the host's port of -p ", sizeof(why), &cut);
+        at = str_append(why, at, text, sizeof(why), &cut);
+        at = str_append(why, at, " (errno ", sizeof(why), &cut);
+        at = str_append(why, at, digits, sizeof(why), &cut);
+        (void)str_append(why, at, ")", sizeof(why), &cut);
+    }
+    return why;
+}
+
+/*
+ * The relay of the box's ports (lightbox_relay.c): forked into the cgroup
+ * lightbox.relay below the box's, where the box's limits hold for it and
+ * whatever ends the box ends it; a session of its own, so that the signals
+ * of start's terminal do not reach it; with the listeners, the box's network
+ * namespace and the pipe it says it is ready on, and nothing else of
+ * start's. start's own copies of the listeners are closed. NULL once it is
+ * confined, or why not.
+ */
+static const char *relay_start(const char *name, int pid, const container_config *config, int32_t *listeners) {
+    char cg[MAX_PATH], relay_cg[MAX_PATH];
+    int32_t ready[2] = { -1, -1 };
+    const char *failed = NULL;
+    int netns = -1;
+    if (!cgroup_path(cg, name) || !path_join(relay_cg, sizeof(relay_cg), cg, RELAY_CGROUP))
+        failed = "the path of the cgroup of the box's relay is too long";
+    else if (!relay_cgroup_made(relay_cg))
+        failed = "cannot make the cgroup of the relay of the box's ports";
+    else if ((netns = open_target_path(pid, "/ns/net")) < 0)
+        failed = "cannot open the box's network namespace for the relay of its ports";
+    else if (lc_kernel_create_pipe(ready, O_CLOEXEC) < 0)
+        failed = "cannot make the pipe of the relay of the box's ports";
+    lc_sysret relay = failed ? -1 : lc_kernel_fork();
+    if (relay == 0) {
+        (void)lc_kernel_create_session();
+        /* its standard streams nobody's, opened before the box's device
+         * filter holds for it */
+        lc_sysret null = lc_kernel_open_file("/dev/null", O_RDWR, 0);
+        for (int32_t i = 0; null >= 0 && i < 3; i++)
+            (void)lc_kernel_duplicate_fd((int32_t)null, i, 0);
+        if (cgroup_enter(relay_cg) < 0)
+            lc_kernel_exit(1);
+        int32_t keep[MAX_PORTS + 2];
+        int nkeep = 0;
+        for (int i = 0; i < config->nports; i++)
+            keep[nkeep++] = listeners[i];
+        keep[nkeep++] = netns;
+        keep[nkeep++] = ready[1];
+        close_all_but(keep, (size_t)nkeep);
+        static uint16_t box_ports[MAX_PORTS];
+        for (int i = 0; i < config->nports; i++)
+            box_ports[i] = config->ports[i].box_port;
+        relay_run(listeners, box_ports, config->nports, netns, ready[1]);
+    }
+    if (relay < 0 && !failed)
+        failed = "cannot fork the relay of the box's ports";
+    for (int i = 0; i < config->nports; i++)
+        lc_kernel_close_file(listeners[i]);
+    if (netns >= 0)
+        lc_kernel_close_file(netns);
+    if (ready[1] >= 0)
+        lc_kernel_close_file(ready[1]);
+    char said = 0;
+    if (!failed && (!readable_within(ready[0], RELAY_READY_MS) || lc_kernel_read_bytes(ready[0], &said, 1) != 1 || said != 'R'))
+        failed = "the relay of the box's ports could not be confined";
+    if (ready[0] >= 0)
+        lc_kernel_close_file(ready[0]);
+    return failed;
+}
+
 static void start_one(const char *name, int hook_wait) {
     require_root("start");
 
@@ -5513,6 +5634,17 @@ static void start_one(const char *name, int hook_wait) {
         goto fail_start;
     int child_pid = (int)init.pid;
 
+    /* The host's ports the box publishes (ROADMAP N.1), as root, here: init
+     * and its monitor have their descriptors already, and have none of
+     * these; and a port that is in use ends the start before anything of
+     * the box has run. */
+    static int32_t port_fds[MAX_PORTS];
+    for (int i = 0; i < config.nports; i++) {
+        start_err = port_listen(&config.ports[i], &port_fds[i]);
+        if (start_err)
+            goto fail_start;
+    }
+
     /*
      * Set up cgroup, networking, and OOM score before init gets its first
      * byte. While it waits for that byte it is certainly there, so everything
@@ -5628,6 +5760,10 @@ static void start_one(const char *name, int hook_wait) {
         start_err = "failed to put in the firewall rules of the container's links or --net";
         goto fail_start;
     }
+    /* and its ports' relay, before the hook, so that what the hook starts is
+     * reached as soon as it listens */
+    if (config.nports > 0 && (start_err = relay_start(name, child_pid, &config, port_fds)) != NULL)
+        goto fail_start;
 
     /* Second byte: init runs the hook, and says how it ended. */
     if (!init_go(&init)) {
@@ -5680,6 +5816,17 @@ static void start_one(const char *name, int hook_wait) {
     print_str(STDOUT,", ip=");
     print_str(STDOUT,ip);
     print_str(STDOUT,")\n");
+    for (int i = 0; i < config.nports; i++) {
+        char on[IPV4_TEXT_MAX];
+        format_ipv4(on, config.ports[i].addr);
+        print_str(STDOUT, "Port ");
+        print_str(STDOUT, on);
+        lc_print_char(STDOUT, ':');
+        lc_print_unsigned(STDOUT, config.ports[i].host_port);
+        print_str(STDOUT, " of the host reaches its port ");
+        lc_print_unsigned(STDOUT, config.ports[i].box_port);
+        lc_print_char(STDOUT, '\n');
+    }
     print_str(STDOUT,"Attach with: lightbox exec ");
     print_str(STDOUT,name);
     print_str(STDOUT," /bin/sh\n");
@@ -7308,6 +7455,10 @@ static const struct { const char *name; const char *text; } command_help[] = {
         "                                it stops as stop stops it, and is expired\n"
         "         --link <name>          Allow network to another container\n"
         "         --dns <address>        A name server for the container (up to 3; default: the host's)\n"
+        "         -p, --publish [<address>:]<host port>:<box port>\n"
+        "                                A TCP port of the host's that reaches the box's port, relayed\n"
+        "                                to its loopback; on 127.0.0.1 unless an address is given, and\n"
+        "                                0.0.0.0 for every address (repeatable)\n"
         "         --profile <name>       agent: a user namespace, the allow-list, an overlay, and the\n"
         "                                network of --net none unless --net outside or proxy:<port> is\n"
         "                                given, with the limits and lifetime of the agent_* settings. As\n"

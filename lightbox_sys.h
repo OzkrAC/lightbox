@@ -58,6 +58,8 @@
 #define LB_SYS_close_range 436
 #define LB_SYS_openat2    437
 #define LB_SYS_mount_setattr 442
+#define LB_SYS_getsockname 51
+#define LB_SYS_getsockopt 55
 #elif defined(__aarch64__)
 #define LB_SYS_fsetxattr  7
 #define LB_SYS_fgetxattr  10
@@ -92,6 +94,8 @@
 #define LB_SYS_close_range 436
 #define LB_SYS_openat2    437
 #define LB_SYS_mount_setattr 442
+#define LB_SYS_getsockname 204
+#define LB_SYS_getsockopt 209
 #else
 #error "lightbox supports x86_64 and aarch64 only"
 #endif
@@ -123,6 +127,9 @@
 #define LB_ELOOP                  40
 #define LB_ENODATA                61
 #define LB_EOPNOTSUPP             95
+#define LB_EADDRINUSE             98
+#define LB_EADDRNOTAVAIL          99
+#define LB_EINPROGRESS            115
 
 /* The signals lightbox names that lightc does not (asm/signal.h) */
 #define LB_SIGPIPE                13
@@ -308,6 +315,12 @@
  * write an interface's flags (sys/socket.h, linux/sockios.h, linux/if.h). */
 #define LB_AF_INET                2
 #define LB_SOCK_DGRAM             2
+
+/* What a published port takes that lightc's sockets do not name (ROADMAP
+ * N.1): a socket that does not block, and the error of a connect that did
+ * not (sys/socket.h). SOCK_NONBLOCK is O_NONBLOCK, the same on both targets. */
+#define LB_SOCK_NONBLOCK          04000
+#define LB_SO_ERROR               4
 #define LB_SIOCGIFFLAGS           0x8913
 #define LB_SIOCSIFFLAGS           0x8914
 #define LB_IFF_UP                 0x1
@@ -605,6 +618,21 @@ static inline lc_sysret lb_sys_sendto(int32_t fd, const void *buf, uint64_t len,
 
 static inline lc_sysret lb_sys_recvfrom(int32_t fd, void *buf, uint64_t len, int32_t flags) {
     return lc_syscall6(SYS_recvfrom, fd, (int64_t)buf, (int64_t)len, flags, 0, 0);
+}
+
+/* What a published port takes that lightc does not wrap (ROADMAP N.1):
+ * accept4(2) with flags, where lc_socket_accept gives none, with lightc's
+ * number; and getsockopt(2) and getsockname(2), with lightbox's. */
+static inline lc_sysret lb_sys_accept4(int32_t fd, int32_t flags) {
+    return lc_syscall4(SYS_accept4, fd, 0, 0, flags);
+}
+
+static inline lc_sysret lb_sys_getsockopt(int32_t fd, int32_t level, int32_t name, void *value, uint32_t *len) {
+    return lc_syscall5(LB_SYS_getsockopt, fd, level, name, (int64_t)value, (int64_t)len);
+}
+
+static inline lc_sysret lb_sys_getsockname(int32_t fd, void *addr, uint32_t *len) {
+    return lc_syscall3(LB_SYS_getsockname, fd, (int64_t)addr, (int64_t)len);
 }
 
 /* ppoll(2) with the caller's signal mask left as it is: wait until one of the

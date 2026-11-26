@@ -28,6 +28,7 @@
  */
 
 #include "lightbox.h"
+#include <lightc/socket.h>
 
 /* ─── Limits ────────────────────────────────────────────────────────────── */
 
@@ -450,6 +451,97 @@ const char *config_add_device(container_config *config, const device_spec *dev) 
     return NULL;
 }
 
+/* A port's number: 1 to 65535, in digits with no zero in front. */
+static bool port_number(const char *text, size_t len, uint16_t *out) {
+    if (len == 0 || len > 5 || text[0] == '0')
+        return false;
+    uint32_t value = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (text[i] < '0' || text[i] > '9')
+            return false;
+        value = value * 10u + (uint32_t)(text[i] - '0');
+    }
+    if (value > 65535u)
+        return false;
+    *out = (uint16_t)value;
+    return true;
+}
+
+const char *parse_port_spec(const char *spec, port_spec *port) {
+    static const char form[] = "a port is written [<address>:]<host port>:<box port>[/tcp]";
+    *port = (port_spec){ .addr = LC_INADDR_LOOPBACK };
+    if (has_control_chars(spec))
+        return form;
+    size_t len = lc_string_length(spec);
+    /* /tcp, which it is without it too */
+    for (size_t i = 0; i < len; i++) {
+        if (spec[i] != '/')
+            continue;
+        if (streq(spec + i + 1, "udp"))
+            return "a UDP port is not published: lightbox publishes TCP ports";
+        if (!streq(spec + i + 1, "tcp"))
+            return form;
+        len = i;
+        break;
+    }
+    size_t colons[2], ncolons = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (spec[i] != ':')
+            continue;
+        if (ncolons == 2)
+            return form;
+        colons[ncolons++] = i;
+    }
+    if (ncolons == 0)
+        return "a port names the host's port and the box's: <host port>:<box port>";
+    size_t start = 0;
+    if (ncolons == 2) {
+        char text[IPV4_TEXT_MAX];
+        size_t alen = colons[0];
+        if (alen == 0 || alen >= sizeof(text))
+            return "the address of a port is an IPv4 address of the host's, or 0.0.0.0 for all of them";
+        lc_bytes_copy(text, spec, alen);
+        text[alen] = '\0';
+        uint32_t addr;
+        if (!parse_ipv4(text, &addr))
+            return "the address of a port is an IPv4 address of the host's, or 0.0.0.0 for all of them";
+        if (addr >= 0xe0000000u)
+            return "the address of a port is the host's own, and no multicast or broadcast address";
+        port->addr = addr;
+        start = colons[0] + 1;
+    }
+    size_t mid = colons[ncolons - 1];
+    if (!port_number(spec + start, mid - start, &port->host_port) ||
+        !port_number(spec + mid + 1, len - mid - 1, &port->box_port))
+        return "a port is a number from 1 to 65535";
+    return NULL;
+}
+
+void port_spec_text(char out[PORT_TEXT_MAX], const port_spec *port) {
+    char addr[IPV4_TEXT_MAX], host[8], box[8];
+    format_ipv4(addr, port->addr);
+    fmt_int(host, port->host_port);
+    fmt_int(box, port->box_port);
+    bool cut = false;
+    size_t at = str_append(out, 0, addr, PORT_TEXT_MAX, &cut);
+    at = str_append(out, at, ":", PORT_TEXT_MAX, &cut);
+    at = str_append(out, at, host, PORT_TEXT_MAX, &cut);
+    at = str_append(out, at, ":", PORT_TEXT_MAX, &cut);
+    (void)str_append(out, at, box, PORT_TEXT_MAX, &cut);
+}
+
+const char *config_add_port(container_config *config, const port_spec *port) {
+    for (int i = 0; i < config->nports; i++) {
+        const port_spec *had = &config->ports[i];
+        if (had->host_port == port->host_port && (had->addr == port->addr || had->addr == 0 || port->addr == 0))
+            return "the box already has a port on that port of the host";
+    }
+    if (config->nports >= MAX_PORTS)
+        return "the box already has the maximum of " STRINGIFY(MAX_PORTS) " ports";
+    config->ports[config->nports++] = *port;
+    return NULL;
+}
+
 /*
  * The devices whose use is the host's (ROADMAP G.1, by the maintainer's word
  * of 2026-11-23), by their numbers (Documentation/admin-guide/devices.txt):
@@ -772,6 +864,12 @@ static const char *config_line(container_config *config, char *line, unsigned *s
         return config_add_device(config, &dev);
     }
 
+    if (streq(key, "port")) {
+        port_spec port;
+        const char *wrong = parse_port_spec(value, &port);
+        return wrong ? wrong : config_add_port(config, &port);
+    }
+
     if (streq(key, "link")) {
         if (config->nlinks >= MAX_LINKS)
             return "more than " STRINGIFY(MAX_LINKS) " links";
@@ -957,8 +1055,8 @@ static bool same_config(const container_config *a, const container_config *b) {
         a->uid_start != b->uid_start || a->gid_start != b->gid_start ||
         a->seccomp_allow != b->seccomp_allow || a->net != b->net || a->proxy_port != b->proxy_port ||
         a->ndns != b->ndns || !streq(a->ttl, b->ttl) || a->ttl_ms != b->ttl_ms || !streq(a->id, b->id) ||
-        a->profile != b->profile || !streq(a->workdir, b->workdir) ||
-        a->nvols != b->nvols || a->nlinks != b->nlinks)
+        a->profile != b->profile || !streq(a->workdir, b->workdir) || a->gpu != b->gpu ||
+        a->nvols != b->nvols || a->ndevs != b->ndevs || a->nports != b->nports || a->nlinks != b->nlinks)
         return false;
     for (int i = 0; i < a->ndns; i++) {
         if (!streq(a->dns[i], b->dns[i]))
@@ -967,6 +1065,16 @@ static bool same_config(const container_config *a, const container_config *b) {
     for (int i = 0; i < a->nvols; i++) {
         if (!streq(a->vols[i].src, b->vols[i].src) || !streq(a->vols[i].dst, b->vols[i].dst) ||
             a->vols[i].ro != b->vols[i].ro)
+            return false;
+    }
+    for (int i = 0; i < a->ndevs; i++) {
+        if (!streq(a->devs[i].host, b->devs[i].host) || !streq(a->devs[i].path, b->devs[i].path) ||
+            a->devs[i].ro != b->devs[i].ro)
+            return false;
+    }
+    for (int i = 0; i < a->nports; i++) {
+        if (a->ports[i].addr != b->ports[i].addr || a->ports[i].host_port != b->ports[i].host_port ||
+            a->ports[i].box_port != b->ports[i].box_port)
             return false;
     }
     for (int i = 0; i < a->nlinks; i++) {
@@ -1045,6 +1153,11 @@ const char *container_config_save(const char *name, const container_config *conf
         put(&out, ":");
         put(&out, dev->path);
         put(&out, dev->ro ? ":ro\n" : "\n");
+    }
+    for (int i = 0; i < config->nports; i++) {
+        char port[PORT_TEXT_MAX];
+        port_spec_text(port, &config->ports[i]);
+        put_line(&out, "port", port);
     }
     for (int i = 0; i < config->nlinks; i++)
         put_line(&out, "link", config->links[i]);
