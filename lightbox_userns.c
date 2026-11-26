@@ -265,9 +265,63 @@ static void container_maps(uint32_t uid_start, uint32_t gid_start, id_map *uids,
 }
 
 int userns_write_maps(int pid, uint32_t uid_start, uint32_t gid_start) {
+    return userns_write_maps_with(pid, uid_start, gid_start, NULL, 0);
+}
+
+bool userns_gid_map_text(char *out, size_t max, uint32_t gid_start, const uint32_t *groups, size_t ngroups) {
+    id_map uids, gids;
+    container_maps(0, gid_start, &uids, &gids);
+    char line[ID_MAP_LINE_MAX];
+    bool cut = false;
+    id_map_line(line, &gids);
+    size_t pos = str_append(out, 0, line, max, &cut);
+    for (size_t i = 0; i < ngroups && !cut; i++) {
+        /* never one of the host's id 0, nor one inside the range, which the kernel refuses */
+        if (groups[i] == 0 || (groups[i] >= gid_start && groups[i] - gid_start < USERNS_SIZE))
+            return false;
+        id_map_line(line, &(id_map){ .inside = USERNS_DEVICE_GID + (uint32_t)i, .outside = groups[i], .count = 1 });
+        pos = str_append(out, pos, line, max, &cut);
+    }
+    return !cut;
+}
+
+int userns_write_maps_with(int pid, uint32_t uid_start, uint32_t gid_start, const uint32_t *groups, size_t ngroups) {
     id_map uids, gids;
     container_maps(uid_start, gid_start, &uids, &gids);
-    return write_maps(pid, &uids, &gids);
+    /* a gid map is written once, whole: its range and its devices' groups in one write */
+    char path[64], text[USERNS_MAP_TEXT_MAX];
+    int rc = write_map(pid, "/uid_map", &uids);
+    if (rc)
+        return rc;
+    if (!userns_gid_map_text(text, sizeof(text), gid_start, groups, ngroups) ||
+        !proc_pid_path(path, sizeof(path), pid, "/gid_map"))
+        return -LB_EINVAL;
+    return write_file(path, text) < 0 ? -LB_EINVAL : 0;
+}
+
+int gid_map_device_groups(const char *text, uint32_t *inside, int max) {
+    int count = 0;
+    for (const char *p = text; *p && count < max; ) {
+        uint32_t fields[3] = { 0, 0, 0 };
+        int n = 0;
+        while (*p && *p != '\n' && n < 3) {
+            while (*p == ' ' || *p == '\t')
+                p++;
+            if (*p < '0' || *p > '9')
+                break;
+            uint64_t v = 0;
+            while (*p >= '0' && *p <= '9' && v <= 0xffffffffULL)
+                v = v * 10 + (uint64_t)(*p++ - '0');
+            fields[n++] = (uint32_t)v;
+        }
+        if (n == 3 && fields[0] >= USERNS_DEVICE_GID && fields[0] < USERNS_DEVICE_GID + MAX_DEVICES && fields[2] == 1)
+            inside[count++] = fields[0];
+        while (*p && *p != '\n')
+            p++;
+        if (*p)
+            p++;
+    }
+    return count;
 }
 
 int userns_fd_with(uint32_t uid_start, uint32_t gid_start) {

@@ -95,6 +95,17 @@ jobs:
       # nothing of a C library, so it is the package for Debian too. It is
       # installed in Debian's own images, to see that apt finds what it
       # depends on there and that the binary runs.
+      # Docker Hub's as the Void image is ghcr.io's: pulled first, three times
+      # at most, a minute apart
+      - name: Pull Debian's images
+        run: |
+          for release in 12 13; do
+            for try in 1 2 3; do
+              docker pull "debian:$release" && break
+              [ "$try" = 3 ] && exit 1
+              sleep 60
+            done
+          done
       - name: Install the package on Debian
         id: debian
         run: |
@@ -210,6 +221,16 @@ jobs:
       # leaves in it is root's, which the steps after it only read. The shell
       # prints each command before it runs it, so that the end of the output
       # names the one that failed.
+      # ghcr.io may take longer to answer than docker waits: run 45430109729
+      # of 2026-11-24 ended so, before anything of lightbox's ran. The image is
+      # pulled first, three times at most, a minute apart.
+      - name: Pull the Void Linux image
+        run: |
+          for try in 1 2 3; do
+            docker pull ghcr.io/void-linux/void-glibc-full:latest && exit 0
+            [ "$try" = 3 ] || sleep 60
+          done
+          exit 1
       - name: Build, package and install in a Void Linux container
         id: void
         run: |

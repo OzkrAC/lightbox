@@ -114,6 +114,12 @@
  *                                             "entries <n>", "sockets <n>", "attributes-left <n>",
  *                                             "bytes <n>" and "sha256 <digest>" of the archive;
  *                                             or "failed: <entry>: <why>" and status 1
+ *   unit tar-one <dir> <name> <as> <archive> [plain] [root] [nosetid]
+ *                                             tar_write_one of <name> in <dir>, as <as>, with
+ *                                             lightbox cp's options: "entries <n>", or "failed: ..."
+ *   unit untar-copy <archive> <dir> [nosetid] [owner <uid> <gid>]
+ *                                             tar_read_tree into <dir> as lightbox cp unpacks:
+ *                                             "entries <n>" and "devices <n>", or "failed: ..."
  *   unit untar <archive> <dir> [tree|upper|upper-user [<uid_start> <gid_start> [<piece>]]]
  *                                             tar_read_tree of the file <archive> into <dir>: as
  *                                             one tree, or as an overlay's upper directory, root's
@@ -148,6 +154,32 @@
  *                                             "refused" and status 1
  *   unit overlay-whole <dir>                  overlay_upper_whole: "whole", "not whole: <path>"
  *                                             with status 1, or "cannot read" with status 2
+ *   unit monitor <record>                     init_spawn_monitored with a child that waits to be
+ *                                             killed, which it then is: whether it is the
+ *                                             command's child, a zombie until the command is done,
+ *                                             what the monitor wrote to record, whether it reaped
+ *   unit monitor-ttl <record> <duration>      the same with that --ttl and no grace, and a child
+ *                                             that never ends: what the monitor wrote, and when
+ *   unit portspec <text>                      parse_port_spec: "port <text it is kept as>", or
+ *                                             "refused: <why>" with status 1
+ *   unit relay                                relay_run between two listeners of loopback's, the
+ *                                             second standing for the box's port: a line for each
+ *                                             thing it was seen to do, as t_relay lists them
+ *   unit monitor-cgroup <record> <dir>        the same with <dir> as the monitor's cgroup: what
+ *                                             init_spawn_monitored said, and how the monitor
+ *                                             ended, its status or "not the command's child"
+ *   unit gpu <root>                           gpu_devices under root: "<host> -> <path>" a line
+ *                                             each, or "more than <n>" with status 1
+ *   unit nvidia <root>                        nvidia_libraries under root: "version <v>", then
+ *                                             "file <host> <name>[ bin]" and "link <name> <target>"
+ *                                             lines; "none", or "missing <name>" with status 1
+ *   unit musl <rootfs>                        root_has_musl: "musl" or "not musl"
+ *   unit gidmap <gid_start> [<group>...]      userns_gid_map_text: the gid map of a container of
+ *                                             --userns with its devices' groups, or "refused"
+ *   unit devgroups <file>                     gid_map_device_groups of a gid_map's text: the gids
+ *                                             inside of the devices' groups, a line each
+ *   unit cgroup2-root <store> <cgroup_root>   ensure_cgroup2_for_start with the store's lock in
+ *                                             <store>: what it says, then "cgroup2"; or its error
  *   unit firewall-kernel <proc_net> <modules> true|false
  *                                             iptables_kernel_missing with ip_masq as given:
  *                                             "all there", "missing: <what>" with status 1, or
@@ -242,6 +274,7 @@
 
 #define main lightbox_main
 #include "../lightbox.c"
+#include <lightc/socket.h>
 #undef main
 
 static void put(const char *s) { print_str(STDOUT, s); }
@@ -535,6 +568,226 @@ static void put_own_privileges(void) {
 }
 
 /* What init is in the harness: all of a container's init but the container. */
+/* ─── The relay of a box's ports (ROADMAP N.1) ─────────────────────────── */
+
+/* Wait up to 5 s for fd to have something to read, or to take a write. */
+static bool unit_ready(int32_t fd, int16_t events) {
+    struct lb_pollfd one = { .fd = fd, .events = events, .revents = 0 };
+    lc_timespec limit = { .seconds = 5, .nanoseconds = 0 };
+    return lb_sys_ppoll(&one, 1, &limit) == 1;
+}
+
+/* A blocking socket connected to that port of loopback's, or -1. */
+static int32_t unit_connect(int port) {
+    lc_result made = lc_socket_create(LC_SOCK_STREAM | LB_SOCK_CLOEXEC);
+    if (made.error)
+        return -1;
+    lc_socket_address to = lc_socket_address_create(127, 0, 0, 1, (uint16_t)port);
+    lc_result connected = lc_socket_connect((int32_t)made.value, &to);
+    if (connected.error) {
+        lc_socket_close((int32_t)made.value);
+        return -1;
+    }
+    return (int32_t)made.value;
+}
+
+/* What fd sends within 5 s, up to len bytes: how many, 0 at its end, -1 on none. */
+static lc_sysret unit_read_some(int32_t fd, char *buf, size_t len) {
+    if (!unit_ready(fd, LB_POLLIN))
+        return -1;
+    return lc_kernel_read_bytes(fd, buf, len);
+}
+
+/* A field of /proc/<pid>/status, such as "Seccomp", into out. */
+static void unit_status_field(int pid, const char *field, char *out, size_t size) {
+    char path[64];
+    static char text[4096];
+    out[0] = '\0';
+    if (!proc_pid_path(path, sizeof(path), pid, "/status") || read_file(path, text, sizeof(text)) <= 0)
+        return;
+    size_t flen = lc_string_length(field);
+    for (const char *line = text; *line; ) {
+        if (lc_string_starts_with(line, lc_string_length(line), field, flen) && line[flen] == ':') {
+            const char *v = line + flen + 1;
+            while (*v == ' ' || *v == '\t')
+                v++;
+            size_t n = 0;
+            while (v[n] && v[n] != '\n' && n + 1 < size) {
+                out[n] = v[n];
+                n++;
+            }
+            out[n] = '\0';
+            return;
+        }
+        while (*line && *line != '\n')
+            line++;
+        if (*line)
+            line++;
+    }
+}
+
+static int unit_relay(void) {
+    lc_sysret box = relay_listen(LC_INADDR_LOOPBACK, 0);
+    lc_sysret front = relay_listen(LC_INADDR_LOOPBACK, 0);
+    int32_t ready[2];
+    if (box < 0 || front < 0 || lc_kernel_create_pipe(ready, O_CLOEXEC) < 0)
+        die("unit: cannot listen on loopback");
+    int box_port = relay_port_of((int32_t)box), front_port = relay_port_of((int32_t)front);
+    lc_sysret pid = lc_kernel_fork();
+    if (pid == 0) {
+        lc_kernel_close_file(ready[0]);
+        lc_kernel_close_file((int32_t)box);
+        int32_t keep[2] = { (int32_t)front, ready[1] };
+        close_all_but(keep, 2);
+        int32_t listener = (int32_t)front;
+        uint16_t to = (uint16_t)box_port;
+        relay_run(&listener, &to, 1, -1, ready[1]);
+    }
+    lc_kernel_close_file(ready[1]);
+    lc_kernel_close_file((int32_t)front);
+    char byte = 0;
+    if (pid < 0 || !unit_ready(ready[0], LB_POLLIN) || lc_kernel_read_bytes(ready[0], &byte, 1) != 1 || byte != 'R') {
+        put("the relay did not say it was ready\n");
+        return 1;
+    }
+    put("ready\n");
+    char seccomp[16], nnp[16];
+    unit_status_field((int)pid, "Seccomp", seccomp, sizeof(seccomp));
+    unit_status_field((int)pid, "NoNewPrivs", nnp, sizeof(nnp));
+    put("seccomp ");
+    put(seccomp);
+    put(", no_new_privs ");
+    put(nnp);
+    put("\n");
+
+    /* one connection, through to the box's port */
+    int32_t client = unit_connect(front_port);
+    lc_sysret server = client >= 0 && unit_ready((int32_t)box, LB_POLLIN) ? lb_sys_accept4((int32_t)box, LB_SOCK_CLOEXEC) : -1;
+    if (server < 0) {
+        put("no connection came through to the box's port\n");
+        return 1;
+    }
+    static char buf[65536];
+    lc_sysret n;
+    if (lc_kernel_write_bytes(client, "ping", 4) == 4 && (n = unit_read_some((int32_t)server, buf, sizeof(buf))) == 4 &&
+        lc_bytes_compare(buf, "ping", 4) == 0)
+        put("ping came through\n");
+    if (lc_kernel_write_bytes((int32_t)server, "pong", 4) == 4 && (n = unit_read_some(client, buf, sizeof(buf))) == 4 &&
+        lc_bytes_compare(buf, "pong", 4) == 0)
+        put("pong came back\n");
+
+    /* a megabyte, written as it is taken and read as it comes, in a pattern
+     * that a byte out of its place breaks */
+    const size_t total = 1048576;
+    size_t sent = 0, got = 0;
+    bool same = true;
+    while (got < total) {
+        struct lb_pollfd two[2] = { { .fd = sent < total ? client : -1, .events = LB_POLLOUT, .revents = 0 },
+                                    { .fd = (int32_t)server, .events = LB_POLLIN, .revents = 0 } };
+        lc_timespec limit = { .seconds = 5, .nanoseconds = 0 };
+        if (lb_sys_ppoll(two, 2, &limit) <= 0)
+            break;
+        if (two[0].revents & LB_POLLOUT) {
+            char chunk[4096];
+            size_t len = total - sent < sizeof(chunk) ? total - sent : sizeof(chunk);
+            for (size_t i = 0; i < len; i++)
+                chunk[i] = (char)((sent + i) % 251);
+            lc_sysret w = lc_kernel_write_bytes(client, chunk, len);
+            if (w <= 0)
+                break;
+            sent += (size_t)w;
+        }
+        if (two[1].revents & LB_POLLIN) {
+            lc_sysret r = lc_kernel_read_bytes((int32_t)server, buf, sizeof(buf));
+            if (r <= 0)
+                break;
+            for (lc_sysret i = 0; i < r; i++)
+                if (buf[i] != (char)((got + (size_t)i) % 251))
+                    same = false;
+            got += (size_t)r;
+        }
+    }
+    if (got == total && same) {
+        char digits[24];
+        fmt_int(digits, (int)total);
+        put_line(digits, " bytes came through as they were sent");
+    }
+
+    /* the end of what the client sends, and an answer to it */
+    (void)lc_socket_shutdown(client, LC_SHUT_WRITE);
+    bool ended = unit_read_some((int32_t)server, buf, sizeof(buf)) == 0;
+    bool answered = lc_kernel_write_bytes((int32_t)server, "bye", 3) == 3;
+    lc_kernel_close_file((int32_t)server);
+    answered = answered && unit_read_some(client, buf, sizeof(buf)) == 3 && lc_bytes_compare(buf, "bye", 3) == 0 &&
+               unit_read_some(client, buf, sizeof(buf)) == 0;
+    if (ended && answered)
+        put("the end came through, and the answer to it\n");
+    lc_kernel_close_file(client);
+
+    /* a box's port where nothing listens: the connection is closed */
+    lc_kernel_close_file((int32_t)box);
+    client = unit_connect(front_port);
+    n = client >= 0 ? unit_read_some(client, buf, sizeof(buf)) : -1;
+    if (n == 0 || n == -104 /* ECONNRESET */)
+        put("a port where nothing listens: the connection is closed\n");
+    if (client >= 0)
+        lc_kernel_close_file(client);
+
+    /* the relay still runs, and ends by this kill alone: no call it made was
+     * one its filter has not */
+    (void)lc_kernel_send_signal((int32_t)pid, SIGKILL);
+    int32_t status = 0;
+    if (lc_kernel_wait_for_child((int32_t)pid, &status, 0) == pid)
+        put((status & 0x7f) == SIGKILL ? "ended by SIGKILL, and by nothing before it\n"
+                                       : (status & 0x7f) == LB_SIGSYS ? "ended by its filter\n" : "ended otherwise\n");
+    return 0;
+}
+
+/* A child for the monitor to clone: it waits to be killed. */
+static int unit_sleeper(void *arg) {
+    (void)arg;
+    for (;;) {
+        lc_timespec long_time = { .seconds = 3600, .nanoseconds = 0 };
+        lc_kernel_sleep(&long_time);
+    }
+    return 0;
+}
+
+/* What the monitor saw, into the file that the name is (ROADMAP M.1): the
+ * exit code of its child, and the descriptors it holds. */
+static void unit_monitor_ended(const char *record, int32_t pid, const char *started, int32_t status, bool expired,
+                               int32_t log_fd) {
+    (void)log_fd;
+    (void)pid;
+    (void)started;
+    char text[256], digits[16];
+    bool cut = false;
+    fmt_int(digits, exit_code_from_status(status));
+    size_t pos = str_append(text, 0, "status ", sizeof(text), &cut);
+    pos = str_append(text, pos, digits, sizeof(text), &cut);
+    if (expired)
+        pos = str_append(text, pos, " expired", sizeof(text), &cut);
+    pos = str_append(text, pos, " fds", sizeof(text), &cut);
+    lc_sysret dir = lc_kernel_open_file("/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+    char buf[2048];
+    lc_sysret n = dir < 0 ? -1 : lc_kernel_read_directory((int32_t)dir, buf, sizeof(buf));
+    for (lc_sysret at = 0; n > 0 && at < n; ) {
+        uint16_t reclen;
+        lc_bytes_copy(&reclen, buf + at + 16, sizeof(reclen));
+        if (reclen == 0)
+            break;
+        const char *entry = buf + at + 19;
+        at += reclen;
+        int fd;
+        if (entry[0] == '.' || !parse_int_in(entry, 0, 1 << 20, &fd) || fd == (int)dir)
+            continue;
+        pos = str_append(text, pos, " ", sizeof(text), &cut);
+        pos = str_append(text, pos, entry, sizeof(text), &cut);
+    }
+    str_append(text, pos, "\n", sizeof(text), &cut);
+    (void)write_file(record, text);
+}
+
 static int unit_init_child(void *arg) {
     const struct child_args *ca = (const struct child_args *)arg;
     init_begin(ca);
@@ -1621,6 +1874,100 @@ int main(int argc, char **argv, char **envp) {
         lc_kernel_close_file((int32_t)fd);
         return 0;
     }
+    if (argc == 4 && streq(argv[1], "monitor-ttl")) {
+        /* the same with a --ttl of argv[3] ms and no grace, and a child that
+         * never ends by itself: the monitor ends it, a margin past the deadline */
+        static container_config config;
+        if (!parse_duration_ms(argv[3], &config.ttl_ms))
+            return 2;
+        struct init_link link = INIT_LINK_NONE;
+        struct child_args ca = { .null_fd = -1, .log_fd = -1, .exit_fd = -1, .starter_signals = -1, .name = argv[2],
+                                 .config = &config, .stop_grace = 0 };
+        int64_t began = boottime_ms();
+        const char *failed = init_spawn_monitored(&link, &ca, 0, unit_sleeper, unit_monitor_ended, NULL);
+        if (failed)
+            die2("unit: ", failed);
+        link.pid = -1;
+        init_link_close(&link);
+        for (int i = 0; i < 200 && !path_exists(argv[2]); i++) {
+            lc_timespec tenth = { .seconds = 0, .nanoseconds = 100000000 };
+            lc_kernel_sleep(&tenth);
+        }
+        static char text[256];
+        put(read_file(argv[2], text, sizeof(text)) > 0 ? text : "the monitor said nothing\n");
+        char ms[24];
+        fmt_int(ms, (int)(boottime_ms() - began));
+        put_line("after ms ", ms);
+        return 0;
+    }
+    if (argc == 3 && streq(argv[1], "portspec")) {
+        port_spec port;
+        const char *wrong = parse_port_spec(argv[2], &port);
+        if (wrong) {
+            put_line("refused: ", wrong);
+            return 1;
+        }
+        char text[PORT_TEXT_MAX];
+        port_spec_text(text, &port);
+        put_line("port ", text);
+        return 0;
+    }
+    if (argc == 2 && streq(argv[1], "relay"))
+        return unit_relay();
+    if (argc == 4 && streq(argv[1], "monitor-cgroup")) {
+        /* a cgroup the monitor cannot go into: start is told, and no init is cloned */
+        struct init_link link = INIT_LINK_NONE;
+        struct child_args ca = { .null_fd = -1, .log_fd = -1, .exit_fd = -1, .starter_signals = -1, .name = argv[2] };
+        const char *failed = init_spawn_monitored(&link, &ca, 0, unit_sleeper, unit_monitor_ended, argv[3]);
+        put_line("said ", failed ? failed : "nothing: init was cloned");
+        int32_t status = 0;
+        lc_sysret waited = lc_kernel_wait_for_child(-1, &status, 0);
+        if (waited < 0) {
+            put("the monitor is not the command's child\n");
+        } else {
+            char digits[16];
+            fmt_int(digits, exit_code_from_status(status));
+            put_line("the monitor ended with status ", digits);
+        }
+        return failed ? 0 : 1;
+    }
+    if (argc == 3 && streq(argv[1], "monitor")) {
+        /* init_spawn_monitored with a child that waits to be killed */
+        struct init_link link = INIT_LINK_NONE;
+        struct child_args ca = { .null_fd = -1, .log_fd = -1, .exit_fd = -1, .starter_signals = -1, .name = argv[2] };
+        const char *failed = init_spawn_monitored(&link, &ca, 0, unit_sleeper, unit_monitor_ended, NULL);
+        if (failed)
+            die2("unit: ", failed);
+        int32_t status;
+        put(lc_kernel_wait_for_child(link.pid, &status, WNOHANG) == -10 /* ECHILD */ ? "not the command's child\n"
+                                                                                   : "the command's child\n");
+        (void)lb_sys_pidfd_send_signal(link.pidfd, SIGKILL, NULL, 0);
+        struct lb_pollfd one = { .fd = link.pidfd, .events = LB_POLLIN, .revents = 0 };
+        lc_timespec limit = { .seconds = 5, .nanoseconds = 0 };
+        put(lb_sys_ppoll(&one, 1, &limit) == 1 ? "ended, as its pidfd says\n" : "not ended\n");
+        /* not reaped while the command holds the control pipe: the pid is still init's */
+        char path[64], stat[256];
+        if (proc_pid_path(path, sizeof(path), link.pid, "/stat") && read_file(path, stat, sizeof(stat)) > 0) {
+            const char *paren = stat;
+            for (const char *p = stat; *p; p++)
+                if (*p == ')')
+                    paren = p;
+            put(paren[1] == ' ' && paren[2] == 'Z' ? "a zombie until the command is done\n" : "not a zombie\n");
+        } else {
+            put("gone before the command was done\n");
+        }
+        int32_t pid = link.pid;
+        link.pid = -1;
+        init_link_close(&link);
+        for (int i = 0; i < 50 && !path_exists(argv[2]); i++) {
+            lc_timespec tenth = { .seconds = 0, .nanoseconds = 100000000 };
+            lc_kernel_sleep(&tenth);
+        }
+        static char text[256];
+        put(read_file(argv[2], text, sizeof(text)) > 0 ? text : "the monitor said nothing\n");
+        put(proc_pid_path(path, sizeof(path), pid, "/stat") && path_exists(path) ? "still there\n" : "reaped\n");
+        return 0;
+    }
     if ((argc == 7 || argc == 8) && streq(argv[1], "init")) {
         int seconds = 0, grace = STOP_TIMEOUT_DEFAULT;
         bool confined = streq(argv[3], "confined");
@@ -1830,6 +2177,75 @@ int main(int argc, char **argv, char **envp) {
         argv = again;
         argc = 4;
     }
+    if (argc >= 6 && streq(argv[1], "tar-one")) {
+        static tar_writer w;
+        static struct unit_tar_sink to;
+        for (int i = 6; i < argc; i++) {
+            if (streq(argv[i], "plain"))
+                w.plain = true;
+            else if (streq(argv[i], "root"))
+                w.owners_root = true;
+            else if (streq(argv[i], "nosetid"))
+                w.no_setid = true;
+            else
+                die("usage: unit tar-one <dir> <name> <as> <archive> [plain] [root] [nosetid]");
+        }
+        lc_sysret dirfd = lc_kernel_open_file(argv[2], O_RDONLY | O_DIRECTORY, 0);
+        lc_sysret out = lc_kernel_open_file(argv[5], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (dirfd < 0 || out < 0)
+            die("unit: cannot open the directory or the archive");
+        to.fd = (int32_t)out;
+        sha256_init(&to.hash);
+        w.sink = unit_tar_write;
+        w.to = &to;
+        if (tar_write_one(&w, (int32_t)dirfd, argv[3], argv[4]) != 0) {
+            put("failed: ");
+            put(w.failed_at);
+            put(": ");
+            put(w.failure ? w.failure : "(no reason given)");
+            put("\n");
+            return 1;
+        }
+        put("entries ");
+        put_int64((int64_t)w.entries);
+        return 0;
+    }
+    if (argc >= 4 && streq(argv[1], "untar-copy")) {
+        static tar_reader r;
+        static struct unit_tar_source source;
+        r.into = TAR_INTO_COPY;
+        for (int i = 4; i < argc; i++) {
+            if (streq(argv[i], "nosetid"))
+                r.no_setid = true;
+            else if (streq(argv[i], "owner") && i + 2 < argc && parse_u32_text(argv[i + 1], &r.owner_uid) &&
+                     parse_u32_text(argv[i + 2], &r.owner_gid)) {
+                r.owner_given = true;
+                i += 2;
+            } else
+                die("usage: unit untar-copy <archive> <dir> [nosetid] [owner <uid> <gid>]");
+        }
+        lc_sysret in = lc_kernel_open_file(argv[2], O_RDONLY, 0);
+        lc_sysret dirfd = lc_kernel_open_file(argv[3], O_RDONLY | O_DIRECTORY, 0);
+        if (in < 0 || dirfd < 0)
+            die("unit: cannot open the archive or the directory");
+        source.fd = (int32_t)in;
+        r.source = unit_tar_read;
+        r.from = &source;
+        r.source_fd = (int32_t)in;
+        if (tar_read_tree(&r, (int32_t)dirfd) != 0) {
+            put("failed: ");
+            put(r.failed_at);
+            put(": ");
+            put(r.failure ? r.failure : "(no reason given)");
+            put("\n");
+            return 1;
+        }
+        put("entries ");
+        put_int64((int64_t)r.entries);
+        put("devices ");
+        put_int64((int64_t)r.devices);
+        return 0;
+    }
     if (argc >= 4 && argc <= 8 && streq(argv[1], "untar")) {
         static tar_reader r;
         static struct unit_tar_source plain;
@@ -1956,6 +2372,87 @@ int main(int argc, char **argv, char **envp) {
             return 1;
         }
         put_line(options, "");
+        return 0;
+    }
+    if (argc == 3 && streq(argv[1], "gpu")) {
+        static device_spec found[MAX_DEVICES];
+        int n = gpu_devices(argv[2], found, MAX_DEVICES);
+        if (n < 0) {
+            put("more than " STRINGIFY(MAX_DEVICES) "\n");
+            return 1;
+        }
+        for (int i = 0; i < n; i++) {
+            put(found[i].host);
+            put_line(" -> ", found[i].path);
+        }
+        return 0;
+    }
+    if (argc == 3 && streq(argv[1], "nvidia")) {
+        static nvidia_files nv;
+        int rc = nvidia_libraries(argv[2], &nv);
+        if (rc == 0) {
+            put("none\n");
+            return 0;
+        }
+        put_line("version ", nv.version);
+        if (rc < 0) {
+            put_line("missing ", nv.missing);
+            return 1;
+        }
+        for (int i = 0; i < nv.nfiles; i++) {
+            put("file ");
+            put(nv.files[i].host);
+            put(" ");
+            put(nv.files[i].name);
+            put(nv.files[i].bin ? " bin\n" : "\n");
+        }
+        for (int i = 0; i < nv.nlinks; i++) {
+            put("link ");
+            put(nv.links[i].name);
+            put_line(" ", nv.links[i].target);
+        }
+        return 0;
+    }
+    if (argc == 3 && streq(argv[1], "musl")) {
+        put(root_has_musl(argv[2]) ? "musl\n" : "not musl\n");
+        return 0;
+    }
+    if (argc >= 3 && streq(argv[1], "gidmap")) {
+        uint32_t start, groups[MAX_DEVICES + 4];
+        size_t n = 0;
+        if (!parse_u32_text(argv[2], &start))
+            return 2;
+        for (int i = 3; i < argc && n < sizeof(groups) / sizeof(groups[0]); i++)
+            if (!parse_u32_text(argv[i], &groups[n++]))
+                return 2;
+        static char text[USERNS_MAP_TEXT_MAX + 64];
+        if (!userns_gid_map_text(text, sizeof(text), start, groups, n)) {
+            put("refused\n");
+            return 1;
+        }
+        put(text);
+        return 0;
+    }
+    if (argc == 3 && streq(argv[1], "devgroups")) {
+        static char text[4096];
+        if (read_file(argv[2], text, sizeof(text)) < 0)
+            return 2;
+        uint32_t inside[MAX_DEVICES];
+        int n = gid_map_device_groups(text, inside, MAX_DEVICES);
+        for (int i = 0; i < n; i++) {
+            char digits[11];
+            format_u32(digits, inside[i]);
+            put_line(digits, "");
+        }
+        return 0;
+    }
+    if (argc == 4 && streq(argv[1], "cgroup2-root")) {
+        /* the store's lock in a directory of the case's, and cgroup_root */
+        if (!str_copy(cfg_global.container_dir, argv[2], sizeof(cfg_global.container_dir)) ||
+            !str_copy(cfg_global.cgroup_root, argv[3], sizeof(cfg_global.cgroup_root)))
+            return 2;
+        ensure_cgroup2_for_start();
+        put("cgroup2\n");
         return 0;
     }
     if (argc == 5 && streq(argv[1], "firewall-kernel")) {

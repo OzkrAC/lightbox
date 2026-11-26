@@ -37,7 +37,8 @@
 # cgroup v2 mount point
 # cgroup_root = /sys/fs/cgroup
 
-# The cgroup that holds the containers': each container's is <cgroup_base>/<name>
+# The cgroup that holds the containers': each container's is <cgroup_base>/<name>,
+# and their monitors are in <cgroup_base>/lightbox.monitors
 # Derived from cgroup_root if not set explicitly
 # cgroup_base = /sys/fs/cgroup/lightbox
 

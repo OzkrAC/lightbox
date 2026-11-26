@@ -262,6 +262,17 @@ start() { # name
 
 up() { box "$@" && start "$1"; }
 
+# A container's monitor (ROADMAP M.1), init's parent; and the end of it, for
+# a case of what a command clears away where no monitor is, as one that was
+# killed leaves it.
+monitor_of() { awk '/^PPid:/ { print $2 }' "/proc/$(pid_of "$1")/status"; }    # name
+unmonitor() { # name
+    local m
+    m=$(monitor_of "$1") && [ "$(cat "/proc/$m/comm" 2>/dev/null)" = lightbox-mon ] ||
+        { echo "the parent of the init of $1 is no monitor"; return 1; }
+    kill -TERM "$m" && wait_until 5 gone "$m" || { echo "the monitor $m of $1 did not end"; return 1; }
+}
+
 sh_in()     { lb exec "$1" /bin/sh -c "$2" </dev/null; }   # name script
 script_in() { lb exec "$1" /bin/sh; }                      # name, the script on standard input
 hook()      { cat > "$C/$1/rootfs/init.sh"; }              # name, the init hook on standard input
@@ -785,7 +796,8 @@ t_exec_cgroup() {
     up excg || return 1
     said=$(sh_in excg 'cat /proc/self/cgroup')
     echo "the cgroup of an exec: $said"
-    printf '%s\n' "$said" | grep -Eq '/excg/exec-[0-9]+-[0-9]+$' || { echo "it is not in a cgroup of its own"; return 1; }
+    # as the container's cgroup namespace has it, whose root is the container's cgroup (ROADMAP U.4)
+    printf '%s\n' "$said" | grep -Eqx '0::/exec-[0-9]+-[0-9]+' || { echo "it is not in a cgroup of its own"; return 1; }
     [ -z "$(exec_cgroups excg)" ] || { echo "left after the exec: $(exec_cgroups excg)"; return 1; }
     sh_in excg "$KIT setsid sleep 1071 >/dev/null 2>&1 </dev/null &" || return 1
     wait_until 5 running_cmd 'sleep 1071' || { echo "what it started is not running"; return 1; }
@@ -927,7 +939,7 @@ t_agent_doctor() {
     rc=$?
     printf '%s\n' "$said" | grep -A1 '^agent\.'
     [ "$rc" = 0 ] || { echo "doctor --profile agent exited $rc on a host set up for the profile"; return 1; }
-    for check in kernel userns_ranges idmap nft cgroup_kill; do
+    for check in kernel userns_ranges overlayfs idmap nft cgroup_kill; do
         printf '%s\n' "$said" | grep -Eq "^agent\.$check: (yes|ok) " || { echo "agent.$check does not pass"; return 1; }
     done
     nft=$(printf '%s\n' "$said" | sed -n 's/^agent\.nft: ok (\(.*\))$/\1/p')
@@ -1242,6 +1254,7 @@ $KIT setsid sleep 1101 >/dev/null 2>&1 </dev/null &
 EOF
     began=$(date +%s%N)
     start ttlbox || return 1
+    unmonitor ttlbox || return 1        # what init keeps of the lifetime itself, and what a command clears away
     sh_in ttlbox "$KIT setsid sleep 1102 >/dev/null 2>&1 </dev/null &" || return 1
     wait_until 5 running_cmd 'sleep 1101' && wait_until 5 running_cmd 'sleep 1102' ||
         { echo "what the hook and the exec started is not running"; return 1; }
@@ -1370,6 +1383,7 @@ t_exec_cgroup_of_a_dead_init() {
     sh_in exdead "$KIT setsid sleep 1076 >/dev/null 2>&1 </dev/null &" || return 1
     wait_until 5 running_cmd 'sleep 1076' || { echo "what it started is not running"; return 1; }
     [ -n "$(exec_cgroups exdead)" ] || { echo "no cgroup was left"; return 1; }
+    unmonitor exdead || return 1       # what stop clears away where no monitor did
     pid=$(pid_of exdead)
     kill -KILL "$pid"
     wait_until 5 gone "$pid" || return 1
@@ -1423,17 +1437,114 @@ t_start_after_init_died() {
     kill -KILL "$pid"
     wait_until 5 gone "$pid" || { echo "init $pid survived SIGKILL"; return 1; }
     lb ls
-    lb ls | grep -Eq '^crash +[0-9.]+ +exited' || { echo "ls does not show it as exited"; return 1; }
+    # failed where its monitor cleared it away, as an init killed says nothing of its end (ROADMAP M.1)
+    lb ls | grep -Eq '^crash +[0-9.]+ +(exited|failed)' || { echo "ls does not show it as ended"; return 1; }
     # the kernel removes the dead container's interface a moment later
     wait_until 5 no_link "$(port_of crash)" || { echo "$(port_of crash) did not go away"; return 1; }
     start crash || return 1
     [ "$(sh_in crash 'echo back')" = back ]
 }
 
+# A container's monitor clears away what its container leaves, with no
+# command run (ROADMAP M.1). Init is its child, and it holds nothing of the
+# command's but the container's log and /dev/null. Init killed: within a
+# second its records, interface, cgroup and rules are gone, the state is
+# failed and the log says what ended it, and the monitor has ended. Stopped
+# from inside: exited. At the end of its --ttl: expired. A stop after any of
+# them finds nothing to stop.
+t_monitor_clears_away() {
+    local pid mon fds began ms said
+    quietly_cleared() { nothing_left "$1" >/dev/null 2>&1 && [ "$(state_of "$1")" = "$2" ]; }    # name, state
+    up mon1 || return 1
+    pid=$(pid_of mon1)
+    mon=$(monitor_of mon1)
+    [ "$(cat "/proc/$mon/comm")" = lightbox-mon ] || { echo "the parent of init is $(cat "/proc/$mon/comm")"; return 1; }
+    fds=$(for f in /proc/"$mon"/fd/*; do readlink "$f"; done | sort | paste -sd'|')
+    echo "the monitor's descriptors: $fds"
+    [ "$fds" = "$(printf '%s\n' "$C/mon1/console.log" /dev/null /dev/null /dev/null 'anon_inode:[pidfd]' | sort | paste -sd'|')" ] ||
+        { echo "the monitor holds more"; return 1; }
+    began=$(date +%s%N)
+    kill -KILL "$pid"
+    wait_until 3 quietly_cleared mon1 failed || { nothing_left mon1; echo "state: $(state_of mon1)"; return 1; }
+    ms=$(( ($(date +%s%N) - began) / 1000000 ))
+    echo "cleared away $ms ms after init was killed, with no command run"
+    [ "$ms" -lt 1000 ] || { echo "not within a second"; return 1; }
+    grep -q 'init was killed by signal 9; its monitor clears away what it left' "$C/mon1/console.log" ||
+        { echo "the log does not say what ended init"; return 1; }
+    wait_until 5 gone "$mon" || { echo "the monitor did not end"; return 1; }
+    said=$(lb stop mon1 2>&1)
+    printf '%s\n' "$said"
+    case $said in *"had ended without a stop"*) echo "stop found something to clear away"; return 1 ;; esac
+    # stopped from inside: as it ended well
+    up mon2 || return 1
+    sh_in mon2 'kill -TERM 1' >/dev/null 2>&1
+    wait_until 15 quietly_cleared mon2 exited || { nothing_left mon2; echo "state: $(state_of mon2)"; return 1; }
+    # the end of its lifetime
+    box mon3 --ttl 2s && start mon3 || return 1
+    wait_until 8 quietly_cleared mon3 expired || { nothing_left mon3; echo "state: $(state_of mon3)"; return 1; }
+    echo "mon2: $(state_of mon2), mon3: $(state_of mon3), with no command run"
+}
+
+# The monitor goes into a cgroup of lightbox's own beside the containers',
+# lightbox.monitors in cgroup_base, before it clones init (ROADMAP M.1): out
+# of the cgroup of what ran start, a login session that logind ends at a
+# logout where it ends a user's processes, or a service that is stopped.
+# Here start runs from a cgroup of the case's own, which is then killed
+# whole and taken away: the monitor and init go on, and the monitor still
+# clears the box away within a second of init's kill -9, with no command run.
+t_monitor_outlives_its_caller() {
+    local caller=$CG/the-caller pid mon was began ms
+    quietly_cleared() { nothing_left "$1" >/dev/null 2>&1 && [ "$(state_of "$1")" = "$2" ]; }    # name, state
+    box monc && mkdir "$caller" || return 1
+    ( echo "$BASHPID" > "$caller/cgroup.procs" && exec timeout -k 5 60 "$LB" start monc ) >"$OUT/monc.start" 2>&1 </dev/null ||
+        { cat "$OUT/monc.start"; return 1; }
+    settled monc || return 1
+    pid=$(pid_of monc)
+    mon=$(monitor_of monc)
+    [ "$(cat "/proc/$mon/comm")" = lightbox-mon ] || { echo "the parent of init is $(cat "/proc/$mon/comm")"; return 1; }
+    was=$(sed -n 's/^0:://p' "/proc/$mon/cgroup")
+    echo "the monitor's cgroup: $was"
+    [ "$was" = "${CG#/sys/fs/cgroup}/lightbox.monitors" ] || { echo "the monitor is not in lightbox.monitors"; return 1; }
+    # the caller's cgroup, killed whole and taken away, as logind ends a session
+    kill_cgroup "$caller" || { echo "the cgroup of what ran start could not be taken away"; return 1; }
+    alive "$mon" && alive "$pid" || { echo "the monitor or init ended with the cgroup of what ran start"; return 1; }
+    began=$(date +%s%N)
+    kill -KILL "$pid"
+    wait_until 3 quietly_cleared monc failed || { nothing_left monc; echo "state: $(state_of monc)"; return 1; }
+    ms=$(( ($(date +%s%N) - began) / 1000000 ))
+    echo "cleared away $ms ms after init was killed, with the cgroup of what ran start gone"
+    [ "$ms" -lt 1000 ] || { echo "not within a second"; return 1; }
+    wait_until 5 gone "$mon" || { echo "the monitor did not end"; return 1; }
+}
+
+# A --ttl is kept from the host too (ROADMAP M.1): an init that something
+# stopped, here with SIGSTOP, does not end its container at the deadline,
+# and its monitor ends it from the host its grace and a margin later, 2 s,
+# 1 s and 3 s from when start was done, with no command run: expired, with
+# nothing left, and the log says why.
+t_monitor_keeps_the_ttl() {
+    local pid began ms
+    alt_conf monttl 'stop_timeout = 1' || return 1
+    export LIGHTBOX_CONFIG="$ALT_CONF"
+    box mttl --ttl 2s || return 1
+    start mttl || return 1
+    began=$(date +%s%N)
+    pid=$(pid_of mttl)
+    kill -STOP "$pid" || return 1
+    quietly_expired() { nothing_left mttl >/dev/null 2>&1 && [ "$(state_of mttl)" = expired ]; }
+    wait_until 12 quietly_expired || { nothing_left mttl; echo "state: $(state_of mttl)"; return 1; }
+    ms=$(( ($(date +%s%N) - began) / 1000000 ))
+    echo "expired and cleared away $ms ms after start was done, with init stopped"
+    [ "$ms" -ge 5500 ] && [ "$ms" -lt 9000 ] || { echo "not when its lifetime, grace and margin had gone"; return 1; }
+    grep -q 'still running past its --ttl and its grace; its monitor ended it' "$C/mttl/console.log" ||
+        { echo "the log does not say why"; return 1; }
+}
+
 # stop is a command that changes a container, so it is where the record of a
 # dead init gets cleaned up, as start is.
 t_stop_of_a_dead_container_cleans_up() {
     up dead || return 1
+    unmonitor dead || return 1          # as a monitor that was killed leaves it
     pid=$(pid_of dead)
     kill -KILL "$pid"
     wait_until 5 gone "$pid" || { echo "init $pid survived SIGKILL"; return 1; }
@@ -1451,6 +1562,7 @@ t_stop_of_a_dead_container_cleans_up() {
 # it: the next one that changes it does, and records that it ended well.
 t_stopped_from_inside_is_exited() {
     up inside || return 1
+    unmonitor inside || return 1        # the next command's clearing away, where no monitor is
     pid=$(pid_of inside)
     sh_in inside 'kill -TERM 1' >/dev/null 2>&1     # the shell that says it ends with the container
     wait_until 15 gone "$pid" || { echo "init $pid did not end when a process in the container sent it SIGTERM"; return 1; }
@@ -1499,7 +1611,8 @@ t_after_a_reboot() {
     pid=$(pid_of was-up)
     echo "run_dir is mode $(stat -c %a "$RUN"), a container's records $(stat -c %a "$RUN/was-up"), its PID record $(stat -c %a "$RUN/was-up/pid")"
     [ "$(stat -c %a "$RUN")" = 700 ] && [ "$(stat -c %a "$RUN/was-up")" = 700 ] && [ "$(stat -c %a "$RUN/was-up/pid")" = 600 ] || return 1
-    # what a reboot does to it, as far as that can be done here
+    # what a reboot does to it, as far as that can be done here: its monitor ends with it
+    unmonitor was-up || return 1
     kill -KILL "$pid"
     wait_until 5 gone "$pid" || return 1
     wait_until 5 no_link "$(port_of was-up)" || return 1
@@ -1770,7 +1883,12 @@ t_exec_environment() {
     said=$(TERM=vt220 timeout -k 5 60 "$LB" exec envs --env GREETING=hello --env GREETING=hi --workdir /tmp -- \
                /bin/sh -c 'echo "$GREETING $TERM $(pwd) $PATH"' </dev/null)
     echo "$said"
-    [ "$said" = "hi vt220 /tmp /usr/bin:/bin:/usr/sbin:/sbin" ] || return 1
+    [ "$said" = "hi vt220 /tmp /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" ] || return 1
+    # Docker's PATH (ROADMAP R.6): what is installed under /usr/local, as by pip or npm -g, is found by its name
+    sh_in envs 'mkdir -p /usr/local/bin && printf "#!/bin/sh\necho from /usr/local/bin\n" > /usr/local/bin/lbt-local &&
+                chmod 755 /usr/local/bin/lbt-local' || return 1
+    said=$(lb exec envs lbt-local </dev/null)
+    [ "$said" = 'from /usr/local/bin' ] || { echo "a program in /usr/local/bin is not found by its name: $said"; return 1; }
     # nothing else of the caller's environment goes in
     said=$(NOT_FOR_THE_CONTAINER=1 timeout -k 5 60 "$LB" exec envs /bin/sh -c 'env | sort' </dev/null | tr '\n' ' ')
     echo "the environment of a command: $said"
@@ -2217,6 +2335,7 @@ t_past_the_memory_limit() {
     chroot "$BASE" /bin/sh -c 'command -v dd' >/dev/null 2>&1 || { echo "this image has no dd to fill memory with"; return 77; }
     echo "swap on this host: $(awk 'NR > 1 { n++; k += $3 } END { print n + 0 " areas, " k + 0 " KiB" }' /proc/swaps)"
     up hungry --mem 32M || return 1
+    unmonitor hungry || return 1        # the cgroup and its events stay for this case to read
     pid=$(pid_of hungry)
     # 64 MiB in one buffer, which dd fills from /dev/zero
     sh_in hungry 'dd if=/dev/zero of=/dev/null bs=67108864 count=1' >"$OUT/hungry.dd" 2>&1
@@ -2262,13 +2381,295 @@ t_without_io_controller() {
     [ ! -d "$sub/base/limited" ] && no_link "$(port_of limited)"
 }
 
+# A host whose cgroup_root is not the system's /sys/fs/cgroup, after a
+# reboot: the cgroup2 that setup mounted there is gone, and start mounts it
+# again, as setup does, before the container's cgroup is made (ROADMAP F.5).
+# A start that finds it there mounts nothing more; a cgroup_root that is a
+# directory with something in it is refused, as setup refuses it, and leaves
+# nothing of the container. The mount here is of the one hierarchy, so the
+# suite's cgroup is below it as it is below /sys/fs/cgroup.
+t_start_mounts_cgroup2() {
+    local root=$T/cg2 rel=${CG#/sys/fs/cgroup/} said mounts
+    [ "$rel" != "$CG" ] || { echo "the suite's cgroup is not below /sys/fs/cgroup"; return 77; }
+    mkdir -p "$T/cg2conf/home/.config/lightbox" "$root" || return 1
+    sed -e "s#^cgroup_root = .*#cgroup_root = $root#" -e "s#^cgroup_base = .*#cgroup_base = $root/$rel#" \
+        "$HOME/.config/lightbox/lightbox.conf" > "$T/cg2conf/home/.config/lightbox/lightbox.conf"
+    export LIGHTBOX_CONFIG="$T/cg2conf/home/.config/lightbox/lightbox.conf"
+    mount -t cgroup2 none "$root" || return 1          # what setup mounted there before the reboot
+    box cgm || { umount "$root"; return 1; }
+    umount "$root" || return 1
+    said=$(lb start cgm 2>&1 </dev/null) || { printf '%s\n' "$said"; return 1; }
+    printf '%s\n' "$said"
+    printf '%s\n' "$said" | grep -qx "Mounted cgroup2 at $root" || { echo "start did not say that it mounted cgroup2"; return 1; }
+    settled cgm || return 1
+    grep -qx "$(pid_of cgm)" "$CG/cgm/cgroup.procs" || { echo "init is not in the container's cgroup"; return 1; }
+    lb stop cgm >/dev/null || return 1
+    mounts=$(grep -c " $root " /proc/self/mountinfo)
+    said=$(lb start cgm 2>&1 </dev/null) || { printf '%s\n' "$said"; return 1; }
+    printf '%s\n' "$said" | grep -q '^Mounted cgroup2' && { echo "a second start mounted cgroup2 again"; return 1; }
+    [ "$(grep -c " $root " /proc/self/mountinfo)" = "$mounts" ] || { echo "the mounts at $root changed"; return 1; }
+    lb stop cgm >/dev/null && lb rm cgm >/dev/null || return 1
+    umount "$root" || return 1
+    # something in it: refused, as setup refuses it
+    box cgn || return 1
+    : > "$root/not-empty"
+    mounts=$(cat /proc/self/mountinfo)
+    said=$(lb start cgn 2>&1 </dev/null) && { printf '%s\n' "$said"; echo "a start on a cgroup_root with a file in it succeeded"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *"cgroup_root $root is not a cgroup v2 hierarchy (it is a directory that is not empty)"*) ;; *) return 1 ;; esac
+    [ "$mounts" = "$(cat /proc/self/mountinfo)" ] || { echo "the mount table changed"; return 1; }
+    [ ! -d "$CG/cgn" ] && [ "$(state_of cgn)" = stopped ] && no_link "$(port_of cgn)" ||
+        { echo "the refused start left something of the container"; return 1; }
+}
+
+# Init is in the container's cgroup, and a command that exec runs in the
+# exec's own below it (ROADMAP 8.7). Through the container's cgroup
+# namespace each sees its cgroup from the container's, and no path of the
+# host's (ROADMAP U.4); /sys/fs/cgroup is the container's cgroup and what is
+# below it, read-only: its limits are there to read, and not to change.
 t_cgroup_membership() {
-    up member || return 1
+    local where init mounted
+    up member --mem 96M || return 1
     grep -qx "$(pid_of member)" "$CG/member/cgroup.procs" || { echo "init is not in the container's cgroup"; return 1; }
     where=$(sh_in member 'cat /proc/self/cgroup')
-    echo "a command run by exec is in: $where"
-    # the exec's own, below the container's (ROADMAP 8.7)
-    case $where in *"/${CG##*/}/member/exec-"[0-9]*-[0-9]*) ;; *) return 1 ;; esac
+    init=$(sh_in member 'cat /proc/1/cgroup')
+    echo "init is in: $init; a command run by exec in: $where"
+    [ "$init" = '0::/' ] || { echo "init does not see its cgroup as the root"; return 1; }
+    case $where in 0::/exec-[0-9]*-[0-9]*) ;; *) echo "the exec does not see its cgroup below the root"; return 1 ;; esac
+    mounted=$(sh_in member "grep ' /sys/fs/cgroup ' /proc/self/mountinfo")
+    echo "$mounted"
+    case $mounted in *" /sys/fs/cgroup ro,"*" - cgroup2 "*) ;; *) echo "/sys/fs/cgroup is not a read-only cgroup2"; return 1 ;; esac
+    [ "$(sh_in member 'cat /sys/fs/cgroup/memory.max')" = "$(cat "$CG/member/memory.max")" ] &&
+        [ "$(cat "$CG/member/memory.max")" = 100663296 ] || { echo "the container's limit is not what it reads"; return 1; }
+    sh_in member 'echo max > /sys/fs/cgroup/memory.max' 2>/dev/null && { echo "the container changed its limit"; return 1; }
+    [ "$(cat "$CG/member/memory.max")" = 100663296 ] || { echo "the limit changed"; return 1; }
+}
+
+# create --device and start (ROADMAP G.1), with nodes of the case's own made
+# with mknod, which any path of the host's may be: one of /dev/fuse's numbers
+# is in the container at the path given and opens for reading and writing,
+# and given with :ro for reading alone, which the device program holds to
+# whatever the mount says. Its numbers are read at each start: after the node
+# is made again with others, the container has those. A device that has gone
+# is said at start, before anything of the container is made. A box of
+# --profile agent is given a render node, which opens as far as the device
+# program goes on a host with no GPU: the kernel says there is no such
+# device, and not that the program refused it.
+t_device() {
+    local d=$T/devs said
+    [ -c /dev/fuse ] || { echo "this host has no /dev/fuse, whose numbers the case uses"; return 77; }
+    mkdir -p "$d" && mknod -m 666 "$d/fuse" c 10 229 && mknod -m 666 "$d/fuse2" c 10 229 || return 1
+    opens() { # name, path, how: what a shell of the container says when it opens it
+        sh_in "$1" "if exec 3$3$2; then echo opened; fi" 2>&1
+    }
+    numbers() { sh_in "$1" "ls -ln $2" | awk '{ print $1, $5 $6 }'; }   # name, path: "<mode> <major>,<minor>"
+    up devrw --device "$d/fuse:/dev/gpu/fuse" || return 1
+    said=$(numbers devrw /dev/gpu/fuse)
+    echo "in the container: $said"
+    [ "$said" = 'crw-rw-rw- 10,229' ] || { echo "the node is not there as the host has it"; return 1; }
+    said=$(opens devrw /dev/gpu/fuse '<>')
+    [ "$said" = opened ] || { echo "it does not open for reading and writing: $said"; return 1; }
+    up devro --device "$d/fuse2:/dev/fuse:ro" || return 1
+    said=$(opens devro /dev/fuse '<')
+    [ "$said" = opened ] || { echo "given with :ro, it does not open for reading: $said"; return 1; }
+    said=$(opens devro /dev/fuse '<>')
+    echo "given with :ro, opened to write: $said"
+    case $said in *opened*) echo "it opened for writing"; return 1 ;; *'ermitted'*) ;; *) return 1 ;; esac
+    # read again at each start: other numbers, as a kernel gives after a boot
+    lb stop devrw >/dev/null || return 1
+    rm -f "$d/fuse" && mknod -m 666 "$d/fuse" c 1 3 || return 1
+    start devrw || return 1
+    said="$(numbers devrw /dev/gpu/fuse) $(sh_in devrw 'echo x > /dev/gpu/fuse && echo written')"
+    echo "after the node was made again: $said"
+    [ "$said" = 'crw-rw-rw- 1,3 written' ] || { echo "the container does not have the node as it is now"; return 1; }
+    # gone: said at start, and nothing of the container is made
+    lb stop devrw >/dev/null && rm -f "$d/fuse" || return 1
+    said=$(lb start devrw 2>&1 </dev/null) && { echo "a start with a device that has gone succeeded"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *"a device of the container's cannot be given: $d/fuse is not there"*) ;; *) return 1 ;; esac
+    [ "$(state_of devrw)" = stopped ] && [ ! -d "$CG/devrw" ] && nothing_left devrw || return 1
+    # a render node to a box of --profile agent, on a host whose kernel has no such GPU
+    need_subids || { echo "no ranges of ids here for a box of --profile agent: that is not tried"; return 0; }
+    mknod -m 666 "$d/renderD128" c 226 128 || return 1
+    agent_box agpu --device "$d/renderD128:/dev/dri/renderD128" && start agpu || return 1
+    said=$(opens agpu /dev/dri/renderD128 '<>')
+    echo "a render node in a box of --profile agent: $said"
+    case $said in *opened*|*'ermitted'*) echo "the device program did not let it through, or a GPU is here"; return 1 ;; *'No such device'*) ;; *) return 1 ;; esac
+}
+
+# A device that only its group may open, in a box of --userns (ROADMAP G.2):
+# the node's host group is one more line of the box's gid map, at 65536, and
+# the box's processes hold it, root's and another user's that exec runs, so
+# that the node opens for both. A node that only its owner may open, and one
+# of the host's group 0, are refused at create, and at start too when the
+# node changed after create.
+t_device_group() {
+    local d=$T/devgrp said map
+    need_subids || return $?
+    [ -c /dev/fuse ] || { echo "this host has no /dev/fuse, whose numbers the case uses"; return 77; }
+    mkdir -p "$d" && mknod -m 660 "$d/grp" c 10 229 && chgrp 4242 "$d/grp" || return 1
+    box dgrp --userns --device "$d/grp:/dev/grp" && start dgrp || return 1
+    map=$(awk '{ print $1, $2, $3 }' "/proc/$(pid_of dgrp)/gid_map")
+    echo "the box's gid map: $(printf '%s\n' "$map" | paste -sd'|')"
+    printf '%s\n' "$map" | grep -qx '65536 4242 1' || { echo "the node's group is not in the gid map"; return 1; }
+    said=$(sh_in dgrp 'if exec 3<>/dev/grp; then echo opened; fi; grep ^Groups: /proc/self/status' 2>&1)
+    echo "root in the box: $(printf '%s\n' "$said" | paste -sd' ')"
+    case $said in opened*'Groups:'*65536*) ;; *) echo "root of the box does not open it, or does not hold the group"; return 1 ;; esac
+    said=$(lb exec dgrp --user 1000:1000 /bin/sh -c 'if exec 3<>/dev/grp; then echo opened; fi; grep ^Groups: /proc/self/status' </dev/null 2>&1)
+    echo "uid 1000 in the box: $(printf '%s\n' "$said" | paste -sd' ')"
+    case $said in opened*'Groups:'*'65536'*) ;; *) echo "another user of the box does not open it"; return 1 ;; esac
+    # refused at create: the owner's alone, and the host's group 0
+    mknod -m 600 "$d/own" c 10 229 && mknod -m 660 "$d/root" c 10 229 || return 1
+    said=$(lb create downer "$(next_ip)" --userns --device "$d/own:/dev/own" 2>&1) && { echo "created with a node of its owner's alone"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *"$d/own is read and written by its owner alone"*) ;; *) return 1 ;; esac
+    said=$(lb create droot "$(next_ip)" --userns --device "$d/root:/dev/root0" 2>&1) && { echo "created with a node of group 0"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *"$d/root opens to its group, which is root's, gid 0"*) ;; *) return 1 ;; esac
+    # and at start, where the node changed after create
+    lb stop dgrp >/dev/null && chgrp 0 "$d/grp" || return 1
+    said=$(lb start dgrp 2>&1 </dev/null) && { echo "started with a node that changed to group 0"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *"cannot be given: $d/grp opens to its group, which is root's"*) ;; *) return 1 ;; esac
+    [ "$(state_of dgrp)" = stopped ] && [ ! -d "$CG/dgrp" ] && nothing_left dgrp
+}
+
+# --gpu on a host without a GPU (ROADMAP G.3), as a runner is: the start says
+# that there is none, and leaves nothing of the container.
+t_gpu_none() {
+    local said
+    if ls /dev/dri/renderD* /dev/nvidia[0-9]* /dev/kfd >/dev/null 2>&1; then
+        echo "this host has a GPU: what a start without one says is not tried"; return 77
+    fi
+    box nogpu --gpu || return 1
+    said=$(lb start nogpu 2>&1 </dev/null) && { echo "a container of --gpu started without a GPU"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *"created with --gpu, and this host has no GPU for it"*) ;; *) return 1 ;; esac
+    [ "$(state_of nogpu)" = stopped ] && [ ! -d "$CG/nogpu" ] && nothing_left nogpu
+}
+
+# lightbox cp (ROADMAP C.1) of a running box. Into it: a file into a
+# directory under its own name, and as a name of its own, the box's root's,
+# and with -a its owner's; a tree, its link a link, and no setuid bit; what
+# is in a directory, with <dir>/., into a directory that is made. Out of it,
+# into a directory of the host's: the directory's owner's, its link a link.
+# A link in the box that names a host path leads nowhere out of the box: a
+# copy onto it replaces it in the box, and one of it is a link. A box that
+# does not run is refused.
+t_cp() {
+    local d=$T/cpsrc o=$T/cpout said
+    mkdir -p "$d/tree/sub" "$o" && echo one > "$d/file" && chmod 640 "$d/file" && chown 1000:1000 "$d/file" &&
+        echo two > "$d/tree/sub/x" && ln -s /etc/passwd "$d/tree/link" && echo s > "$d/tree/setuid" &&
+        chmod 4755 "$d/tree/setuid" && echo host > "$T/victim" || return 1
+    up cpbox || return 1
+    # what the copies go into, on every root the suite runs on
+    sh_in cpbox 'mkdir -p /tmp /opt /srv' || return 1
+    lb cp "$d/file" cpbox:/tmp >/dev/null || return 1
+    said=$(sh_in cpbox 'cat /tmp/file; stat -c "%a %u:%g" /tmp/file')
+    echo "into /tmp: $(printf '%s\n' "$said" | paste -sd' ')"
+    [ "$said" = "one
+640 0:0" ] || { echo "the file is not the box root's, as it was"; return 1; }
+    lb cp -a "$d/file" cpbox:/tmp/named >/dev/null || return 1
+    [ "$(sh_in cpbox 'stat -c "%u:%g" /tmp/named; cat /tmp/named' | paste -sd' ')" = '1000:1000 one' ] ||
+        { echo "-a did not keep the owner, or the name"; return 1; }
+    lb cp "$d/tree" cpbox:/opt >/dev/null || return 1
+    said=$(sh_in cpbox 'cat /opt/tree/sub/x; readlink /opt/tree/link; stat -c %a /opt/tree/setuid' | paste -sd' ')
+    echo "a tree: $said"
+    [ "$said" = 'two /etc/passwd 755' ] || { echo "the tree is not what it was, or kept its setuid bit"; return 1; }
+    lb cp "$d/tree/." cpbox:/srv/contents >/dev/null || return 1
+    [ "$(sh_in cpbox 'cat /srv/contents/sub/x')" = two ] || { echo "<dir>/. did not copy what is in it"; return 1; }
+    # out, into a directory of the host's that is 1234's
+    chown 1234:1234 "$o" || return 1
+    lb cp cpbox:/opt/tree "$o" >/dev/null || return 1
+    said=$(stat -c '%u:%g' "$o/tree" "$o/tree/sub/x" "$o/tree/setuid" | sort -u | paste -sd' ')
+    echo "out: $said, $(cat "$o/tree/sub/x"), link $(readlink "$o/tree/link")"
+    [ "$said" = 1234:1234 ] && [ "$(cat "$o/tree/sub/x")" = two ] && [ -L "$o/tree/link" ] ||
+        { echo "what came out is not the directory owner's, or not what it was"; return 1; }
+    # links of the box's that name host paths
+    sh_in cpbox "ln -s '$T/victim' /tmp/escape && ln -s '$T' /tmp/hostdir && ln -s /etc /tmp/shadow" || return 1
+    lb cp "$d/file" cpbox:/tmp/escape >/dev/null && lb cp "$d/file" cpbox:/tmp/hostdir >/dev/null || return 1
+    [ "$(cat "$T/victim")" = host ] && [ ! -e "$T/file" ] || { echo "a copy into the box wrote on the host"; return 1; }
+    [ "$(sh_in cpbox 'cat /tmp/escape /tmp/hostdir' | paste -sd' ')" = 'one one' ] ||
+        { echo "the copies are not in the box, in the place of its links"; return 1; }
+    lb cp cpbox:/tmp/shadow "$o" >/dev/null || return 1
+    [ -L "$o/shadow" ] && [ "$(readlink "$o/shadow")" = /etc ] || { echo "a link of the box's came out as what it names"; return 1; }
+    # a box that does not run
+    lb stop cpbox >/dev/null || return 1
+    said=$(lb cp "$d/file" cpbox:/tmp 2>&1) && { echo "a copy into a stopped box succeeded"; return 1; }
+    printf '%s\n' "$said"
+    case $said in *"this one is not running: cpbox"*) ;; *) return 1 ;; esac
+}
+
+# -p of a box (ROADMAP N.1): a port of the host's reaches the box's port
+# through the relay, which connects on the box's loopback, so that what the
+# box serves on its loopback alone is reached too. On 127.0.0.1 unless told:
+# the host reaches it there, and the namespace that stands for the internet
+# does not; on 0.0.0.0 that namespace does. The relay is nobody, with no
+# capability, under its filter and no_new_privs, in lightbox.relay below the
+# box's cgroup and in the box's network, and in no namespace of the box's
+# processes besides: they cannot see it. A port in use refuses a second
+# box's start, which leaves nothing. A stop ends the relay and frees the port.
+t_publish() {
+    need_nc || return $?
+    need_listeners || return $?
+    local pid relay said near far hp=18080 any=18443 out rc=0
+    box pub -p "$hp:8000" -p "0.0.0.0:$any:8001" && start pub || return 1
+    grep -qx "Port 127.0.0.1:$hp of the host reaches its port 8000" "$OUT/pub.start" &&
+        grep -qx "Port 0.0.0.0:$any of the host reaches its port 8001" "$OUT/pub.start" ||
+        { echo "start does not say what it publishes"; return 1; }
+    pid=$(pid_of pub)
+    # in the box's network: one on its loopback alone, one on every address of it
+    near=$(tcp_listener 127.0.0.1 8000 'from the box' "$pid") || return 1
+    far=$(tcp_listener 0.0.0.0 8001 'from the box, on every address' "$pid") || { kill "$near"; return 1; }
+    listening() { nsenter -t "$pid" -n ss -ltn | grep -q ":$1 "; }
+    wait_until 5 listening 8000 && wait_until 5 listening 8001 || { echo "the listeners in the box did not come up"; rc=1; }
+    out=$(cat "$T/outside")
+    if [ $rc = 0 ]; then
+        said=$("$BB" nc -w 3 127.0.0.1 "$hp" </dev/null 2>&1)
+        echo "the host, 127.0.0.1:$hp: ${said:-no answer}"
+        [ "$said" = 'from the box' ] || rc=1
+        said=$("$BB" nc -w 3 127.0.0.1 "$any" </dev/null 2>&1)
+        echo "the host, 127.0.0.1:$any: ${said:-no answer}"
+        [ "$said" = 'from the box, on every address' ] || rc=1
+        said=$(nsenter -t "$out" -n "$BB" nc -w 3 192.0.2.2 "$hp" </dev/null 2>&1)
+        echo "the outside, 192.0.2.2:$hp: ${said:-no answer}"
+        case $said in *[Rr]efused*) ;; *) echo "a port on 127.0.0.1 was reached from beyond the host"; rc=1 ;; esac
+        said=$(nsenter -t "$out" -n "$BB" nc -w 3 192.0.2.2 "$any" </dev/null 2>&1)
+        echo "the outside, 192.0.2.2:$any: ${said:-no answer}"
+        [ "$said" = 'from the box, on every address' ] || rc=1
+    fi
+    # the relay
+    relay=$(cat "$CG/pub/lightbox.relay/cgroup.procs" 2>/dev/null)
+    if [ "$(printf '%s\n' "$relay" | grep -c .)" != 1 ]; then
+        echo "lightbox.relay holds: ${relay:-nothing}"; rc=1
+    else
+        said="uid $(status_field "$relay" Uid) gid $(status_field "$relay" Gid) seccomp $(status_field "$relay" Seccomp)"
+        said="$said no_new_privs $(status_field "$relay" NoNewPrivs) effective $(status_field "$relay" CapEff)"
+        said="$said bounding $(status_field "$relay" CapBnd)"
+        echo "the relay: $said"
+        [ "$said" = "uid 65534 gid 65534 seccomp 2 no_new_privs 1 effective 0000000000000000 bounding 0000000000000000" ] || rc=1
+        [ "$(readlink "/proc/$relay/ns/net")" = "$(readlink "/proc/$pid/ns/net")" ] || { echo "the relay is not in the box's network"; rc=1; }
+        [ "$(awk '$1 == "NSpid:" { print NF - 1 }' "/proc/$relay/status")" = 1 ] &&
+            [ "$(readlink "/proc/$relay/ns/mnt")" != "$(readlink "/proc/$pid/ns/mnt")" ] ||
+            { echo "the relay is in a namespace of the box's processes"; rc=1; }
+    fi
+    # a second box on that port: refused, and nothing of it is left
+    if box pub2 -p "$hp:9000"; then
+        said=$(lb start pub2 2>&1 </dev/null) && { echo "a second box took the port"; rc=1; }
+        printf '%s\n' "$said"
+        case $said in *"the host's port of -p 127.0.0.1:$hp:9000 is in use"*) ;; *) rc=1 ;; esac
+        nothing_left pub2 >/dev/null || { nothing_left pub2; rc=1; }
+    else
+        rc=1
+    fi
+    kill "$near" "$far" 2>/dev/null
+    # a stop ends the relay, and the port is free
+    lb stop pub >/dev/null || return 1
+    [ -z "$relay" ] || wait_until 5 gone "$relay" || ! alive "$relay" || { echo "the relay $relay outlived its box"; rc=1; }
+    port_free() { ! ss -ltn | grep -q "127.0.0.1:$hp "; }
+    wait_until 5 port_free || { echo "the host's port $hp is still taken"; rc=1; }
+    nothing_left pub >/dev/null || { nothing_left pub; rc=1; }
+    return $rc
 }
 
 # ─── Cases: the init hook, starting and stopping ────────────────────────────
@@ -2693,17 +3094,23 @@ t_killed_start_leaves_no_container() {
     echo "$starter" >> "$T/background"
     wait_until 10 test -e "$T/restore.reached" ||
         { echo "start did not reach the firewall transaction:"; cat "$OUT/orphan.start"; return 1; }
-    init=$(children_of "$starter" "$(basename "$LB" | cut -c1-15)")
-    [ -n "$init" ] || { echo "the starter has no cloned child"; return 1; }
+    # init is the child of the start's monitor (ROADMAP M.1), which is the start's
+    mon=$(children_of "$starter" lightbox-mon)
+    [ -n "$mon" ] || { echo "the starter has no monitor"; return 1; }
+    init=$(children_of "$mon" "$(basename "$LB" | cut -c1-15)")
+    [ -n "$init" ] || { echo "the monitor has no cloned child"; return 1; }
     kill -KILL "$starter"
     wait "$starter" 2>/dev/null
     sleep 2
     for p in $init; do
         if alive "$p"; then
-            echo "pid $p, the child of the killed start, is still running"
+            echo "pid $p, the init of the killed start, is still running"
             return 1
         fi
     done
+    # and its monitor clears away what the start left, which the stand-in of
+    # iptables-restore, still in place, holds up for its 5 s
+    wait_until 15 gone "$mon" || { echo "the monitor $mon of the killed start did not end"; return 1; }
 }
 
 t_stale_pid_start() {
@@ -4799,6 +5206,9 @@ if [ "$MODE" = inside ]; then
     check 'a stopped container starts again and keeps its files'          t_restart_keeps_files
     check 'a container whose init died starts again'                      t_start_after_init_died
     check 'stop of a container whose init died clears it away, as failed' t_stop_of_a_dead_container_cleans_up
+    check "a container's monitor clears away what it leaves within a second, with no command run" t_monitor_clears_away
+    check "a container's monitor is in a cgroup of lightbox's, and outlives the cgroup of what ran start" t_monitor_outlives_its_caller
+    check 'a --ttl that init does not keep, as it was stopped, is kept by its monitor from the host' t_monitor_keeps_the_ttl
     check 'a container stopped from inside is exited, and cleared away by the next command' t_stopped_from_inside_is_exited
     check 'after a reboot containers are stopped, and start'              t_after_a_reboot
     check 'a container started before the upgrade is seen, and stopped'   t_container_started_before_the_upgrade
@@ -4845,7 +5255,13 @@ if [ "$MODE" = inside ]; then
     check '--io-max reaches io.max'                                        t_io_limit
     check 'past its memory limit a process is killed, and its container with it' t_past_the_memory_limit
     check 'without io, a container starts and is told once; with an I/O limit, not' t_without_io_controller
+    check 'start mounts cgroup2 at a cgroup_root of its own that a reboot emptied, as setup does' t_start_mounts_cgroup2
     check "init is in the container's cgroup, and a command run by exec in its exec's below it" t_cgroup_membership
+    check "create --device: a node of the host's opens in the container as it is given, and its numbers are read at each start" t_device
+    check "a device that only its group may open: its group is in a box's gid map, held by root and by another user" t_device_group
+    check '--gpu on a host without a GPU: the start says so, and leaves nothing' t_gpu_none
+    check 'cp copies into a running box and out of it, through the box'"'"'s own root' t_cp
+    check 'a port the box publishes reaches its loopback through a relay of nobody'"'"'s, where it was told to' t_publish
 
     check 'the init hook runs with /tmp and /run mounted'                 t_hook_runs
     check 'a service the hook starts outlives the start command'          t_service_outlives_start

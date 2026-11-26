@@ -293,9 +293,9 @@ static const char *text_with_number(char *buf, size_t bufsz, const char *before,
  * cgroup below it may have another. NULL, or what failed: a container that
  * is not privileged does not start without it.
  */
-static const char *device_filter_attach(const char *cg) {
+static const char *device_filter_attach(const char *cg, const struct lb_dev_row *given, size_t ngiven) {
     static char err[200], log[4096];
-    lc_sysret prog = device_program_load(log, sizeof(log));
+    lc_sysret prog = device_program_load(given, ngiven, log, sizeof(log));
     if (prog < 0) {
         if (log[0]) {
             print_str(STDERR, "The kernel's verifier said of the device program:\n");
@@ -326,7 +326,8 @@ static const char *device_filter_attach(const char *cg) {
     return NULL;
 }
 
-static const char *cgroup_create(const char *name, int pid, const container_config *config) {
+static const char *cgroup_create(const char *name, int pid, const container_config *config,
+                                 const struct lb_dev_row *given) {
     char cg[MAX_PATH], path[MAX_PATH];
     if (!cgroup_path(cg, name) || !path_join(path, sizeof(path), cg, "cgroup.controllers"))
         return "the path of the container's cgroup is too long";
@@ -385,7 +386,7 @@ static const char *cgroup_create(const char *name, int pid, const container_conf
 
     /* the devices it may open, before anything of it runs in the cgroup */
     if (!config->privileged) {
-        const char *failed = device_filter_attach(cg);
+        const char *failed = device_filter_attach(cg, given, (size_t)config->ndevs);
         if (failed)
             return failed;
     }
@@ -699,6 +700,50 @@ static void exec_cgroup_end(const char *name, const char *cg, bool limited) {
         each_cgroup_below(container_cg, 1, remove_exec_cgroup_left);
 }
 
+/*
+ * The cgroup of the containers' monitors (ROADMAP M.1), beside the
+ * containers' own in cgroup_base. A monitor that stayed in the cgroup of
+ * what ran start, a login session or a service, would be ended with it: by
+ * logind at a logout where it ends a user's processes, or by the service's
+ * stop, and its container would then be cleared away by the next command
+ * alone. Here it is out of their reach, and out of its container's limits,
+ * its device filter and the kill of its stop. The first start makes it, and
+ * it is kept as the monitors come and go; setup --teardown takes it away.
+ */
+static void monitor_cgroup_make(char cg[MAX_PATH]) {
+    if (!path_join(cg, MAX_PATH, cfg_global.cgroup_base, MONITOR_CGROUP))
+        die("Error: the path of the containers' monitors' cgroup is too long");
+    (void)lc_kernel_mkdirat(AT_FDCWD, cfg_global.cgroup_base, 0755);
+    lc_sysret rc = lc_kernel_mkdirat(AT_FDCWD, cg, 0755);
+    if (rc < 0 && rc != -LB_EEXIST) {
+        char digits[16];
+        fmt_int(digits, (int)-rc);
+        print_str(STDERR, "Error: cannot make the cgroup of the containers' monitors ");
+        print_str(STDERR, cg);
+        print_str(STDERR, " (errno ");
+        print_str(STDERR, digits);
+        print_str(STDERR, ")\n");
+        lc_kernel_exit(failure_status);
+    }
+}
+
+/* Move this process into a cgroup that is there: 0, or the negative errno.
+ * Nothing is made, as write_file would make it: a path that is no cgroup
+ * has no cgroup.procs to write to. */
+static lc_sysret cgroup_enter(const char *cg) {
+    char path[MAX_PATH], self[16];
+    if (!path_join(path, sizeof(path), cg, "cgroup.procs"))
+        return -LB_ENAMETOOLONG;
+    lc_sysret fd = lc_kernel_open_file(path, O_WRONLY | O_CLOEXEC, 0);
+    if (fd < 0)
+        return fd;
+    fmt_int(self, lc_kernel_get_process_id());
+    size_t len = lc_string_length(self);
+    lc_sysret n = lc_kernel_write_bytes((int32_t)fd, self, len);
+    lc_kernel_close_file((int32_t)fd);
+    return n == (lc_sysret)len ? 0 : n < 0 ? n : -LB_EIO;
+}
+
 /* Move this process into a cgroup, the one of its exec. */
 static void cgroup_join_self(const char *cg) {
     char pidbuf[16];
@@ -824,7 +869,6 @@ static void apply_sandbox(bool allow_list) {
  * user made for a test has none, the ids stay: its root is that user, and
  * the rest is done all the same. Any step that fails ends the process.
  */
-#define NOBODY_ID 65534u
 
 void sandbox_host_tool(const char *program) {
     if (lc_kernel_unshare(CLONE_NEWNET | CLONE_NEWIPC) < 0)
@@ -1378,9 +1422,9 @@ static const char *make_resolv(container_config *cfg, char dns[MAX_DNS][16], int
  */
 static const char *const create_value_options[] = {
     "--mem", "--swap", "--pids", "--cpu", "--io-max", "--vol", "--rootfs", "--base", "--seccomp", "--net",
-    "--oom-score", "--ttl", "--link", "--dns", "--profile", "--workspace",
+    "--oom-score", "--ttl", "--link", "--dns", "--profile", "--workspace", "--device", "-p", "--publish",
 };
-static const char *const create_flag_options[] = { "--userns", "--read-only", "--copy", "--privileged" };
+static const char *const create_flag_options[] = { "--userns", "--read-only", "--copy", "--privileged", "--gpu" };
 
 /*
  * --profile agent (ROADMAP 8.10): what this phase built, with one switch. A
@@ -1401,6 +1445,12 @@ static void agent_profile(container_config *cfg, bool net_given, bool full_copy)
         die("Error: --profile agent refuses --seccomp deny");
     if (full_copy)
         die("Error: --profile agent refuses --copy: its root is an overlay of its base");
+    /* its box is no server for the network: what an agent that a prompt has
+     * turned can read, it would give whoever connects, past every rule of
+     * what leaves it (ROADMAP N.1, by the maintainer's word of 2026-11-25) */
+    if (cfg->nports > 0)
+        die("Error: --profile agent refuses -p: an agent's box publishes no port; the host reaches one of "
+            "--net outside or proxy at its address");
     cfg->profile = PROFILE_AGENT;
     cfg->userns = true;
     if (!net_given)
@@ -1690,6 +1740,8 @@ static void cmd_create(int argc, char **argv) {
             full_copy = true;
         } else if (streq(opt, "--read-only")) {
             cfg.read_only = true;
+        } else if (streq(opt, "--gpu")) {
+            cfg.gpu = true;
         } else if (streq(opt, "--oom-score")) {
             const char *value = option_value(argc, argv, &i);
             if (!parse_oom_score(value, &cfg.oom_score))
@@ -1705,6 +1757,22 @@ static void cmd_create(int argc, char **argv) {
             const char *wrong = config_add_volume(&cfg, &vol);
             if (wrong)
                 die_about("Error: --vol: ", wrong, value);
+        } else if (streq(opt, "--device")) {
+            const char *value = option_value(argc, argv, &i);
+            device_spec dev;
+            const char *wrong = parse_device_spec(value, &dev);
+            if (!wrong)
+                wrong = config_add_device(&cfg, &dev);
+            if (wrong)
+                die_about("Error: --device: ", wrong, value);
+        } else if (streq(opt, "-p") || streq(opt, "--publish")) {
+            const char *value = option_value(argc, argv, &i);
+            port_spec port;
+            const char *wrong = parse_port_spec(value, &port);
+            if (!wrong)
+                wrong = config_add_port(&cfg, &port);
+            if (wrong)
+                die_about("Error: -p: ", wrong, value);
         } else if (streq(opt, "--dns")) {
             const char *value = option_value(argc, argv, &i);
             if (ndns >= MAX_DNS) die("Error: more than " STRINGIFY(MAX_DNS) " --dns options: a resolver reads no more");
@@ -1727,6 +1795,20 @@ static void cmd_create(int argc, char **argv) {
         agent_profile(&cfg, net_given, full_copy);
     if (workspace)
         add_workspace(&cfg, workspace);
+    /* each device as the host has it now, which start looks at again
+     * (ROADMAP G.1): never one that gives the host away, and to a box of
+     * --profile agent a GPU's compute nodes alone */
+    for (int d = 0; d < cfg.ndevs; d++) {
+        uint32_t major, minor, group;
+        const char *refused = device_check(&cfg.devs[d], cfg.profile == PROFILE_AGENT, &major, &minor);
+        /* and with --userns, one that it could open (ROADMAP G.2) */
+        struct lb_statx stx;
+        if (!refused && cfg.userns &&
+            lb_sys_statx(AT_FDCWD, cfg.devs[d].host, 0, LB_STATX_TYPE | LB_STATX_MODE | LB_STATX_GID, &stx) == 0)
+            refused = device_userns_group(cfg.devs[d].host, &stx, cfg.devs[d].ro, &group);
+        if (refused)
+            die2("Error: --device: ", refused);
+    }
     if (create_image)
         take_image_limits(create_image, &cfg);
 
@@ -2150,6 +2232,12 @@ struct child_args {
     int32_t      exit_fd;                   /* where init says how it ended; -1: nowhere */
     const char  *name;
     const container_config *config;         /* read by the command, before the clone */
+    const struct lb_dev_row *dev_rows;      /* the numbers of config's devices, as start found them */
+    const int32_t *dev_trees;               /* and their nodes' mounts, cloned, attached nowhere yet */
+    int          ndev_groups;               /* with --userns: how many devices' groups its gid map has */
+    const nvidia_files *nvidia;             /* --gpu: NVIDIA's libraries, with nnvidia of them taken */
+    const int32_t *nvidia_trees;            /* and their files' mounts, cloned, attached nowhere yet */
+    int          nnvidia;
     const char  *root;
     const char  *overlay;                   /* the options of the overlay init mounts; NULL: none */
     bool         userns;                    /* in a user namespace of its own, whose maps the command writes */
@@ -2257,10 +2345,15 @@ static void init_begin(const struct child_args *ca) {
     if (ca->starter_signals >= 0)
         lc_kernel_close_file(ca->starter_signals);
     /* and the volumes the command took, which build_container attaches */
-    int32_t keep[5 + MAX_VOLS] = { ca->go_rd, ca->report_wr, ca->null_fd, ca->log_fd, ca->exit_fd };
+    int32_t keep[5 + MAX_VOLS + MAX_DEVICES + NVIDIA_FILES_MAX] = { ca->go_rd, ca->report_wr, ca->null_fd, ca->log_fd, ca->exit_fd };
     size_t nkeep = 5;
     for (int i = 0; ca->volumes && i < ca->nvolumes; i++)
         keep[nkeep++] = ca->volumes[i].tree;
+    /* and the devices', which build_container attaches */
+    for (int i = 0; ca->config && ca->dev_trees && i < ca->config->ndevs; i++)
+        keep[nkeep++] = ca->dev_trees[i];
+    for (int i = 0; ca->nvidia_trees && i < ca->nnvidia; i++)
+        keep[nkeep++] = ca->nvidia_trees[i];
     close_all_but(keep, nkeep);
 
     if (!go_received(ca->go_rd))
@@ -2323,6 +2416,24 @@ static int proxy_environment(const container_config *config, uint32_t gateway,
 }
 
 /*
+ * The PATH of the programs of the hook and of exec: Docker's, in its order,
+ * with /usr/local, where what is installed from an archive, by pip or by
+ * npm -g lands, so that an image made for Docker finds its programs here as
+ * it does there (ROADMAP R.6). The host's tools have TOOL_ENV's, which
+ * nothing of a container's is in.
+ *
+ * --gpu with NVIDIA's libraries (ROADMAP G.3): where they are, for the
+ * programs of the hook and of exec, as LD_LIBRARY_PATH, and nvidia-smi at
+ * the end of PATH; where the start gave them, as NVIDIA_DIR/lib is there.
+ */
+#define BOX_PATH_ENV     "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+#define NVIDIA_PATH_ENV  BOX_PATH_ENV ":" NVIDIA_DIR "/bin"
+#define NVIDIA_LIB_ENV   "LD_LIBRARY_PATH=" NVIDIA_DIR "/lib"
+static bool nvidia_given(bool gpu) {
+    return gpu && path_is_directory(NVIDIA_DIR "/lib");
+}
+
+/*
  * Run the image's hook as a child of init: its PID, or -1 once the failure
  * has been reported. Like every program lightbox starts it begins with no
  * signal blocked. Init's own descriptors are close-on-exec and do not reach
@@ -2341,11 +2452,15 @@ static int32_t start_hook(const char *script, const container_config *config, ui
 
         const char *a[] = { "/bin/sh", script, NULL };
         static char proxy[PROXY_ENV_COUNT][PROXY_VAR_MAX];
-        const char *e[3 + PROXY_ENV_COUNT + 1] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "HOME=/root", "TERM=xterm" };
-        int n = proxy_environment(config, gateway, proxy);
-        for (int i = 0; i < n; i++)
-            e[3 + i] = proxy[i];
-        e[3 + n] = NULL;
+        bool nvidia = nvidia_given(config && config->gpu);
+        const char *e[4 + PROXY_ENV_COUNT + 1] = { nvidia ? NVIDIA_PATH_ENV : BOX_PATH_ENV, "HOME=/root", "TERM=xterm" };
+        int n = 3;
+        if (nvidia)
+            e[n++] = NVIDIA_LIB_ENV;
+        int nproxy = proxy_environment(config, gateway, proxy);
+        for (int i = 0; i < nproxy; i++)
+            e[n++] = proxy[i];
+        e[n] = NULL;
         lc_sysret failed = exec_program("/bin/sh", a, e);
         say_with_number("Error: cannot execute /bin/sh for the init hook (errno ", (int)-failed, ")\n");
         lc_kernel_exit(127);
@@ -2619,6 +2734,7 @@ struct exec_request {
     const char  *term;                  /* the caller's TERM, or NULL */
     const char  *proxy[PROXY_ENV_COUNT];    /* --net proxy: where its proxy is */
     int          nproxy;
+    bool         gpu;                       /* --gpu: NVIDIA's libraries named where the start gave them */
     const char *const *argv;            /* the command, NULL at its end */
 };
 
@@ -3023,9 +3139,12 @@ static bool same_variable(const char *a, const char *b) {
     if (cut)
         die("Error: the command's environment does not fit");
 
-    const char *base[5 + PROXY_ENV_COUNT];
+    const char *base[6 + PROXY_ENV_COUNT];
     int nbase = 0;
-    base[nbase++] = "PATH=/usr/bin:/bin:/usr/sbin:/sbin";
+    bool nvidia = nvidia_given(req->gpu);
+    base[nbase++] = nvidia ? NVIDIA_PATH_ENV : BOX_PATH_ENV;
+    if (nvidia)
+        base[nbase++] = NVIDIA_LIB_ENV;
     base[nbase++] = home_env;
     base[nbase++] = term_env;
     if (name[0]) {
@@ -3035,7 +3154,7 @@ static bool same_variable(const char *a, const char *b) {
     for (int i = 0; i < req->nproxy; i++)
         base[nbase++] = req->proxy[i];
 
-    const char *envp[5 + PROXY_ENV_COUNT + MAX_EXEC_ENV + 1];
+    const char *envp[6 + PROXY_ENV_COUNT + MAX_EXEC_ENV + 1];
     int n = 0;
     for (int i = 0; i < nbase; i++) {
         bool replaced = false;
@@ -3797,6 +3916,15 @@ static int exec_inside_container(const char *cg, int target_pid, int privileged,
         die("Error: failed to open target root");
 
     int userfd = userns ? open_target_path(target_pid, "/ns/user") : -1;
+    /* the groups of its devices that its gid map has past its range (ROADMAP
+     * G.2), read here on the host: every command holds them, whoever it runs as */
+    uint32_t device_groups[MAX_DEVICES];
+    int ndevice_groups = 0;
+    if (userns) {
+        char path[64], map[USERNS_MAP_TEXT_MAX + 64];
+        if (proc_pid_path(path, sizeof(path), target_pid, "/gid_map") && read_file(path, map, sizeof(map)) > 0)
+            ndevice_groups = gid_map_device_groups(map, device_groups, MAX_DEVICES);
+    }
     if (userns && userfd < 0)
         die("Error: failed to open the container's user namespace");
     int mntfd = open_target_path(target_pid, "/ns/mnt");
@@ -3804,7 +3932,8 @@ static int exec_inside_container(const char *cg, int target_pid, int privileged,
     int ipcfd = open_target_path(target_pid, "/ns/ipc");
     int netfd = open_target_path(target_pid, "/ns/net");
     int pidfd = open_target_path(target_pid, "/ns/pid");
-    if (mntfd < 0 || utsfd < 0 || ipcfd < 0 || netfd < 0 || pidfd < 0)
+    int cgroupfd = open_target_path(target_pid, "/ns/cgroup");
+    if (mntfd < 0 || utsfd < 0 || ipcfd < 0 || netfd < 0 || pidfd < 0 || cgroupfd < 0)
         die("Error: failed to open target namespace fd");
 
     /* Join the exec's cgroup, below the container's, before switching mount
@@ -3823,6 +3952,12 @@ static int exec_inside_container(const char *cg, int target_pid, int privileged,
         if (write_file("/proc/self/oom_score_adj", score) < 0)
             die("Error: failed to give the command the container's OOM score");
     }
+
+    /* The cgroup namespace before the user namespace, as host root, who may
+     * join it whichever user namespace owns it: the container's, or the
+     * host's for a container that a lightbox before 0.11 started (ROADMAP
+     * U.4). The exec's cgroup, joined above, is then below its root. */
+    require_setns_fd(cgroupfd, LB_CLONE_NEWCGROUP, "cgroup");
 
     /* The user namespace first, whose root then joins the others, which it
      * owns, as the container's root: what it makes there is the container's,
@@ -3848,6 +3983,16 @@ static int exec_inside_container(const char *cg, int target_pid, int privileged,
      * are read here, where no path in them leads out of the container. */
     struct identity id;
     resolve_identity(req, "/etc/passwd", "/etc/group", &id);
+    for (int g = 0; g < ndevice_groups; g++) {
+        bool held = false;
+        for (int i = 0; i < id.ngroups && !held; i++)
+            held = id.groups[i] == device_groups[g];
+        if (held)
+            continue;
+        if (id.ngroups >= MAX_EXEC_GROUPS)
+            die("Error: the command's groups and those of the container's devices are more than " STRINGIFY(MAX_EXEC_GROUPS));
+        id.groups[id.ngroups++] = device_groups[g];
+    }
 
     /* What the command gets in the place of a terminal of the caller's: made
      * here, where /dev/pts is the container's. */
@@ -3889,8 +4034,10 @@ struct init_link {
     int32_t go_wr;          /* -1: closed */
     int32_t report_rd;      /* -1: closed */
     void   *stack;          /* MAP_FAILED: none */
+    int32_t control_wr;     /* with a monitor: held until the command is done with init; -1: none */
+    int32_t pidfd;          /* with a monitor, whose child init is: init's pidfd; -1: none */
 };
-#define INIT_LINK_NONE { -1, -1, -1, MAP_FAILED }
+#define INIT_LINK_NONE { -1, -1, -1, MAP_FAILED, -1, -1 }
 
 /*
  * While a container is being started, SIGINT, SIGTERM and SIGHUP do not end
@@ -3955,9 +4102,11 @@ static void close_container_streams(int32_t *null_fd, int32_t *log_fd) {
  * Make the two pipes and clone init, which runs fn(ca) on a stack of its own
  * in the namespaces that flags names. The pipe ends in ca are filled in here.
  * NULL, or what failed; link then holds whatever exists, for init_abandon.
+ * Init is the caller's child: the unit harness's, which waits for it, while
+ * start has a monitor clone it (init_spawn_monitored, ROADMAP M.1).
  */
-static const char *init_spawn(struct init_link *link, struct child_args *ca,
-                              int flags, int (*fn)(void *)) {
+[[maybe_unused]] static const char *init_spawn(struct init_link *link, struct child_args *ca,
+                                               int flags, int (*fn)(void *)) {
     int32_t go[2], report[2];
 
     if (lc_kernel_create_pipe(go, O_CLOEXEC) < 0)
@@ -3995,6 +4144,242 @@ static const char *init_spawn(struct init_link *link, struct child_args *ca,
     return failed;
 }
 
+/*
+ * The monitor of a container (ROADMAP M.1): a process of the host's, forked
+ * by start, that clones init, so that init is its child and the kernel tells
+ * it how init ended, however it ends; and then does what ended says of it,
+ * once start is done with init, which it says by closing the control pipe.
+ * Until then init is not reaped, and its pid is init's for start to use. It
+ * keeps nothing of start's but the container's log: no lock, no descriptor
+ * of a volume or a device, no terminal. It is a session of its own, not
+ * dumpable, and holds no signal back, so that a SIGTERM ends it; the
+ * container then goes on, and the next command clears away what it leaves,
+ * as before the monitor.
+ */
+typedef void (*init_ended_fn)(const char *name, int32_t pid, const char *started, int32_t status, bool expired,
+                              int32_t log_fd);
+
+/* How long past its --ttl and its grace the monitor lets init go on before
+ * it ends it from the host; init ends the container at the deadline itself. */
+#define MONITOR_TTL_MARGIN_MS 3000
+
+/* What the monitor says in the place of init's pid where it could not go
+ * into its cgroup, followed by the errno. */
+#define MONITOR_NO_CGROUP 0
+
+[[noreturn]] static void monitor_main(struct child_args *ca, int flags, int (*fn)(void *), init_ended_fn ended,
+                                      const char *cgroup, int32_t pid_wr, int32_t control_rd, const int32_t ends[4]) {
+    (void)lc_kernel_create_session();
+    /* out of the cgroup of what ran start, before init is cloned there */
+    lc_sysret entered = cgroup ? cgroup_enter(cgroup) : 0;
+    if (entered < 0) {
+        const int32_t said[2] = { MONITOR_NO_CGROUP, (int32_t)-entered };
+        (void)lc_kernel_write_all(pid_wr, said, sizeof(said));
+        lc_kernel_exit(failure_status);
+    }
+    void *stack = lc_kernel_map_memory(NULL, CHILD_STACK_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    lc_sysret pid = stack == MAP_FAILED ? -LB_ENOMEM
+                                        : lc_kernel_clone(flags | SIGCHLD, (char *)stack + CHILD_STACK_SIZE, fn, ca);
+    int32_t said = (int32_t)pid;
+    (void)lc_kernel_write_all(pid_wr, &said, sizeof(said));
+    if (pid < 0)
+        lc_kernel_exit(failure_status);
+    /* its start time, which with its pid is the identity of init on record */
+    static char started[32];
+    if (proc_starttime((int)pid, started, sizeof(started)) < 0)
+        started[0] = '\0';
+    lc_sysret pidfd = lb_sys_pidfd_open((int32_t)pid, 0);
+
+    /* its standard streams nobody's, and of start's descriptors the control
+     * pipe and the container's log alone */
+    lc_sysret null = lc_kernel_open_file("/dev/null", O_RDWR, 0);
+    for (int32_t i = 0; null >= 0 && i < 3; i++)
+        (void)lc_kernel_duplicate_fd((int32_t)null, i, 0);
+    for (int i = 0; i < 4; i++)
+        lc_kernel_close_file(ends[i]);
+    int32_t keep[6] = { 0, 1, 2, control_rd };
+    size_t nkeep = 4;
+    if (pidfd >= 0)
+        keep[nkeep++] = (int32_t)pidfd;
+    if (ca->log_fd >= 0)
+        keep[nkeep++] = ca->log_fd;
+    close_all_but(keep, nkeep);
+    uint64_t no_signals = 0;
+    lc_kernel_set_signal_mask(LC_SIG_SETMASK, &no_signals, NULL);
+    (void)lc_kernel_prctl(LB_PR_SET_DUMPABLE, 0, 0, 0, 0);
+    (void)lc_kernel_prctl(LB_PR_SET_NAME, (uint64_t)(uintptr_t)"lightbox-mon", 0, 0, 0);
+
+    /* until start is done with init */
+    char byte;
+    while (lc_kernel_read_retry(control_rd, &byte, 1) > 0)
+        ;
+    lc_kernel_close_file(control_rd);
+
+    /* --ttl, kept from the host as well: init ends the container at its
+     * deadline, and where init has not ended its grace and a margin after
+     * that, as one that something stopped would not, the monitor ends it,
+     * where nothing in the container can keep it from that. Counted from
+     * here, when start is done, which is after init began to count. */
+    bool expired = false;
+    int64_t deadline = ca->config && ca->config->ttl_ms && pidfd >= 0
+                       ? boottime_ms() + ca->config->ttl_ms + (int64_t)ca->stop_grace * 1000 + MONITOR_TTL_MARGIN_MS : 0;
+    while (deadline) {
+        int64_t left = deadline - boottime_ms();
+        if (left <= 0) {
+            (void)lb_sys_pidfd_send_signal((int32_t)pidfd, SIGKILL, NULL, 0);
+            expired = true;
+            break;
+        }
+        struct lb_pollfd one = { .fd = (int32_t)pidfd, .events = LB_POLLIN, .revents = 0 };
+        lc_timespec wait = { .seconds = left / 1000, .nanoseconds = (left % 1000) * 1000000 };
+        lc_sysret ready = lb_sys_ppoll(&one, 1, &wait);
+        if (ready > 0 || (ready < 0 && ready != -LB_EINTR))
+            break;                      /* init ended, or the wait cannot go on: it is waited for below */
+    }
+
+    /* init's pidfd is held until init is reaped, with a --ttl or not: what
+     * the monitor holds is the same for all of init's life */
+    int32_t status = 0;
+    int waited = wait_child((int32_t)pid, &status);
+    if (pidfd >= 0)
+        lc_kernel_close_file((int32_t)pidfd);
+    if (waited != 0)
+        lc_kernel_exit(failure_status);
+    ended(ca->name, (int32_t)pid, started, status, expired, ca->log_fd);
+    lc_kernel_exit(0);
+}
+
+static bool reconcile(const char *name);
+
+/*
+ * What a container's monitor does once its init has ended, however it ended
+ * (ROADMAP M.1): says so in the container's log when a signal ended it, which
+ * init could not say itself, and clears away what the container left as soon
+ * as the container is its to touch, which a command that works on it says
+ * by its lock. A stop clears away all of it itself, and the monitor then
+ * finds nothing; a container that was removed meanwhile ends the monitor at
+ * its lock. Without the monitor this waited for the next lightbox command.
+ */
+static void monitor_cleanup(const char *name, int32_t pid, const char *started, int32_t status, bool expired,
+                            int32_t log_fd) {
+    int signal = status & 0x7f;
+    if (expired && log_fd >= 0) {
+        print_str(log_fd, "lightbox: the container was still running past its --ttl and its grace; its monitor ended it\n");
+    } else if (signal && log_fd >= 0) {
+        char digits[16];
+        fmt_int(digits, signal);
+        print_str(log_fd, "lightbox: the container's init was killed by signal ");
+        print_str(log_fd, digits);
+        print_str(log_fd, "; its monitor clears away what it left\n");
+    }
+    /* Only while the record says this init and no command has cleared it
+     * away: a stop, an rm or a start after it does, under the lock, and then
+     * the monitor takes none, which the next command would find taken and
+     * wait for. A start that was cut short before init was on record left
+     * its state at starting. The lock is tried, and the record looked at
+     * again, until one of the two settles it. */
+    for (;;) {
+        char recorded[32], state[32];
+        int on_record = get_container_pid(name);
+        if (on_record > 0 && (on_record != pid || get_container_pid_starttime(name, recorded, sizeof(recorded)) < 0 ||
+                              !streq(recorded, started)))
+            return;                     /* another init's, since */
+        if (on_record <= 0) {
+            get_container_state(name, state, sizeof(state));
+            if (!streq(state, "starting") && !streq(state, "running") && !streq(state, "stopping"))
+                return;                 /* cleared away by a command */
+        }
+        int32_t lock = container_lock_try(name);
+        if (lock >= 0) {
+            /* what init would have said, had it ended the container itself */
+            int said;
+            char path[MAX_PATH];
+            if (expired && !container_exit_report(name, &said)) {
+                container_exit_path(path, name);
+                (void)write_file(path, STRINGIFY(INIT_EXPIRED) "\n");
+            }
+            (void)reconcile(name);
+            lc_kernel_close_file(lock);
+            return;
+        }
+        lc_timespec moment = { .seconds = 0, .nanoseconds = 20000000 };
+        lc_kernel_sleep(&moment);
+    }
+}
+
+/* init_spawn with a monitor between the command and init: init is the
+ * monitor's child, and link has its pidfd and the control pipe's end. The
+ * monitor goes into cgroup first, where one is given. */
+static const char *init_spawn_monitored(struct init_link *link, struct child_args *ca, int flags, int (*fn)(void *),
+                                        init_ended_fn ended, const char *cgroup) {
+    int32_t go[2], report[2], pids[2], control[2];
+    if (lc_kernel_create_pipe(go, O_CLOEXEC) < 0)
+        return "failed to create the pipe to the container's init";
+    if (lc_kernel_create_pipe(report, O_CLOEXEC) < 0) {
+        lc_kernel_close_file(go[0]);
+        lc_kernel_close_file(go[1]);
+        return "failed to create the pipe from the container's init";
+    }
+    if (lc_kernel_create_pipe(pids, O_CLOEXEC) < 0 || lc_kernel_create_pipe(control, O_CLOEXEC) < 0) {
+        for (int i = 0; i < 2; i++) {
+            lc_kernel_close_file(go[i]);
+            lc_kernel_close_file(report[i]);
+        }
+        return "failed to create the pipes of the container's monitor";
+    }
+    link->go_wr = go[1];
+    link->report_rd = report[0];
+    ca->go_rd = go[0];
+    ca->go_wr = go[1];
+    ca->report_rd = report[0];
+    ca->report_wr = report[1];
+
+    lc_sysret monitor = lc_kernel_fork();
+    if (monitor == 0) {
+        lc_kernel_close_file(pids[0]);
+        lc_kernel_close_file(control[1]);
+        const int32_t ends[4] = { go[0], go[1], report[0], report[1] };
+        monitor_main(ca, flags, fn, ended, cgroup, pids[1], control[0], ends);
+    }
+    /* init's ends are init's and the monitor's */
+    lc_kernel_close_file(go[0]);
+    lc_kernel_close_file(report[1]);
+    lc_kernel_close_file(pids[1]);
+    lc_kernel_close_file(control[0]);
+    link->control_wr = control[1];
+    if (monitor < 0) {
+        lc_kernel_close_file(pids[0]);
+        return "failed to fork the container's monitor";
+    }
+    int32_t pid = -1, err = 0;
+    lc_sysret got = lc_kernel_read_retry(pids[0], &pid, sizeof(pid));
+    if (got == (lc_sysret)sizeof(pid) && pid == MONITOR_NO_CGROUP && cgroup &&
+        lc_kernel_read_retry(pids[0], &err, sizeof(err)) == (lc_sysret)sizeof(err)) {
+        lc_kernel_close_file(pids[0]);
+        static char failed[MAX_PATH + 96];
+        char digits[16];
+        fmt_int(digits, err);
+        bool cut = false;
+        size_t at = str_append(failed, 0, "the container's monitor cannot go into the cgroup ", sizeof(failed), &cut);
+        at = str_append(failed, at, cgroup, sizeof(failed), &cut);
+        at = str_append(failed, at, " (errno ", sizeof(failed), &cut);
+        at = str_append(failed, at, digits, sizeof(failed), &cut);
+        (void)str_append(failed, at, ")", sizeof(failed), &cut);
+        return failed;
+    }
+    lc_kernel_close_file(pids[0]);
+    if (got != (lc_sysret)sizeof(pid) || pid <= 0)
+        return "clone failed";
+    link->pid = pid;
+    lc_sysret pidfd = lb_sys_pidfd_open(pid, 0);
+    if (pidfd < 0) {
+        link->pid = -1;
+        return "cannot open the pidfd of the container's init";
+    }
+    link->pidfd = (int32_t)pidfd;
+    return NULL;
+}
+
 /* One byte for init to go on with. */
 static bool init_go(const struct init_link *link) {
     return lc_kernel_write_bytes(link->go_wr, "x", 1) == 1;
@@ -4003,6 +4388,15 @@ static bool init_go(const struct init_link *link) {
 /* Close the command's ends of the pipes and free the stack init was cloned
  * on. Each is marked, so this can be called at any point, and again. */
 static void init_link_close(struct init_link *link) {
+    /* the monitor's: from here on init is its own to wait for */
+    if (link->control_wr >= 0) {
+        lc_kernel_close_file(link->control_wr);
+        link->control_wr = -1;
+    }
+    if (link->pidfd >= 0) {
+        lc_kernel_close_file(link->pidfd);
+        link->pidfd = -1;
+    }
     if (link->go_wr >= 0) {
         lc_kernel_close_file(link->go_wr);
         link->go_wr = -1;
@@ -4024,7 +4418,17 @@ static void init_link_close(struct init_link *link) {
  * to go on.
  */
 static void init_abandon(struct init_link *link) {
-    if (link->pid > 0) {
+    if (link->pid > 0 && link->pidfd >= 0) {
+        /* the monitor's child, which it reaps only once the control pipe
+         * closes, so that the pid is init's until then: ended through its
+         * pidfd, and seen to end there */
+        (void)lb_sys_pidfd_send_signal(link->pidfd, SIGKILL, NULL, 0);
+        struct lb_pollfd one = { .fd = link->pidfd, .events = LB_POLLIN, .revents = 0 };
+        lc_timespec limit = { .seconds = 10, .nanoseconds = 0 };
+        while (lb_sys_ppoll(&one, 1, &limit) == -LB_EINTR)
+            ;
+        link->pid = -1;
+    } else if (link->pid > 0) {
         int32_t status;
         lc_kernel_send_signal(link->pid, SIGKILL);
         (void)wait_child(link->pid, &status);
@@ -4355,6 +4759,13 @@ static void attach_volumes(const struct volume_mount *vols, int count) {
  * with the reason on stderr; the command then sees init's pipe close.
  */
 static void build_container(const struct child_args *ca) {
+    /* A cgroup namespace of its own, whose root is the container's cgroup,
+     * which the command put init in before its first byte: the container
+     * sees its cgroup as / and nothing of the host's paths above it
+     * (ROADMAP U.4). What init starts is in it, and exec joins it. */
+    if (lc_kernel_unshare(LB_CLONE_NEWCGROUP) < 0)
+        die("Error: failed to give the container a cgroup namespace of its own");
+
     /* make all mounts private — prevents host mount events (including
      * the host's /proc) from propagating into the container */
     require_mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
@@ -4398,7 +4809,13 @@ static void build_container(const struct child_args *ca) {
     /* In a user namespace of its own, init is the container's root from
      * here on, uid and gid 0 there and the first of its range on the host,
      * and what it makes is the container's root's. */
-    if (ca->userns && (lc_kernel_setgroups(0, NULL) < 0 || lc_kernel_setgid(0) < 0 || lc_kernel_setuid(0) < 0))
+    /* and holds the groups of the devices it is given that only their group
+     * opens, which its gid map has past its range (ROADMAP G.2), and no other */
+    uint32_t device_groups[MAX_DEVICES];
+    for (int g = 0; g < ca->ndev_groups; g++)
+        device_groups[g] = USERNS_DEVICE_GID + (uint32_t)g;
+    if (ca->userns && (lc_kernel_setgroups((size_t)ca->ndev_groups, device_groups) < 0 || lc_kernel_setgid(0) < 0 ||
+                       lc_kernel_setuid(0) < 0))
         die("Error: failed to become the root of the container's user namespace");
     if (lb_sys_fchdir((int32_t)rootfd) < 0)
         die2("Error: chdir to rootfs failed: ", ca->root);
@@ -4434,6 +4851,38 @@ static void build_container(const struct child_args *ca) {
             }
         }
 
+        /* The devices it is given (ROADMAP G.1): the mount of each node that
+         * start took, at its path under /dev, read-only with :ro, as those
+         * of every container are bound; and what is there then is looked at
+         * once more, as the device program lets the container open the
+         * numbers start found and no others. */
+        for (int d = 0; ca->config && ca->dev_trees && d < ca->config->ndevs; d++) {
+            const device_spec *dev = &ca->config->devs[d];
+            const char *in_root = dev->path + 1;        /* "dev/...", from the root */
+            char dir[MAX_PATH];
+            for (size_t at = 4; in_root[at]; at++)
+                if (in_root[at] == '/') {
+                    lc_bytes_copy(dir, in_root, at);
+                    dir[at] = '\0';
+                    (void)lc_kernel_mkdirat(AT_FDCWD, dir, 0755);
+                }
+            lc_sysret fd = lc_kernel_open_file(in_root, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+            if (fd < 0)
+                die2("Error: cannot make the place of a device in the container: ", dev->path);
+            lc_kernel_close_file((int32_t)fd);
+            if (attach_tree(ca->dev_trees[d], in_root) < 0)
+                die2("Error: cannot put a device in the container: ", dev->path);
+            lc_kernel_close_file(ca->dev_trees[d]);
+            if (!ca->privileged)
+                require_mount(NULL, in_root, NULL, MS_REMOUNT | MS_BIND | MS_NOSUID | MS_NOEXEC | (dev->ro ? MS_RDONLY : 0),
+                              NULL);
+            struct lb_statx bound;
+            if (lb_sys_statx(AT_FDCWD, in_root, AT_SYMLINK_NOFOLLOW, LB_STATX_TYPE, &bound) < 0 ||
+                (bound.stx_mode & LB_S_IFMT) != LB_S_IFCHR || bound.stx_rdev_major != ca->dev_rows[d].major_first ||
+                bound.stx_rdev_minor != ca->dev_rows[d].minor_first)
+                die2("Error: the device bound into the container is not the one start looked at: ", dev->host);
+        }
+
         /* pts and shm */
         char pts[MAX_PATH], shm[MAX_PATH];
         path_join_or_die(pts, MAX_PATH, dev_path, "pts");
@@ -4461,6 +4910,11 @@ static void build_container(const struct child_args *ca) {
     require_mount("proc", "/proc", "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL);
 
     require_mount("sysfs", "/sys", "sysfs", MS_RDONLY, NULL);
+    /* the container's own cgroup and what is below it, through its cgroup
+     * namespace: to read its limits and its use, and read-only, so that no
+     * process of it changes a limit; a privileged container may */
+    require_mount("cgroup2", "/sys/fs/cgroup", "cgroup2",
+                  MS_NOSUID | MS_NODEV | MS_NOEXEC | (ca->privileged ? 0 : MS_RDONLY), NULL);
     cleanup_old_root_or_die();
 
     /* devpts and shm inside container */
@@ -4480,6 +4934,33 @@ static void build_container(const struct child_args *ca) {
      * share with them. */
     require_mount("tmpfs", "/tmp", "tmpfs", MS_NOSUID | MS_NODEV, NULL);
     require_mount("tmpfs", "/run", "tmpfs", MS_NOSUID | MS_NODEV, "mode=755");
+    /* NVIDIA's libraries of its module's version, where start took them
+     * (ROADMAP G.3): read-only at NVIDIA_DIR/lib with the host's links to
+     * them, and nvidia-smi at NVIDIA_DIR/bin; not noexec, as a library is
+     * mapped to be run. */
+    if (ca->nnvidia > 0) {
+        static const char *const dirs[] = { "/run/lightbox", NVIDIA_DIR, NVIDIA_DIR "/lib", NVIDIA_DIR "/bin" };
+        for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++)
+            if (lc_kernel_mkdirat(AT_FDCWD, dirs[i], 0755) < 0 && !path_is_directory(dirs[i]))
+                die2("Error: cannot make the directory of NVIDIA's libraries: ", dirs[i]);
+        for (int i = 0; i < ca->nnvidia; i++) {
+            char at[MAX_PATH];
+            path_join_or_die(at, sizeof(at), ca->nvidia->files[i].bin ? NVIDIA_DIR "/bin" : NVIDIA_DIR "/lib",
+                             ca->nvidia->files[i].name);
+            lc_sysret fd = lc_kernel_open_file(at, O_WRONLY | O_CREAT | O_CLOEXEC, ca->nvidia->files[i].bin ? 0755 : 0644);
+            if (fd < 0 || attach_tree(ca->nvidia_trees[i], at) < 0)
+                die2("Error: cannot put one of NVIDIA's libraries in the container: ", at);
+            lc_kernel_close_file((int32_t)fd);
+            lc_kernel_close_file(ca->nvidia_trees[i]);
+            require_mount(NULL, at, NULL, MS_REMOUNT | MS_BIND | MS_RDONLY | MS_NOSUID | MS_NODEV, NULL);
+        }
+        for (int i = 0; i < ca->nvidia->nlinks; i++) {
+            char at[MAX_PATH];
+            path_join_or_die(at, sizeof(at), NVIDIA_DIR "/lib", ca->nvidia->links[i].name);
+            if (lc_kernel_symlinkat(ca->nvidia->links[i].target, AT_FDCWD, at) < 0)
+                die2("Error: cannot make a link of NVIDIA's libraries in the container: ", at);
+        }
+    }
     if (ca->read_only)
         require_mount("tmpfs", "/var/tmp", "tmpfs", MS_NOSUID | MS_NODEV, NULL);
 
@@ -4655,6 +5136,122 @@ static void require_upper_whole(const char *name, const char *root) {
         print_str(STDERR, "Warning: could not record that the container's own files are whole; the next start looks again\n");
 }
 
+/* Whether the container's root has musl's loader: its own files, and the
+ * snapshot's under them where it is an overlay of one (ROADMAP G.3). */
+static bool gpu_root_is_musl(const char *name, const container_config *config) {
+    char root[MAX_PATH], base[MAX_PATH];
+    container_root(root, name);
+    return root_has_musl(root) || (config->base[0] && base_rootfs_path(base, config->base) && root_has_musl(base));
+}
+
+/* ─── The box's published ports (ROADMAP N.1) ───────────────────────────── */
+
+/* The cgroup of the relay of a box's ports, below the box's: a name with a
+ * dot, which no exec's has. */
+#define RELAY_CGROUP "lightbox.relay"
+/* How long start waits for the relay to say that it is confined. */
+#define RELAY_READY_MS 5000
+
+/* The relay's cgroup, which a start that failed may have left */
+static bool relay_cgroup_made(const char *cg) {
+    lc_sysret rc = lc_kernel_mkdirat(AT_FDCWD, cg, 0755);
+    return rc == 0 || rc == -LB_EEXIST;
+}
+
+/* A socket of the host's that listens on a port the box publishes, as root:
+ * NULL with it in *fd, or why not. */
+static const char *port_listen(const port_spec *port, int32_t *fd) {
+    static char why[PORT_TEXT_MAX + 120];
+    char text[PORT_TEXT_MAX], addr[IPV4_TEXT_MAX], digits[16];
+    port_spec_text(text, port);
+    format_ipv4(addr, port->addr);
+    lc_sysret rc = relay_listen(port->addr, port->host_port);
+    if (rc >= 0) {
+        *fd = (int32_t)rc;
+        return NULL;
+    }
+    bool cut = false;
+    size_t at = 0;
+    if (rc == -LB_EADDRINUSE) {
+        at = str_append(why, at, "the host's port of -p ", sizeof(why), &cut);
+        at = str_append(why, at, text, sizeof(why), &cut);
+        (void)str_append(why, at, " is in use", sizeof(why), &cut);
+    } else if (rc == -LB_EADDRNOTAVAIL) {
+        at = str_append(why, at, addr, sizeof(why), &cut);
+        at = str_append(why, at, ", of -p ", sizeof(why), &cut);
+        at = str_append(why, at, text, sizeof(why), &cut);
+        (void)str_append(why, at, ", is no address of this host", sizeof(why), &cut);
+    } else {
+        fmt_int(digits, (int)-rc);
+        at = str_append(why, at, "cannot listen on the host's port of -p ", sizeof(why), &cut);
+        at = str_append(why, at, text, sizeof(why), &cut);
+        at = str_append(why, at, " (errno ", sizeof(why), &cut);
+        at = str_append(why, at, digits, sizeof(why), &cut);
+        (void)str_append(why, at, ")", sizeof(why), &cut);
+    }
+    return why;
+}
+
+/*
+ * The relay of the box's ports (lightbox_relay.c): forked into the cgroup
+ * lightbox.relay below the box's, where the box's limits hold for it and
+ * whatever ends the box ends it; a session of its own, so that the signals
+ * of start's terminal do not reach it; with the listeners, the box's network
+ * namespace and the pipe it says it is ready on, and nothing else of
+ * start's. start's own copies of the listeners are closed. NULL once it is
+ * confined, or why not.
+ */
+static const char *relay_start(const char *name, int pid, const container_config *config, int32_t *listeners) {
+    char cg[MAX_PATH], relay_cg[MAX_PATH];
+    int32_t ready[2] = { -1, -1 };
+    const char *failed = NULL;
+    int netns = -1;
+    if (!cgroup_path(cg, name) || !path_join(relay_cg, sizeof(relay_cg), cg, RELAY_CGROUP))
+        failed = "the path of the cgroup of the box's relay is too long";
+    else if (!relay_cgroup_made(relay_cg))
+        failed = "cannot make the cgroup of the relay of the box's ports";
+    else if ((netns = open_target_path(pid, "/ns/net")) < 0)
+        failed = "cannot open the box's network namespace for the relay of its ports";
+    else if (lc_kernel_create_pipe(ready, O_CLOEXEC) < 0)
+        failed = "cannot make the pipe of the relay of the box's ports";
+    lc_sysret relay = failed ? -1 : lc_kernel_fork();
+    if (relay == 0) {
+        (void)lc_kernel_create_session();
+        /* its standard streams nobody's, opened before the box's device
+         * filter holds for it */
+        lc_sysret null = lc_kernel_open_file("/dev/null", O_RDWR, 0);
+        for (int32_t i = 0; null >= 0 && i < 3; i++)
+            (void)lc_kernel_duplicate_fd((int32_t)null, i, 0);
+        if (cgroup_enter(relay_cg) < 0)
+            lc_kernel_exit(1);
+        int32_t keep[MAX_PORTS + 2];
+        int nkeep = 0;
+        for (int i = 0; i < config->nports; i++)
+            keep[nkeep++] = listeners[i];
+        keep[nkeep++] = netns;
+        keep[nkeep++] = ready[1];
+        close_all_but(keep, (size_t)nkeep);
+        static uint16_t box_ports[MAX_PORTS];
+        for (int i = 0; i < config->nports; i++)
+            box_ports[i] = config->ports[i].box_port;
+        relay_run(listeners, box_ports, config->nports, netns, ready[1]);
+    }
+    if (relay < 0 && !failed)
+        failed = "cannot fork the relay of the box's ports";
+    for (int i = 0; i < config->nports; i++)
+        lc_kernel_close_file(listeners[i]);
+    if (netns >= 0)
+        lc_kernel_close_file(netns);
+    if (ready[1] >= 0)
+        lc_kernel_close_file(ready[1]);
+    char said = 0;
+    if (!failed && (!readable_within(ready[0], RELAY_READY_MS) || lc_kernel_read_bytes(ready[0], &said, 1) != 1 || said != 'R'))
+        failed = "the relay of the box's ports could not be confined";
+    if (ready[0] >= 0)
+        lc_kernel_close_file(ready[0]);
+    return failed;
+}
+
 static void start_one(const char *name, int hook_wait) {
     require_root("start");
 
@@ -4675,6 +5272,12 @@ static void start_one(const char *name, int hook_wait) {
     if (!path_exists(root)) die2("Error: container does not exist: ", name);
 
     if (is_running(name)) die2("Error: container is already running: ", name);
+    /* cgroup v2 at cgroup_root, which a reboot took where setup mounted it;
+     * a container of any network needs it, and so does what reconcile
+     * clears away */
+    ensure_cgroup2_for_start();
+    static char monitor_cg[MAX_PATH];
+    monitor_cgroup_make(monitor_cg);
     (void)reconcile(name);          /* an earlier run that ended without a stop */
     container_forget_pid(name);     /* and whatever else one left on record */
 
@@ -4683,6 +5286,108 @@ static void start_one(const char *name, int hook_wait) {
     static container_config config;
     container_config_load_or_die(name, &config);
     bool privileged = config.privileged;
+
+    /* The devices it is given, as the host has them now (ROADMAP G.1): each
+     * node's mount, cloned here as host root, where a box of --userns could
+     * not reach the node's path, and attached by init as it is, so that
+     * what the container gets is the very node looked at. The kernel may have
+     * given one other numbers since the last start; the device program goes
+     * by these. One that is refused now is said before anything of the start
+     * is made. */
+    /* --gpu: the host's GPUs as they are now (ROADMAP G.3), each one more of
+     * the devices it is given, in this start alone and never in .conf */
+    if (config.gpu) {
+        static device_spec found[MAX_DEVICES];
+        int n = gpu_devices("", found, MAX_DEVICES);
+        if (n < 0)
+            die("Error: this host has more GPU nodes than the " STRINGIFY(MAX_DEVICES) " devices a container may have");
+        if (n == 0)
+            die("Error: the container was created with --gpu, and this host has no GPU for it: no render node in "
+                "/dev/dri, no NVIDIA node in /dev and no /dev/kfd");
+        print_str(STDOUT, "The host's GPU:");
+        for (int i = 0; i < n; i++) {
+            bool given = false;
+            for (int d = 0; d < config.ndevs && !given; d++)
+                given = streq(config.devs[d].path, found[i].path);
+            if (!given && config_add_device(&config, &found[i]) != NULL)
+                die("Error: the container's devices and the host's GPU nodes are more than " STRINGIFY(MAX_DEVICES));
+            lc_print_char(STDOUT, ' ');
+            print_str(STDOUT, found[i].path);
+        }
+        lc_print_char(STDOUT, '\n');
+    }
+    /* and NVIDIA's libraries, where its module is loaded (ROADMAP G.3): each
+     * file's mount cloned here, as host root, and attached by init */
+    static nvidia_files nvidia;
+    static int32_t nvidia_trees[NVIDIA_FILES_MAX];
+    int nnvidia = 0;
+    if (config.gpu) {
+        int found = nvidia_libraries("", &nvidia);
+        if (found < 0) {
+            print_str(STDERR, "Warning: NVIDIA's kernel module ");
+            print_str(STDERR, nvidia.version);
+            print_str(STDERR, " is loaded, and its ");
+            print_str(STDERR, nvidia.missing);
+            print_str(STDERR, " is in none of the host's directories of libraries: the container has the GPU's nodes, "
+                              "and not NVIDIA's libraries\n");
+        } else if (found > 0 && gpu_root_is_musl(name, &config)) {
+            print_str(STDOUT, "Note: NVIDIA's libraries are built for glibc, and the container's root has musl's loader: "
+                              "it has the GPU's nodes, and not NVIDIA's libraries\n");
+        } else if (found > 0) {
+            for (int i = 0; i < nvidia.nfiles; i++) {
+                lc_sysret tree = lb_sys_open_tree(AT_FDCWD, nvidia.files[i].host, LB_OPEN_TREE_CLONE | LB_OPEN_TREE_CLOEXEC);
+                struct lb_statx stx;
+                if (tree < 0 || lb_sys_statx((int32_t)tree, "", LB_AT_EMPTY_PATH, LB_STATX_TYPE, &stx) < 0 ||
+                    (stx.stx_mode & LB_S_IFMT) != LB_S_IFREG)
+                    die2("Error: cannot take one of NVIDIA's libraries: ", nvidia.files[i].host);
+                nvidia_trees[nnvidia++] = (int32_t)tree;
+            }
+            print_str(STDOUT, "NVIDIA's libraries of ");
+            print_str(STDOUT, nvidia.version);
+            print_str(STDOUT, ": at " NVIDIA_DIR "/lib, and LD_LIBRARY_PATH names them\n");
+        }
+    }
+    static struct lb_dev_row dev_rows[MAX_DEVICES];
+    static int32_t dev_trees[MAX_DEVICES];
+    /* and with --userns, the host's groups of those only their group may
+     * open, which its gid map and its processes get (ROADMAP G.2) */
+    static uint32_t dev_groups[MAX_DEVICES];
+    int ndev_groups = 0;
+    for (int d = 0; d < config.ndevs; d++) {
+        const device_spec *dev = &config.devs[d];
+        lc_sysret tree = lb_sys_open_tree(AT_FDCWD, dev->host, LB_OPEN_TREE_CLONE | LB_OPEN_TREE_CLOEXEC);
+        struct lb_statx stx;
+        if (tree == -LB_ENOENT) {
+            print_str(STDERR, "Error: a device of the container's cannot be given: ");
+            print_str(STDERR, dev->host);
+            print_str(STDERR, " is not there\n");
+            lc_kernel_exit(failure_status);
+        }
+        if (tree < 0 || lb_sys_statx((int32_t)tree, "", LB_AT_EMPTY_PATH, LB_STATX_TYPE | LB_STATX_MODE | LB_STATX_GID,
+                                     &stx) < 0) {
+            say_with_number("Error: cannot take a device of the container's (errno ", (int)(tree < 0 ? -tree : 0), "): ");
+            print_str(STDERR, dev->host);
+            lc_print_char(STDERR, '\n');
+            lc_kernel_exit(failure_status);
+        }
+        const char *refused = device_refused(dev->host, &stx, config.profile == PROFILE_AGENT);
+        struct lb_statfs sfs;
+        if (!refused && lb_sys_fstatfs((int32_t)tree, &sfs) == 0 && (sfs.f_flags & LB_ST_NODEV))
+            refused = device_on_nodev(dev->host);
+        uint32_t group = 0;
+        if (!refused && config.userns)
+            refused = device_userns_group(dev->host, &stx, dev->ro, &group);
+        if (refused)
+            die2("Error: a device of the container's cannot be given: ", refused);
+        bool have = group == 0;
+        for (int g = 0; g < ndev_groups && !have; g++)
+            have = dev_groups[g] == group;
+        if (!have)
+            dev_groups[ndev_groups++] = group;
+        dev_trees[d] = (int32_t)tree;
+        dev_rows[d] = (struct lb_dev_row){ stx.stx_rdev_major, stx.stx_rdev_major, stx.stx_rdev_minor,
+                                           stx.stx_rdev_minor, dev->ro ? LB_DEV_R : LB_DEV_RW };
+    }
     /* --net none: loopback, and no address, interface or rule (ROADMAP 8.5) */
     bool networked = config.net != NET_NONE;
 
@@ -4897,6 +5602,12 @@ static void start_one(const char *name, int hook_wait) {
         .exit_fd = exit_fd,
         .name = name,
         .config = &config,
+        .dev_rows = dev_rows,
+        .dev_trees = dev_trees,
+        .ndev_groups = ndev_groups,
+        .nvidia = &nvidia,
+        .nvidia_trees = nvidia_trees,
+        .nnvidia = nnvidia,
         .root = start_root,
         .overlay = config.base[0] && !config.userns ? overlay : NULL,
         .userns = config.userns,
@@ -4914,7 +5625,7 @@ static void start_one(const char *name, int hook_wait) {
     int clone_flags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET |
                       (config.userns ? CLONE_NEWUSER : 0);
 
-    start_err = init_spawn(&init, &ca, clone_flags, container_child);
+    start_err = init_spawn_monitored(&init, &ca, clone_flags, container_child, monitor_cleanup, monitor_cg);
     close_container_streams(&null_fd, &log_fd);     /* init has its own copies */
     close_volumes(userns_volumes, nuserns_volumes);
     lc_kernel_close_file(exit_fd);
@@ -4923,6 +5634,17 @@ static void start_one(const char *name, int hook_wait) {
         goto fail_start;
     int child_pid = (int)init.pid;
 
+    /* The host's ports the box publishes (ROADMAP N.1), as root, here: init
+     * and its monitor have their descriptors already, and have none of
+     * these; and a port that is in use ends the start before anything of
+     * the box has run. */
+    static int32_t port_fds[MAX_PORTS];
+    for (int i = 0; i < config.nports; i++) {
+        start_err = port_listen(&config.ports[i], &port_fds[i]);
+        if (start_err)
+            goto fail_start;
+    }
+
     /*
      * Set up cgroup, networking, and OOM score before init gets its first
      * byte. While it waits for that byte it is certainly there, so everything
@@ -4930,13 +5652,14 @@ static void start_one(const char *name, int hook_wait) {
      */
 
     /* its ids: uid and gid 0 there are the first of its range here */
-    if (config.userns && userns_write_maps(child_pid, config.uid_start, config.gid_start) != 0) {
+    if (config.userns && userns_write_maps_with(child_pid, config.uid_start, config.gid_start, dev_groups,
+                                                (size_t)ndev_groups) != 0) {
         start_err = "failed to write the maps of the container's user namespace";
         goto fail_start;
     }
 
     /* set up cgroup */
-    start_err = cgroup_create(name, child_pid, &config);
+    start_err = cgroup_create(name, child_pid, &config, dev_rows);
     if (start_err)
         goto fail_start;
 
@@ -5037,6 +5760,10 @@ static void start_one(const char *name, int hook_wait) {
         start_err = "failed to put in the firewall rules of the container's links or --net";
         goto fail_start;
     }
+    /* and its ports' relay, before the hook, so that what the hook starts is
+     * reached as soon as it listens */
+    if (config.nports > 0 && (start_err = relay_start(name, child_pid, &config, port_fds)) != NULL)
+        goto fail_start;
 
     /* Second byte: init runs the hook, and says how it ended. */
     if (!init_go(&init)) {
@@ -5089,6 +5816,17 @@ static void start_one(const char *name, int hook_wait) {
     print_str(STDOUT,", ip=");
     print_str(STDOUT,ip);
     print_str(STDOUT,")\n");
+    for (int i = 0; i < config.nports; i++) {
+        char on[IPV4_TEXT_MAX];
+        format_ipv4(on, config.ports[i].addr);
+        print_str(STDOUT, "Port ");
+        print_str(STDOUT, on);
+        lc_print_char(STDOUT, ':');
+        lc_print_unsigned(STDOUT, config.ports[i].host_port);
+        print_str(STDOUT, " of the host reaches its port ");
+        lc_print_unsigned(STDOUT, config.ports[i].box_port);
+        lc_print_char(STDOUT, '\n');
+    }
     print_str(STDOUT,"Attach with: lightbox exec ");
     print_str(STDOUT,name);
     print_str(STDOUT," /bin/sh\n");
@@ -5881,6 +6619,7 @@ static void cmd_exec(int argc, char **argv) {
         req.workdir = config.workdir;
     int pid = get_container_pid(name);
     bool privileged = config.privileged;
+    req.gpu = config.gpu;
     /* where its proxy is: the gateway that it started with, as lightbox.conf
      * has it, which start sees to */
     static char proxy[PROXY_ENV_COUNT][PROXY_VAR_MAX];
@@ -5950,6 +6689,380 @@ static void cmd_exec(int argc, char **argv) {
         code = EXEC_TIMED_OUT;
     }
     exec_audit_end(code, timed_out);
+    lc_kernel_exit(code);
+}
+
+/* ─── cmd_cp (ROADMAP C.1) ──────────────────────────────────────────────── */
+
+/*
+ * lightbox cp: a file, a link or a tree between the host and a running box,
+ * as a tar archive that I.2's writer writes and I.3's reader unpacks, in a
+ * process of its own whose root is the directory it unpacks into. Nothing of
+ * the box's is resolved on the host: the box's side of a copy is a process
+ * that joins the box as exec does, its cgroup, user and mount namespaces and
+ * its root, and finds names there, where a link of the box's leads nowhere
+ * but into the box. Into a box what is copied is its root's, with -a its
+ * owners'; out of one it is the owner's of the directory it goes into; no
+ * setuid or setgid bit goes either way, and no device is made.
+ */
+struct cp_end {
+    bool in_box;
+    char box[NAME_MAX_LEN + 1];
+    char path[MAX_PATH];        /* as given, with no slash at its end */
+    bool contents;              /* <dir>/.: what is in it, and not it */
+    char dir[MAX_PATH];         /* the directory the entry is in; with contents, the directory itself */
+    char name[MAX_PATH];        /* the entry's name in dir; empty with contents */
+};
+
+static void cp_end_parse(const char *arg, struct cp_end *e) {
+    *e = (struct cp_end){ 0 };
+    const char *path = arg;
+    const char *colon = NULL;
+    for (const char *c = arg; *c && !colon; c++)
+        if (*c == ':')
+            colon = c;
+    if (colon && colon > arg && (size_t)(colon - arg) <= NAME_MAX_LEN && colon[1] == '/') {
+        char box[NAME_MAX_LEN + 1];
+        lc_bytes_copy(box, arg, (size_t)(colon - arg));
+        box[colon - arg] = '\0';
+        if (name_is_valid(box)) {
+            e->in_box = true;
+            lc_bytes_copy(e->box, box, sizeof(box));
+            path = colon + 1;
+        }
+    }
+    if (!path[0] || has_control_chars(path) || !str_copy(e->path, path, sizeof(e->path)))
+        die2("Error: cp takes a path of the host's, or <box>:<absolute path>, not: ", arg);
+    size_t len = lc_string_length(e->path);
+    while (len > 1 && e->path[len - 1] == '/')
+        e->path[--len] = '\0';
+    /* <dir>/., and / itself: what is in it */
+    if (streq(e->path, "/") || streq(e->path, ".") || (len >= 2 && streq(e->path + len - 2, "/."))) {
+        e->contents = true;
+        if (len >= 2 && streq(e->path + len - 2, "/."))
+            e->path[len - 2 == 0 ? 1 : len - 2] = '\0';
+        str_copy_or_die(e->dir, e->path, sizeof(e->dir), "a path of cp");
+        return;
+    }
+    const char *slash = NULL;
+    for (const char *c = e->path; *c; c++)
+        if (*c == '/')
+            slash = c;
+    const char *base = slash ? slash + 1 : e->path;
+    if (streq(base, ".") || streq(base, ".."))
+        die2("Error: cp takes a file, a link or a directory by its name, or <dir>/. for what is in it, not: ", arg);
+    str_copy_or_die(e->name, base, sizeof(e->name), "a path of cp");
+    if (!slash)
+        str_copy_or_die(e->dir, ".", sizeof(e->dir), "a path of cp");
+    else if (slash == e->path)
+        str_copy_or_die(e->dir, "/", sizeof(e->dir), "a path of cp");
+    else {
+        size_t dlen = (size_t)(slash - e->path);
+        lc_bytes_copy(e->dir, e->path, dlen);
+        e->dir[dlen] = '\0';
+    }
+}
+
+/* Where a copy goes, in the namespace this process is in: into dst where
+ * it is a directory, under the source's name, which *top then is; else as
+ * dst, in the directory above it, under dst's own name. With contents, into
+ * dst, made where it is not there. The directory's descriptor, or -1 once
+ * said; st has what that directory is. */
+static int32_t cp_target(const struct cp_end *dst, const struct cp_end *src, const char **top, struct lb_statx *st) {
+    struct lb_statx at;
+    bool is_dir = lb_sys_statx(AT_FDCWD, dst->path, 0, LB_STATX_TYPE, &at) == 0 && (at.stx_mode & LB_S_IFMT) == LB_S_IFDIR;
+    const char *into = dst->path;
+    *top = src->name;
+    if (src->contents && !is_dir && !dst->contents) {
+        /* made as its parent's owner's, as what goes into it will be */
+        struct lb_statx parent;
+        if (lb_sys_statx(AT_FDCWD, dst->dir, 0, LB_STATX_TYPE | LB_STATX_UID | LB_STATX_GID, &parent) < 0 ||
+            (parent.stx_mode & LB_S_IFMT) != LB_S_IFDIR || lc_kernel_mkdirat(AT_FDCWD, dst->path, 0755) < 0 ||
+            lc_kernel_fchownat(AT_FDCWD, dst->path, parent.stx_uid, parent.stx_gid, AT_SYMLINK_NOFOLLOW) < 0) {
+            print_str(STDERR, "Error: cp cannot make the directory to copy into: ");
+            print_str(STDERR, dst->path);
+            lc_print_char(STDERR, '\n');
+            return -1;
+        }
+    } else if (!is_dir) {
+        if (dst->contents) {
+            print_str(STDERR, "Error: cp copies into a directory that is there: ");
+            print_str(STDERR, dst->path);
+            lc_print_char(STDERR, '\n');
+            return -1;
+        }
+        into = dst->dir;
+        *top = dst->name;
+    }
+    lc_sysret fd = lc_kernel_open_file(into, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+    if (fd < 0 || lb_sys_statx((int32_t)fd, "", LB_AT_EMPTY_PATH, LB_STATX_TYPE | LB_STATX_UID | LB_STATX_GID, st) < 0) {
+        print_str(STDERR, "Error: cp has no directory to copy into: ");
+        print_str(STDERR, into);
+        lc_print_char(STDERR, '\n');
+        if (fd >= 0)
+            lc_kernel_close_file((int32_t)fd);
+        return -1;
+    }
+    return (int32_t)fd;
+}
+
+/* The directory a source entry is in, and that the entry is there: its
+ * descriptor, or -1 once said. */
+static int32_t cp_source_dir(const struct cp_end *src) {
+    lc_sysret fd = lc_kernel_open_file(src->dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+    struct lb_statx st;
+    if (fd < 0 || (!src->contents && lb_sys_statx((int32_t)fd, src->name, AT_SYMLINK_NOFOLLOW, LB_STATX_TYPE, &st) < 0)) {
+        print_str(STDERR, "Error: cp has nothing to copy at ");
+        print_str(STDERR, src->path);
+        lc_print_char(STDERR, '\n');
+        if (fd >= 0)
+            lc_kernel_close_file((int32_t)fd);
+        return -1;
+    }
+    return (int32_t)fd;
+}
+
+/* This process into a running box, as exec's worker goes into one: the
+ * exec's cgroup, the box's cgroup, user and mount namespaces, as its root,
+ * and the box's root as its own. Ends the process when it cannot. */
+static void cp_join(const char *cg, int target_pid, bool userns) {
+    if (lc_kernel_prctl(LB_PR_SET_DUMPABLE, 0, 0, 0, 0) < 0)
+        die("Error: failed to close the copy to the box's processes");
+    int rootfd = open_target_path(target_pid, "/root");
+    int userfd = userns ? open_target_path(target_pid, "/ns/user") : -1;
+    int mntfd = open_target_path(target_pid, "/ns/mnt");
+    int cgroupfd = open_target_path(target_pid, "/ns/cgroup");
+    if (rootfd < 0 || mntfd < 0 || cgroupfd < 0 || (userns && userfd < 0))
+        die("Error: failed to open the box's root and namespaces");
+    cgroup_join_self(cg);
+    require_setns_fd(cgroupfd, LB_CLONE_NEWCGROUP, "cgroup");
+    if (userns) {
+        require_setns_fd(userfd, CLONE_NEWUSER, "user");
+        if (lc_kernel_setgroups(0, NULL) < 0 || lc_kernel_setgid(0) < 0 || lc_kernel_setuid(0) < 0)
+            die("Error: failed to become the root of the box's user namespace");
+    }
+    require_setns_fd(mntfd, CLONE_NEWNS, "mount");
+    if (lb_sys_fchdir(rootfd) < 0 || lb_sys_chroot(".") < 0 || lc_kernel_chdir("/") < 0)
+        die("Error: failed to take the box's root as the copy's");
+    lc_kernel_close_file(rootfd);
+    lc_kernel_close_file(mntfd);
+    lc_kernel_close_file(cgroupfd);
+    if (userfd >= 0)
+        lc_kernel_close_file(userfd);
+}
+
+/* When one side of a copy fails the other does too, the writer at a pipe
+ * with no reader and the reader at an archive cut short: the side that
+ * failed first says why, and the other says nothing. */
+static bool cp_pipe_broke;
+
+static int cp_sink(void *to, const void *data, size_t len) {
+    if (lc_kernel_write_all(*(const int32_t *)to, data, len) == (lc_sysret)len)
+        return 0;
+    cp_pipe_broke = true;
+    return -1;
+}
+
+static int64_t cp_source(void *from, void *data, size_t len) {
+    return lc_kernel_read_retry(*(const int32_t *)from, data, len);
+}
+
+/* A tar archive of the source, in dirfd, into fd: 0; 1 once said; or
+ * CP_PIPE_BROKE, said by nobody, where the reader went away first. dirfd is
+ * closed. */
+#define CP_PIPE_BROKE 2
+static int cp_write(int32_t fd, int32_t dirfd, const struct cp_end *src, const char *top, bool owners_root) {
+    static int32_t sink_fd;
+    sink_fd = fd;
+    static tar_writer w;
+    w = (tar_writer){ .sink = cp_sink, .to = &sink_fd, .plain = true, .owners_root = owners_root, .no_setid = true };
+    int rc = src->contents ? tar_write_tree(&w, dirfd) : tar_write_one(&w, dirfd, src->name, top);
+    lc_kernel_close_file(dirfd);
+    if (rc != 0 && cp_pipe_broke)
+        return CP_PIPE_BROKE;
+    if (rc != 0) {
+        print_str(STDERR, "Error: cp could not send what is at ");
+        print_str(STDERR, w.failed_at[0] ? w.failed_at : src->path);
+        print_str(STDERR, ": it ");
+        print_str(STDERR, w.failure ? w.failure : "failed");
+        lc_print_char(STDERR, '\n');
+        return 1;
+    }
+    return 0;
+}
+
+/* The archive on fd unpacked into dirfd: 0, or 1, said where say is. */
+static tar_reader cp_reader;
+
+static void cp_say_read(void) {
+    print_str(STDERR, "Error: cp could not make ");
+    print_str(STDERR, cp_reader.failed_at[0] ? cp_reader.failed_at : "what it was sent");
+    print_str(STDERR, ": ");
+    print_str(STDERR, cp_reader.failure ? cp_reader.failure : "it failed");
+    lc_print_char(STDERR, '\n');
+}
+
+static int cp_read(int32_t fd, int32_t dirfd, bool owner_given, uint32_t uid, uint32_t gid, bool say) {
+    static int32_t source_fd;
+    source_fd = fd;
+    tar_reader *r = &cp_reader;
+    *r = (tar_reader){ .source = cp_source, .from = &source_fd, .source_fd = fd, .into = TAR_INTO_COPY, .no_setid = true,
+                      .owner_given = owner_given, .owner_uid = uid, .owner_gid = gid };
+    if (tar_read_tree(r, dirfd) != 0) {
+        if (say)
+            cp_say_read();
+        return 1;
+    }
+    if (r->devices)
+        say_with_number("Note: cp made none of the ", (int)r->devices, " devices it was sent; a box's devices are lightbox's to give\n");
+    return 0;
+}
+
+static void cmd_cp(int argc, char **argv) {
+    bool archive = false;
+    const char *args[2];
+    int nargs = 0;
+    for (int i = 0; i < argc; i++) {
+        if (streq(argv[i], "-a") || streq(argv[i], "--archive"))
+            archive = true;
+        else if (argv[i][0] == '-' && argv[i][1])
+            die2("Error: unknown option: ", argv[i]);
+        else if (nargs < 2)
+            args[nargs++] = argv[i];
+        else
+            die2("Error: unexpected argument: ", argv[i]);
+    }
+    if (nargs != 2)
+        die("Usage: lightbox cp [-a] <host path> <box>:<path> | lightbox cp [-a] <box>:<path> <host path>");
+    static struct cp_end src, dst;
+    cp_end_parse(args[0], &src);
+    cp_end_parse(args[1], &dst);
+    if (src.in_box == dst.in_box)
+        die("Error: cp copies between the host and a box: one of the two is <box>:<path>");
+    const struct cp_end *box_end = src.in_box ? &src : &dst;
+    if (box_end->path[0] != '/')
+        die2("Error: a path in a box is absolute: ", box_end->path);
+    const char *name = box_end->box;
+    require_root("cp");
+    if (!is_running(name))
+        die2("Error: cp copies into and out of a running box, and this one is not running: ", name);
+    static container_config config;
+    container_config_load_or_die(name, &config);
+    int pid = get_container_pid(name);
+
+    /* out of the box: where it goes is the host's, and settled first */
+    const char *top = src.name;
+    int32_t target = -1;
+    struct lb_statx owner;
+    if (dst.in_box == false && (target = cp_target(&dst, &src, &top, &owner)) < 0)
+        lc_kernel_exit(failure_status);
+    /* into it: what is copied is the host's, and there before anything */
+    int32_t source = -1;
+    if (!src.in_box && (source = cp_source_dir(&src)) < 0)
+        lc_kernel_exit(failure_status);
+
+    /* the archive; where the copy goes, from the box's side of a copy into
+     * it; and from the host's side, whether it was what failed first */
+    int32_t data[2], answer[2], verdict[2];
+    if (lc_kernel_create_pipe(data, O_CLOEXEC) < 0 || lc_kernel_create_pipe(answer, O_CLOEXEC) < 0 ||
+        lc_kernel_create_pipe(verdict, O_CLOEXEC) < 0)
+        die("Error: cp cannot make its pipes");
+    /* a reader that ends early ends the writing with EPIPE, not the command */
+    uint64_t pipe_signal = sigmask_from_signal(LB_SIGPIPE);
+    lc_kernel_set_signal_mask(LC_SIG_BLOCK, &pipe_signal, NULL);
+
+    static char cg[MAX_PATH];
+    exec_cgroup_make(name, cg);
+    exec_via = "cp";
+    const char *words[] = { "cp", args[0], args[1], NULL };
+    struct exec_request req = { .argv = words };
+    if (!exec_audit_start(name, &config, cg, &req, monotonic_ms())) {
+        exec_cgroup_end(name, cg, true);
+        lc_kernel_exit(failure_status);
+    }
+
+    lc_sysret helper = lc_kernel_fork();
+    if (helper < 0) {
+        print_str(STDERR, "Error: cp cannot fork the process that goes into the box\n");
+        exec_cgroup_end(name, cg, true);
+        exec_audit_end(failure_status, false);
+        lc_kernel_exit(failure_status);
+    }
+    if (helper == 0) {
+        on_failure(NULL);
+        lc_kernel_close_file(answer[0]);
+        lc_kernel_close_file(verdict[1]);
+        /* nothing of the host's goes into the box but the pipes */
+        if (source >= 0)
+            lc_kernel_close_file(source);
+        if (target >= 0)
+            lc_kernel_close_file(target);
+        cp_join(cg, pid, config.userns);
+        if (src.in_box) {
+            /* out: the box's side writes */
+            lc_kernel_close_file(data[0]);
+            int32_t from = cp_source_dir(&src);
+            lc_kernel_exit(from < 0 ? failure_status : cp_write(data[1], from, &src, top, false));
+        }
+        /* in: the box's side settles where it goes, says it, and unpacks */
+        lc_kernel_close_file(data[1]);
+        struct lb_statx at;
+        int32_t into = cp_target(&dst, &src, &top, &at);
+        char said = into < 0 ? 'E' : top == src.name ? 'S' : 'D';
+        (void)lc_kernel_write_all(answer[1], &said, 1);
+        lc_kernel_close_file(answer[1]);
+        if (into < 0)
+            lc_kernel_exit(failure_status);
+        if (cp_read(data[0], into, false, 0, 0, false) == 0)
+            lc_kernel_exit(0);
+        /* the host's writer let go of first, then its word on what failed */
+        lc_kernel_close_file(data[0]);
+        char word = 0;
+        if (lc_kernel_read_retry(verdict[0], &word, 1) != 1 || word != 'W')
+            cp_say_read();
+        lc_kernel_exit(failure_status);
+    }
+
+    lc_kernel_close_file(answer[1]);
+    lc_kernel_close_file(verdict[0]);
+    int rc = 0;
+    if (src.in_box) {
+        lc_kernel_close_file(data[1]);
+        lc_kernel_close_file(answer[0]);
+        rc = cp_read(data[0], target, true, owner.stx_uid, owner.stx_gid, false);
+        lc_kernel_close_file(data[0]);
+        lc_kernel_close_file(target);
+    } else {
+        lc_kernel_close_file(data[0]);
+        char said = 'E';
+        if (lc_kernel_read_retry(answer[0], &said, 1) != 1)
+            said = 'E';
+        lc_kernel_close_file(answer[0]);
+        if (said != 'E')
+            rc = cp_write(data[1], source, &src, said == 'S' ? src.name : dst.name, !archive);
+        else
+            lc_kernel_close_file(source);
+        if (rc != 0 && !cp_pipe_broke)
+            (void)lc_kernel_write_all(verdict[1], "W", 1);
+        lc_kernel_close_file(data[1]);
+    }
+    lc_kernel_close_file(verdict[1]);
+    int32_t status = 0;
+    int helper_code = wait_child((int32_t)helper, &status) == 0 ? exit_code_from_status(status) : failure_status;
+    /* out of it: the host's reader says why where it failed first */
+    if (src.in_box && rc != 0 && (helper_code == 0 || helper_code == CP_PIPE_BROKE))
+        cp_say_read();
+    int code = rc != 0 || helper_code != 0 ? failure_status : 0;
+    /* nothing of a copy outlives it */
+    exec_cgroup_end(name, cg, true);
+    exec_audit_end(code, false);
+    if (code == 0) {
+        print_str(STDOUT, "Copied ");
+        print_str(STDOUT, args[0]);
+        print_str(STDOUT, " to ");
+        print_str(STDOUT, args[1]);
+        lc_print_char(STDOUT, '\n');
+    }
     lc_kernel_exit(code);
 }
 
@@ -6316,6 +7429,13 @@ static const struct { const char *name; const char *text; } command_help[] = {
         "         --io-max <limit>       I/O limit for one disk: \"8:0 wbps=10485760\", with rbps, wbps,\n"
         "                                riops or wiops (default: none)\n"
         "         --vol  <src:dst[:ro]>  Bind mount (repeatable)\n"
+        "         --gpu                  The host's GPUs for compute, found at each start: its render\n"
+        "                                nodes, NVIDIA's and /dev/kfd, each as --device gives one\n"
+        "         --device <host>[:<path>][:ro]\n"
+        "                                A character device of the host's at <path> under /dev, or at its\n"
+        "                                own path, read alone with :ro (repeatable); never a block device\n"
+        "                                or one that gives the host away, and to --profile agent a GPU's\n"
+        "                                compute nodes alone\n"
         "         --rootfs <path>        The base it is made from (default: $LIGHTBOX_ROOTFS or lightbox.conf)\n"
         "         --base <id>            The snapshot it is made from, as base ls shows it, in the place\n"
         "                                of a base: the one base import unpacked an image into\n"
@@ -6335,11 +7455,15 @@ static const struct { const char *name; const char *text; } command_help[] = {
         "                                it stops as stop stops it, and is expired\n"
         "         --link <name>          Allow network to another container\n"
         "         --dns <address>        A name server for the container (up to 3; default: the host's)\n"
+        "         -p, --publish [<address>:]<host port>:<box port>\n"
+        "                                A TCP port of the host's that reaches the box's port, relayed\n"
+        "                                to its loopback; on 127.0.0.1 unless an address is given, and\n"
+        "                                0.0.0.0 for every address (repeatable)\n"
         "         --profile <name>       agent: a user namespace, the allow-list, an overlay, and the\n"
         "                                network of --net none unless --net outside or proxy:<port> is\n"
         "                                given, with the limits and lifetime of the agent_* settings. As\n"
-        "                                root; it refuses --privileged, --link, --net nat, --seccomp deny\n"
-        "                                and --copy\n"
+        "                                root; it refuses --privileged, --link, --net nat, --seccomp deny,\n"
+        "                                --copy and -p\n"
         "         --workspace <dir>      The directory at /workspace, where every exec runs\n" },
     { "start",
         "  start  <name>... [-t <seconds>]  Start stopped containers, one after the other\n"
@@ -6371,6 +7495,13 @@ static const struct { const char *name; const char *text; } command_help[] = {
         "                                 5m or 1.5h; exec then exits with 124\n"
         "         exec exits with the command's status, or 128 plus the signal that ended it; with\n"
         "         125 when lightbox failed, 126 when the command could not be run, 127 when not found\n" },
+    { "cp",
+        "  cp     [-a] <host path> <box>:<path>  Copy a file, a link or a directory into a running box,\n"
+        "  cp     [-a] <box>:<path> <host path>  or out of one: into <path> where it is a directory, and\n"
+        "                                else as <path>; <dir>/. copies what is in <dir>. What goes in\n"
+        "                                is the box's root's, with -a its owners'; what comes out is\n"
+        "                                the owner's of the directory it goes into. No setuid or setgid\n"
+        "                                bit and no device either way\n" },
     { "run",
         "  run    [create options] [exec options] [--] [cmd [args...]]\n"
         "                                Create a box, start it, run a command in it as exec runs it,\n"
@@ -6558,6 +7689,7 @@ int main(int argc, char **argv, char **envp) {
     else if (streq(cmd, "rm-vol")) cmd_rm_vol(sub_argc, sub_argv);
     else if (streq(cmd, "rm"))     cmd_rm(sub_argc, sub_argv);
     else if (streq(cmd, "exec"))   cmd_exec(sub_argc, sub_argv);
+    else if (streq(cmd, "cp"))     cmd_cp(sub_argc, sub_argv);
     else if (streq(cmd, "run"))    cmd_run(sub_argc, sub_argv);
     else if (streq(cmd, "logs"))   cmd_logs(sub_argc, sub_argv);
     else if (streq(cmd, "inspect")) cmd_inspect(sub_argc, sub_argv);

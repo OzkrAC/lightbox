@@ -116,6 +116,8 @@ A container with `--net none` has no address, and `create` says `created (no net
 | `--ttl <duration>` | none | How long the container may run from each start. At the end init shuts it down as `stop` does, and it is `expired` ([lifetime](#create-ttl)) |
 | `--vol <src>:<dst>[:ro]` | | A directory or a file of the host's in the container. Repeatable, up to 16, one at a destination ([Storage](storage.html#volumes)) |
 | `--workspace <dir>` | none | A directory of the host's at `/workspace`, where every `exec` then runs ([Agent boxes](agents.html#workspace)) |
+| `--device <host>[:<path>][:ro]` | | A character device of the host's, at its own path under `/dev` or at `<path>`, for reading alone with `:ro`. Repeatable, up to 16. Never a block device, nor one that gives the host away ([devices](#create-devices)) |
+| `--gpu` | off | The host's GPUs, for compute, found at each start, each given as `--device` gives one; and NVIDIA's libraries where its kernel module is loaded ([devices](#create-devices)) |
 | `--read-only` | off | A root filesystem that cannot be written to. `/tmp`, `/run` and, in such a container, `/var/tmp` are filesystems in memory, and they and the volumes still can |
 | `--userns` | off | A user namespace of its own: the container's root is an unprivileged uid of the host's. As root ([Security](security.html#userns)) |
 | `--seccomp allow|deny` | `allow` | The seccomp profile: the allow-list, or the deny-list ([Security](security.html#seccomp)) |
@@ -123,7 +125,8 @@ A container with `--net none` has no address, and `create` says `created (no net
 | `--net <mode>` | `outside` | What it may reach: `outside`, the internet and its name servers only; `nat`, the host and its networks too, as every container before 0.8; `none`, loopback alone; `proxy:<port>`, that TCP port of the gateway and nothing else ([Networking](networking.html#net)) |
 | `--link <name>` | | Allow traffic between this container and another. Repeatable, up to 8 ([Networking](networking.html#links)) |
 | `--dns <address>` | the host's | A name server for the container. Repeatable, up to 3 ([Networking](networking.html#dns)) |
-| `--profile agent` | none | The agent profile: `--userns`, the allow-list, an overlay, and `--net none` unless `--net outside` or `--net proxy:<port>` is given, with the limits and the lifetime of the `agent_*` settings. As root. It refuses `--privileged`, `--link`, `--net nat`, `--seccomp deny` and `--copy` ([Agent boxes](agents.html#profile)) |
+| `-p`, `--publish [<address>:]<host port>:<box port>` | none | A TCP port of the host's that reaches the container's port: on `127.0.0.1` unless an address is given, which this host alone reaches, and on every address with `0.0.0.0`. Repeatable, up to 16 ([Networking](networking.html#ports)) |
+| `--profile agent` | none | The agent profile: `--userns`, the allow-list, an overlay, and `--net none` unless `--net outside` or `--net proxy:<port>` is given, with the limits and the lifetime of the `agent_*` settings. As root. It refuses `--privileged`, `--link`, `--net nat`, `--seccomp deny`, `--copy` and `-p` ([Agent boxes](agents.html#profile)) |
 
 The defaults of `--mem`, `--pids`, `--cpu` and `--oom-score` are the `default_*` settings of `lightbox.conf` ([Configuration](configuration.html#settings)).
 
@@ -138,6 +141,14 @@ The defaults of `--mem`, `--pids`, `--cpu` and `--oom-score` are the `default_*`
 `--ttl` counts from each start on the clock of the time since boot, which goes on while the host is suspended. At the end init shuts the container down as `stop` does, with all it runs, the commands of `exec` among them, and writes why in its log. `ls` and `inspect` show it as `expired`, and the next `start`, `stop` or `rm` clears away what it left.
 
 Init keeps the time, inside the container. No process there can send it a signal it does not handle, trace it or set its clock, but a kernel flaw past the sandbox could: the lifetime is a guard against containers that are forgotten or run away, and not a security boundary.
+
+#### Devices and GPUs {#create-devices}
+
+`--device` gives a container a character device of the host's, such as a GPU's render node: `--device /dev/dri/renderD128`. The node's numbers are read again at each start, as the kernel may give it others after a boot, and the container may open those numbers and no others. A block device is refused, and so is one that gives the host away: its memory and I/O ports, the kernel's log, its consoles and what they show, its input devices and `uinput`, the watchdog, and a CPU's model-specific registers and `cpuid`. So is a node on a mount of the host's with `nodev`. A box of `--profile agent` is given a GPU's compute nodes alone. [Security](security.html#devices) says how a container of `--userns` opens a node that is its group's.
+
+`--gpu` is kept in the container's configuration as `gpu=1`, and the GPUs are found at each start: the render nodes of `/dev/dri`, of any DRM driver; NVIDIA's nodes, but `nvidia-modeset`; and AMD's `/dev/kfd`. A card node is never given, as it is a display's. `start` names what it found, and ends when there is none: `the container was created with --gpu, and this host has no GPU for it`.
+
+Where NVIDIA's kernel module is loaded, the container is also given NVIDIA's own libraries of the module's version, which no image can carry for every host, read-only at `/run/lightbox/gpu/lib`, and `nvidia-smi` at `/run/lightbox/gpu/bin`. The hook and every command of `exec` have `LD_LIBRARY_PATH` name them, and that `bin` at the end of their `PATH`. They are built for glibc: a container whose root has musl's loader is given the GPU's nodes and not the libraries, and `start` says so. Nothing of NVIDIA's container toolkit runs.
 
 #### What create refuses
 
@@ -158,6 +169,9 @@ Each of these ends `create` before anything is made:
 | `--net outside` or `proxy` with `firewall = false` | An error that says the mode needs lightbox's firewall rules |
 | `--userns` with no free range of ids | `Error: no range of host ids for the container's user namespace:`, why, and the line to add to `/etc/subuid` and `/etc/subgid` |
 | `--userns` where the kernel or the filesystem has no idmapped mounts | An error that says which; nothing falls back to a copy that is chowned |
+| A `--device` that is no character device, gives the host away or is not there | `Error: --device:`, its path and why, such as `Error: --device: /dev/mem is the host's memory: no container is given it` or `/dev/sda is a block device: no container is given one` |
+| A `-p` that is no port, is UDP, or is on a port of the host's that another of the container's has | `Error: -p:`, the port and why, such as `Error: -p: 53:53/udp: a UDP port is not published: lightbox publishes TCP ports` |
+| `-p` with `--profile agent` | `Error: --profile agent refuses -p: an agent's box publishes no port; the host reaches one of --net outside or proxy at its address` |
 
 Where an overlay cannot be mounted, without overlayfs in the kernel or without the right to mount, `create` makes a copy and says so: `Note: an overlay cannot be mounted here (errno 1): the container is a copy of its base; lightbox doctor says why`.
 
@@ -342,8 +356,10 @@ Attach with: lightbox exec web /bin/sh
 
 What `start` does before and around that:
 
-- **The host's network.** `start` looks for the bridge, lightbox's firewall rules and forwarding, and makes them again as `setup` does when they are not all there, after a reboot for one, saying so.
-- **What an earlier run left.** A container that ended without a stop is cleared away first, and `start` says so.
+- **The host's network.** `start` looks for the bridge, lightbox's firewall rules and forwarding, and makes them again as `setup` does when they are not all there, after a reboot for one, saying so. On a host whose `cgroup_root` is a directory of its own, and not the system's `/sys/fs/cgroup`, it mounts cgroup2 there first, as `setup` does, where a reboot took that mount.
+- **What an earlier run left.** A container that ended without a stop, and that its monitor did not clear away, is cleared away first, and `start` says so.
+- **Its monitor.** `start` forks a monitor, `lightbox-mon`, which clones the container's init and clears the container away within a second of its end, whatever ended it ([How it works](internals.html#monitor)).
+- **Its ports.** Each port of `-p` is taken on the host before anything of the container runs, and one that is in use ends the start. `start` names each: `Port 127.0.0.1:8080 of the host reaches its port 80`.
 - **A hook that fails** fails the start: `start` says which status it exited with, and the container is stopped and cleared away.
 - **Ctrl-C, or a signal,** while `start` is working undoes the start: nothing of the container is left running, and `start` exits with 128 plus the signal's number.
 
@@ -427,7 +443,8 @@ The command is found as a shell finds it: a name without a slash is looked for i
 {.ref}
 | Variable | Value |
 |---|---|
-| `PATH` | `/usr/bin:/bin:/usr/sbin:/sbin` |
+| `PATH` | `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`, Docker's, since 0.11; with NVIDIA's libraries of `--gpu`, and `/run/lightbox/gpu/bin` at its end |
+| `LD_LIBRARY_PATH` | `/run/lightbox/gpu/lib`, in a container given NVIDIA's libraries by `--gpu`, and not set otherwise |
 | `HOME` | The home directory of the user the command runs as, from the container's `/etc/passwd`; `/root` for uid 0 and `/` for any other uid that has no account there |
 | `USER`, `LOGNAME` | The name of that user; neither is set for a uid that has no account |
 | `TERM` | The `TERM` that `exec` was run with, when it is a plain name of up to 64 letters, digits, `-`, `_`, `.` and `+`; `xterm` otherwise |
@@ -467,6 +484,31 @@ sudo lightbox run --profile agent --workspace "$PWD" --timeout 10m -- make test
 - **Signals.** SIGINT, SIGTERM and SIGHUP sent to `run` go on to the command. One that comes while the box is being made stops `run` there, and it exits with 128 plus the signal's number.
 - **The box is removed** once the command has ended, or when it has not within `stop_timeout`. The removal is in a session of its own, which a terminal's keys do not reach.
 - **A run that is killed outright** cannot remove its box, which runs on. The box's `.runner` names that `run`, by its PID and start time, and the next `run` removes every box whose `run` is gone, and says so. A box that must not outlive a killed `run` for long gets a `--ttl`, as `--timeout` keeps its command to its time in any case.
+
+## Copying files {#copying}
+
+### cp {#cp}
+
+```text{.synopsis}
+lightbox cp [-a] <host path> <name>:<path>
+lightbox cp [-a] <name>:<path> <host path>
+```
+
+Copies a file, a link or a directory into a running container, or out of one, as `docker cp` does. A path in the container is absolute.
+
+```sh
+lightbox cp ./site web:/srv
+lightbox cp web:/var/log/app.log .
+lightbox cp ./dist/. web:/srv/app
+```
+
+- **Where it goes.** Into the destination when it is a directory, under the source's own name; otherwise the source becomes the destination, in the directory above it, which has to be there. `<dir>/.` copies what is in the directory and not the directory, into a destination that is made when it is not there.
+- **Whose it is.** What goes into a container is owned by its root, and with `-a` by the owners it has. What comes out is owned by the owner of the directory it goes into.
+- **What does not go.** No setuid or setgid bit, either way, and no device: one that was sent is said and not made. A link is copied as a link, and never followed.
+- **Through the container's own root.** Nothing of the container's is looked up on the host: the container's side of a copy is a process that joins it as `exec` does, so that a link of the container's leads nowhere but into it. The tree goes as a tar archive that lightbox's own reader unpacks, in a process held to the directory it unpacks into ([Security](security.html#cp)).
+- **Recorded.** Each copy is two lines in the [audit log](#audit-log), with `cp` for its `via`.
+
+A container that is not running is refused: `Error: cp copies into and out of a running box, and this one is not running:` and its name. Two paths of the host's, or two of a container's, are refused too: `Error: cp copies between the host and a box: one of the two is <box>:<path>`. As root.
 
 ## Looking at containers {#looking}
 
@@ -530,6 +572,7 @@ gid_start: -
 oom_score: 500
 privileged: 0
 readonly: 1
+gpu: 0
 seccomp: allow
 net: outside
 ttl: -
@@ -537,6 +580,8 @@ id: 2c5b2f57f53a5cdd
 profile: -
 workdir: -
 volume: /srv/www:/var/www:ro
+device: -
+port: 127.0.0.1:8080:80
 link: -
 ```
 
@@ -553,10 +598,13 @@ link: -
 | `storage`, `base` | `overlay` and the id of the snapshot it overlays, or `copy` |
 | `userns`, `uid_start`, `gid_start` | Whether it has a user namespace, and the host's uid and gid of its root |
 | `privileged`, `readonly`, `seccomp` | Its sandbox; `seccomp` is `-` for a privileged container, which has no filter |
+| `gpu` | Whether it was created with `--gpu` |
 | `net`, `link` | What it may reach, and a line for each container it is linked to |
 | `ttl`, `profile`, `workdir` | Its lifetime, `agent` for a box of the profile, and the directory its commands run in |
 | `id` | The id that `create` drew for it, by which the audit log tells it from a later container of the same name |
 | `volume` | A line for each volume, as `<src>:<dst>[:ro]` |
+| `device` | A line for each device of `--device`, as `<host>:<path>[:ro]` |
+| `port` | A line for each port of `-p`, as `<address>:<host port>:<box port>` |
 
 When a container's configuration cannot be used, `inspect` shows what it can and ends with an error that says what is wrong with it; `inspect --json` gives the error alone.
 
@@ -575,7 +623,7 @@ The log is the file `console.log` in the container's directory, which only root 
 
 ### The audit log {#audit-log}
 
-Every `exec`, and so the command of every `run`, appends two lines to `<lightbox_dir>/audit.log`: one as the command is about to start, and one when it has ended. Each is one JSON object, written with one `write` on a descriptor opened to append, so that the lines of commands that run at once do not mix. `lightbox logs --audit <name>` prints the lines of one box.
+Every `exec`, and so the command of every `run`, and every `cp`, appends two lines to `<lightbox_dir>/audit.log`: one as the command is about to start, and one when it has ended. Each is one JSON object, written with one `write` on a descriptor opened to append, so that the lines of commands that run at once do not mix. `lightbox logs --audit <name>` prints the lines of one box.
 
 ```json
 {"box":"web","box_id":"8c1f0e7a5d3b2a19","time":"2026-11-21T16:39:23.123Z","event":"start","exec_id":"4242-981234","via":"exec","uid":0,"loginuid":1000,"user":null,"workdir":"/srv","timeout":"10m","env":["CI"],"argv":["make","test"]}
@@ -590,12 +638,12 @@ Every `exec`, and so the command of every `run`, appends two lines to `<lightbox
 | `time` | both | When the line was written, in UTC, to the millisecond |
 | `event` | both | `start` or `end` |
 | `exec_id` | both | The PID and start time of the `exec`, as its cgroup is named. It pairs a start with its end |
-| `via` | start | `exec` or `run` |
+| `via` | start | `exec`, `run` or `cp` |
 | `uid` | start | The caller's uid, which is 0 under `sudo` |
 | `loginuid` | start | The uid of the user who logged in, from `/proc/self/loginuid`, which `sudo` and `su` keep; `null` when no login set one |
 | `user`, `workdir`, `timeout` | start | `--user`, `--workdir` and `--timeout` as given, and `null` when not given. A command that runs in a box's workspace because it was given no `--workdir` has `null` |
 | `env` | start | The keys of `--env`, and not their values, which are often credentials |
-| `argv` | start | The command as given, or `/bin/sh` |
+| `argv` | start | The command as given, or `/bin/sh`; for `cp`, `cp` and its two paths |
 | `status` | end | What `exec` exited with, 124 to 127 among them |
 | `duration_ms` | end | How long it took, from the moment `exec` began |
 | `timed_out` | end | Whether `--timeout` ended the command |
@@ -631,7 +679,9 @@ overall: ok
 ```
 
 - **`--json`** gives the same to programs, as [JSON](#json).
-- **`--profile agent`** adds the checks of what a box of the agent profile needs: the kernel's release, a range of ids, idmapped mounts on the filesystems that hold the containers and the snapshots, `nft`, and `cgroup.kill`.
+- **`--profile agent`** adds the checks of what a box of the agent profile needs: the kernel's release, a range of ids, idmapped mounts on the filesystems that hold the containers and the snapshots, overlayfs, `nft`, and `cgroup.kill`.
+
+Among the checks, `firewall_kernel` asks the kernel, without putting a rule in, whether it has what lightbox's firewall rules need, and names what it lacks with its module and its kernel option, such as `REJECT target (ipt_REJECT, CONFIG_IP_NF_TARGET_REJECT)`.
 
 Run as an ordinary user, `doctor` reports what it can see and says which checks only root can make. [Troubleshooting](troubleshooting.html#checks) explains every check and its fix.
 
@@ -689,7 +739,7 @@ lightbox <command> --help
 lightbox --version
 ```
 
-`help` and `--help` print the usage, or one command's part of it, on standard output. `--version` prints the version of lightbox and of the lightc it was built with, as `lightbox 0.10.0 (lightc 0.1.1)`. Neither reads the configuration, so neither prints its warnings.
+`help` and `--help` print the usage, or one command's part of it, on standard output. `--version` prints the version of lightbox and of the lightc it was built with, as `lightbox 0.11.0 (lightc 0.1.1)`. Neither reads the configuration, so neither prints its warnings.
 
 Where lightbox is installed, by a package or by `make install`, `man lightbox` shows its manual page, `lightbox(8)`: the commands and their options on one page, with a line or two on each.
 
@@ -709,10 +759,10 @@ An array with an object for each container:
 
 ### inspect --json
 
-An array with one object, with the keys of `inspect`'s lines in their order. What has no value is `null`, a flag is `true` or `false`, and `pid`, `uid_start`, `gid_start` and `oom_score` are numbers. `volumes` is an array of objects and `links` an array of names:
+An array with one object, with the keys of `inspect`'s lines in their order. What has no value is `null`, a flag is `true` or `false`, and `pid`, `uid_start`, `gid_start` and `oom_score` are numbers. `volumes`, `devices` and `ports` are arrays of objects, and `links` an array of names:
 
 ```json
-[{"name":"api","state":"stopped","running":false,"ip":"10.0.0.3","host_interface":"vb-e74fc019056a","dir":"/var/lib/lightbox/containers/api","rootfs":"/var/lib/lightbox/containers/api/rootfs","config_path":"/var/lib/lightbox/containers/api/.conf","ip_path":"/var/lib/lightbox/containers/api/.ip","log_path":"/var/lib/lightbox/containers/api/console.log","audit_path":"/var/lib/lightbox/audit.log","pid_path":"/run/lightbox/api/pid","pid_start_path":"/run/lightbox/api/pid_start","state_path":"/run/lightbox/api/state","pid":null,"pid_starttime":null,"mem":"256M","swap":"0","pids":"128","cpu":"1","io":null,"storage":"overlay","base":"3f9a1c0b7d2e","userns":false,"uid_start":null,"gid_start":null,"oom_score":500,"privileged":false,"readonly":false,"seccomp":"allow","net":"nat","ttl":"8h","id":"6eab8c372107f175","profile":null,"workdir":null,"volumes":[{"src":"/srv/www","dst":"/var/www","ro":true}],"links":["db"]}]
+[{"name":"api","state":"stopped","running":false,"ip":"10.0.0.3","host_interface":"vb-e74fc019056a","dir":"/var/lib/lightbox/containers/api","rootfs":"/var/lib/lightbox/containers/api/rootfs","config_path":"/var/lib/lightbox/containers/api/.conf","ip_path":"/var/lib/lightbox/containers/api/.ip","log_path":"/var/lib/lightbox/containers/api/console.log","audit_path":"/var/lib/lightbox/audit.log","pid_path":"/run/lightbox/api/pid","pid_start_path":"/run/lightbox/api/pid_start","state_path":"/run/lightbox/api/state","pid":null,"pid_starttime":null,"mem":"256M","swap":"0","pids":"128","cpu":"1","io":null,"storage":"overlay","base":"3f9a1c0b7d2e","userns":false,"uid_start":null,"gid_start":null,"oom_score":500,"privileged":false,"readonly":false,"gpu":false,"seccomp":"allow","net":"nat","ttl":"8h","id":"6eab8c372107f175","profile":null,"workdir":null,"volumes":[{"src":"/srv/www","dst":"/var/www","ro":true}],"devices":[],"ports":[{"address":"127.0.0.1","host_port":8080,"box_port":80}],"links":["db"]}]
 ```
 
 The limits are strings, as they were given: `"512M"`, `"max"`, `"0.5"`. A configuration that cannot be used gives no JSON, and an error.

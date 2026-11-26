@@ -1537,18 +1537,18 @@ t_command_environment() {
         run() { env -i "$@"; }          # the harness with exactly this environment
         got=$(run TERM=vt220 "$UNIT" command "$P" "$G" --user lbuser /usr/bin/env | sort | paste -sd' ' -)
         echo "as lbuser: $got"
-        [ "$got" = "HOME=/home/lbuser LOGNAME=lbuser PATH=/usr/bin:/bin:/usr/sbin:/sbin TERM=vt220 USER=lbuser" ] || exit 1
+        [ "$got" = "HOME=/home/lbuser LOGNAME=lbuser PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin TERM=vt220 USER=lbuser" ] || exit 1
         # a uid without an account has no name to give, and a TERM that is not a plain name is not passed on
         got=$(run 'TERM=x$(reboot)' "$UNIT" command "$P" "$G" --user 1234 /usr/bin/env | sort | paste -sd' ' -)
         echo "as 1234: $got"
-        [ "$got" = "HOME=/ PATH=/usr/bin:/bin:/usr/sbin:/sbin TERM=xterm" ] || exit 1
+        [ "$got" = "HOME=/ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin TERM=xterm" ] || exit 1
         got=$(run "$UNIT" command "$P" "$G" /usr/bin/env | sort | paste -sd' ' -)
         echo "as root: $got"
-        [ "$got" = "HOME=/root LOGNAME=root PATH=/usr/bin:/bin:/usr/sbin:/sbin TERM=xterm USER=root" ] || exit 1
+        [ "$got" = "HOME=/root LOGNAME=root PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin TERM=xterm USER=root" ] || exit 1
         # --env adds, replaces what is there, and the later of two wins; nothing else of the caller's gets in
         got=$(run SECRET=1 "$UNIT" command "$P" "$G" --env A=1 --env HOME=/elsewhere -e A=2 --env B= /usr/bin/env | sort | paste -sd' ' -)
         echo "with --env: $got"
-        [ "$got" = "A=2 B= HOME=/elsewhere LOGNAME=root PATH=/usr/bin:/bin:/usr/sbin:/sbin TERM=xterm USER=root" ]
+        [ "$got" = "A=2 B= HOME=/elsewhere LOGNAME=root PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin TERM=xterm USER=root" ]
     )
     rc=$?
     rm -rf -- "$A"
@@ -3030,7 +3030,7 @@ config_strict() {
     got=$(config)
     case $got in "refused: $D/web/.conf: line 10: more than 8 links") ;; *) echo "9 links: $got"; bad=1 ;; esac
     # a file too large to be a configuration
-    { echo version=1; head -c 30000 /dev/zero | tr '\0' '\n'; } > "$D/web/.conf"
+    { echo version=1; head -c 50000 /dev/zero | tr '\0' '\n'; } > "$D/web/.conf"
     got=$(config)
     case $got in "refused: $D/web/.conf: is larger than lightbox supports") ;; *) echo "large: $got"; bad=1 ;; esac
     # the line that is named is the line an editor shows, empty ones counted
@@ -3866,6 +3866,44 @@ check 'a tree is one archive, which GNU tar unpacks to a tree that gives it agai
 check "an overlay's marks are written the way an image has them" t_tar_overlay
 check "ids are written less the start of a container's range, and none from outside it" t_tar_ids
 check 'what an archive cannot hold ends the writing, with the entry named' t_tar_refusals
+
+# What lightbox cp sends and makes (ROADMAP C.1), as root of a user namespace
+# with ids: one entry of a directory under another name at the archive's top;
+# a name that begins with .wh. taken as a name, which an image would read as
+# a mark; no setuid bit made; every entry the owner's that is given, or root's
+# where the archive says nothing else; a link made as a link and not followed,
+# and a link in the way of the copy replaced and not written through.
+t_tar_copy() {
+    in_namespace_with_ids '
+        mkdir -p "$D/src/d/sub" "$D/out1" "$D/out2" "$D/out3" "$D/elsewhere" || exit 1
+        echo a > "$D/src/d/file" && chmod 4755 "$D/src/d/file" && chown 5:6 "$D/src/d/file" &&
+            echo b > "$D/src/d/sub/x" && ln -s /etc/passwd "$D/src/d/link" && echo w > "$D/src/d/.wh.kept" &&
+            echo s > "$D/src/single" && chown 9:9 "$D/src/single" && chmod 2755 "$D/src/single" || exit 1
+        out=$("$UNIT" tar-one "$D/src" d renamed "$D/a1" plain); echo "a tree as renamed: $out"
+        [ "$out" = "entries 6" ] || exit 1
+        out=$("$UNIT" untar-copy "$D/a1" "$D/out1" nosetid owner 7 8); echo "unpacked: $out"
+        [ "$out" = "entries 6
+devices 0" ] || exit 1
+        got=$(stat -c "%n %a %u:%g" "$D/out1/renamed" "$D/out1/renamed/file" "$D/out1/renamed/.wh.kept" | sed "s#$D/##" | paste -sd"|")
+        echo "$got"
+        [ "$got" = "out1/renamed 755 7:8|out1/renamed/file 755 7:8|out1/renamed/.wh.kept 644 7:8" ] || exit 1
+        [ -L "$D/out1/renamed/link" ] && [ "$(readlink "$D/out1/renamed/link")" = /etc/passwd ] &&
+            [ "$(cat "$D/out1/renamed/sub/x")" = b ] || { echo "the link or the file below is not what it was"; exit 1; }
+        # a file of its own, every owner root and no set-id bit in the archive
+        out=$("$UNIT" tar-one "$D/src" single one "$D/a2" plain root nosetid) && [ "$out" = "entries 1" ] || exit 1
+        "$UNIT" untar-copy "$D/a2" "$D/out2" >/dev/null || exit 1
+        got=$(stat -c "%a %u:%g" "$D/out2/one"); echo "one: $got, $(cat "$D/out2/one")"
+        [ "$got" = "755 0:0" ] && [ "$(cat "$D/out2/one")" = s ] || exit 1
+        # without plain a .wh. name is refused, as an image would take it for a mark
+        out=$("$UNIT" tar-one "$D/src" d renamed "$D/a3") && { echo "a .wh. name was written as an image writes"; exit 1; }
+        case $out in *".wh."*) ;; *) echo "$out"; exit 1 ;; esac
+        # a link where the copy goes: taken away, and nothing made where it led
+        ln -s "$D/elsewhere" "$D/out3/renamed" || exit 1
+        "$UNIT" untar-copy "$D/a1" "$D/out3" nosetid >/dev/null || exit 1
+        [ -d "$D/out3/renamed" ] && [ ! -L "$D/out3/renamed" ] && [ -z "$(ls -A "$D/elsewhere")" ] ||
+            { echo "the link in the way was written through: $(ls -A "$D/elsewhere")"; exit 1; }'
+}
+check 'what lightbox cp sends and makes: one entry renamed, names as names, no set-id bit, owners given' t_tar_copy
 
 # I.3: an archive unpacked into a directory, by a process whose root that
 # directory is. The cases run as the root of a user namespace, as I.2's do:
@@ -4890,6 +4928,257 @@ links: physdev match (xt_physdev, CONFIG_NETFILTER_XT_MATCH_PHYSDEV)" 0
     return $bad
 }
 check 'what the iptables rules need of the kernel is found registered, built in or as a module, or named' t_firewall_kernel
+
+# What start does with a cgroup_root that a reboot emptied (ROADMAP F.5), as
+# root of a user, a mount and a cgroup namespace of the case's own: an empty
+# directory, or none, gets cgroup2 mounted, and is said so; one that has it
+# is left as it is, with no second mount; a directory with something in it is
+# refused, as setup refuses it, and nothing is mounted.
+t_start_cgroup2_root() {
+    unshare -r --mount --cgroup true 2>/dev/null || { echo "user and cgroup namespaces are not available to this user"; return 77; }
+    local dir rc
+    dir=$(mktemp -d "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    mkdir -p "$dir/store" "$dir/empty" "$dir/full" && : > "$dir/full/file" || { rm -rf -- "$dir"; return 1; }
+    unshare -r --mount --cgroup -- bash -c '
+        UNIT=$1; D=$2; bad=0
+        at() { awk -v m="$1" '"'"'$5 == m { n++ } END { print n + 0 }'"'"' /proc/self/mountinfo; }
+        said=$("$UNIT" cgroup2-root "$D/store" "$D/empty" 2>&1); rc=$?; echo "empty: $said"
+        [ $rc -eq 0 ] && [ "$said" = "Mounted cgroup2 at $D/empty
+cgroup2" ] && [ "$(stat -f -c %T "$D/empty")" = cgroup2fs ] || { echo "  not mounted, or not said"; bad=1; }
+        said=$("$UNIT" cgroup2-root "$D/store" "$D/empty" 2>&1); rc=$?; echo "again: $said"
+        [ $rc -eq 0 ] && [ "$said" = cgroup2 ] && [ "$(at "$D/empty")" = 1 ] || { echo "  mounted again"; bad=1; }
+        said=$("$UNIT" cgroup2-root "$D/store" "$D/none" 2>&1); rc=$?; echo "none: $said"
+        [ $rc -eq 0 ] && [ "$(stat -f -c %T "$D/none")" = cgroup2fs ] || { echo "  not made and mounted"; bad=1; }
+        said=$("$UNIT" cgroup2-root "$D/store" "$D/full" 2>&1); rc=$?; echo "full: $said"
+        [ $rc -ne 0 ] && [ "$(at "$D/full")" = 0 ] || { echo "  a directory with a file in it was mounted on"; bad=1; }
+        case $said in *"cgroup_root $D/full is not a cgroup v2 hierarchy (it is a directory that is not empty)"*) ;;
+            *) echo "  not refused as setup refuses it"; bad=1 ;; esac
+        exit $bad
+    ' _ "$UNIT" "$dir"
+    rc=$?
+    rm -rf -- "$dir"
+    return $rc
+}
+check 'start mounts cgroup2 on an empty cgroup_root, once, and refuses one with something in it' t_start_cgroup2_root
+
+# The gid map of a container of --userns with the host's groups of devices
+# that only their group may open (ROADMAP G.2): its range, then a line of one
+# gid each at 65536 and on, written as one text; never the host's gid 0, nor
+# a group inside the range, which the kernel would refuse. exec reads the
+# gids inside of those lines back from a gid_map, padded as the kernel pads
+# it, and nothing else: not the range, not a line of more than one gid, not
+# one past the devices' window.
+t_userns_device_groups() {
+    local said bad=0 f
+    is() { # what, want, words...
+        local what=$1 want=$2
+        shift 2
+        said=$("$UNIT" "$@")
+        [ "$said" = "$want" ] || { printf '%s: %s\n  expected: %s\n' "$what" "$said" "$want"; bad=1; }
+    }
+    is "a range alone" "0 2147549183 65536" gidmap 2147549183
+    is "two groups" "0 2147549183 65536
+65536 993 1
+65537 44 1" gidmap 2147549183 993 44
+    is "the host's gid 0" refused gidmap 2147549183 993 0
+    is "a group inside the range" refused gidmap 100000 100005
+    is "the gid after the range" "0 100000 65536
+65536 165536 1" gidmap 100000 165536
+    f=$(mktemp "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    printf '%10s %10s %10s\n' 0 2147549183 65536 65536 993 1 65537 44 1 65538 7 2 65552 9 1 70000 5 1 > "$f"
+    is "read back, padded" "65536
+65537" devgroups "$f"
+    rm -f -- "$f"
+    return $bad
+}
+check 'a gid map has the range and a line of each device'"'"'s group, and exec reads them back' t_userns_device_groups
+
+# What --gpu finds of a host's (ROADMAP G.3), in a tree of the case's own that
+# stands for it: the render nodes of /dev/dri, NVIDIA's GPUs, control node and
+# nvidia-uvm with its tools, and /dev/kfd, each at its own path, in the order
+# of their names; not a card node, nvidia-modeset, nvidia-caps, which is a
+# directory, or a name that only begins as one does. A host with none of them
+# has none, and one with more than a container may have is said so.
+t_gpu_devices() {
+    local r said bad=0 i
+    r=$(mktemp -d "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    mkdir -p "$r/dev/dri" "$r/dev/nvidia-caps" "$r/none/dev" || return 1
+    for f in dri/renderD129 dri/renderD128 dri/card0 dri/renderDx nvidia1 nvidia0 nvidiactl nvidia-modeset nvidia-uvm \
+             nvidia-uvm-tools nvidiax kfd null; do : > "$r/dev/$f"; done
+    said=$("$UNIT" gpu "$r")
+    printf '%s\n' "$said" | sed "s#$r#<r>#g"
+    [ "$said" = "$r/dev/dri/renderD128 -> /dev/dri/renderD128
+$r/dev/dri/renderD129 -> /dev/dri/renderD129
+$r/dev/kfd -> /dev/kfd
+$r/dev/nvidia-uvm -> /dev/nvidia-uvm
+$r/dev/nvidia-uvm-tools -> /dev/nvidia-uvm-tools
+$r/dev/nvidia0 -> /dev/nvidia0
+$r/dev/nvidia1 -> /dev/nvidia1
+$r/dev/nvidiactl -> /dev/nvidiactl" ] || { echo "not what --gpu gives"; bad=1; }
+    [ -z "$("$UNIT" gpu "$r/none")" ] || { echo "a host without a GPU has one"; bad=1; }
+    for i in $(seq 0 16); do : > "$r/dev/dri/renderD$((200 + i))"; done
+    said=$("$UNIT" gpu "$r") && { echo "more than a container may have was taken"; bad=1; }
+    [ "$said" = 'more than 16' ] || { echo "$said"; bad=1; }
+    rm -rf -- "$r"
+    return $bad
+}
+check 'what --gpu finds of a host'"'"'s: render nodes, NVIDIA'"'"'s and kfd, and not a display'"'"'s' t_gpu_devices
+
+# NVIDIA's libraries for a box of --gpu (ROADMAP G.3), in a tree of the case's
+# own that stands for a host with NVIDIA's driver: the version the module says,
+# each library of that version from the first directory that has it, the
+# host's links that lead to it and no other, and nvidia-smi; not a library of
+# another version, a link to one, or a link out of the directory. A host
+# without the module has none, and one without its libcuda is said so. A
+# root with musl's loader in /lib is told from one without.
+t_nvidia_libraries() {
+    local r said bad=0 lib v=550.54.14
+    case $(uname -m) in
+        x86_64) lib=usr/lib/x86_64-linux-gnu ;;
+        aarch64) lib=usr/lib/aarch64-linux-gnu ;;
+        *) echo "no directory of libraries is known here for $(uname -m)"; return 77 ;;
+    esac
+    r=$(mktemp -d "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    mkdir -p "$r/proc/driver/nvidia" "$r/$lib" "$r/usr/lib64" "$r/usr/bin" "$r/none" "$r/nocuda/proc/driver/nvidia" || return 1
+    printf 'NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  %s  Release Build  (dvs-builder@U16)  Thu Feb 22 2024\nGCC version:  gcc 12.2.0\n' \
+        "$v" > "$r/proc/driver/nvidia/version"
+    cp "$r/proc/driver/nvidia/version" "$r/nocuda/proc/driver/nvidia/version"
+    for f in libcuda libnvidia-ml libnvidia-ptxjitcompiler; do : > "$r/$lib/$f.so.$v"; done
+    : > "$r/$lib/libcuda.so.535.104.05"
+    : > "$r/usr/lib64/libnvidia-nvvm.so.$v"
+    ln -s "libcuda.so.$v" "$r/$lib/libcuda.so.1"
+    ln -s libcuda.so.1 "$r/$lib/libcuda.so"
+    ln -s libcuda.so.535.104.05 "$r/$lib/libcuda.so.2"
+    ln -s "/elsewhere/libnvidia-ml.so.$v" "$r/$lib/libnvidia-ml.so.2"
+    ln -s "libnvidia-ml.so.$v" "$r/$lib/libnvidia-ml.so.1"
+    ln -s "libnvidia-nvvm.so.$v" "$r/usr/lib64/libnvidia-nvvm.so.4"
+    : > "$r/usr/bin/nvidia-smi"
+    said=$("$UNIT" nvidia "$r" | sed "s#$r#<r>#g" | sort)
+    printf '%s\n' "$said"
+    [ "$said" = "$(printf '%s\n' "file <r>/$lib/libcuda.so.$v libcuda.so.$v" "file <r>/$lib/libnvidia-ml.so.$v libnvidia-ml.so.$v" \
+        "file <r>/$lib/libnvidia-ptxjitcompiler.so.$v libnvidia-ptxjitcompiler.so.$v" \
+        "file <r>/usr/bin/nvidia-smi nvidia-smi bin" "file <r>/usr/lib64/libnvidia-nvvm.so.$v libnvidia-nvvm.so.$v" \
+        "link libcuda.so libcuda.so.1" "link libcuda.so.1 libcuda.so.$v" "link libnvidia-ml.so.1 libnvidia-ml.so.$v" \
+        "link libnvidia-nvvm.so.4 libnvidia-nvvm.so.$v" "version $v" | sort)" ] || { echo "not what a box of --gpu is given"; bad=1; }
+    [ "$("$UNIT" nvidia "$r/none")" = none ] || { echo "a host without the module has libraries"; bad=1; }
+    said=$("$UNIT" nvidia "$r/nocuda") && { echo "a host without libcuda gave libraries"; bad=1; }
+    [ "$said" = "version $v
+missing libcuda.so.$v" ] || { echo "$said"; bad=1; }
+    mkdir -p "$r/alpine/lib" "$r/debian/lib" && : > "$r/alpine/lib/ld-musl-x86_64.so.1" && : > "$r/debian/lib/ld-linux.so.2" || bad=1
+    [ "$("$UNIT" musl "$r/alpine")" = musl ] && [ "$("$UNIT" musl "$r/debian")" = 'not musl' ] &&
+        [ "$("$UNIT" musl "$r/none")" = 'not musl' ] || { echo "musl is not told from glibc"; bad=1; }
+    rm -rf -- "$r"
+    return $bad
+}
+check 'NVIDIA'"'"'s libraries of the module'"'"'s version, with the host'"'"'s links to them, and musl told from glibc' t_nvidia_libraries
+
+# A container's monitor (ROADMAP M.1), with a child that waits to be killed in
+# the place of init: the child is the monitor's and not the command's; killed
+# through its pidfd it is not reaped while the command holds the control
+# pipe, so that its pid is still its own; then the monitor reaps it, sees the
+# signal that ended it, and holds nothing of the command's but its standard
+# streams, which are /dev/null.
+t_monitor() {
+    local f said
+    f=$(mktemp -u "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    said=$(timeout -k 5 30 "$UNIT" monitor "$f")
+    printf '%s\n' "$said"
+    rm -f -- "$f"
+    [ "$said" = "not the command's child
+ended, as its pidfd says
+a zombie until the command is done
+status 137 fds 0 1 2
+reaped" ]
+}
+check 'a monitor is init'"'"'s parent, reaps it once the command is done, and holds nothing of the command'"'"'s' t_monitor
+
+# The monitor goes into a cgroup of lightbox's own before it clones init
+# (ROADMAP M.1). Given a directory that is no cgroup it says so to start,
+# with the errno, ends, and clones nothing; and it makes no cgroup.procs
+# there, as a write that made the file would have joined nothing and said
+# nothing.
+t_monitor_cgroup() {
+    local d said
+    d=$(mktemp -d "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    said=$(timeout -k 5 30 "$UNIT" monitor-cgroup "$d/record" "$d")
+    printf '%s\n' "$said"
+    [ "$said" = "said the container's monitor cannot go into the cgroup $d (errno 2)
+the monitor ended with status 1" ] && [ -z "$(ls -A "$d")" ]
+    local rc=$?
+    rmdir -- "$d"
+    return $rc
+}
+check 'a monitor that cannot go into its cgroup says so to start, clones nothing and makes no file' t_monitor_cgroup
+
+# A port as -p and a box's .conf give it (ROADMAP N.1): 127.0.0.1 unless an
+# address is given, 0.0.0.0 for every address, and kept with its address
+# named; /tcp, which it is without; and what is no port refused, each with
+# its reason: UDP, which is not published, a port without the box's, one
+# out of 1 to 65535 or with a zero in front, an address that is none, a
+# multicast or broadcast address, and too many parts.
+t_port_spec() {
+    local bad=0 t want got
+    while IFS='|' read -r t want; do
+        got=$("$UNIT" portspec "$t")
+        [ "$got" = "$want" ] || { echo "$t: $got, not: $want"; bad=1; }
+    done <<'END'
+8080:80|port 127.0.0.1:8080:80
+127.0.0.1:8080:80|port 127.0.0.1:8080:80
+0.0.0.0:443:8443|port 0.0.0.0:443:8443
+10.1.2.3:22:22/tcp|port 10.1.2.3:22:22
+8080:80/udp|refused: a UDP port is not published: lightbox publishes TCP ports
+8080|refused: a port names the host's port and the box's: <host port>:<box port>
+:80|refused: a port is a number from 1 to 65535
+0:80|refused: a port is a number from 1 to 65535
+80:65536|refused: a port is a number from 1 to 65535
+080:80|refused: a port is a number from 1 to 65535
+1.2.3:80:80|refused: the address of a port is an IPv4 address of the host's, or 0.0.0.0 for all of them
+224.0.0.1:80:80|refused: the address of a port is the host's own, and no multicast or broadcast address
+255.255.255.255:1:1|refused: the address of a port is the host's own, and no multicast or broadcast address
+a:b:c:d|refused: a port is written [<address>:]<host port>:<box port>[/tcp]
+8080:80/sctp|refused: a port is written [<address>:]<host port>:<box port>[/tcp]
+END
+    return $bad
+}
+check 'a port is [<address>:]<host port>:<box port>, on 127.0.0.1 unless an address is given' t_port_spec
+
+# The relay of a box's ports (ROADMAP N.1), between two listeners of
+# loopback's, the second standing for the box's port, as an ordinary user,
+# where it keeps its ids: it says it is ready once its filter is in, which
+# /proc then shows with no_new_privs; bytes go both ways, a megabyte in a
+# pattern that a byte out of place breaks, and each side's end comes through
+# to the other; a connection to a box's port where nothing listens is
+# closed; and it is ended by the case's SIGKILL, and by no call its filter
+# has not, as a relay that made one would have been.
+t_relay() {
+    local said
+    said=$(timeout -k 5 60 "$UNIT" relay)
+    printf '%s\n' "$said"
+    [ "$said" = "ready
+seccomp 2, no_new_privs 1
+ping came through
+pong came back
+1048576 bytes came through as they were sent
+the end came through, and the answer to it
+a port where nothing listens: the connection is closed
+ended by SIGKILL, and by nothing before it" ]
+}
+check 'the relay of a box'"'"'s ports copies both ways under its filter, and passes each end on' t_relay
+
+# The monitor keeps a --ttl from the host as well (ROADMAP M.1): a child that
+# never ends by itself, as an init that something stopped would not, is ended
+# by the monitor its grace and a margin of 3 s past the deadline, which here
+# is 1 s with no grace, and the monitor says that it expired.
+t_monitor_ttl() {
+    local f said ms
+    f=$(mktemp -u "${TMPDIR:-/tmp}/lightbox-unit.XXXXXX") || return 1
+    said=$(timeout -k 5 30 "$UNIT" monitor-ttl "$f" 1s)
+    printf '%s\n' "$said"
+    rm -f -- "$f"
+    ms=$(printf '%s\n' "$said" | sed -n 's/^after ms //p')
+    [ "$(printf '%s\n' "$said" | head -n 1)" = 'status 137 expired fds 0 1 2' ] && [ "${ms:-0}" -ge 3900 ] && [ "$ms" -lt 6000 ]
+}
+check 'the monitor ends a child past its --ttl, its grace and a margin, and says it expired' t_monitor_ttl
 check 'a host tool that reads an image runs as nobody, with no capability and no network' t_tool_sandbox
 check 'where nobody has no id the tool keeps its own, and where it cannot be confined it is not run' t_tool_sandbox_without_ids
 

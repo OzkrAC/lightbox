@@ -28,6 +28,7 @@
  */
 
 #include "lightbox.h"
+#include <lightc/socket.h>
 
 /* ─── Limits ────────────────────────────────────────────────────────────── */
 
@@ -367,6 +368,319 @@ const char *parse_volume_spec(const char *spec, volume_spec *vol) {
     return destination_problem(vol->dst);
 }
 
+/* ─── Devices (ROADMAP G.1) ─────────────────────────────────────────────── */
+
+/* What every container has in its /dev already, and what init makes there:
+ * no device is put in their place, nor below one, which would make it a
+ * directory before init puts it there. */
+static bool device_path_taken(const char *path) {
+    static const char *const nodes[] = {
+        "/dev/null", "/dev/zero", "/dev/full", "/dev/random", "/dev/urandom", "/dev/tty", "/dev/ptmx",
+        "/dev/fd", "/dev/stdin", "/dev/stdout", "/dev/stderr", "/dev/pts", "/dev/shm",
+    };
+    for (size_t i = 0; i < sizeof(nodes) / sizeof(nodes[0]); i++)
+        if (path_is_under(path, nodes[i]))
+            return true;
+    return false;
+}
+
+const char *parse_device_spec(const char *spec, device_spec *dev) {
+    /* one line of a file of lines, as a volume is */
+    if (has_control_chars(spec))
+        return "a device's paths may not contain control characters";
+    const char *parts[4] = { spec, NULL, NULL, NULL };
+    size_t nparts = 1;
+    for (const char *c = spec; *c; c++)
+        if (*c == ':') {
+            if (nparts == 3)
+                return "a device is written <host path>[:<path in the container>][:ro], and its paths have no colon in them";
+            parts[nparts++] = c + 1;
+        }
+    *dev = (device_spec){ 0 };
+    size_t hlen = (size_t)((nparts > 1 ? parts[1] - 1 : spec + lc_string_length(spec)) - spec);
+    if (hlen == 0 || hlen >= sizeof(dev->host))
+        return "the device's path on the host is empty or too long";
+    lc_bytes_copy(dev->host, spec, hlen);
+    dev->host[hlen] = '\0';
+    if (!normalise_path(dev->host))
+        return "the device's path on the host must be an absolute path without ..";
+
+    /* host:ro, host:path or host:path:ro */
+    const char *path = NULL;
+    size_t plen = 0;
+    if (nparts == 3) {
+        if (!streq(parts[2], "ro"))
+            return "after the device's path in the container only :ro may follow";
+        dev->ro = true;
+        path = parts[1];
+        plen = (size_t)(parts[2] - 1 - parts[1]);
+    } else if (nparts == 2) {
+        if (streq(parts[1], "ro"))
+            dev->ro = true;
+        else {
+            path = parts[1];
+            plen = lc_string_length(parts[1]);
+        }
+    }
+    if (path) {
+        if (plen == 0 || plen >= sizeof(dev->path))
+            return "the device's path in the container is empty or too long";
+        lc_bytes_copy(dev->path, path, plen);
+        dev->path[plen] = '\0';
+    } else {
+        if (!path_is_under(dev->host, "/dev"))
+            return "a device that is not under /dev on the host needs its path in the container: <host path>:/dev/<name>";
+        lc_bytes_copy(dev->path, dev->host, hlen + 1);
+    }
+    if (!normalise_path(dev->path))
+        return "the device's path in the container must be an absolute path without ..";
+    if (!path_is_under(dev->path, "/dev") || streq(dev->path, "/dev"))
+        return "a device's path in the container is under /dev";
+    if (device_path_taken(dev->path))
+        return "every container has that path of /dev already";
+    return NULL;
+}
+
+const char *config_add_device(container_config *config, const device_spec *dev) {
+    for (int i = 0; i < config->ndevs; i++)
+        if (streq(config->devs[i].path, dev->path))
+            return "there is already a device at that path in the container";
+    if (config->ndevs >= MAX_DEVICES)
+        return "the container already has the maximum of " STRINGIFY(MAX_DEVICES) " devices";
+    config->devs[config->ndevs++] = *dev;
+    return NULL;
+}
+
+/* A port's number: 1 to 65535, in digits with no zero in front. */
+static bool port_number(const char *text, size_t len, uint16_t *out) {
+    if (len == 0 || len > 5 || text[0] == '0')
+        return false;
+    uint32_t value = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (text[i] < '0' || text[i] > '9')
+            return false;
+        value = value * 10u + (uint32_t)(text[i] - '0');
+    }
+    if (value > 65535u)
+        return false;
+    *out = (uint16_t)value;
+    return true;
+}
+
+const char *parse_port_spec(const char *spec, port_spec *port) {
+    static const char form[] = "a port is written [<address>:]<host port>:<box port>[/tcp]";
+    *port = (port_spec){ .addr = LC_INADDR_LOOPBACK };
+    if (has_control_chars(spec))
+        return form;
+    size_t len = lc_string_length(spec);
+    /* /tcp, which it is without it too */
+    for (size_t i = 0; i < len; i++) {
+        if (spec[i] != '/')
+            continue;
+        if (streq(spec + i + 1, "udp"))
+            return "a UDP port is not published: lightbox publishes TCP ports";
+        if (!streq(spec + i + 1, "tcp"))
+            return form;
+        len = i;
+        break;
+    }
+    size_t colons[2], ncolons = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (spec[i] != ':')
+            continue;
+        if (ncolons == 2)
+            return form;
+        colons[ncolons++] = i;
+    }
+    if (ncolons == 0)
+        return "a port names the host's port and the box's: <host port>:<box port>";
+    size_t start = 0;
+    if (ncolons == 2) {
+        char text[IPV4_TEXT_MAX];
+        size_t alen = colons[0];
+        if (alen == 0 || alen >= sizeof(text))
+            return "the address of a port is an IPv4 address of the host's, or 0.0.0.0 for all of them";
+        lc_bytes_copy(text, spec, alen);
+        text[alen] = '\0';
+        uint32_t addr;
+        if (!parse_ipv4(text, &addr))
+            return "the address of a port is an IPv4 address of the host's, or 0.0.0.0 for all of them";
+        if (addr >= 0xe0000000u)
+            return "the address of a port is the host's own, and no multicast or broadcast address";
+        port->addr = addr;
+        start = colons[0] + 1;
+    }
+    size_t mid = colons[ncolons - 1];
+    if (!port_number(spec + start, mid - start, &port->host_port) ||
+        !port_number(spec + mid + 1, len - mid - 1, &port->box_port))
+        return "a port is a number from 1 to 65535";
+    return NULL;
+}
+
+void port_spec_text(char out[PORT_TEXT_MAX], const port_spec *port) {
+    char addr[IPV4_TEXT_MAX], host[8], box[8];
+    format_ipv4(addr, port->addr);
+    fmt_int(host, port->host_port);
+    fmt_int(box, port->box_port);
+    bool cut = false;
+    size_t at = str_append(out, 0, addr, PORT_TEXT_MAX, &cut);
+    at = str_append(out, at, ":", PORT_TEXT_MAX, &cut);
+    at = str_append(out, at, host, PORT_TEXT_MAX, &cut);
+    at = str_append(out, at, ":", PORT_TEXT_MAX, &cut);
+    (void)str_append(out, at, box, PORT_TEXT_MAX, &cut);
+}
+
+const char *config_add_port(container_config *config, const port_spec *port) {
+    for (int i = 0; i < config->nports; i++) {
+        const port_spec *had = &config->ports[i];
+        if (had->host_port == port->host_port && (had->addr == port->addr || had->addr == 0 || port->addr == 0))
+            return "the box already has a port on that port of the host";
+    }
+    if (config->nports >= MAX_PORTS)
+        return "the box already has the maximum of " STRINGIFY(MAX_PORTS) " ports";
+    config->ports[config->nports++] = *port;
+    return NULL;
+}
+
+/*
+ * The devices whose use is the host's (ROADMAP G.1, by the maintainer's word
+ * of 2026-11-23), by their numbers (Documentation/admin-guide/devices.txt):
+ * no container is given one, whatever its path.
+ */
+#define DEV_ANY_MINOR 0xfffffU
+static const struct { uint32_t major, minor_first, minor_last; const char *what; } DEVICES_REFUSED[] = {
+    { 1,   1,   2,   "the host's memory" },
+    { 1,   4,   4,   "the host's I/O ports" },
+    { 1,   11,  11,  "the kernel's log" },
+    { 4,   0,   63,  "a virtual console of the host's" },
+    { 5,   1,   1,   "the host's console" },
+    { 7,   0,   DEV_ANY_MINOR, "what a virtual console of the host's shows" },
+    { 13,  0,   DEV_ANY_MINOR, "an input device of the host's, which reads its keys and its pointer" },
+    { 10,  223, 223, "uinput, which makes a host's keys and pointer" },
+    { 10,  130, 130, "the watchdog, which restarts the host when it is closed" },
+    { 202, 0,   DEV_ANY_MINOR, "a CPU's model-specific registers" },
+    { 203, 0,   DEV_ANY_MINOR, "a CPU's cpuid" },
+};
+
+/* The major of a kind of character device as /proc/devices names it, given
+ * by the kernel at boot, or 0. */
+static uint32_t char_major_named(const char *name) {
+    static char text[8192];
+    if (read_file("/proc/devices", text, sizeof(text)) <= 0)
+        return 0;
+    bool chars = false;
+    size_t len = lc_string_length(name);
+    for (const char *line = text; *line; ) {
+        const char *end = line;
+        while (*end && *end != '\n')
+            end++;
+        if (lc_string_starts_with(line, (size_t)(end - line), "Character devices:", 18))
+            chars = true;
+        else if (lc_string_starts_with(line, (size_t)(end - line), "Block devices:", 14))
+            chars = false;
+        else if (chars) {
+            const char *p = line;
+            while (p < end && *p == ' ')
+                p++;
+            uint32_t major = 0;
+            while (p < end && *p >= '0' && *p <= '9')
+                major = major * 10 + (uint32_t)(*p++ - '0');
+            if (p < end && *p == ' ' && (size_t)(end - p - 1) == len && lc_bytes_compare(p + 1, name, len) == 0)
+                return major;
+        }
+        line = *end ? end + 1 : end;
+    }
+    return 0;
+}
+
+/* A GPU's compute nodes, the devices a box of --profile agent may have: a
+ * render node; NVIDIA's GPUs, its control node and nvidia-uvm, whose major
+ * is given at boot, but nvidia-modeset; and AMD's kfd. */
+static bool gpu_compute_node(uint32_t major, uint32_t minor) {
+    if (major == 226)
+        return minor >= 128 && minor <= 255;
+    if (major == 195)
+        return minor <= 253 || minor == 255;
+    uint32_t uvm = char_major_named("nvidia-uvm"), kfd = char_major_named("kfd");
+    return (uvm && major == uvm) || (kfd && major == kfd);
+}
+
+const char *device_refused(const char *host, const struct lb_statx *stx, bool agent) {
+    static char why[MAX_PATH + 160];
+    bool cut = false;
+    const char *wrong = NULL;
+    uint32_t major = stx->stx_rdev_major, minor = stx->stx_rdev_minor;
+    if ((stx->stx_mode & LB_S_IFMT) == LB_S_IFBLK)
+        wrong = " is a block device: no container is given one";
+    else if ((stx->stx_mode & LB_S_IFMT) != LB_S_IFCHR)
+        wrong = " is not a character device";
+    for (size_t i = 0; i < sizeof(DEVICES_REFUSED) / sizeof(DEVICES_REFUSED[0]) && !wrong; i++)
+        if (major == DEVICES_REFUSED[i].major && minor >= DEVICES_REFUSED[i].minor_first &&
+            minor <= DEVICES_REFUSED[i].minor_last) {
+            size_t pos = str_append(why, 0, host, sizeof(why), &cut);
+            pos = str_append(why, pos, " is ", sizeof(why), &cut);
+            pos = str_append(why, pos, DEVICES_REFUSED[i].what, sizeof(why), &cut);
+            str_append(why, pos, ": no container is given it", sizeof(why), &cut);
+            return why;
+        }
+    if (!wrong && agent && !gpu_compute_node(major, minor))
+        wrong = " is not a GPU's compute node: a box of --profile agent is given render nodes, NVIDIA's "
+                "and AMD's kfd, and nothing else";
+    if (!wrong)
+        return NULL;
+    str_append(why, str_append(why, 0, host, sizeof(why), &cut), wrong, sizeof(why), &cut);
+    return why;
+}
+
+const char *device_on_nodev(const char *host) {
+    static char why[MAX_PATH + 80];
+    bool cut = false;
+    str_append(why, str_append(why, 0, host, sizeof(why), &cut),
+               " is on a mount of the host's with nodev, where no device opens, nor is it lifted for a container",
+               sizeof(why), &cut);
+    return why;
+}
+
+const char *device_userns_group(const char *host, const struct lb_statx *stx, bool ro, uint32_t *gid) {
+    static char why[MAX_PATH + 160];
+    bool cut = false;
+    uint32_t want = ro ? 04u : 06u, other = stx->stx_mode & 07u, group = (stx->stx_mode >> 3) & 07u;
+    *gid = 0;
+    if ((other & want) == want)
+        return NULL;                        /* anyone may: nothing to map */
+    const char *wrong;
+    if ((group & want) != want)
+        wrong = ro ? " is read by its owner alone, whom no container of --userns stands for"
+                   : " is read and written by its owner alone, whom no container of --userns stands for";
+    else if (stx->stx_gid == 0)
+        wrong = " opens to its group, which is root's, gid 0, and that a container of --userns never holds: give the "
+                "node a group of its own";
+    else {
+        *gid = stx->stx_gid;
+        return NULL;
+    }
+    str_append(why, str_append(why, 0, host, sizeof(why), &cut), wrong, sizeof(why), &cut);
+    return why;
+}
+
+const char *device_check(const device_spec *dev, bool agent, uint32_t *major, uint32_t *minor) {
+    static char why[MAX_PATH + 40];
+    bool cut = false;
+    struct lb_statx stx;
+    lc_sysret rc = lb_sys_statx(AT_FDCWD, dev->host, 0, LB_STATX_TYPE, &stx);
+    if (rc < 0) {
+        str_append(why, str_append(why, 0, dev->host, sizeof(why), &cut),
+                   rc == -LB_ENOENT ? " is not there" : " cannot be looked at", sizeof(why), &cut);
+        return why;
+    }
+    struct lb_statfs sfs;
+    if ((stx.stx_mode & LB_S_IFMT) == LB_S_IFCHR && lb_sys_statfs(dev->host, &sfs) == 0 && (sfs.f_flags & LB_ST_NODEV))
+        return device_on_nodev(dev->host);
+    *major = stx.stx_rdev_major;
+    *minor = stx.stx_rdev_minor;
+    return device_refused(dev->host, &stx, agent);
+}
+
 int config_volume_at(const container_config *config, const char *dst) {
     for (int i = 0; i < config->nvols; i++) {
         if (streq(config->vols[i].dst, dst))
@@ -478,7 +792,7 @@ enum {
     KEY_PRIVILEGED = 1 << 4, KEY_READONLY = 1 << 5, KEY_USERNS = 1 << 6,
     KEY_UID_START = 1 << 7, KEY_IO = 1 << 8, KEY_SWAP = 1 << 9, KEY_BASE = 1 << 10,
     KEY_GID_START = 1 << 11, KEY_SECCOMP = 1 << 12, KEY_NET = 1 << 13, KEY_DNS = 1 << 14,
-    KEY_TTL = 1 << 15, KEY_ID = 1 << 16, KEY_PROFILE = 1 << 17, KEY_WORKDIR = 1 << 18,
+    KEY_TTL = 1 << 15, KEY_ID = 1 << 16, KEY_PROFILE = 1 << 17, KEY_WORKDIR = 1 << 18, KEY_GPU = 1 << 19,
 };
 
 static unsigned key_bit(const char *key) {
@@ -488,7 +802,7 @@ static unsigned key_bit(const char *key) {
         { "uid_start", KEY_UID_START }, { "io", KEY_IO }, { "swap", KEY_SWAP }, { "base", KEY_BASE },
         { "gid_start", KEY_GID_START }, { "seccomp", KEY_SECCOMP }, { "net", KEY_NET },
         { "dns", KEY_DNS }, { "ttl", KEY_TTL }, { "id", KEY_ID },
-        { "profile", KEY_PROFILE }, { "workdir", KEY_WORKDIR },
+        { "profile", KEY_PROFILE }, { "workdir", KEY_WORKDIR }, { "gpu", KEY_GPU },
     };
     for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
         if (streq(key, keys[i].name))
@@ -540,6 +854,22 @@ static const char *config_line(container_config *config, char *line, unsigned *s
         return NULL;
     }
 
+    if (streq(key, "device")) {
+        if (config->ndevs >= MAX_DEVICES)
+            return "more than " STRINGIFY(MAX_DEVICES) " devices";
+        device_spec dev;
+        const char *wrong = parse_device_spec(value, &dev);
+        if (wrong)
+            return wrong;
+        return config_add_device(config, &dev);
+    }
+
+    if (streq(key, "port")) {
+        port_spec port;
+        const char *wrong = parse_port_spec(value, &port);
+        return wrong ? wrong : config_add_port(config, &port);
+    }
+
     if (streq(key, "link")) {
         if (config->nlinks >= MAX_LINKS)
             return "more than " STRINGIFY(MAX_LINKS) " links";
@@ -586,6 +916,8 @@ static const char *config_line(container_config *config, char *line, unsigned *s
             return parse_flag(value, &config->read_only) ? NULL : "readonly is not 0 or 1";
         case KEY_USERNS:
             return parse_flag(value, &config->userns) ? NULL : "userns is not 0 or 1";
+        case KEY_GPU:
+            return parse_flag(value, &config->gpu) ? NULL : "gpu is not 0 or 1";
         case KEY_BASE:
             return base_id_ok(value) && str_copy(config->base, value, sizeof(config->base))
                    ? NULL : "base is not the id of a base snapshot";
@@ -723,8 +1055,8 @@ static bool same_config(const container_config *a, const container_config *b) {
         a->uid_start != b->uid_start || a->gid_start != b->gid_start ||
         a->seccomp_allow != b->seccomp_allow || a->net != b->net || a->proxy_port != b->proxy_port ||
         a->ndns != b->ndns || !streq(a->ttl, b->ttl) || a->ttl_ms != b->ttl_ms || !streq(a->id, b->id) ||
-        a->profile != b->profile || !streq(a->workdir, b->workdir) ||
-        a->nvols != b->nvols || a->nlinks != b->nlinks)
+        a->profile != b->profile || !streq(a->workdir, b->workdir) || a->gpu != b->gpu ||
+        a->nvols != b->nvols || a->ndevs != b->ndevs || a->nports != b->nports || a->nlinks != b->nlinks)
         return false;
     for (int i = 0; i < a->ndns; i++) {
         if (!streq(a->dns[i], b->dns[i]))
@@ -733,6 +1065,16 @@ static bool same_config(const container_config *a, const container_config *b) {
     for (int i = 0; i < a->nvols; i++) {
         if (!streq(a->vols[i].src, b->vols[i].src) || !streq(a->vols[i].dst, b->vols[i].dst) ||
             a->vols[i].ro != b->vols[i].ro)
+            return false;
+    }
+    for (int i = 0; i < a->ndevs; i++) {
+        if (!streq(a->devs[i].host, b->devs[i].host) || !streq(a->devs[i].path, b->devs[i].path) ||
+            a->devs[i].ro != b->devs[i].ro)
+            return false;
+    }
+    for (int i = 0; i < a->nports; i++) {
+        if (a->ports[i].addr != b->ports[i].addr || a->ports[i].host_port != b->ports[i].host_port ||
+            a->ports[i].box_port != b->ports[i].box_port)
             return false;
     }
     for (int i = 0; i < a->nlinks; i++) {
@@ -756,6 +1098,7 @@ const char *container_config_save(const char *name, const container_config *conf
     put_number(&out, "oom_score", config->oom_score);
     if (config->privileged) put_line(&out, "privileged", "1");
     if (config->read_only)  put_line(&out, "readonly", "1");
+    if (config->gpu)        put_line(&out, "gpu", "1");
     /* without the line, the deny-list: what create --seccomp deny makes, and
      * what every container had before 0.8 */
     if (config->seccomp_allow) put_line(&out, "seccomp", "allow");
@@ -802,6 +1145,19 @@ const char *container_config_save(const char *name, const container_config *conf
         put(&out, ":");
         put(&out, vol->dst);
         put(&out, vol->ro ? ":ro\n" : "\n");
+    }
+    for (int i = 0; i < config->ndevs; i++) {
+        const device_spec *dev = &config->devs[i];
+        put(&out, "device=");
+        put(&out, dev->host);
+        put(&out, ":");
+        put(&out, dev->path);
+        put(&out, dev->ro ? ":ro\n" : "\n");
+    }
+    for (int i = 0; i < config->nports; i++) {
+        char port[PORT_TEXT_MAX];
+        port_spec_text(port, &config->ports[i]);
+        put_line(&out, "port", port);
     }
     for (int i = 0; i < config->nlinks; i++)
         put_line(&out, "link", config->links[i]);

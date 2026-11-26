@@ -15,7 +15,7 @@
   // The release these pages describe, shown beside the name in the navigation
   // of every page: the one place to change when the pages are brought up to a
   // new release.
-  var VERSION = '0.10.0';
+  var VERSION = '0.11.0';
   var REPO = 'https://github.com/OzkrAC/lightbox';
 
   // The pages, in the order of the navigation. The first is the home page,

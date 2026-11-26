@@ -990,16 +990,22 @@ void require_mount(const char *source, const char *target,
 
 /* ─── The device program ────────────────────────────────────────────────── */
 
-lc_sysret device_program_load(char *log, uint32_t log_size) {
-    static struct lb_ebpf_insn prog[LB_DEV_PROG_LEN];
+bool bpf_call_missing(void) {
+    /* given no program, refused whoever asks; ENOSYS where there is no call */
+    return lb_sys_bpf(LB_BPF_PROG_LOAD, NULL, 0) == -LB_ENOSYS;
+}
+
+lc_sysret device_program_load(const struct lb_dev_row *extra, size_t nextra, char *log, uint32_t log_size) {
+    static struct lb_ebpf_insn prog[LB_DEV_PROG_MAX];
     if (log && log_size)
         log[0] = '\0';
-    if (lb_devices_build(prog) != LB_DEV_PROG_LEN)
+    size_t len = lb_devices_build_with(prog, extra, nextra);
+    if (len == 0 || len != LB_DEV_PROG_LEN_FOR(nextra))
         return -LB_EINVAL;
     /* It calls no helper of the kernel's, which is all a license decides. */
     struct lb_bpf_prog_load load = {
         .prog_type = LB_BPF_PROG_TYPE_CGROUP_DEVICE,
-        .insn_cnt = LB_DEV_PROG_LEN,
+        .insn_cnt = (uint32_t)len,
         .insns = (uint64_t)(uintptr_t)prog,
         .license = (uint64_t)(uintptr_t)"",
         .prog_name = "lightbox_dev",

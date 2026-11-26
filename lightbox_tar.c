@@ -493,12 +493,13 @@ static bool shifted_id(uint32_t id, uint32_t start, uint64_t *out) {
 }
 
 /* The entry of that name in a directory, whose own name, with its slash, is
- * in path. */
-static int write_entry(struct out *o, int32_t dirfd, const char *name) {
-    size_t name_len = lc_string_length(name);
+ * in path, written under the name as: the same name, but for the top of what
+ * tar_write_one writes. */
+static int write_entry_as(struct out *o, int32_t dirfd, const char *name, const char *as) {
+    size_t name_len = lc_string_length(as);
     if (o->len + sizeof(WHITEOUT_PREFIX) + name_len + 1 > TAR_PATH_MAX)
         return fail(o, "has an entry whose name is too long for an archive");
-    lc_bytes_copy(o->path + o->len, name, name_len + 1);
+    lc_bytes_copy(o->path + o->len, as, name_len + 1);
     o->len += name_len;
 
     struct lb_statx st;
@@ -506,17 +507,17 @@ static int write_entry(struct out *o, int32_t dirfd, const char *name) {
                      LB_STATX_TYPE | LB_STATX_MODE | LB_STATX_NLINK | LB_STATX_UID | LB_STATX_GID |
                      LB_STATX_MTIME | LB_STATX_INO | LB_STATX_SIZE, &st) < 0)
         return fail(o, "cannot be looked at");
-    if (starts_with(name, WHITEOUT_PREFIX))
+    if (!o->w->plain && starts_with(as, WHITEOUT_PREFIX))
         return fail(o, "has a name that begins with .wh., which in an image marks what a layer removes");
 
-    struct entry e = { .mode = st.stx_mode & 07777u, .mtime = st.stx_mtime_sec };
+    struct entry e = { .mode = st.stx_mode & (o->w->no_setid ? 01777u : 07777u), .mtime = st.stx_mtime_sec };
     /* What an overlay marks a file of its base as taken out with, the device
      * 0:0, is made by the kernel as whoever mounted the overlay, which is
      * host root and nobody of the container's range: its mark is root's in
      * the image, whoever the device belongs to. */
     bool taken_out = o->w->overlay && (st.stx_mode & LB_S_IFMT) == LB_S_IFCHR && st.stx_rdev_major == 0 &&
                      st.stx_rdev_minor == 0;
-    if (!taken_out &&
+    if (!taken_out && !o->w->owners_root &&
         (!shifted_id(st.stx_uid, o->w->uid_start, &e.uid) || !shifted_id(st.stx_gid, o->w->gid_start, &e.gid)))
         return fail(o, "belongs to an id outside the container's range");
 
@@ -550,7 +551,7 @@ static int write_entry(struct out *o, int32_t dirfd, const char *name) {
             /* taken out of the base: .wh.<name>, in the place of the name */
             size_t dir_len = o->len - name_len;
             lc_bytes_copy(o->path + dir_len, WHITEOUT_PREFIX, sizeof(WHITEOUT_PREFIX) - 1);
-            lc_bytes_copy(o->path + dir_len + sizeof(WHITEOUT_PREFIX) - 1, name, name_len + 1);
+            lc_bytes_copy(o->path + dir_len + sizeof(WHITEOUT_PREFIX) - 1, as, name_len + 1);
             o->len += sizeof(WHITEOUT_PREFIX) - 1;
             e.type = '0';
             return put_header(o, &e);
@@ -571,6 +572,10 @@ static int write_entry(struct out *o, int32_t dirfd, const char *name) {
     default:
         return fail(o, "is of a kind that an archive has no entry for");
     }
+}
+
+static int write_entry(struct out *o, int32_t dirfd, const char *name) {
+    return write_entry_as(o, dirfd, name, name);
 }
 
 /* the heap of a heapsort: names by their bytes */
@@ -639,7 +644,7 @@ static int write_dir(struct out *o, int32_t dirfd) {
     return rc;
 }
 
-int tar_write_tree(tar_writer *w, int32_t dirfd) {
+static int write_archive(tar_writer *w, int32_t dirfd, const char *name, const char *as) {
     static const uint8_t end[2 * TAR_BLOCK];
     struct out o;
     lc_bytes_fill(&o, 0, sizeof(o));
@@ -658,7 +663,7 @@ int tar_write_tree(tar_writer *w, int32_t dirfd) {
         o.buffer = buffer.value;
         o.xattr_names = names.value;
         o.xattr_value = value.value;
-        rc = write_dir(&o, dirfd);
+        rc = name ? write_entry_as(&o, dirfd, name, as) : write_dir(&o, dirfd);
         if (rc == 0)
             rc = emit(&o, end, sizeof(end));
     }
@@ -673,6 +678,14 @@ int tar_write_tree(tar_writer *w, int32_t dirfd) {
     mem_free(&o.links);
     mem_free(&o.link_names);
     return rc;
+}
+
+int tar_write_tree(tar_writer *w, int32_t dirfd) {
+    return write_archive(w, dirfd, NULL, NULL);
+}
+
+int tar_write_one(tar_writer *w, int32_t dirfd, const char *name, const char *as) {
+    return write_archive(w, dirfd, name, as);
 }
 
 /* ─── The reader (ROADMAP I.3) ──────────────────────────────────────────── */
@@ -1549,6 +1562,11 @@ static int opaque_in_tree(struct in *in) {
 /* The ids an entry is given: the header's and the start of the range. */
 static int entry_ids(struct in *in, const struct head *h, uint32_t *uid, uint32_t *gid) {
     const tar_reader *r = in->r;
+    if (r->owner_given) {
+        *uid = r->owner_uid;
+        *gid = r->owner_gid;
+        return 0;
+    }
     if ((r->uid_start && h->uid >= USERNS_SIZE) || (r->gid_start && h->gid >= USERNS_SIZE) ||
         h->uid >= UINT32_MAX - (uint64_t)r->uid_start || h->gid >= UINT32_MAX - (uint64_t)r->gid_start)
         return lose(in, READ_ID);
@@ -1751,7 +1769,7 @@ static int entry(struct in *in, const uint8_t block[TAR_BLOCK]) {
         !field_number(block + 116, 8, &gid) || !field_number(block + 124, 12, &size) ||
         !field_number(block + 136, 12, &h.mtime) || mode < 0 || uid < 0 || gid < 0 || size < 0)
         return lose(in, READ_NUMBER);
-    h.mode = (uint32_t)mode & 07777u;
+    h.mode = (uint32_t)mode & (in->r->no_setid ? 01777u : 07777u);
     h.uid = (uint64_t)uid;
     h.gid = (uint64_t)gid;
     h.size = (uint64_t)size;
@@ -1803,7 +1821,7 @@ static int entry(struct in *in, const uint8_t block[TAR_BLOCK]) {
     if (entry_ids(in, &h, &to_uid, &to_gid) != 0)
         return -1;
 
-    enum mark mark = mark_of(in->name, &in->name_len, h.type == '0');
+    enum mark mark = in->r->into == TAR_INTO_COPY ? MARK_NONE : mark_of(in->name, &in->name_len, h.type == '0');
     if (mark == MARK_BAD)
         return lose(in, READ_MARK);
     if (mark != MARK_NONE) {

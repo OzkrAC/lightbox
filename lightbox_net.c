@@ -1609,6 +1609,19 @@ int iptables_kernel_missing(const char *proc_net, const char *modules, char *mis
     return missing[0] ? 0 : 1;
 }
 
+bool kernel_module_listed(const char *modules, const char *name, bool *listed) {
+    char needle[64], path[MAX_PATH];
+    bool cut = false, found[1] = { false };
+    str_append(needle, str_append(needle, str_append(needle, 0, "/", sizeof(needle), &cut), name, sizeof(needle), &cut),
+               ".ko", sizeof(needle), &cut);
+    const char *needles[1] = { needle };
+    *listed = false;
+    static const char *const lists[] = { "modules.builtin", "modules.dep" };
+    for (size_t l = 0; l < 2 && !cut; l++)
+        *listed = (path_join(path, sizeof(path), modules, lists[l]) && file_mentions(path, needles, found, 1)) || *listed;
+    return found[0];
+}
+
 bool running_kernel_modules(char out[MAX_PATH]) {
     char release[128];
     int n = read_file("/proc/sys/kernel/osrelease", release, sizeof(release));
@@ -2279,8 +2292,17 @@ void ensure_host_network(const char *starting) {
         /* what took setup's rules took those of the links too */
         (void)put_back_running_links(starting);     /* each has said why, if it could not */
     }
-    if (lock >= 0)
-        lc_kernel_close_file(lock);
+    store_unlock(lock);
+}
+
+void ensure_cgroup2_for_start(void) {
+    struct lb_statfs sfs;
+    if (lb_sys_statfs(cfg_global.cgroup_root, &sfs) == 0 && sfs.f_type == LB_CGROUP2_SUPER_MAGIC)
+        return;
+    /* as setup, and one at a time: whoever waited finds it mounted */
+    int32_t lock = store_lock();
+    ensure_cgroup2_root();
+    store_unlock(lock);
 }
 
 /* LIGHTBOX-USER is the host's, made by lightbox: taken away with its jump
@@ -2326,6 +2348,17 @@ void teardown_host(void) {
         lc_print_char(STDOUT, '\n');
     }
 
+    /* the monitors' cgroup in it (ROADMAP M.1). No container runs, but the
+     * monitor of one that was just stopped ends a moment after the stop, as
+     * it sees init's end: busy is waited out for up to 5 s, after which
+     * cgroup_base is said to be left, as before */
+    char monitors[MAX_PATH];
+    if (path_join(monitors, sizeof(monitors), cfg_global.cgroup_base, MONITOR_CGROUP)) {
+        for (int tries = 0; lc_kernel_unlinkat(AT_FDCWD, monitors, AT_REMOVEDIR) == -LB_EBUSY && tries < 500; tries++) {
+            lc_timespec moment = { .seconds = 0, .nanoseconds = 10000000 };
+            lc_kernel_sleep(&moment);
+        }
+    }
     /* cgroup_base, which start made; never the hierarchy itself */
     if (!streq(cfg_global.cgroup_base, cfg_global.cgroup_root) && path_exists(cfg_global.cgroup_base)) {
         if (lc_kernel_unlinkat(AT_FDCWD, cfg_global.cgroup_base, AT_REMOVEDIR) == 0) {

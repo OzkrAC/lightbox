@@ -1612,6 +1612,130 @@ assert c["seccomp"] == "allow", "the profile"
     grep -q "^Error: the container's configuration cannot be used: " "$W/err"
 }
 
+# create --device (ROADMAP G.1), as an ordinary user, with nodes every Linux
+# has: a character device of the host's goes in .conf as host:path[:ro], at
+# its own path under /dev or the one given, and inspect shows it in text and
+# in JSON. Refused, each with its reason and before anything is made: a block
+# device, the host's memory and log and the other devices that give the host
+# away, anything that is no character device or not there, a path in the
+# container outside /dev or one every container has, a spec of the wrong
+# shape, a seventeenth device; and to a box of --profile agent anything that
+# is no GPU's compute node. A device line of .conf that cannot be read is an
+# error of the configuration.
+t_create_device() {
+    local bad=0 said json before blk
+    no() { # what it says, create's options
+        local want=$1
+        shift
+        said=$(lb create dev 10.0.0.4 "$@" 2>&1) && { echo "create --device $*: succeeded"; lb rm dev >/dev/null 2>&1; bad=1; return; }
+        case $said in *"$want"*) ;; *) echo "create $*: $said"; bad=1 ;; esac
+        [ ! -e "$C/dev" ] || { echo "create $*: the container is there"; bad=1; }
+    }
+    # one at its own path, read alone, as host:ro: a node most hosts have that no container has already
+    local own="" d
+    for d in /dev/fuse /dev/net/tun /dev/loop-control; do [ -c "$d" ] && { own=$d; break; }; done
+    [ -n "$own" ] || echo "none of /dev/fuse, /dev/net/tun and /dev/loop-control here: host:ro at its own path is not tried"
+    lb create web 10.0.0.2 --device /dev/null:/dev/gpu/null --device /dev/zero:/dev/zero2:ro ${own:+--device "$own:ro"} \
+        >/dev/null || return 1
+    want='device=/dev/null:/dev/gpu/null
+device=/dev/zero:/dev/zero2:ro'
+    [ -n "$own" ] && want="$want
+device=$own:$own:ro"
+    [ "$(grep '^device=' "$C/web/.conf")" = "$want" ] || { grep '^device=' "$C/web/.conf"; echo "the .conf does not have them"; return 1; }
+    said=$(lb inspect web | grep '^device: ')
+    [ "$said" = "$(printf '%s\n' "$want" | sed 's/^device=/device: /')" ] || { echo "$said"; echo "inspect does not show them"; return 1; }
+    if command -v python3 >/dev/null 2>&1; then
+        lb inspect web --json | python3 -I -c '
+import json, sys
+d = json.load(sys.stdin)[0]["devices"]
+want = [{"host": "/dev/null", "path": "/dev/gpu/null", "ro": False}, {"host": "/dev/zero", "path": "/dev/zero2", "ro": True}]
+if sys.argv[1]:
+    want.append({"host": sys.argv[1], "path": sys.argv[1], "ro": True})
+assert d == want, d
+' "$own" || { echo "inspect --json does not have them"; return 1; }
+    fi
+    lb create db 10.0.0.3 >/dev/null && [ "$(lb inspect db | grep '^device')" = 'device: -' ] ||
+        { echo "a container without devices is not shown so"; return 1; }
+    [ "$(lb inspect db | grep '^gpu: ')" = 'gpu: 0' ] && ! grep -q '^gpu=' "$C/db/.conf" || { echo "a container without --gpu is said to have it"; return 1; }
+    # --gpu: kept as gpu=1, the nodes found at each start and none in .conf (ROADMAP G.3)
+    lb create gpu 10.0.0.5 --gpu >/dev/null || return 1
+    grep -qx 'gpu=1' "$C/gpu/.conf" && ! grep -q '^device=' "$C/gpu/.conf" && [ "$(lb inspect gpu | grep '^gpu: ')" = 'gpu: 1' ] ||
+        { grep -E '^(gpu|device)' "$C/gpu/.conf"; echo "--gpu is not kept as gpu=1 alone"; return 1; }
+    if command -v python3 >/dev/null 2>&1; then
+        lb inspect gpu --json | python3 -I -c 'import json, sys; d = json.load(sys.stdin)[0]; assert d["gpu"] is True and d["devices"] == [], d' ||
+            { echo "inspect --json does not say gpu"; return 1; }
+    fi
+    before=$(ls "$C")
+    blk=$(find /dev -maxdepth 2 -type b 2>/dev/null | head -n 1)
+    [ -n "$blk" ] && no 'is a block device: no container is given one' --device "$blk:/dev/disk0"
+    for refused in '/dev/mem:the host'"'"'s memory' '/dev/kmsg:the kernel'"'"'s log' '/dev/port:the host'"'"'s I/O ports' \
+                   '/dev/tty0:a virtual console' '/dev/console:the host'"'"'s console' '/dev/uinput:uinput'; do
+        [ -c "${refused%%:*}" ] && no "${refused%%:*} is ${refused#*:}" --device "${refused%%:*}"
+    done
+    mkfifo "$W/fifo"
+    no 'is not a character device' --device "$W/fifo:/dev/fifo"
+    no 'is not there' --device /dev/lightbox-no-such-node
+    no 'needs its path in the container' --device "$W/fifo"
+    no 'is under /dev' --device /dev/null:/etc/null
+    no 'is under /dev' --device /dev/null:/dev
+    no 'every container has that path of /dev already' --device /dev/null
+    no 'every container has that path of /dev already' --device /dev/zero:/dev/pts/7
+    no 'every container has that path of /dev already' --device /dev/zero:/dev/shm/x
+    no 'only :ro may follow' --device /dev/null:/dev/a:rw
+    no 'its paths have no colon in them' --device /dev/null:/dev/a:ro:x
+    no 'must be an absolute path without ..' --device dev/null:/dev/a
+    no 'must be an absolute path without ..' --device /dev/null:/dev/../etc/a
+    no 'there is already a device at that path' --device /dev/null:/dev/a --device /dev/zero:/dev/a
+    set -- ; for i in $(seq 1 17); do set -- "$@" --device "/dev/null:/dev/n$i"; done
+    no 'the maximum of 16 devices' "$@"
+    no 'is not a GPU'"'"'s compute node: a box of --profile agent is given render nodes' --profile agent --device /dev/null:/dev/gpu
+    # with --userns, a node it could open (ROADMAP G.2): one that only its owner
+    # may is refused, and one that only its group may, of a group other than
+    # 0, is taken and ends at the root that --userns needs
+    local node
+    # a node of the host's that no rule of its own refuses, as /dev/vcsa6 of a runner, 0660, is refused
+    # for what it is before its group is looked at
+    candidate() { find /dev -maxdepth 2 -type c "$@" ! -name mem ! -name kmem ! -name port ! -name kmsg ! -name 'tty*' \
+                      ! -name console ! -name 'vcs*' ! -name uinput ! -name 'watchdog*' ! -path '*/input/*' \
+                      ! -path '*/cpu/*' 2>/dev/null | head -n 1; }
+    node=$(candidate -perm 0600 -user 0)
+    [ -n "$node" ] && no 'is read and written by its owner alone, whom no container of --userns stands for' \
+        --userns --device "$node:/dev/own"
+    node=$(candidate -perm 0660 -group 0)
+    [ -n "$node" ] && no 'which is root'"'"'s, gid 0, and that a container of --userns never holds' --userns --device "$node:/dev/grp0"
+    node=$(candidate -perm 0660 ! -group 0)
+    [ -n "$node" ] && no 'create --userns must be run as root' --userns --device "$node:/dev/grp"
+    [ "$before" = "$(ls "$C")" ] || { echo "a refused create left something in the store"; bad=1; }
+    # what a .conf of the container's says, read back
+    echo 'device=/dev/null' >> "$C/web/.conf"
+    said=$(lb inspect web 2>&1) && { echo "inspect of a .conf with a device line that cannot be read succeeded"; bad=1; }
+    case $said in *"configuration cannot be used"*"every container has that path"*) ;; *) echo "$said"; bad=1 ;; esac
+    return $bad
+}
+
+# lightbox cp (ROADMAP C.1): what it refuses before anything, which an
+# ordinary user is told too, and root then.
+t_cp_arguments() {
+    local bad=0 said
+    no() { # what it says, cp's words
+        local want=$1
+        shift
+        said=$(lb cp "$@" 2>&1) && { echo "cp $*: succeeded"; bad=1; return; }
+        case $said in *"$want"*) ;; *) echo "cp $*: $said"; bad=1 ;; esac
+    }
+    no 'Usage: lightbox cp [-a] <host path> <box>:<path>'
+    no 'Usage: lightbox cp [-a] <host path> <box>:<path>' /etc/hostname
+    no 'Error: unexpected argument: three' /a web:/b three
+    no 'Error: unknown option: -x' -x /a web:/b
+    no 'one of the two is <box>:<path>' /a /b
+    no 'one of the two is <box>:<path>' web:/a web:/b
+    no 'one of the two is <box>:<path>' web:relative /b
+    no 'or <dir>/. for what is in it, not: /a/..' /a/.. web:/b
+    no 'lightbox cp must be run as root' /etc/hostname web:/tmp
+    no 'lightbox cp must be run as root' -a web:/etc/hostname "$W"
+    return $bad
+}
+
 # A carriage return at the end of a line is no part of the value, as a file
 # written on Windows has it, and neither is a # after a space: the rest of
 # the line is a comment. A # with no space before it is part of the value.
@@ -1878,7 +2002,7 @@ sys.exit(0 if d["overall"] == "ok" else 1)
 }
 
 # doctor --profile agent (ROADMAP 8.11): after the checks of every container,
-# five of what a box of the profile needs, in text and in --json, each one
+# six of what a box of the profile needs, in text and in --json, each one
 # that fails followed by its fix. An ordinary user cannot make an idmapped
 # mount, and is told that whether one works is not known. Without the option
 # there are none of them, and a value that is not agent, or none, is refused.
@@ -1889,7 +2013,7 @@ t_doctor_profile() {
     report=$(lb doctor --profile agent 2>&1) && { printf '%s\n' "$report"; echo "doctor exited 0 for an ordinary user"; return 1; }
     printf '%s\n' "$report" | sed -n '/^agent\./,$p'
     names=$(printf '%s\n' "$report" | sed -n 's/^\(agent\.[a-z_]*\): .*/\1/p' | paste -sd' ')
-    [ "$names" = 'agent.kernel agent.userns_ranges agent.idmap agent.nft agent.cgroup_kill' ] ||
+    [ "$names" = 'agent.kernel agent.userns_ranges agent.overlayfs agent.idmap agent.nft agent.cgroup_kill' ] ||
         { echo "the profile's checks: $names"; return 1; }
     printf '%s\n' "$report" | grep -Eqx 'agent\.kernel: (yes|no) \(.+; the profile needs Linux 5\.19 or later, for an overlay on an idmapped layer\)' ||
         { echo "agent.kernel does not say what it needs"; return 1; }
@@ -1897,6 +2021,22 @@ t_doctor_profile() {
       'agent.idmap: no (not known: only root may make an idmapped mount)|  to fix: sudo lightbox doctor --profile agent' ] ||
         { echo "agent.idmap does not say that only root can tell"; return 1; }
     printf '%s\n' "$report" | grep -Eqx 'agent\.nft: (ok|missing) \(/.+/nft\)' || { echo "agent.nft does not name nft"; return 1; }
+    # overlayfs as the host has it (ROADMAP R.4): listed, a module of the
+    # running kernel's to load, or none, which a box cannot do without
+    local mods want
+    mods=/lib/modules/$(uname -r)
+    [ -d "$mods" ] || mods=/usr/lib/modules/$(uname -r)
+    if grep -q "$(printf '\toverlay$')" /proc/filesystems; then
+        want='agent.overlayfs: yes (in /proc/filesystems)'
+    elif grep -qs '/overlay\.ko' "$mods/modules.builtin" "$mods/modules.dep"; then
+        want="agent.overlayfs: yes (a module of the kernel's, which the first overlay mounted loads)"
+    elif [ -e "$mods/modules.builtin" ] || [ -e "$mods/modules.dep" ]; then
+        want='agent.overlayfs: no (the kernel has none, built in or as a module: a box is an overlay of its base)'
+    else
+        want="agent.overlayfs: no (not in /proc/filesystems, and the running kernel's modules are not listed)"
+    fi
+    printf '%s\n' "$report" | grep -Fqx "$want" ||
+        { printf '%s\n' "$report" | grep '^agent\.overlayfs: '; echo "expected: $want"; return 1; }
     printf '%s\n' "$report" | awk '/^agent\./ { on = 1 }
         on && want { if ($0 !~ /^  to fix: ./) { print "no fix after " name; bad = 1 } want = 0; next }
         on && /^agent\.[a-z_]+: (no|missing)( |$)/ { want = 1; name = $1 }
@@ -1908,7 +2048,7 @@ t_doctor_profile() {
 import json, sys
 d = json.load(sys.stdin)
 names = [c["check"] for c in d["checks"] if c["check"].startswith("agent.")]
-assert names == ["agent.kernel", "agent.userns_ranges", "agent.idmap", "agent.nft", "agent.cgroup_kill"], names
+assert names == ["agent.kernel", "agent.userns_ranges", "agent.overlayfs", "agent.idmap", "agent.nft", "agent.cgroup_kill"], names
 for c in d["checks"]:
     assert isinstance(c["ok"], bool) and (c["fix"] is None) == c["ok"], c
     assert c["text"].startswith(("yes", "no", "ok", "missing", "unusable")) or c["check"] == "network", c
@@ -1919,6 +2059,28 @@ assert d["overall"] == "degraded", d["overall"]
     [ "$said" = 'Error: option --profile requires a value' ] || { echo "--profile alone: $said"; return 1; }
     said=$(lb doctor --profile other 2>&1) && return 1
     [ "$said" = 'Error: --profile takes agent, not: other' ] || { echo "--profile other: $said"; return 1; }
+}
+
+# device_filter without root (ROADMAP R.4): a kernel without the bpf call is
+# named, as anyone may ask it; on one with the call, whether the program
+# loads is root's to try, and an ordinary user is told it is not known.
+t_doctor_device_filter_as_a_user() {
+    [ "$(id -u)" -ne 0 ] || { echo "run as root: what an ordinary user is told is not shown"; return 77; }
+    command -v python3 >/dev/null 2>&1 || { echo "no python3 to ask for the bpf call with"; return 77; }
+    local want said
+    if python3 -I -c '
+import ctypes, platform, sys
+nr = {"x86_64": 321, "aarch64": 280}[platform.machine()]
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall(nr, 5, None, 0)
+sys.exit(0 if ctypes.get_errno() == 38 else 1)'; then
+        want='device_filter: no (the kernel has no bpf system call, which loads the program)|  to fix: boot a kernel with CONFIG_CGROUP_BPF and CONFIG_BPF_SYSCALL; only a --privileged container starts without it'
+    else
+        want='device_filter: no (not known: only root may load the program)|  to fix: sudo lightbox doctor'
+    fi
+    said=$(lb doctor 2>&1 | grep -A1 '^device_filter: ' | paste -sd'|')
+    printf '%s\n' "$said"
+    [ "$said" = "$want" ] || { echo "expected: $want"; return 1; }
 }
 
 # update takes --mem, --pids and --cpu, held to what create holds them to,
@@ -2378,6 +2540,62 @@ check 'ls is sorted by name'                                  t_ls_is_sorted
 check 'ls lists only directories with a container name'       t_ls_lists_only_containers
 check 'inspect shows volumes, links and the log'                       t_inspect_shows_volumes_and_links
 check 'inspect --json is one JSON object, typed, or nothing'             t_inspect_json
+check 'create --device keeps a character device of the host'"'"'s, and refuses what gives the host away' t_create_device
+
+# create -p (ROADMAP N.1), as an ordinary user: a port goes in .conf as
+# port=<address>:<host port>:<box port>, on 127.0.0.1 unless an address is
+# given, and inspect shows it in text and in JSON. Refused, each with its
+# reason and before anything is made: a UDP port, a number that is no port,
+# a second port on one port of the host, on one address or on every address
+# and one of them, a seventeenth port, and -p to a box of --profile agent. A
+# port line of .conf that cannot be read is an error of the configuration.
+t_create_port() {
+    local bad=0 said want many i
+    no() { # what it says, create's options
+        local what=$1
+        shift
+        said=$(lb create pub 10.0.0.4 "$@" 2>&1) && { echo "create $*: succeeded"; lb rm pub >/dev/null 2>&1; bad=1; return; }
+        case $said in *"$what"*) ;; *) echo "create $*: $said"; bad=1 ;; esac
+        [ ! -e "$C/pub" ] || { echo "create $*: the container is there"; bad=1; }
+    }
+    lb create web 10.0.0.2 -p 8080:80 --publish 0.0.0.0:8443:443/tcp -p 10.9.8.7:2222:22 >/dev/null || return 1
+    want='port=127.0.0.1:8080:80
+port=0.0.0.0:8443:443
+port=10.9.8.7:2222:22'
+    [ "$(grep '^port=' "$C/web/.conf")" = "$want" ] || { grep '^port=' "$C/web/.conf"; echo "the .conf does not have them"; return 1; }
+    said=$(lb inspect web | grep '^port: ')
+    [ "$said" = "$(printf '%s\n' "$want" | sed 's/^port=/port: /')" ] || { echo "$said"; echo "inspect does not show them"; return 1; }
+    if command -v python3 >/dev/null 2>&1; then
+        lb inspect web --json | python3 -I -c '
+import json, sys
+d = json.load(sys.stdin)[0]["ports"]
+want = [{"address": "127.0.0.1", "host_port": 8080, "box_port": 80},
+        {"address": "0.0.0.0", "host_port": 8443, "box_port": 443},
+        {"address": "10.9.8.7", "host_port": 2222, "box_port": 22}]
+assert d == want, d
+' || { echo "inspect --json does not have them"; return 1; }
+    fi
+    lb create db 10.0.0.3 >/dev/null && [ "$(lb inspect db | grep '^port')" = 'port: -' ] ||
+        { echo "a container without ports is not shown so"; return 1; }
+    no 'a UDP port is not published' -p 53:53/udp
+    no 'a port is a number from 1 to 65535' -p 0:80
+    no 'the box already has a port on that port of the host' -p 8080:80 -p 8080:81
+    no 'the box already has a port on that port of the host' -p 0.0.0.0:8080:80 -p 127.0.0.1:8080:81
+    many=""
+    for i in $(seq 1 17); do many="$many -p $((9000 + i)):80"; done
+    # shellcheck disable=SC2086  # options of one word each
+    no 'the box already has the maximum of 16 ports' $many
+    no '--profile agent refuses -p' --profile agent -p 8080:80
+    # one port on two addresses is two ports, and two ports may reach one port of the box
+    lb create two 10.0.0.5 -p 127.0.0.1:8080:80 -p 10.9.8.7:8080:80 -p 9090:80 >/dev/null ||
+        { echo "a port on two addresses, or two that reach one port of the box, was refused"; bad=1; }
+    printf 'port=nonsense\n' >> "$C/db/.conf"
+    said=$(lb inspect db 2>&1) && { echo "a .conf with a port that is none was read"; bad=1; }
+    case $said in *"names the host's port and the box's"*) ;; *) echo "$said"; bad=1 ;; esac
+    return $bad
+}
+check 'create -p keeps a port of the host'"'"'s for the box, on 127.0.0.1 unless told, and refuses what is none' t_create_port
+check 'cp refuses what it cannot copy, before it asks for root'      t_cp_arguments
 check 'configuration: carriage returns are stripped'                   t_config_strips_carriage_returns
 check 'configuration: inline comments are stripped'                    t_config_strips_inline_comments
 check 'configuration: unknown keys and lines that are no setting are said, with the line' t_config_reports_unknown_keys
@@ -2389,6 +2607,7 @@ check 'a surplus argument is an error that names it'                    t_surplu
 check 'doctor says how to fix each thing it finds missing'              t_doctor_says_how_to_fix
 check 'doctor --json: settings and checks, typed'                       t_doctor_json
 check 'doctor --profile agent: what the profile needs, and its fixes'   t_doctor_profile
+check 'doctor says without root that a kernel has no bpf call, and else that root may tell' t_doctor_device_filter_as_a_user
 check 'update, restart, rm -f and reset check their options before anything'  t_update_restart_rm_options
 check 'update writes the limits into a stopped container'"'"'s .conf'       t_update_rewrites_the_conf
 check 'create --userns is root'"'"'s, and inspect and doctor show the ranges' t_userns_as_a_user_sees_it

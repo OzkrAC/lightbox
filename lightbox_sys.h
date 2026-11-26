@@ -36,6 +36,7 @@
 #define LB_SYS_capget     125
 #define LB_SYS_capset     126
 #define LB_SYS_statfs     137
+#define LB_SYS_fstatfs    138
 #define LB_SYS_chroot     161
 #define LB_SYS_fsetxattr  190
 #define LB_SYS_fgetxattr  193
@@ -57,6 +58,8 @@
 #define LB_SYS_close_range 436
 #define LB_SYS_openat2    437
 #define LB_SYS_mount_setattr 442
+#define LB_SYS_getsockname 51
+#define LB_SYS_getsockopt 55
 #elif defined(__aarch64__)
 #define LB_SYS_fsetxattr  7
 #define LB_SYS_fgetxattr  10
@@ -66,6 +69,7 @@
 #define LB_SYS_linkat     37
 #define LB_SYS_renameat   38
 #define LB_SYS_statfs     43
+#define LB_SYS_fstatfs    44
 #define LB_SYS_fchdir     50
 #define LB_SYS_chroot     51
 #define LB_SYS_fchmod     52
@@ -90,6 +94,8 @@
 #define LB_SYS_close_range 436
 #define LB_SYS_openat2    437
 #define LB_SYS_mount_setattr 442
+#define LB_SYS_getsockname 204
+#define LB_SYS_getsockopt 209
 #else
 #error "lightbox supports x86_64 and aarch64 only"
 #endif
@@ -116,10 +122,14 @@
 #define LB_ENOTDIR                20
 #define LB_EISDIR                 21
 #define LB_ERANGE                 34
+#define LB_ENAMETOOLONG           36
 #define LB_ENOTEMPTY              39
 #define LB_ELOOP                  40
 #define LB_ENODATA                61
 #define LB_EOPNOTSUPP             95
+#define LB_EADDRINUSE             98
+#define LB_EADDRNOTAVAIL          99
+#define LB_EINPROGRESS            115
 
 /* The signals lightbox names that lightc does not (asm/signal.h) */
 #define LB_SIGPIPE                13
@@ -268,6 +278,10 @@
 #define LB_MOVE_MOUNT_F_EMPTY_PATH    0x00000004    /* the tree is the descriptor itself */
 #define LB_MOVE_MOUNT_T_SYMLINKS      0x00000010    /* follow a link at the end of the target */
 
+/* clone(2) and unshare(2): the namespace that lightc does not name yet
+ * (linux/sched.h; ROADMAP U.4) */
+#define LB_CLONE_NEWCGROUP            0x02000000
+
 /* prctl(2) requests (linux/prctl.h) */
 #define LB_PR_SET_DUMPABLE            4
 #define LB_PR_SET_KEEPCAPS            8
@@ -301,6 +315,12 @@
  * write an interface's flags (sys/socket.h, linux/sockios.h, linux/if.h). */
 #define LB_AF_INET                2
 #define LB_SOCK_DGRAM             2
+
+/* What a published port takes that lightc's sockets do not name (ROADMAP
+ * N.1): a socket that does not block, and the error of a connect that did
+ * not (sys/socket.h). SOCK_NONBLOCK is O_NONBLOCK, the same on both targets. */
+#define LB_SOCK_NONBLOCK          04000
+#define LB_SO_ERROR               4
 #define LB_SIOCGIFFLAGS           0x8913
 #define LB_SIOCSIFFLAGS           0x8914
 #define LB_IFF_UP                 0x1
@@ -600,6 +620,21 @@ static inline lc_sysret lb_sys_recvfrom(int32_t fd, void *buf, uint64_t len, int
     return lc_syscall6(SYS_recvfrom, fd, (int64_t)buf, (int64_t)len, flags, 0, 0);
 }
 
+/* What a published port takes that lightc does not wrap (ROADMAP N.1):
+ * accept4(2) with flags, where lc_socket_accept gives none, with lightc's
+ * number; and getsockopt(2) and getsockname(2), with lightbox's. */
+static inline lc_sysret lb_sys_accept4(int32_t fd, int32_t flags) {
+    return lc_syscall4(SYS_accept4, fd, 0, 0, flags);
+}
+
+static inline lc_sysret lb_sys_getsockopt(int32_t fd, int32_t level, int32_t name, void *value, uint32_t *len) {
+    return lc_syscall5(LB_SYS_getsockopt, fd, level, name, (int64_t)value, (int64_t)len);
+}
+
+static inline lc_sysret lb_sys_getsockname(int32_t fd, void *addr, uint32_t *len) {
+    return lc_syscall3(LB_SYS_getsockname, fd, (int64_t)addr, (int64_t)len);
+}
+
 /* ppoll(2) with the caller's signal mask left as it is: wait until one of the
  * descriptors has something, or for as long as timeout says. The number of
  * descriptors that have something, 0 when the time ran out. */
@@ -727,6 +762,11 @@ static inline lc_sysret lb_sys_umask(uint32_t mask) {
 
 static inline lc_sysret lb_sys_statfs(const char *path, struct lb_statfs *buf) {
     return lc_syscall2(LB_SYS_statfs, (int64_t)path, (int64_t)buf);
+}
+
+/* the same of what a descriptor is open on, one of open_tree's among them */
+static inline lc_sysret lb_sys_fstatfs(int32_t fd, struct lb_statfs *buf) {
+    return lc_syscall2(LB_SYS_fstatfs, fd, (int64_t)buf);
 }
 
 static inline lc_sysret lb_sys_statx(int32_t dirfd, const char *path, int32_t flags,

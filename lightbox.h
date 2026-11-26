@@ -18,13 +18,16 @@
 
 /* What --version says: the release, set when it is tagged, and "-dev" after
  * it on the way to the next one. */
-#define LIGHTBOX_VERSION "0.11.0-dev"
+#define LIGHTBOX_VERSION "0.11.0"
 
 #define MAX_PATH         512
 #define NAME_MAX_LEN     30
 #define MAX_VOLS         16
 #define MAX_LINKS        8
+#define MAX_DEVICES      16     /* LB_DEV_EXTRA_MAX of lightbox_devices.h (ROADMAP G.1) */
 #define MAX_DNS          3       /* as many as a resolver reads from resolv.conf */
+#define MAX_PORTS        16      /* -p of create (ROADMAP N.1) */
+#define PORT_TEXT_MAX    24      /* "255.255.255.255:65535:65535" and its NUL */
 
 /* What a container may reach (ROADMAP 8.5, 8.6): today's network, the
  * internet and its name servers only, nothing at all, or one port of the
@@ -33,12 +36,14 @@
 enum { NET_NAT = 0, NET_OUTSIDE = 1, NET_NONE = 2, NET_PROXY = 3 };
 #define NET_MODE_TEXT_MAX 12    /* "proxy:65535" and its NUL */
 
-/* The largest legal container .conf: MAX_VOLS volumes of two MAX_PATH paths,
- * MAX_LINKS links and the scalar keys. The reader and the writer of a .conf
- * use a buffer of exactly this size, so a config is never cut on the way in
- * or out; one that does not fit is an error. */
-#define CONF_MAX         20480
-_Static_assert(CONF_MAX > MAX_VOLS * (2 * MAX_PATH + 8) + MAX_LINKS * (NAME_MAX_LEN + 8) + 512,
+/* The largest legal container .conf: MAX_VOLS volumes and MAX_DEVICES
+ * devices of two MAX_PATH paths each, MAX_LINKS links and the scalar keys.
+ * The reader and the writer of a .conf use a buffer of exactly this size, so
+ * a config is never cut on the way in or out; one that does not fit is an
+ * error. */
+#define CONF_MAX         40960
+_Static_assert(CONF_MAX > MAX_VOLS * (2 * MAX_PATH + 8) + MAX_DEVICES * (2 * MAX_PATH + 12) +
+                          MAX_LINKS * (NAME_MAX_LEN + 8) + MAX_PORTS * (PORT_TEXT_MAX + 8) + 512,
                "CONF_MAX is too small for the largest legal container config");
 
 /* The limits as text, the way they are given and the way the file has them. */
@@ -127,6 +132,31 @@ typedef struct {
     bool ro;
 } volume_spec;
 
+/* A device of the host's that a container is given (ROADMAP G.1): its node
+ * on the host, whose numbers are read at each start, as the kernel may give
+ * one others after a boot; where it is in the container, under /dev; and
+ * whether it is given to read alone. */
+typedef struct {
+    char host[MAX_PATH];
+    char path[MAX_PATH];
+    bool ro;
+} device_spec;
+
+/*
+ * A port of the host's that reaches one of the box's (ROADMAP N.1): TCP on
+ * the host's address addr, which is 127.0.0.1 unless another is given and 0
+ * for every address the host has, and its port host_port, to the box's port
+ * box_port. The relay of the box's ports takes each connection and makes one
+ * to box_port on the box's own loopback, so that what the box serves on its
+ * loopback alone is published too. The address is as parse_ipv4 gives it,
+ * its first number the highest byte.
+ */
+typedef struct {
+    uint32_t addr;
+    uint16_t host_port;
+    uint16_t box_port;
+} port_spec;
+
 /* A box's id (ROADMAP 8.9): 16 lowercase hex digits that create draws and
  * .conf keeps, which the audit log tells a box from a later one of its name
  * by. A box made before boxes had one has none. */
@@ -171,6 +201,11 @@ typedef struct {
     uint32_t gid_start;
     int  nvols;
     volume_spec vols[MAX_VOLS];
+    int  ndevs;
+    device_spec devs[MAX_DEVICES];
+    bool gpu;                   /* --gpu: the host's GPUs, found at each start (ROADMAP G.3) */
+    int  nports;
+    port_spec ports[MAX_PORTS];
     int  nlinks;
     char links[MAX_LINKS][NAME_MAX_LEN + 1];
 } container_config;
@@ -206,6 +241,33 @@ void net_mode_text(char out[NET_MODE_TEXT_MAX], int mode, int proxy_port);
 /* The destination alone, in the one spelling it is stored in. */
 [[nodiscard]] const char *parse_volume_destination(const char *text, char dst[MAX_PATH]);
 
+/*
+ * A port as -p and the file give it (ROADMAP N.1): [<address>:]<host
+ * port>:<box port>[/tcp], 127.0.0.1 without an address and 0.0.0.0 for every
+ * address. NULL when it is one, or what is wrong with it. The text it is
+ * kept and shown as is <address>:<host port>:<box port>, the address always
+ * named. config_add_port refuses a second port on the same port of the host.
+ */
+[[nodiscard]] const char *parse_port_spec(const char *spec, port_spec *port);
+void port_spec_text(char out[PORT_TEXT_MAX], const port_spec *port);
+[[nodiscard]] const char *config_add_port(container_config *config, const port_spec *port);
+
+/* nobody's uid and gid, which a host tool and the relay of a box's ports run as */
+#define NOBODY_ID 65534u
+
+/*
+ * The relay of a box's published ports (lightbox_relay.c). relay_listen: a
+ * TCP socket that listens on that address and port of the host's, made as
+ * start makes it, or the negative errno; relay_port_of: the port one listens
+ * on, for a socket that was given port 0. relay_run, in a process of its
+ * own that holds nothing else: listeners[i] relayed to box_ports[i] on the
+ * loopback of the network namespace netns (-1: the one it is in), once it is
+ * confined, which it says by a byte on ready. It ends only with an error.
+ */
+lc_sysret relay_listen(uint32_t addr, uint16_t port);
+int relay_port_of(int32_t fd);
+[[noreturn]] void relay_run(const int32_t *listeners, const uint16_t *box_ports, int n, int32_t netns, int32_t ready);
+
 /* A configuration with nothing in it and no limit given yet. */
 void container_config_init(container_config *config);
 /* Give every limit that has not been given the default of lightbox.conf.
@@ -233,6 +295,57 @@ void container_config_load_or_die(const char *name, container_config *config);
 int config_volume_at(const container_config *config, const char *dst);
 /* NULL, or why the volume cannot be added: no room, or the destination is taken. */
 [[nodiscard]] const char *config_add_volume(container_config *config, const volume_spec *vol);
+/* --device <host>[:<path>][:ro] and a .conf's device line (ROADMAP G.1):
+ * NULL, or what is wrong with it. The path in the container is the host's
+ * where none is given, and is under /dev and none of the nodes every
+ * container has. */
+[[nodiscard]] const char *parse_device_spec(const char *spec, device_spec *dev);
+[[nodiscard]] const char *config_add_device(container_config *config, const device_spec *dev);
+/* What a device given to a container is on the host now: NULL with its
+ * numbers, or why it is not given. Never a block device, nor one that gives
+ * the host away; to a box of --profile agent a GPU's compute nodes alone. */
+[[nodiscard]] const char *device_check(const device_spec *dev, bool agent, uint32_t *major, uint32_t *minor);
+/* The same of what is known of a node already, as start has it of the mount
+ * it took of the node: NULL, or why the node at host is not given. */
+struct lb_statx;
+[[nodiscard]] const char *device_refused(const char *host, const struct lb_statx *stx, bool agent);
+/* Why a node on a mount with nodev is not given: the host's nodev is not
+ * lifted for a container, and in a user namespace it could not be. */
+[[nodiscard]] const char *device_on_nodev(const char *host);
+/* What a container of --userns needs to open a node as it is given
+ * (ROADMAP G.2), from its mode and group, which stx has: NULL with *gid 0
+ * when anyone may, NULL with its group's gid when only its group may, which
+ * the container is then given; or why the container cannot open it. */
+[[nodiscard]] const char *device_userns_group(const char *host, const struct lb_statx *stx, bool ro, uint32_t *gid);
+/* The host's GPUs for compute, as --gpu gives them (ROADMAP G.3, lightbox_gpu.c):
+ * the render nodes of /dev/dri, NVIDIA's nodes and /dev/kfd under root, ""
+ * for the host itself, each at its own path, in the order of their names:
+ * how many, or -1 for more than max. */
+[[nodiscard]] int gpu_devices(const char *root, device_spec *out, int max);
+/*
+ * NVIDIA's libraries for a box of --gpu (ROADMAP G.3): where root has
+ * NVIDIA's kernel module loaded, the version it says in
+ * /proc/driver/nvidia/version, the files of that version that a CUDA program
+ * and nvidia-smi load, found in the host's directories of libraries under
+ * root, and the host's links to them. 1 with them; 0 with no module; -1 with
+ * the module and no libcuda of its version, which missing names.
+ * root_has_musl: whether a root filesystem has musl's loader in /lib.
+ */
+#define NVIDIA_VERSION_MAX 32
+#define NVIDIA_NAME_MAX    96
+#define NVIDIA_FILES_MAX   8
+#define NVIDIA_LINKS_MAX   24
+#define NVIDIA_DIR         "/run/lightbox/gpu"
+typedef struct {
+    char version[NVIDIA_VERSION_MAX];
+    int  nfiles;
+    struct { char host[MAX_PATH]; char name[NVIDIA_NAME_MAX]; bool bin; } files[NVIDIA_FILES_MAX];
+    int  nlinks;
+    struct { char name[NVIDIA_NAME_MAX]; char target[NVIDIA_NAME_MAX]; } links[NVIDIA_LINKS_MAX];
+    char missing[NVIDIA_NAME_MAX];
+} nvidia_files;
+[[nodiscard]] int nvidia_libraries(const char *root, nvidia_files *out);
+[[nodiscard]] bool root_has_musl(const char *rootfs);
 /* Take out every volume at a destination: how many there were. */
 int config_remove_volumes_at(container_config *config, const char *dst);
 
@@ -333,10 +446,16 @@ void require_write_file(const char *path, const char *data);
  * Writing is atomic, and replaces a link of that name with the file. 0 or -1.
  * Reading gives the text and its length, 0 for a file that is not there, and
  * -1 for one that cannot be read, is not a regular file or does not fit. */
-/* The cgroup device program of lightbox_devices.h, loaded (ROADMAP 8.4): its
- * descriptor, or -errno. A program the kernel refuses is loaded once more
- * for the verifier to say why, into log, which is empty otherwise. */
-lc_sysret device_program_load(char *log, uint32_t log_size);
+/* The cgroup device program of lightbox_devices.h, loaded (ROADMAP 8.4),
+ * with a row for each device a container is given (ROADMAP G.1): its
+ * descriptor, or -errno, -EINVAL for rows it may not have. A program the
+ * kernel refuses is loaded once more for the verifier to say why, into log,
+ * which is empty otherwise. */
+struct lb_dev_row;
+lc_sysret device_program_load(const struct lb_dev_row *extra, size_t nextra, char *log, uint32_t log_size);
+/* Whether the kernel has no bpf system call at all, which anyone may ask:
+ * then no device program is loaded, by root either (ROADMAP R.4). */
+[[nodiscard]] bool bpf_call_missing(void);
 
 [[nodiscard]] int write_file_in_root(const char *root, const char *dir, const char *name,
                                      const char *data, int32_t mode);
@@ -480,6 +599,21 @@ void id_map_line(char out[ID_MAP_LINE_MAX], const id_map *map);
                                id_map *uids, id_map *gids);
 /* uid_map and gid_map of a process in a new user namespace: 0, or minus an errno */
 [[nodiscard]] int userns_write_maps(int pid, uint32_t uid_start, uint32_t gid_start);
+/*
+ * The host's groups of the devices a container of --userns is given, which
+ * only their group may open (ROADMAP G.2): each is one more line of its gid
+ * map, of one gid, at USERNS_DEVICE_GID and on, past its range, and its
+ * processes hold them. No id 0 of the host's is ever one of them.
+ * userns_gid_map_text: the map, false when it does not fit; userns_write_maps_with:
+ * both maps, the gid map with those lines; gid_map_device_groups: the gids
+ * inside of those lines in the text of a gid_map, how many.
+ */
+#define USERNS_DEVICE_GID USERNS_SIZE
+#define USERNS_MAP_TEXT_MAX (ID_MAP_LINE_MAX * (1 + MAX_DEVICES))
+[[nodiscard]] bool userns_gid_map_text(char *out, size_t max, uint32_t gid_start, const uint32_t *groups, size_t ngroups);
+[[nodiscard]] int userns_write_maps_with(int pid, uint32_t uid_start, uint32_t gid_start, const uint32_t *groups,
+                                         size_t ngroups);
+int gid_map_device_groups(const char *text, uint32_t *inside, int max);
 /* A user namespace with a container's maps, for idmapped mounts: a
  * descriptor, or minus an errno */
 [[nodiscard]] int userns_fd_with(uint32_t uid_start, uint32_t gid_start);
@@ -542,6 +676,13 @@ typedef struct {
     /* The tree is an overlay's upper directory: what it marks as taken out
      * of its base is written as an image marks it. */
     bool        overlay;
+    /* For lightbox cp (ROADMAP C.1): names are taken as they are, one that
+     * begins with .wh. too, which nothing reads as a mark then; every owner
+     * is written as 0 with owners_root; and no setuid or setgid bit with
+     * no_setid. */
+    bool        plain;
+    bool        owners_root;
+    bool        no_setid;
 
     uint64_t    entries;            /* written */
     uint64_t    sockets;            /* left out: a socket is of a process that is gone */
@@ -553,6 +694,9 @@ typedef struct {
 /* The tree under a directory, which is not an entry itself, and the
  * archive's end: 0, or -1 with failure and failed_at set. */
 [[nodiscard]] int tar_write_tree(tar_writer *w, int32_t dirfd);
+/* One entry of a directory, name, and what is in it where it is one, at the
+ * archive's top as as, and the archive's end: what lightbox cp sends. */
+[[nodiscard]] int tar_write_one(tar_writer *w, int32_t dirfd, const char *name, const char *as);
 
 /* Where an archive's bytes come from, in order: how many were put at data,
  * at most len, 0 at the archive's end, or less than 0 to end the reading.
@@ -565,6 +709,7 @@ typedef enum {
     TAR_INTO_TREE,              /* one tree for all layers: a mark takes out what it names */
     TAR_INTO_UPPER,             /* an overlay's upper directory: a mark becomes the overlay's own */
     TAR_INTO_UPPER_USERXATTR,   /* the same, for an overlay mounted with userxattr */
+    TAR_INTO_COPY,              /* lightbox cp (ROADMAP C.1): a name is a name, and no mark */
 } tar_into;
 
 /*
@@ -585,6 +730,13 @@ typedef struct {
     uint32_t    uid_start;
     uint32_t    gid_start;
     tar_into    into;
+    /* For lightbox cp (ROADMAP C.1): no setuid or setgid bit is made with
+     * no_setid; and with owner_given every entry is owner_uid's and
+     * owner_gid's, whatever the archive says. */
+    bool        no_setid;
+    bool        owner_given;
+    uint32_t    owner_uid;
+    uint32_t    owner_gid;
 
     uint64_t    entries;            /* made, or taken out by a mark */
     uint64_t    devices;            /* not made: a container's devices are lightbox's to give */
@@ -932,6 +1084,8 @@ int32_t store_lock(void);
 /* Whether this process holds the store's lock: it does from a store_lock()
  * that found a store until it ends. */
 bool store_lock_held(void);
+/* The store's lock let go, as store_lock gave it; -1 is nothing to let go. */
+void store_unlock(int32_t fd);
 /* A container's lock if no command holds it, without waiting: the
  * descriptor that holds it, or -1. */
 int32_t container_lock_try(const char *name);
@@ -1085,6 +1239,13 @@ bool bridge_traffic_is_filtered(void);
  * start makes it again when it is not all there, as setup makes it.
  */
 void ensure_host_network(const char *starting);
+/* cgroup_root a cgroup v2 hierarchy for a start, mounted there as setup
+ * mounts it where a reboot took the mount (ROADMAP F.5), under the store's
+ * lock; and refused as setup refuses it where that cannot be done. */
+void ensure_cgroup2_for_start(void);
+/* The cgroup of the containers' monitors in cgroup_base (ROADMAP M.1): a
+ * name with a dot, which no container's name has. */
+#define MONITOR_CGROUP "lightbox.monitors"
 /* What of it is not there, as "the bridge, the firewall rules", or NULL
  * when all of it is. The firewall is looked at only by root. */
 const char *host_network_missing(void);
@@ -1134,6 +1295,9 @@ bool host_port_ok(const char *ifname);
 [[nodiscard]] int iptables_kernel_missing(const char *proc_net, const char *modules, char *missing, size_t max,
                                           char *links, size_t links_max);
 [[nodiscard]] bool running_kernel_modules(char out[MAX_PATH]);
+/* Whether a module of that name is in the lists of the modules directory,
+ * built in or to load; listed says whether either list could be read. */
+[[nodiscard]] bool kernel_module_listed(const char *modules, const char *name, bool *listed);
 /* nft --check of the rules setup puts in, which the kernel validates and
  * nothing commits: 1 taken, 0 refused with what nft said in said, -1 not
  * asked, as there is no nft or the bridge's name is not one nft takes. Only

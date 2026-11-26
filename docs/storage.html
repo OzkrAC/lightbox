@@ -104,6 +104,7 @@ A *base* is a directory that holds a root filesystem: what a container is made f
 - **Changing or removing the base afterwards changes no container.** A snapshot is what its base was when it was taken.
 - **A snapshot is found by the path of its base, as it was written.** `create` takes the newest snapshot whose `source` is that path, letter for letter: the same directory under another spelling, a relative path or one with a slash at its end, is another base to lightbox and gets a snapshot of its own. Name a base by one absolute path.
 - **A snapshot's id** is 12 hex digits, from a hash of the base's path and the time. A container's `.conf` names its snapshot as `base=<id>`, and `inspect` shows it.
+- **A snapshot is made as `.<id>.new`** and renamed when it is whole. One that a killed `create`, `import`, `base add` or `base import` left unfinished is taken away by the next command that takes a snapshot, under the store's lock, which says so: `Removed an unfinished base snapshot, which a command that was killed left:` and its path.
 
 Three commands look after the snapshots. They take the lock of the store, as `create` does.
 
@@ -367,7 +368,7 @@ To free it:
 - `lightbox base ls` shows the snapshots that no container is on, with `-`, and `lightbox base rm <id>` removes them; a snapshot that `base import` made is one of them until a container is made of it.
 - `console.log` is opened to append, so it can be emptied while the container runs: `truncate -s 0 /var/lib/lightbox/containers/web/console.log`.
 - `audit.log` is opened anew for every line, so it can be moved aside. `logs --audit` then shows what is in the file that is there.
-- A directory in `bases/` whose name begins with a dot and ends in `.new` is a snapshot that a killed command did not finish. Nothing uses it, and it can be removed.
+- A directory in `bases/` whose name begins with a dot and ends in `.new` is a snapshot that a killed command did not finish. Nothing uses it, and the next command that takes a snapshot removes it, since 0.11.
 
 To keep a container from filling a disk, put what it writes where there is a limit already:
 

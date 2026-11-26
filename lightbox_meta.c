@@ -293,6 +293,63 @@ static void report_volumes(struct report *r, const container_config *config) {
     lc_print_char(STDOUT, ']');
 }
 
+/* The devices (ROADMAP G.1): a line each, "<host>:<path>[:ro]", or an array of objects. */
+static void report_devices(struct report *r, const container_config *config) {
+    if (!r->json) {
+        if (config->ndevs == 0)
+            print_kv("device", "-");
+        for (int i = 0; i < config->ndevs; i++) {
+            print_str(STDOUT, "device: ");
+            print_str(STDOUT, config->devs[i].host);
+            lc_print_char(STDOUT, ':');
+            print_str(STDOUT, config->devs[i].path);
+            print_str(STDOUT, config->devs[i].ro ? ":ro\n" : "\n");
+        }
+        return;
+    }
+    json_key("devices", r->first);
+    r->first = false;
+    lc_print_char(STDOUT, '[');
+    for (int i = 0; i < config->ndevs; i++) {
+        if (i) lc_print_char(STDOUT, ',');
+        lc_print_char(STDOUT, '{');
+        json_key("host", true);  json_string(config->devs[i].host);
+        json_key("path", false); json_string(config->devs[i].path);
+        json_key("ro", false);   print_str(STDOUT, config->devs[i].ro ? "true" : "false");
+        lc_print_char(STDOUT, '}');
+    }
+    lc_print_char(STDOUT, ']');
+}
+
+/* The ports it publishes (ROADMAP N.1): a line each, "<address>:<host
+ * port>:<box port>", or an array of objects. */
+static void report_ports(struct report *r, const container_config *config) {
+    if (!r->json) {
+        if (config->nports == 0)
+            print_kv("port", "-");
+        for (int i = 0; i < config->nports; i++) {
+            char text[PORT_TEXT_MAX];
+            port_spec_text(text, &config->ports[i]);
+            print_kv("port", text);
+        }
+        return;
+    }
+    json_key("ports", r->first);
+    r->first = false;
+    lc_print_char(STDOUT, '[');
+    for (int i = 0; i < config->nports; i++) {
+        char addr[IPV4_TEXT_MAX];
+        format_ipv4(addr, config->ports[i].addr);
+        if (i) lc_print_char(STDOUT, ',');
+        lc_print_char(STDOUT, '{');
+        json_key("address", true);    json_string(addr);
+        json_key("host_port", false); lc_print_unsigned(STDOUT, config->ports[i].host_port);
+        json_key("box_port", false);  lc_print_unsigned(STDOUT, config->ports[i].box_port);
+        lc_print_char(STDOUT, '}');
+    }
+    lc_print_char(STDOUT, ']');
+}
+
 /* The containers it is linked to: a line each, or an array of names. */
 static void report_links(struct report *r, const container_config *config) {
     if (!r->json) {
@@ -402,6 +459,7 @@ void cmd_inspect(int argc, char **argv) {
         report_number(&r, "oom_score", config.oom_score);
         report_flag(&r, "privileged", config.privileged, "1", "0");
         report_flag(&r, "readonly", config.read_only, "1", "0");
+        report_flag(&r, "gpu", config.gpu, "1", "0");
         report_text(&r, "seccomp", config.privileged ? NULL : config.seccomp_allow ? "allow" : "deny");
         char mode[NET_MODE_TEXT_MAX];
         net_mode_text(mode, config.net, config.proxy_port);
@@ -411,6 +469,8 @@ void cmd_inspect(int argc, char **argv) {
         report_text(&r, "profile", config.profile == PROFILE_AGENT ? "agent" : NULL);
         report_text(&r, "workdir", config.workdir[0] ? config.workdir : NULL);
         report_volumes(&r, &config);
+        report_devices(&r, &config);
+        report_ports(&r, &config);
         report_links(&r, &config);
     }
     if (json)
@@ -591,7 +651,7 @@ static void check_cgroups(struct doctor *d) {
     struct lb_statfs sfs;
     bool v2 = lb_sys_statfs(root, &sfs) == 0 && sfs.f_type == LB_CGROUP2_SUPER_MAGIC;
     doc_yes_no(d, "cgroup2", v2, root,
-               "boot with cgroup_no_v1=all, or set cgroup_root to an empty directory, which lightbox setup mounts cgroup2 on");
+               "boot with cgroup_no_v1=all, or set cgroup_root to an empty directory, which setup and start mount cgroup2 on");
     if (!v2)
         return;
     char path[MAX_PATH], list[256];
@@ -631,12 +691,19 @@ static void check_cgroups(struct doctor *d) {
 /* The cgroup device program a container that is not privileged starts with
  * (ROADMAP 8.4): loaded and let go, which only root may. */
 static void check_device_filter(struct doctor *d) {
+    static const char fix[] = "boot a kernel with CONFIG_CGROUP_BPF and CONFIG_BPF_SYSCALL; only a --privileged container "
+                              "starts without it";
+    /* a call the kernel does not have answers ENOSYS to anyone (ROADMAP R.4) */
+    if (bpf_call_missing()) {
+        doc_yes_no(d, "device_filter", false, "the kernel has no bpf system call, which loads the program", fix);
+        return;
+    }
     if (lb_sys_geteuid() != 0) {
         doc_yes_no(d, "device_filter", false, "not known: only root may load the program", "sudo lightbox doctor");
         return;
     }
     static char log[2048];
-    lc_sysret fd = device_program_load(log, sizeof(log));
+    lc_sysret fd = device_program_load(NULL, 0, log, sizeof(log));
     if (fd >= 0) {
         lc_kernel_close_file((int32_t)fd);
         doc_yes_no(d, "device_filter", true, "the kernel loads the cgroup device program", NULL);
@@ -646,8 +713,7 @@ static void check_device_filter(struct doctor *d) {
     bool cut = false;
     size_t pos = str_append(text, 0, "the kernel refuses the cgroup device program: errno ", sizeof(text), &cut);
     fmt_int(text + pos, (int)-fd);
-    doc_yes_no(d, "device_filter", false, text,
-               "boot a kernel with CONFIG_CGROUP_BPF and CONFIG_BPF_SYSCALL; only a --privileged container starts without it");
+    doc_yes_no(d, "device_filter", false, text, fix);
 }
 
 /*
@@ -763,11 +829,20 @@ static void check_exec_sealing(struct doctor *d) {
     }
 }
 
-/* Is overlayfs among the filesystems the kernel has? */
-static bool overlayfs_listed(void) {
+/* Is overlayfs among the filesystems the kernel has, or a module of the
+ * running kernel's that the first mount of one loads? /proc/filesystems
+ * lists it only once it is loaded (ROADMAP R.4). */
+enum overlayfs_kind { OVERLAYFS_LISTED, OVERLAYFS_MODULE, OVERLAYFS_NONE, OVERLAYFS_UNKNOWN };
+static enum overlayfs_kind overlayfs_here(void) {
     static char filesystems[8192];
-    return read_file("/proc/filesystems", filesystems, sizeof(filesystems)) > 0 &&
-           lc_string_contains(filesystems, lc_string_length(filesystems), "\toverlay\n", 9);
+    if (read_file("/proc/filesystems", filesystems, sizeof(filesystems)) > 0 &&
+        lc_string_contains(filesystems, lc_string_length(filesystems), "\toverlay\n", 9))
+        return OVERLAYFS_LISTED;
+    char modules[MAX_PATH];
+    bool listed = false;
+    if (running_kernel_modules(modules) && kernel_module_listed(modules, "overlay", &listed))
+        return OVERLAYFS_MODULE;
+    return listed ? OVERLAYFS_NONE : OVERLAYFS_UNKNOWN;
 }
 
 /*
@@ -776,9 +851,9 @@ static bool overlayfs_listed(void) {
  * snapshot of its base, which needs Linux 5.19, a filesystem under the
  * snapshots and the containers that idmaps, and a range of ids; exec and
  * stop end what it started with cgroup.kill; and nft is what filters its
- * traffic at the bridge with firewall_backend = nftables. Whether overlayfs
- * is there is not looked at: create tries a mount, which loads it, and
- * /proc/filesystems lists it only once it is loaded.
+ * traffic at the bridge with firewall_backend = nftables. overlayfs is
+ * looked for in /proc/filesystems and among the running kernel's modules,
+ * as a box is an overlay and the profile refuses --copy (ROADMAP R.4).
  */
 #define AGENT_KERNEL_MAJOR 5
 #define AGENT_KERNEL_MINOR 19
@@ -900,6 +975,18 @@ static void check_agent(struct doctor *d) {
                    "give " USERNS_OWNER " a range in " SUBUID_FILE " and " SUBGID_FILE ", such as "
                    USERNS_OWNER ":2147483647:2147483648");
     }
+    {
+        enum overlayfs_kind kind = overlayfs_here();
+        static const char *const said[] = {
+            [OVERLAYFS_LISTED] = "in /proc/filesystems",
+            [OVERLAYFS_MODULE] = "a module of the kernel's, which the first overlay mounted loads",
+            [OVERLAYFS_NONE] = "the kernel has none, built in or as a module: a box is an overlay of its base",
+            [OVERLAYFS_UNKNOWN] = "not in /proc/filesystems, and the running kernel's modules are not listed",
+        };
+        doc_yes_no(d, "agent.overlayfs", kind == OVERLAYFS_LISTED || kind == OVERLAYFS_MODULE, said[kind],
+                   kind == OVERLAYFS_UNKNOWN ? "modprobe overlay, and see that /proc/filesystems lists it"
+                                             : "boot a kernel with CONFIG_OVERLAY_FS: --profile agent refuses --copy");
+    }
     check_agent_idmap(d);
     const char *nft = tool_path_nft();
     doc_file(d, "agent.nft", path_executable(nft), nft,
@@ -984,8 +1071,11 @@ void cmd_doctor(int argc, char **argv) {
     }
     /* told, not counted: without it a new container is a copy of its base */
     {
-        bool overlay = overlayfs_listed();
-        doc_setting(d, "overlayfs", overlay ? "yes" : "no (a new container is a copy of its base, not an overlay)",
+        enum overlayfs_kind kind = overlayfs_here();
+        bool overlay = kind == OVERLAYFS_LISTED || kind == OVERLAYFS_MODULE;
+        doc_setting(d, "overlayfs", kind == OVERLAYFS_LISTED ? "yes"
+                                    : kind == OVERLAYFS_MODULE ? "yes (a module, which the first overlay mounted loads)"
+                                    : "no (a new container is a copy of its base, not an overlay)",
                     overlay ? "true" : "false");
     }
     /* told, not counted: only a container created with --userns needs one */

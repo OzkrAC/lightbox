@@ -163,6 +163,53 @@ stops it, and is
 A directory or a file of the host's in the container.
 Repeatable, up to 16.
 .TP
+.B \-\-gpu
+The host's GPUs for compute, found at each start and never kept:
+the render nodes of
+.IR /dev/dri ,
+NVIDIA's GPUs,
+.I nvidiactl
+and
+.IR nvidia\-uvm ,
+and
+.IR /dev/kfd ,
+each given as
+.B \-\-device
+gives one.
+A start that finds none ends and says so.
+Where NVIDIA's kernel module is loaded, also NVIDIA's libraries of its version
+that a CUDA program and nvidia\-smi load, read-only at
+.IR /run/lightbox/gpu/lib ,
+and nvidia\-smi at
+.IR /run/lightbox/gpu/bin ,
+which
+.B LD_LIBRARY_PATH
+and
+.B PATH
+name for the hook and
+.BR exec ;
+not to a container whose root has musl's loader.
+.TP
+.BI \-\-device " host" \fR[\fB:\fIpath\fR][\fB:ro\fR]
+A character device of the host's in the container, at
+.I path
+under
+.IR /dev ,
+or at its own path; read alone with
+.BR :ro .
+Its numbers are read at each start.
+Never a block device, nor the host's memory, ports, kernel log, consoles,
+input devices, uinput, watchdog, MSRs or cpuid;
+to a box of
+.B \-\-profile agent
+a GPU's compute nodes alone.
+With
+.BR \-\-userns ,
+a node that only its group may open gives the container that group alone,
+mapped at gid 65536;
+one that only its owner may open, or of group 0, is refused.
+Repeatable, up to 16.
+.TP
 .BI \-\-workspace " dir"
 A directory of the host's at
 .IR /workspace ,
@@ -207,6 +254,17 @@ A name server for the container.
 Repeatable, up to 3.
 The default is the host's.
 .TP
+.BR \-p ", " \-\-publish " [\fIaddress\fB:\fR]\fIhost-port\fB:\fIbox-port\fR"
+A TCP port of the host's that reaches the box's port, relayed to the box's
+own loopback: on 127.0.0.1 unless an address is given, and on every address
+with 0.0.0.0.
+Repeatable, up to 16.
+The relay runs as nobody, with no capability and under its own seccomp
+filter, in the box's network and cgroup, and ends with the box.
+A port that is in use refuses the start.
+.B \-\-profile agent
+refuses it.
+.TP
 .B \-\-profile agent
 A box for an AI agent's session: a user namespace, the allow\-list, an
 overlay, and the network of
@@ -220,9 +278,10 @@ It refuses
 .BR \-\-privileged ,
 .BR \-\-link ,
 .BR "\-\-net nat" ,
-.B \-\-seccomp deny
+.BR "\-\-seccomp deny" ,
+.B \-\-copy
 and
-.BR \-\-copy .
+.BR \-p .
 .RE
 .TP
 .BI update " name" " \fR[\fB\-\-mem\fR \fIlimit\fR] [\fB\-\-pids\fR \fIlimit\fR] [\fB\-\-cpu\fR \fInum\fR]"
@@ -296,6 +355,21 @@ End the command, and all it started, after this long.
 .B exec
 then exits with 124.
 .RE
+.TP
+.BR cp " [" \-a "] \fIhost-path box\fB:\fIpath\fR, " cp " [" \-a "] \fIbox\fB:\fIpath host-path\fR"
+Copy a file, a link or a directory into a running box, or out of one,
+through the box's own root, where no link of the box's leads out of it.
+Where the destination is a directory the source goes into it under its own name,
+and otherwise it is the destination;
+.IB dir /.
+copies what is in
+.IR dir .
+What goes in is owned by the box's root, and with
+.B \-a
+by the owners it has;
+what comes out is owned by the owner of the directory it goes into.
+No setuid or setgid bit and no device is made either way.
+Each copy is two lines in the audit log.
 .TP
 .BR run " [\fIcreate options\fR] [\fIexec options\fR] [" \-\- "] [\fIcommand\fR [\fIarguments\fR]]"
 Create a box, start it, run a command in it as

@@ -16,6 +16,11 @@
  * a wrong row is seen too: /dev/mem, /dev/kmsg and /dev/console are refused,
  * /dev/null is not, and no device can be made.
  *
+ * The same again for the program of a container given devices with --device
+ * (ROADMAP G.1), with the rows of a box with a GPU after the table's: those
+ * devices open with the access each row gives, no other does, none is made,
+ * and a row a container may not be given builds no program.
+ *
  * An ordinary hosted program: it needs a C library and nothing of lightc.
  */
 
@@ -26,8 +31,10 @@
 
 #include "../lightbox_devices.h"
 
-static struct lb_ebpf_insn prog[LB_DEV_PROG_LEN];
+static struct lb_ebpf_insn prog[LB_DEV_PROG_MAX];
 static size_t prog_len;
+static const struct lb_dev_row *extra_rows;
+static size_t extra_count;
 static unsigned long verdicts, failures;
 
 static void fail(const char *what) {
@@ -42,7 +49,7 @@ static void fail(const char *what) {
  * path ending in an exit with r0 set. The program has no loop, so walking it
  * from the top with the set of written registers settles each path. */
 static void check_shape(void) {
-    struct bpf_insn kernels[LB_DEV_PROG_LEN];
+    struct bpf_insn kernels[LB_DEV_PROG_MAX];
     memcpy(kernels, prog, sizeof(kernels));
     for (size_t i = 0; i < prog_len; i++) {
         const struct lb_ebpf_insn *in = &prog[i];
@@ -53,9 +60,9 @@ static void check_shape(void) {
     }
 
     /* written[i]: the registers written on every path to instruction i */
-    uint16_t written[LB_DEV_PROG_LEN + 1];
-    int reached[LB_DEV_PROG_LEN + 1] = { 0 };
-    for (size_t i = 0; i <= LB_DEV_PROG_LEN; i++)
+    uint16_t written[LB_DEV_PROG_MAX + 1];
+    int reached[LB_DEV_PROG_MAX + 1] = { 0 };
+    for (size_t i = 0; i <= LB_DEV_PROG_MAX; i++)
         written[i] = 0xffff;
     written[0] = 1u << 1;       /* r1: the context */
     reached[0] = 1;
@@ -154,12 +161,12 @@ static uint64_t run(uint32_t kind, uint32_t access, uint32_t major, uint32_t min
     return 3;
 }
 
-/* What the tables say of one request. */
+/* What the tables, and the rows given, say of one request. */
 static int allowed(uint32_t kind, uint32_t access, uint32_t major, uint32_t minor) {
     if (kind != LB_DEVCG_DEV_CHAR)
         return 0;
-    for (size_t i = 0; i < LB_DEV_TABLE_LEN; i++) {
-        const struct lb_dev_row *row = &LB_DEV_TABLE[i];
+    for (size_t i = 0; i < LB_DEV_TABLE_LEN + extra_count; i++) {
+        const struct lb_dev_row *row = i < LB_DEV_TABLE_LEN ? &LB_DEV_TABLE[i] : &extra_rows[i - LB_DEV_TABLE_LEN];
         if (major >= row->major_first && major <= row->major_last &&
             minor >= row->minor_first && minor <= row->minor_last && !(access & ~row->access))
             return 1;
@@ -178,6 +185,25 @@ static void expect(const char *what, uint32_t kind, uint32_t access, uint32_t ma
     }
 }
 
+/* Every kind and access, majors past the highest row and minors at the
+ * edges of each, against what the tables and the rows given say. */
+static void check_all(void) {
+    check_shape();
+    static const uint32_t far[] = { 511, 1000, 4095, 4096, 0x7fffffffU, 0x80000000U, 0xffffffffU };
+    static const uint32_t minors_far[] = { LB_DEV_MINOR_MAX, LB_DEV_MINOR_MAX + 1, 0x7fffffffU,
+                                           0x80000000U, 0xffffffffU };
+    for (uint32_t kind = 0; kind < 4; kind++)
+        for (uint32_t access = 0; access < 8; access++) {
+            for (uint32_t major = 0; major < 300 + sizeof(far) / sizeof(far[0]); major++) {
+                uint32_t mj = major < 300 ? major : far[major - 300];
+                for (uint32_t minor = 0; minor < 300 + sizeof(minors_far) / sizeof(minors_far[0]); minor++) {
+                    uint32_t mn = minor < 300 ? minor : minors_far[minor - 300];
+                    expect("the tables", kind, access, mj, mn, allowed(kind, access, mj, mn));
+                }
+            }
+        }
+}
+
 int main(void) {
     prog_len = lb_devices_build(prog);
     if (prog_len != LB_DEV_PROG_LEN) {
@@ -192,23 +218,7 @@ int main(void) {
             (row->access & ~(uint32_t)(LB_DEVCG_ACC_READ | LB_DEVCG_ACC_WRITE)))
             fail("a row is out of range, or gives mknod");
     }
-    check_shape();
-
-    /* every kind and access, majors past the highest row and minors at the
-     * edges of each */
-    static const uint32_t far[] = { 1000, 4095, 4096, 0x7fffffffU, 0x80000000U, 0xffffffffU };
-    static const uint32_t minors_far[] = { LB_DEV_MINOR_MAX, LB_DEV_MINOR_MAX + 1, 0x7fffffffU,
-                                           0x80000000U, 0xffffffffU };
-    for (uint32_t kind = 0; kind < 4; kind++)
-        for (uint32_t access = 0; access < 8; access++) {
-            for (uint32_t major = 0; major < 300 + sizeof(far) / sizeof(far[0]); major++) {
-                uint32_t mj = major < 300 ? major : far[major - 300];
-                for (uint32_t minor = 0; minor < 300 + sizeof(minors_far) / sizeof(minors_far[0]); minor++) {
-                    uint32_t mn = minor < 300 ? minor : minors_far[minor - 300];
-                    expect("the tables", kind, access, mj, mn, allowed(kind, access, mj, mn));
-                }
-            }
-        }
+    check_all();
 
     /* by hand */
     const uint32_t C = LB_DEVCG_DEV_CHAR, B = LB_DEVCG_DEV_BLOCK;
@@ -240,8 +250,60 @@ int main(void) {
     expect("mknod of a terminal", C, M, 136, 0, 0);
     expect("mknod of 0:0, which the kernel never asks for", C, M, 0, 0, 0);
     expect("mknod of a block device", B, M, 7, 0, 0);
-
     printf("  %zu instructions, %zu rows, %lu verdicts checked, %lu wrong\n",
            prog_len, (size_t)LB_DEV_TABLE_LEN, verdicts, failures);
+
+    /* A box with a GPU (ROADMAP G.1): a render node, NVIDIA's control node, a
+     * major the kernel gives at boot, as nvidia-uvm's, and /dev/fuse read alone */
+    static const struct lb_dev_row gpu[] = {
+        { 226, 226, 128, 128, LB_DEV_RW },
+        { 195, 195, 255, 255, LB_DEV_RW },
+        { 511, 511, 0, 1, LB_DEV_RW },
+        { 10, 10, 229, 229, LB_DEV_R },
+    };
+    extra_rows = gpu;
+    extra_count = sizeof(gpu) / sizeof(gpu[0]);
+    unsigned long before = verdicts;
+    prog_len = lb_devices_build_with(prog, gpu, extra_count);
+    if (prog_len != LB_DEV_PROG_LEN_FOR(extra_count)) {
+        printf("  built %zu instructions with rows given, its length says %zu\n", prog_len,
+               (size_t)LB_DEV_PROG_LEN_FOR(extra_count));
+        return 1;
+    }
+    check_all();
+    expect("a render node given", C, R | W, 226, 128, 1);
+    expect("the render node after it", C, R | W, 226, 129, 0);
+    expect("a card node", C, R | W, 226, 0, 0);
+    expect("nvidiactl given", C, R | W, 195, 255, 1);
+    expect("nvidia-modeset", C, R | W, 195, 254, 0);
+    expect("nvidia-uvm-tools given", C, R | W, 511, 1, 1);
+    expect("past nvidia-uvm's minors", C, R | W, 511, 2, 0);
+    expect("/dev/fuse given to read, read", C, R, 10, 229, 1);
+    expect("/dev/fuse given to read, written", C, W, 10, 229, 0);
+    expect("mknod of a device given", C, M, 226, 128, 0);
+    expect("a block device of a render node's numbers", B, R | W, 226, 128, 0);
+    expect("/dev/null still", C, R | W, 1, 3, 1);
+    expect("/dev/mem still not", C, R, 1, 1, 0);
+    printf("  with %zu rows given: %zu instructions, %lu verdicts checked\n", extra_count, prog_len, verdicts - before);
+
+    /* rows a container may not be given build nothing, nor do too many */
+    static const struct lb_dev_row bad[] = {
+        { 226, 226, 128, 128, LB_DEV_RW | LB_DEVCG_ACC_MKNOD },
+        { 226, 226, 128, 128, 0 },
+        { 0x80000000U, 0x80000000U, 0, 0, LB_DEV_RW },
+        { 226, 226, 0, LB_DEV_MINOR_MAX + 1, LB_DEV_RW },
+        { 227, 226, 0, 0, LB_DEV_RW },
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++)
+        if (lb_devices_build_with(prog, &bad[i], 1) != 0)
+            fail("a row that may not be given built a program");
+    static struct lb_dev_row many[LB_DEV_EXTRA_MAX + 1];
+    for (size_t i = 0; i <= LB_DEV_EXTRA_MAX; i++)
+        many[i] = (struct lb_dev_row){ 226, 226, 128 + (uint32_t)i, 128 + (uint32_t)i, LB_DEV_RW };
+    if (lb_devices_build_with(prog, many, LB_DEV_EXTRA_MAX) != LB_DEV_PROG_MAX)
+        fail("the most rows a container may be given did not build a program of LB_DEV_PROG_MAX");
+    if (lb_devices_build_with(prog, many, LB_DEV_EXTRA_MAX + 1) != 0)
+        fail("more rows than a container may be given built a program");
+    printf("  %zu instructions at the most; %lu wrong in all\n", (size_t)LB_DEV_PROG_MAX, failures);
     return failures ? 1 : 0;
 }

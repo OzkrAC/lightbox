@@ -51,8 +51,9 @@ None of it is on disk. A reboot takes the bridge, the rules and forwarding with 
 | What it may reach | `create --net` | Its `.conf`, and rules for as long as it runs |
 | The containers it is linked to | `create --link` | Its `.conf`, and rules for as long as it runs |
 | The name servers it asks | `create --dns`, the `dns` setting, or the host's own | Its `/etc/resolv.conf`, and `.resolv` beside its `.conf` |
+| The host's ports that reach it | `create -p` | Its `.conf`, and a relay for as long as it runs |
 
-What `create` decided stays: `update` changes limits and nothing of the network. A container that is to have another address, another `--net`, other links or other name servers is removed and created again.
+What `create` decided stays: `update` changes limits and nothing of the network. A container that is to have another address, another `--net`, other links, other name servers or other ports is removed and created again.
 
 ## The bridge {#bridge}
 
@@ -325,8 +326,25 @@ lightbox ships no proxy. What a container may reach through one is the proxy's c
 The four modes are about what a container reaches. The other way round:
 
 - **The host reaches every container that has an address**, at that address, whatever the container's `--net`. lightbox's rules are about what comes from the bridge, and each of them lets a container's answers back before it refuses anything.
-- **No port of the host's leads to a container.** lightbox publishes no ports. A service in a container is used from the host, at the container's address, or by a container linked to it.
+- **A port of the host's leads to a container only where `-p` publishes it** ([Published ports](#ports)). Otherwise a service in a container is used from the host, at the container's address, or by a container linked to it.
 - **A new connection from another machine to a container's address** is not accepted by lightbox's rules. With iptables it goes on to the host's own `FORWARD` rules and policy, which `setup` set to DROP if it was the one to turn forwarding on. With nftables lightbox's own chain drops it, unless it carries the mark of [`bridge_accept_fwmark`](#nftables).
+
+## Published ports {#ports}
+
+`create -p` gives a container a TCP port of the host's that reaches one of its own, as `docker run -p` does, with two differences.
+
+```sh
+lightbox create web -p 8080:80                 # 127.0.0.1:8080, from this host alone
+lightbox create api -p 0.0.0.0:8443:443        # every address of the host's
+lightbox create db -p 10.1.2.3:5432:5432       # one address of the host's
+```
+
+- **On 127.0.0.1 unless an address is given.** `-p 8080:80` is reached from this host and from nowhere else. Every address takes `0.0.0.0`, and one address is named: it has to be one of the host's when the container starts. Docker listens on every address unless told otherwise.
+- **No firewall rule.** A connection to the port is the host's own, so the host's firewall says who reaches it, on every address. Docker's DNAT rules send such connections through the `FORWARD` chain, where a host firewall such as ufw, whose rules are `INPUT`'s, does not see them. lightbox makes no rule for a port, and leaves `route_localnet` off: turned on, it let a LAN's machines reach a host's loopback services in Kubernetes (CVE-2020-8558).
+- **A relay, on the container's loopback.** A relay of the container's takes each connection and makes one to the container's port on the container's own loopback. What the container serves on loopback alone is reached too, and it sees every connection come from `127.0.0.1`, not from the client's address. A container of `--net none` publishes too, as the relay reaches it there.
+- **TCP alone, up to 16 ports.** `/udp` is refused. One port of the host's is one container's: a second on it is refused by `create`, and a container whose port is in use does not start: `Error: the host's port of -p 127.0.0.1:8080:80 is in use`.
+
+The relay is a process of the container's: it runs in the container's network namespace and in a cgroup below the container's, `lightbox.relay`, whose limits hold for it and whose end ends it. It is nobody, with no capability and a seccomp filter of the calls it makes, so that a relay that something made do otherwise reaches what the container reaches and no more ([Security](security.html#network)). `inspect` shows the ports, and `--profile agent` refuses `-p`: an agent's box is no server for the network ([Agent boxes](agents.html#profile-refuses)).
 
 ## Links between containers {#links}
 
@@ -905,4 +923,4 @@ IPv6 is off inside containers. A container gets an IPv4 address and IPv4 firewal
 - **Everything else follows.** A container's address, its gateway and its name servers are IPv4: `--dns` takes no IPv6 address, and IPv6 name servers in the host's files are passed over. Inside a container no interface has an IPv6 address, loopback included, so a program that listens on IPv6 alone has nothing to listen on.
 
 {.source}
-Source: `lightbox_net.c` has the addresses, the firewall of both backends, `setup`, `reload` and the teardown; `lightbox_netlink.c` the rtnetlink requests; `lightbox.c` the network parts of `create`, `start` and init; and `contrib/proxy/` the Squid configuration.
+Source: `lightbox_net.c` has the addresses, the firewall of both backends, `setup`, `reload` and the teardown; `lightbox_netlink.c` the rtnetlink requests; `lightbox_relay.c` the relay of published ports; `lightbox.c` the network parts of `create`, `start` and init; and `contrib/proxy/` the Squid configuration.

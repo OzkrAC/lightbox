@@ -16,6 +16,7 @@
 #include <stdint.h>
 
 #include <linux/if.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 
@@ -26,6 +27,12 @@
     _Static_assert((ours) == (theirs), #ours " differs from " #theirs)
 
 SAME_VALUE(LB_AF_INET, AF_INET);
+
+/* a published port's sockets (ROADMAP N.1), what lightc does not name */
+SAME_VALUE(LB_SOCK_NONBLOCK, SOCK_NONBLOCK);
+SAME_VALUE(LB_SOCK_CLOEXEC, SOCK_CLOEXEC);
+SAME_VALUE(LB_SO_ERROR, SO_ERROR);
+SAME_VALUE(LB_SECCOMP_RELAY_SOCKET_TYPE, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC);
 
 /* statfs's flags of access times, which only the C library's headers name */
 SAME_VALUE(LB_ST_NOATIME, ST_NOATIME);

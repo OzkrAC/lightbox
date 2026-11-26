@@ -26,6 +26,7 @@
 #ifndef LIGHTBOX_DEVICES_H
 #define LIGHTBOX_DEVICES_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -141,13 +142,21 @@ static const struct lb_dev_row LB_DEV_TABLE[] = {
 
 /* ─── The program ───────────────────────────────────────────────────────── */
 
+/* The devices a container may be given with --device (ROADMAP G.1), each a
+ * row of its own after the table's. */
+#define LB_DEV_EXTRA_MAX  16
+
 /* Instructions: six to read the context, one for the kind of device, seven
- * per row and two to refuse. lb_devices_build() writes exactly this many. */
+ * per row and two to refuse. lb_devices_build_with() writes exactly
+ * LB_DEV_PROG_LEN_FOR(the rows it is given), and lb_devices_build()
+ * LB_DEV_PROG_LEN, the table's alone. */
 #define LB_DEV_PROG_HEAD  7
 #define LB_DEV_ROW_INSNS  7
-#define LB_DEV_PROG_LEN   (LB_DEV_PROG_HEAD + LB_DEV_ROW_INSNS * LB_DEV_TABLE_LEN + 2)
+#define LB_DEV_PROG_LEN_FOR(extra) (LB_DEV_PROG_HEAD + LB_DEV_ROW_INSNS * (LB_DEV_TABLE_LEN + (extra)) + 2)
+#define LB_DEV_PROG_LEN   LB_DEV_PROG_LEN_FOR(0)
+#define LB_DEV_PROG_MAX   LB_DEV_PROG_LEN_FOR(LB_DEV_EXTRA_MAX)
 
-_Static_assert(LB_DEV_PROG_LEN < 4096, "the jumps of the program are 16 bits");
+_Static_assert(LB_DEV_PROG_MAX < 4096, "the jumps of the program are 16 bits");
 
 /* The numbers of a row are compared as immediates, which the kernel widens
  * to 64 bits with their sign: each has to be below 2^31. */
@@ -167,16 +176,33 @@ static inline void lb_ebpf_jump(struct lb_ebpf_insn *prog, size_t *n, uint8_t co
     lb_ebpf_put(prog, n, code, dst, 0, (int16_t)((int32_t)target - (int32_t)*n - 1), (int32_t)imm);
 }
 
+/* A row a container is given may be: numbers below 2^31, minors no higher
+ * than the kernel has, and reading, or reading and writing, but never mknod. */
+static inline bool lb_dev_row_ok(const struct lb_dev_row *row) {
+    return LB_DEV_NUMBER_OK(row->major_last) && LB_DEV_NUMBER_OK(row->minor_last) &&
+           row->major_first <= row->major_last && row->minor_first <= row->minor_last &&
+           row->minor_last <= LB_DEV_MINOR_MAX &&
+           (row->access == LB_DEV_R || row->access == LB_DEV_RW);
+}
+
 /*
- * Write the program into prog, which holds LB_DEV_PROG_LEN instructions, and
- * return how many were written. r1 is the context; the program keeps the
- * access in r2, the kind of device in r3 and its numbers in r4 and r5, and
- * returns 1 to allow and 0 to refuse. Every number it compares with is below
- * 2^31, so the kernel's widening of an immediate to 64 bits keeps it.
+ * Write the program into prog, which holds LB_DEV_PROG_LEN_FOR(nextra)
+ * instructions: the rows of the table, then the extra ones a container is
+ * given (ROADMAP G.1), and return how many were written; 0, and nothing
+ * written, for more than LB_DEV_EXTRA_MAX extra rows or one that is not
+ * lb_dev_row_ok. r1 is the context; the program keeps the access in r2, the
+ * kind of device in r3 and its numbers in r4 and r5, and returns 1 to allow
+ * and 0 to refuse. Every number it compares with is below 2^31, so the
+ * kernel's widening of an immediate to 64 bits keeps it.
  */
-static inline size_t lb_devices_build(struct lb_ebpf_insn *prog) {
+static inline size_t lb_devices_build_with(struct lb_ebpf_insn *prog, const struct lb_dev_row *extra, size_t nextra) {
+    if (nextra > LB_DEV_EXTRA_MAX)
+        return 0;
+    for (size_t i = 0; i < nextra; i++)
+        if (!lb_dev_row_ok(&extra[i]))
+            return 0;
     size_t n = 0;
-    const size_t deny = LB_DEV_PROG_LEN - 2;   /* where the refusal is */
+    const size_t deny = LB_DEV_PROG_LEN_FOR(nextra) - 2;   /* where the refusal is */
 
     lb_ebpf_put(prog, &n, LB_EBPF_LDX_MEM_W, 2, 1, LB_DEVCG_CTX_ACCESS_TYPE, 0);
     lb_ebpf_put(prog, &n, LB_EBPF_ALU64_MOV_X, 3, 2, 0, 0);
@@ -190,8 +216,8 @@ static inline size_t lb_devices_build(struct lb_ebpf_insn *prog) {
 
     /* a row: its majors, its minors, and no access it does not give, mknod
      * among them; past any of them the next row */
-    for (size_t i = 0; i < LB_DEV_TABLE_LEN; i++) {
-        const struct lb_dev_row *row = &LB_DEV_TABLE[i];
+    for (size_t i = 0; i < LB_DEV_TABLE_LEN + nextra; i++) {
+        const struct lb_dev_row *row = i < LB_DEV_TABLE_LEN ? &LB_DEV_TABLE[i] : &extra[i - LB_DEV_TABLE_LEN];
         const size_t next = n + LB_DEV_ROW_INSNS;
         lb_ebpf_jump(prog, &n, LB_EBPF_JMP_JLT_K, 4, next, row->major_first);
         lb_ebpf_jump(prog, &n, LB_EBPF_JMP_JGT_K, 4, next, row->major_last);
@@ -206,6 +232,11 @@ static inline size_t lb_devices_build(struct lb_ebpf_insn *prog) {
     lb_ebpf_put(prog, &n, LB_EBPF_ALU64_MOV_K, 0, 0, 0, 0);
     lb_ebpf_put(prog, &n, LB_EBPF_JMP_EXIT, 0, 0, 0, 0);
     return n;
+}
+
+/* The program of the table alone: LB_DEV_PROG_LEN instructions. */
+static inline size_t lb_devices_build(struct lb_ebpf_insn *prog) {
+    return lb_devices_build_with(prog, NULL, 0);
 }
 
 #endif /* LIGHTBOX_DEVICES_H */
